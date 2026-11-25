@@ -22,3 +22,7 @@ Owner: `siem_engineer` (Increment 03, Package E)
   - `POST /api/storage/oauth/start`
   - `POST /api/storage/oauth/disconnect`
   - `POST /api/storage/oauth/finish` (`{ attemptHandle }` parsed once from `?oauth=finish#oauth-attempt=<43-char-handle>` after pre-refreshing `GET /api/csrf`, with immediate `history.replaceState` URL cleanup).
+
+## Increment 07: Microsoft 365 phase file sync
+
+`/admin/storage/file-sync` is the destination approval and health page. The shared phase slot `PhaseFileSyncSlot` reads approved target labels and writes only into the host editor value. The workspace's existing File sync tab shows a separate managed transfer section when records exist. Administrator resync is an explicit dry run followed by a confirmation; unknown outcomes trigger inspection only.

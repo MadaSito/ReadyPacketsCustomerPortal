@@ -48,3 +48,29 @@
    - `scripts/dev/tc.sh` — 0 diagnostics
    - `./node_modules/.bin/eslint` on owned `payments` paths — 0 errors, 0 warnings
    - **Not verified in this sandbox**: live external network calls to Stripe or Square production/sandbox endpoints; full Vite production bundle or live browser session (verified via jsdom + `axe-core` tests per build contract).
+
+## 4. Increment 07 — Package M (`D9` Stripe Completion, `D12` Receipt Sync Port, `D5` Payment/Intake Triggers)
+
+1. **D9 Server & Protocol Completion (`server/modules/payments/*`, `server/modules/compliance/*`)**:
+   - Async bank-debit Checkout Sessions (`checkout.session.completed` with `payment_status = "unpaid"`) record `payment_webhook_events.status = "awaiting_settlement"` (`AWAITING_ASYNC_SETTLEMENT`), transition `orders.paymentState -> "pending_async"` via `orders.payments.onPaymentEventInTx`, and return `200 OK`; subsequent `checkout.session.async_payment_succeeded` books the invoice, advances the order (`INVOICE_PAID`), transitions the cart (`checked_out`), and issues immutable receipt `RPR-...`; `checkout.session.async_payment_failed` marks the attempt `failed` and reverts `orders.paymentState -> "unpaid"`.
+   - `charge.refunded` queries `GET /v1/refunds?payment_intent=...` (or `charge=...`) over pinned egress (`listRefundsForPayment`), settles matching portal refunds, and flags unlinked external/Dashboard refunds (`status = "attention_required"`, `reasonCode = "UNLINKED_PROVIDER_REFUND"`, `payment.refund.flagged` audit, and `opsAlerts.emit` with hashed dedup key and zero raw provider IDs) without auto-booking.
+   - Secondary Stripe webhook signing secret (`payments.stripe.webhook_secret_secondary`), staged credential save while `provider = "none"`, `payments.admin.readiness`, `payments.admin.testConnection` (`GET /v1/checkout/sessions?limit=1`), `payments.admin.sendSelfTestWebhook` (`SELF_TEST_OK`), and zero-secret `payment_webhook_rejections` diagnostics with 14-day retention pruning.
+   - Backward-compatible `parsePaymentsConfigSetting` defaults verified for pre-Increment-07 stored settings shapes; router guard ordering verified (`UNAUTHORIZED` / `FORBIDDEN` before Zod input parsing).
+2. **D12 Receipt PDF Sync Port & D5 Automation Triggers (`server/modules/compliance/*`)**:
+   - `compliance.receipts.getFileSyncPdf({ receiptPublicId, orderPublicId }, tx)` verifies parent-order binding and renders deterministic `%PDF-` bytes for `managedFileSync`.
+   - Registered `payment.succeeded`, `payment.failed`, `payment.refunded`, `intake.submitted`, and `intake.reviewed` automation triggers in `server/modules/compliance/automationTriggers.ts`.
+3. **Admin & Customer Client Surfaces (designed and tested against WCAG 2.2 AA)**:
+   - `/admin/payments/setup` (`PaymentSetupPage.tsx`), `/admin/payments` incomplete-setup banner (`PaymentsPage.tsx`), secondary signing secret input (`PaymentSettings.tsx`), and customer `/invoices` `"Pay online"` action + read-only return banner (`InvoicePages.tsx`).
+4. **Increment 07 Verification Commands & Results**:
+   - `scripts/dev/test.sh server/modules/payments/stripeCompletion.e2e.test.ts` — 4/4 passed (real MySQL + protocol-fake Stripe + Express raw HTTP)
+   - `scripts/dev/test.sh server/modules/payments/refunds.test.ts` — 8/8 passed
+   - `scripts/dev/test.sh server/modules/payments/payments.test.ts` — 7/7 passed
+   - `scripts/dev/test.sh server/modules/payments/providers/square.test.ts` — 5/5 passed
+   - `scripts/dev/test.sh server/modules/payments/providers/square-refund.test.ts` — 5/5 passed
+   - `scripts/dev/test.sh client/src/features/payments/payments.test.tsx` — 12/12 passed (light + dark `axe-core`)
+   - `scripts/dev/test.sh client/src/features/compliance/customer/complianceCustomer.test.tsx` — 16/16 passed
+   - `scripts/dev/test.sh server/modules/compliance/receiptsAndSmallTotals.test.ts` — 6/6 passed
+   - `scripts/dev/test.sh server/modules/compliance/compliance.test.ts` — 13/13 passed
+   - `pnpm exec eslint` (`--max-warnings 0`) across all owned `compliance` and `payments` server/client files — 0 errors, 0 warnings
+   - Full `scripts/dev/tc.sh` — verified
+

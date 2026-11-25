@@ -258,6 +258,16 @@ function createFakeProvidersProtocol() {
         };
       }
 
+      if (method === "GET" && u.pathname === "/v1/checkout/sessions") {
+        const auth = headersLower["authorization"] ?? "";
+        const livemode = auth.startsWith("Bearer sk_live_") || auth.startsWith("Bearer rk_live_");
+        return {
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from(JSON.stringify({ object: "list", data: [{ livemode }] }), "utf8"),
+        };
+      }
+
       if (method === "GET" && u.pathname.startsWith("/v1/checkout/sessions/")) {
         const sessionId = decodeURIComponent(u.pathname.slice("/v1/checkout/sessions/".length));
         const s = stripeSessions.get(sessionId);
@@ -875,16 +885,31 @@ describe("payments.refunds — B5 console order refunds, reconciliation, webhook
     expect(referralRefundEvents[0]?.event.totalMinor).toBe(8_500);
   });
 
-  it("executes Stripe provider refunds, never re-POSTs on 'unknown' outcome, reserves balance, and settles via GET reconciliation", async () => {
-    const { h, protocol, compliance, payments, seedOrder, callerFor } = createHarness();
-    const webhookSecret = "whsec_test_refund_suite_secret_01";
+  async function activateStripeForTest(
+    payments: ReturnType<typeof createHarness>["payments"],
+    stripeSecretKey: string,
+    stripeWebhookSecret: string,
+  ) {
+    await payments.admin.updateSettings(adminPrincipal, {
+      provider: "none",
+      mode: "test",
+      currency: "USD",
+      stripeSecretKey,
+      stripeWebhookSecret,
+    });
+    await payments.admin.testConnection(adminPrincipal);
+    await payments.admin.sendSelfTestWebhook(adminPrincipal);
     await payments.admin.updateSettings(adminPrincipal, {
       provider: "stripe",
       mode: "test",
       currency: "USD",
-      stripeSecretKey: "sk_test_refund_suite_secret_01",
-      stripeWebhookSecret: webhookSecret,
     });
+  }
+
+  it("executes Stripe provider refunds, never re-POSTs on 'unknown' outcome, reserves balance, and settles via GET reconciliation", async () => {
+    const { h, protocol, compliance, payments, seedOrder, callerFor } = createHarness();
+    const webhookSecret = "whsec_test_refund_suite_secret_01";
+    await activateStripeForTest(payments, "sk_test_refund_suite_secret_01", webhookSecret);
 
     const order = seedOrder(customerBPrincipal);
     const invoicePublicId = await issueOrderInvoice(compliance, order.publicId, 10_000);
@@ -1039,13 +1064,7 @@ describe("payments.refunds — B5 console order refunds, reconciliation, webhook
   it("settles a pending Stripe refund through a verified `refund.updated` webhook and links payment_webhook_events", async () => {
     const { h, protocol, compliance, payments, seedOrder, callerFor } = createHarness();
     const webhookSecret = "whsec_test_refund_webhook_02";
-    await payments.admin.updateSettings(adminPrincipal, {
-      provider: "stripe",
-      mode: "test",
-      currency: "USD",
-      stripeSecretKey: "sk_test_refund_webhook_02",
-      stripeWebhookSecret: webhookSecret,
-    });
+    await activateStripeForTest(payments, "sk_test_refund_webhook_02", webhookSecret);
 
     const order = seedOrder(customerAPrincipal);
     const invoicePublicId = await issueOrderInvoice(compliance, order.publicId, 5_000);
@@ -1248,13 +1267,7 @@ describe("payments.refunds — B5 console order refunds, reconciliation, webhook
 
   it("normalizes cross-customer attempt-only checkoutStatus and cancelAttempt calls to NOT_FOUND:PAYMENT_ATTEMPT_NOT_FOUND", async () => {
     const { compliance, payments, seedOrder } = createHarness();
-    await payments.admin.updateSettings(adminPrincipal, {
-      provider: "stripe",
-      mode: "test",
-      currency: "USD",
-      stripeSecretKey: "sk_test_norm_validkey_04",
-      stripeWebhookSecret: "whsec_test_norm_validsecret_04",
-    });
+    await activateStripeForTest(payments, "sk_test_norm_validkey_04", "whsec_test_norm_validsecret_04");
 
     const aliceOrder = seedOrder(customerAPrincipal);
     const invoicePublicId = await issueOrderInvoice(compliance, aliceOrder.publicId, 3_000);
@@ -1283,13 +1296,7 @@ describe("payments.refunds — B5 console order refunds, reconciliation, webhook
   it("refuses signed same-amount sibling Stripe Dashboard webhooks, missing payment/charge binding, and direct-GET ID mismatches before settling the genuine portal refund", async () => {
     const { h, protocol, compliance, payments, seedOrder, callerFor } = createHarness();
     const webhookSecret = "whsec_test_sibling_guard_07";
-    await payments.admin.updateSettings(adminPrincipal, {
-      provider: "stripe",
-      mode: "test",
-      currency: "USD",
-      stripeSecretKey: "sk_test_sibling_guard_07",
-      stripeWebhookSecret: webhookSecret,
-    });
+    await activateStripeForTest(payments, "sk_test_sibling_guard_07", webhookSecret);
 
     const order = seedOrder(customerAPrincipal);
     const invoicePublicId = await issueOrderInvoice(compliance, order.publicId, 25_000);
@@ -1387,7 +1394,7 @@ describe("payments.refunds — B5 console order refunds, reconciliation, webhook
       });
       expect(res.httpStatus).toBe(200);
       expect(res.booked).toBe(false);
-      expect(res.reasonCode).toBe("IGNORED");
+      expect(res.reasonCode).toBe("UNLINKED_PROVIDER_REFUND");
     }
 
     // Even if a webhook envelope spoofs `metadata.refund_public_id` pointing at `dashboardRefundId`,
@@ -1575,13 +1582,7 @@ describe("payments.refunds — B5 console order refunds, reconciliation, webhook
   it("enforces payments.refund + REFUND ORDER on legacy compliance.invoices.admin.recordRefund, blocks provider_online bypass while a reservation is pending, and coordinates manual reservations", async () => {
     const { h, protocol, compliance, payments, seedOrder, callerFor } = createHarness();
     const webhookSecret = "whsec_test_legacy_guard_08";
-    await payments.admin.updateSettings(adminPrincipal, {
-      provider: "stripe",
-      mode: "test",
-      currency: "USD",
-      stripeSecretKey: "sk_test_legacy_guard_08",
-      stripeWebhookSecret: webhookSecret,
-    });
+    await activateStripeForTest(payments, "sk_test_legacy_guard_08", webhookSecret);
 
     const order = seedOrder(customerAPrincipal);
     const invoicePublicId = await issueOrderInvoice(compliance, order.publicId, 20_000);

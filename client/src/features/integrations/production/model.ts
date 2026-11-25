@@ -11,6 +11,7 @@ export type ProductionDispatchState =
   | "delivered"
   | "failed"
   | "dead"
+  | "stopped"
   | "unknown";
 export type ProductionSettingsState =
   | "disabled"
@@ -56,9 +57,30 @@ export interface ProductionSettingsView {
   p401UrlMask: ProductionUrlMask | null;
   authHeaderName: string;
   authHeaderValueConfigured: boolean;
+  signingEnabled: boolean;
+  signingSecretConfigured: boolean;
+  signingSecretLast4: string | null;
+  previousSigningSecretActive: boolean;
   canonVersion: string;
   runMode: string;
   timeoutMs: number;
+}
+
+export interface WorkflowAutoQueueItemView {
+  workflowPublicId: string;
+  workflowKey: string;
+  workflowName: string;
+  isDefault: boolean;
+  p101OnPaymentConfirmed: boolean;
+  p201OnPhase1Locked: boolean;
+  updatedAt: Date | string | null;
+}
+
+export interface SetWorkflowAutoQueueInput {
+  workflowPublicId?: string;
+  workflowKey?: string;
+  p101OnPaymentConfirmed: boolean;
+  p201OnPhase1Locked: boolean;
 }
 
 export interface ProductionSettingsUpdateInput {
@@ -125,12 +147,18 @@ export interface ProductionDispatchItem {
   resendReason: string | null;
   retryOf: string | null;
   redeliveryOf: string | null;
+  triggerSource?: string;
+  stageKey?: string | null;
+  stoppedAt?: Date | string | null;
+  stoppedByPublicId?: string | null;
+  stopReason?: string | null;
   requestedByPublicId: string | null;
   correlationId: string;
   createdAt: Date | string;
   updatedAt: Date | string;
   deliveredAt: Date | string | null;
   finalizedAt: Date | string | null;
+  nextAttemptAt?: Date | string | null;
 }
 
 export interface ProductionValidationError {
@@ -178,9 +206,11 @@ export interface ProductionOrderPreview {
   p401: ProductionLaterPhasePreview;
 }
 
+export type ProductionDispatchFilterState = ProductionDispatchState | "retrying";
+
 export interface ProductionListDispatchesInput {
   phase?: ProductionPhase;
-  state?: ProductionDispatchState;
+  state?: ProductionDispatchFilterState;
   orderReference?: string;
   fromDate?: Date;
   toDate?: Date;
@@ -212,10 +242,59 @@ export const DISPATCH_STATE_META: Record<ProductionDispatchState, { label: strin
   queued: { label: "Queued", tone: "info" },
   sending: { label: "Sending", tone: "info" },
   delivered: { label: "Delivered", tone: "success" },
-  failed: { label: "Failed (retrying)", tone: "warning" },
+  failed: { label: "Failed", tone: "danger" },
   dead: { label: "Dead-lettered", tone: "danger" },
+  stopped: { label: "Stopped", tone: "neutral" },
   unknown: { label: "Outcome unknown", tone: "warning" },
 };
+
+export const RETRYING_DISPATCH_META: { label: string; tone: Tone } = {
+  label: "Failed (retrying)",
+  tone: "warning",
+};
+
+export function getDispatchStateMeta(
+  row: Pick<ProductionDispatchItem, "state" | "attemptCount" | "nextAttemptAt">,
+): { label: string; tone: Tone } {
+  if (row.state === "queued" && row.attemptCount > 0 && Boolean(row.nextAttemptAt)) {
+    return RETRYING_DISPATCH_META;
+  }
+  return DISPATCH_STATE_META[row.state];
+}
+
+export const DISPATCH_FILTER_STATE_OPTIONS: readonly {
+  value: "" | ProductionDispatchFilterState;
+  label: string;
+}[] = [
+  { value: "", label: "All states" },
+  { value: "queued", label: DISPATCH_STATE_META.queued.label },
+  { value: "sending", label: DISPATCH_STATE_META.sending.label },
+  { value: "delivered", label: DISPATCH_STATE_META.delivered.label },
+  { value: "retrying", label: RETRYING_DISPATCH_META.label },
+  { value: "failed", label: DISPATCH_STATE_META.failed.label },
+  { value: "dead", label: DISPATCH_STATE_META.dead.label },
+  { value: "stopped", label: DISPATCH_STATE_META.stopped.label },
+  { value: "unknown", label: DISPATCH_STATE_META.unknown.label },
+];
+
+const TRIGGER_SOURCE_LABELS: Record<string, string> = {
+  manual: "Manual operator trigger",
+  operator: "Manual operator trigger",
+  lifecycle_payment_confirmed: "Automatic — payment confirmed",
+  payment_confirmed: "Automatic — payment confirmed",
+  lifecycle_phase1_locked: "Automatic — Phase 1 locked",
+  phase1_locked: "Automatic — Phase 1 locked",
+  stage_bundle: "Phase action",
+  automation_rule: "Automation rule",
+  retry: "Manual retry",
+  redeliver: "Administrator redelivery",
+  resend: "Administrator re-send",
+};
+
+export function formatTriggerSource(source: string | null | undefined): string | null {
+  if (!source) return null;
+  return TRIGGER_SOURCE_LABELS[source] ?? source.replace(/_/gu, " ");
+}
 
 export const SETTINGS_STATE_META: Record<ProductionSettingsState, { label: string; tone: Tone }> = {
   configured: { label: "Configured", tone: "success" },

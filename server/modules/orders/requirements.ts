@@ -336,10 +336,18 @@ export function createRequirementsService(deps: RequirementsDeps) {
      * re-check and the transition lookup, before the status update. Cancellation targets bypass the
      * requirement check (an order can always be canceled where the workflow allows it) but still lock phases.
      */
-    async onTransition(tx: Tx, principal: SessionPrincipal | null, view: OrderAccessView, bound: BoundWorkflow, toStatus: string): Promise<void> {
+    async onTransition(
+      tx: Tx,
+      principal: SessionPrincipal | null,
+      view: OrderAccessView,
+      bound: BoundWorkflow,
+      toStatus: string,
+      options: { skipRequirements?: boolean } = {},
+    ): Promise<void> {
       const definition = bound.definition;
       const target = findState(definition, toStatus);
-      if (!(target && isCancelState(target))) {
+      // Increment 07: an audited administrator reopen / override moves back without the forward requirement check.
+      if (!options.skipRequirements && !(target && isCancelState(target))) {
         const unmet = await unmetFor(tx, view, bound);
         if (unmet.uploads.length || unmet.acknowledgements.length || unmet.documents.length) throw requirementsUnmet(unmet.uploads, unmet.acknowledgements, unmet.documents);
       }
@@ -356,7 +364,10 @@ export function createRequirementsService(deps: RequirementsDeps) {
           events.push({ eventName: "order.phase.locked", phase: row.phaseKey });
         }
       }
-      if (fromPhase && fromPhase !== toPhase) {
+      // Increment 07 (D1): in format 3 only a "submit and lock" phase locks when the order leaves it.
+      const fromStage = definition.stages?.find((stage) => stage.key === fromPhase);
+      const locksOnLeave = !definition.stages?.length || fromStage?.progression === "submit_lock";
+      if (fromPhase && fromPhase !== toPhase && locksOnLeave) {
         const existing = rows.find((row) => row.phaseKey === fromPhase);
         if (existing) {
           await tx
@@ -398,6 +409,12 @@ export function createRequirementsService(deps: RequirementsDeps) {
           tx,
         );
       }
+    },
+
+    /** Increment 07 (D1): REQUIREMENTS_UNMET when the current status still has open tasks (phase Next / Submit). */
+    async assertRequirementsMetInTx(tx: Tx, view: OrderAccessView, bound: BoundWorkflow): Promise<void> {
+      const unmet = await unmetFor(tx, view, bound);
+      if (unmet.uploads.length || unmet.acknowledgements.length || unmet.documents.length) throw requirementsUnmet(unmet.uploads, unmet.acknowledgements, unmet.documents);
     },
 
     /** Client view: phase rail + checklist of the current status. Read access suffices. */
@@ -783,6 +800,9 @@ export function createRequirementsService(deps: RequirementsDeps) {
         if (!roleHasCapability(principal.role, "orders.phase.unlock")) throw forbidden("CAPABILITY_NOT_GRANTED");
         await deps.actorCheck(principal, tx, "orders.phase.unlock");
         if (view.lockState === "legal_hold" || view.lockState === "imported_read_only") throw orderLocked(view.lockState);
+        // Increment 07 (D1): format-3 phases are reopened through orders.stages.reopen (admin, step-up, audited).
+        const pinned = await workflows.byVersionId(tx, view.workflowVersionId);
+        if (pinned.definition.stages?.length) throw conflict("USE_STAGE_REOPEN", "Phases in this workflow are reopened from the phase panel.");
         const [row] = await tx
           .select()
           .from(orderPhaseLocks)

@@ -18,6 +18,63 @@ procedure.
 
 - The owner confirmed the redelivery and retry rules of ADR 0041 (no code change).
 
+## Increment 07
+
+Requested by the owner on 2026-11-24 (prompt 26) and checked in the lead's QA on 2026-11-25. What was and was not verified is recorded in [STATUS.md](docs/application-context/STATUS.md#verification-for-increment-07).
+
+### Added
+
+- **Phases-first workflows** ([ADR 0055](docs/adr/0055-phases-first-order-workflow.md)):
+  - definition format 3, with up to 20 named phases the customer sees;
+  - a customer phase wizard with Next and Submit and lock, acknowledgement evidence, staff review and an administrator reopen with a reason;
+  - questions with versioned answers, and an administrator checklist.
+  - Formats 1 and 2 keep working and show derived phases. Existing orders are never re-pinned.
+- **Progress bar** on every order. Each phase counts by its weight (1–100, default 1), and the derived value is floor(done weight × 100 ÷ total weight), capped at 99 until the order reaches a `done` status. The bar shows the higher of that and an explicit completion update, and it goes down only on an audited administrator reopen. It has no animation under reduced motion.
+- **Standard workflow.** A fresh install gets the phases "ReadyPackets standard workflow", starting with **Payment**. On upgrade, the default workflow gets a phases draft to review and publish, and nothing is published automatically.
+- **Status catalogue** (`/admin/workflows/statuses`, [ADR 0056](docs/adr/0056-status-catalogue-and-attention.md)) and the "Awaiting staff review" / "Awaiting customer response" filters on `/admin/orders`.
+- **Phase actions** ([ADR 0057](docs/adr/0057-phase-actions-completion-rules.md)):
+  - a human-confirmed bundle of status, completion (fixed or a range drawn once), e-mail, webhook and dashboard alert, with an optional delay of up to 30 days;
+  - rule ordering and new payment, intake and phase triggers;
+  - unattended rules never change status.
+- **Operational alerts** (`/admin/alerts` and an `/admin` widget, [ADR 0058](docs/adr/0058-outbound-webhooks-and-operational-alerts.md)):
+  - P101 / P201 lifecycle auto-queue, off by default per workflow. P101 is queued when a real payment is recorded (a Stripe webhook or a recorded manual payment), not when an administrator's status change passes the payment phase, and never retroactively. P201 is queued when the intake phase is submitted, after a delivered P101;
+  - production pipeline payload signing, off by default (generate a secret first). New webhook subscriptions are signed by default and start paused;
+  - stop, retry and redeliver on deliveries;
+  - integrations hub cards that show live state, with the old planning placeholders removed.
+- **Phase-bound files** ([ADR 0059](docs/adr/0059-phase-bound-files.md)):
+  - per-phase limits, with audio duration checked on the server;
+  - on a phases order, every customer upload names the current phase and an enabled upload action (`STAGE_REQUIRED` otherwise). Orders on older workflow formats keep uploads without a phase;
+  - WAV and other audio keep the original and add a WebM/Opus copy (a re-encode);
+  - playback grants with range requests;
+  - phase ZIP, and a whole-order ZIP for administrators behind step-up. ZIPs hold the current customer-visible versions, so audio is the WebM/Opus copy. Files are named `<order ref>-<phase slug>.zip` or `<order ref>-all-files.zip`.
+- **Stripe completion** (`/admin/payments/setup`, [ADR 0060](docs/adr/0060-stripe-completion-and-payment-state.md)):
+  - an order payment state, and a "Pay online" button on invoices;
+  - bank debits wait for the asynchronous success event;
+  - a setup checklist, self-tests and a rejections log;
+  - activation needs the egress preset, a successful API check and a self-test for the current staged key and mode, then a confirmation. Live mode also needs the typed words `ACTIVATE LIVE PAYMENTS`;
+  - a paid session with portal metadata that matches no order is flagged for staff, with a warning alert;
+  - card payments below Stripe's minimum charge still follow `payments.small_totals`.
+- **Microsoft 365 / SharePoint sync** ([ADR 0061](docs/adr/0061-microsoft-365-file-sync.md)):
+  - one-way, per phase, with originals, conversion-staging and intake-delivery targets under `CustomerName-CustomerID/OrderNumber`;
+  - a write test, and resync with a dry run.
+- **SAML 2.0 with Microsoft Entra ID** (`/admin/sso`, [ADR 0062](docs/adr/0062-saml-entra-id.md)):
+  - SP-initiated, with signed assertions and pinned certificates;
+  - MFA modes `claim` (recommended for new setups), `entra` (behind the typed words `ENTRA MANAGES MFA`) and `portal`. An upgraded existing SSO configuration starts in `portal`, and switching protocol disables SSO until it is enabled again;
+  - a local administrator with MFA always remains.
+
+### Not built
+
+- **Document conversion profiles** (they need LibreOffice or Ghostscript on the server).
+- **Two-way SharePoint sync.**
+- **Unattended status changes.**
+- **Some SAML features:** IdP-initiated SAML, single logout and encrypted assertions.
+- **Stripe Elements.**
+
+### Operations
+
+- **Migration `0007_increment_07`**: additive. 16 new tables, 40 new columns on 11 existing tables and one widened enum (`payment_webhook_events.status`) in 96 statements, with no `DROP`. Reported by /root at `f4fa798`: it applied cleanly on a copy of an increment 06 database (189 → 205 tables, 8 migrations), and existing orders got `payment_state = not_required` and `attention = none`.
+- **Upgrade notes:** [UPGRADE.md — increment 07 and migration 0007](docs/operations/UPGRADE.md#increment-07-and-migration-0007). It covers the hash check against one journal row, the SAML proxy paths, playback range pass-through and the Stripe webhook's country-only exemption.
+
 ## Increment 06
 
 <!-- platform_engineer: from INCREMENT_06_CONTRACT.md and the owners' handoffs. Verification is recorded in docs/application-context/STATUS.md; PR #13. -->

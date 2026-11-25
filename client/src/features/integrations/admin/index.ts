@@ -11,6 +11,7 @@ const guard = { access: "admin", capability: "integrations.manage" } as const;
 export const integrationsAdminRoutes: readonly RouteDef[] = [
   { ...guard, path: "/admin/integrations", title: "Integrations", component: lazy(() => import("./pages/IntegrationsOverviewPage")) },
   { ...guard, path: "/admin/integrations/smtp", title: "E-mail (SMTP)", component: lazy(() => import("./pages/SmtpPage")) },
+  { ...guard, path: "/admin/integrations/graph", title: "Microsoft Graph & SharePoint", component: lazy(() => import("./pages/GraphMailPage")) },
   { ...guard, path: "/admin/integrations/analytics", title: "Analytics", component: lazy(() => import("./pages/AnalyticsPage")) },
   { ...guard, path: "/admin/integrations/egress", title: "Outbound connections", component: lazy(() => import("./pages/EgressPage")) },
 ];

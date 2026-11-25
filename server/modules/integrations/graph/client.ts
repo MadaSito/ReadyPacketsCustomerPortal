@@ -278,6 +278,44 @@ function extractSafeGraphErrorCode(rawBody: Buffer): string | null {
   return null;
 }
 
+export function parseRetryAfterSeconds(
+  headers: Record<string, string> | undefined,
+  nowMs: number = Date.now(),
+): number | null {
+  if (!headers) return null;
+  let raw: string | undefined;
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === "retry-after" && typeof v === "string" && v.trim() !== "") {
+      raw = v.trim();
+      break;
+    }
+  }
+  if (!raw) return null;
+  if (/^\d{1,7}$/.test(raw)) {
+    const parsedInt = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsedInt)) {
+      return Math.min(300, Math.max(1, parsedInt));
+    }
+  }
+  const parsedDateMs = Date.parse(raw);
+  if (Number.isFinite(parsedDateMs)) {
+    const deltaSec = Math.ceil((parsedDateMs - nowMs) / 1000);
+    return Math.min(300, Math.max(1, deltaSec));
+  }
+  return null;
+}
+
+export interface GraphClientDiagnosticsEvent {
+  kind: "auth_error" | "throttled" | "succeeded";
+  status: number;
+  reasonCode?: string;
+}
+
+export interface GraphClientOptions {
+  now?: () => Date;
+  onResponseDiagnostic?: (event: GraphClientDiagnosticsEvent) => void;
+}
+
 function mapEgressFailureToGraphError(error: unknown, wireEntered: boolean): GraphApiError {
   if (error instanceof GraphApiError) return error;
   if (error instanceof DomainError) {
@@ -338,7 +376,9 @@ export function createGraphClientFromResolver(
   tokenCache: GraphTokenCache,
   resolveCredentials: GraphCredentialResolver,
   checkIsConfigured?: () => Promise<boolean>,
+  options?: GraphClientOptions,
 ): GraphClient {
+  const nowMs = () => (options?.now ? options.now().getTime() : Date.now());
   return {
     async isConfigured(): Promise<boolean> {
       if (checkIsConfigured) {
@@ -426,8 +466,27 @@ export function createGraphClientFromResolver(
       }
 
       if (response.status >= 400) {
+        if (response.status === 401) {
+          // Increment 07 (D7): evict cached application token on HTTP 401 so subsequent calls mint a fresh token.
+          tokenCache.invalidate(creds);
+        }
         const graphCode = extractSafeGraphErrorCode(response.body);
         const retryable = response.status === 429 || response.status >= 500;
+        const retryAfterSeconds = retryable ? parseRetryAfterSeconds(response.headers, nowMs()) : null;
+        const reasonCode = response.status === 429 ? "GRAPH_THROTTLED" : `GRAPH_HTTP_${response.status}`;
+        if (response.status === 401 || response.status === 403) {
+          options?.onResponseDiagnostic?.({
+            kind: "auth_error",
+            status: response.status,
+            reasonCode,
+          });
+        } else if (response.status === 429) {
+          options?.onResponseDiagnostic?.({
+            kind: "throttled",
+            status: response.status,
+            reasonCode,
+          });
+        }
         const code =
           response.status === 401 || response.status === 403
             ? "FORBIDDEN"
@@ -438,7 +497,7 @@ export function createGraphClientFromResolver(
                 : "VALIDATION";
         throw new GraphApiError({
           code,
-          reasonCode: response.status === 429 ? "GRAPH_THROTTLED" : `GRAPH_HTTP_${response.status}`,
+          reasonCode,
           safeMessage:
             response.status === 429
               ? "Microsoft Graph throttled the request."
@@ -446,9 +505,15 @@ export function createGraphClientFromResolver(
           status: response.status,
           graphCode,
           retryable,
+          retryAfterSeconds,
           requestSent: true,
         });
       }
+
+      options?.onResponseDiagnostic?.({
+        kind: "succeeded",
+        status: response.status,
+      });
 
       const rawBody = response.body;
       return {
@@ -539,6 +604,7 @@ export function createGraphClientFromResolver(
       if (response.status >= 400) {
         const graphCode = extractSafeGraphErrorCode(response.body);
         const retryable = response.status === 429 || response.status >= 500;
+        const retryAfterSeconds = retryable ? parseRetryAfterSeconds(response.headers, nowMs()) : null;
         throw new GraphApiError({
           code: retryable ? "UNAVAILABLE" : "VALIDATION",
           reasonCode: response.status === 429 ? "GRAPH_UPLOAD_THROTTLED" : `GRAPH_UPLOAD_HTTP_${response.status}`,
@@ -546,6 +612,7 @@ export function createGraphClientFromResolver(
           status: response.status,
           graphCode,
           retryable,
+          retryAfterSeconds,
           requestSent: true,
         });
       }
@@ -617,6 +684,7 @@ export function createGraphClientFromResolver(
       if (response.status >= 400) {
         const graphCode = extractSafeGraphErrorCode(response.body);
         const retryable = response.status === 429 || response.status >= 500;
+        const retryAfterSeconds = retryable ? parseRetryAfterSeconds(response.headers, nowMs()) : null;
         throw new GraphApiError({
           code: retryable ? "UNAVAILABLE" : "VALIDATION",
           reasonCode: `GRAPH_UPLOAD_HTTP_${response.status}`,
@@ -624,6 +692,7 @@ export function createGraphClientFromResolver(
           status: response.status,
           graphCode,
           retryable,
+          retryAfterSeconds,
           requestSent: true,
         });
       }

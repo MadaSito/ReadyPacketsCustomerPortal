@@ -1,6 +1,6 @@
 /**
  * Workflow designer — increment 04 fields: phases (whole workflow) and per-status requirements
- * (upload slots and acknowledgements). Shared by the wizard "Phases and requirements" step and the canvas
+ * (upload slots and acknowledgements). Shared by the wizard "Status requirements" step and the canvas
  * side panel. The server validates everything; these fields only edit the draft and show its issues.
  */
 import { useQuery } from "@tanstack/react-query";
@@ -152,9 +152,9 @@ export function PhasesEditor({ definition, issues, onChange }: { definition: Dra
   const phases = definition.phases ?? [];
   return (
     <fieldset className="flex min-w-0 flex-col gap-3 rounded-[var(--radius-card)] border border-line p-4">
-      <legend className="px-1 text-sm font-semibold text-ink">Phases</legend>
+      <legend className="px-1 text-sm font-semibold text-ink">Status groups (older workflows)</legend>
       <p className="text-sm text-body">
-        Optional. Group statuses into phases (for example Intake, Review, Delivery). Customers see the phases as a progress bar. When an order leaves a phase, that phase locks so its uploads and
+        Optional. For new workflows, use the Phases tab instead. Group statuses (for example Intake, Review, Delivery). Customers see the groups as a progress bar. When an order leaves a phase, that phase locks so its uploads and
         acceptances stay as reviewed; staff can unlock it with a reason.
       </p>
       {phases.length === 0 ? <p className="text-sm text-muted">No phases. Orders show statuses only.</p> : null}
@@ -540,7 +540,16 @@ export function RulesReviewSummary({ definition }: { definition: DraftDefinition
     acknowledgements: states.reduce((sum, state) => sum + (state.requirements?.acknowledgements.length ?? 0), 0),
   });
   const phaseRows = phases.map((phase) => ({ key: phase.key, label: phase.label.trim() || phase.key, ...countsOf(definition.states.filter((state) => state.phase === phase.key)) }));
-  const unphased = countsOf(definition.states.filter((state) => !state.phase || !phases.some((phase) => phase.key === state.phase)));
+  // Increment 07 QA: a phases (format 3) draft summarises its stages; the classic groups apply only without them.
+  const stages = (definition.stages ?? []) as { key?: string; staffLabel?: string; customerLabel?: string; statusKeys?: string[]; progression?: string }[];
+  const stageRows = stages.map((stage, index) => {
+    const keys = new Set(stage.statusKeys ?? []);
+    return { key: stage.key || `stage_${index}`, label: stage.staffLabel?.trim() || stage.customerLabel?.trim() || stage.key || `Phase ${index + 1}`, locks: stage.progression === "submit_lock", ...countsOf(definition.states.filter((state) => keys.has(state.key))) };
+  });
+  const staged = new Set(stages.flatMap((stage) => stage.statusKeys ?? []));
+  const unphased = stageRows.length
+    ? countsOf(definition.states.filter((state) => !staged.has(state.key)))
+    : countsOf(definition.states.filter((state) => !state.phase || !phases.some((phase) => phase.key === state.phase)));
   const stateLabel = (key: string) => definition.states.find((state) => state.key === key)?.label.trim() || key;
   const policyTitle = (id: string) => policies.data?.find((doc) => doc.documentPublicId === id)?.title ?? (id ? (policies.isPending ? "Loading…" : "Policy not available") : "No policy chosen");
   const workflowFolder = definition.storageFolder?.trim() || "";
@@ -556,7 +565,19 @@ export function RulesReviewSummary({ definition }: { definition: DraftDefinition
       <div className="grid min-w-0 gap-4 sm:grid-cols-2">
         <div className="min-w-0 rounded-[var(--radius-card)] border border-line p-4">
           <h4 className="text-sm font-semibold text-ink">Phases</h4>
-          {phaseRows.length === 0 ? (
+          {stageRows.length ? (
+            <>
+              <p className="mt-1 text-sm text-muted">{`${plural(stageRows.length, "phase", "phases")}. A phase set to submit and lock locks when the customer submits it; an administrator can reopen it.`}</p>
+              <ul className="mt-2 flex flex-col gap-2 text-sm text-body">
+                {stageRows.map((row) => (
+                  <li key={row.key} className="min-w-0 break-words">
+                    <span className="font-medium text-ink">{row.label}</span>: {plural(row.statuses, "status", "statuses")}
+                    {row.locks ? "; submit and lock" : ""}; requirements: {reqText(row)}
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : phaseRows.length === 0 ? (
             <p className="mt-1 text-sm text-muted">No phases. Orders show statuses only.</p>
           ) : (
             <>

@@ -29,12 +29,22 @@ export const paymentsConfigSchema = z.object({
   webhookToleranceSeconds: z.number().int().min(30).max(300),
   stripeSecretKeyLast4: z.string().max(8).nullable(),
   stripeWebhookSecretLast4: z.string().max(8).nullable(),
+  stripeWebhookSecretSecondaryLast4: z.string().max(8).nullable().default(null),
+  stripeLastApiVerifiedAt: z.string().max(64).nullable().default(null),
+  stripeApiVerifiedFingerprint: z.string().max(64).nullable().default(null),
+  stripeLastSelfTestAt: z.string().max(64).nullable().default(null),
+  stripeSelfTestedFingerprint: z.string().max(64).nullable().default(null),
   squareLocationId: z.string().regex(/^[A-Za-z0-9_-]{4,64}$/u).nullable(),
   squareAccessTokenLast4: z.string().max(8).nullable(),
   squareWebhookSignatureKeyLast4: z.string().max(8).nullable(),
 });
 
 export type PaymentsConfigValue = z.infer<typeof paymentsConfigSchema>;
+
+export function parsePaymentsConfigSetting(raw: unknown): PaymentsConfigValue {
+  const parsed = paymentsConfigSchema.safeParse(raw);
+  return parsed.success ? parsed.data : PAYMENTS_CONFIG_SETTING.default;
+}
 
 export const PAYMENTS_CONFIG_SETTING = defineSetting({
   key: "payments.config",
@@ -52,6 +62,11 @@ export const PAYMENTS_CONFIG_SETTING = defineSetting({
     webhookToleranceSeconds: 300,
     stripeSecretKeyLast4: null,
     stripeWebhookSecretLast4: null,
+    stripeWebhookSecretSecondaryLast4: null,
+    stripeLastApiVerifiedAt: null,
+    stripeApiVerifiedFingerprint: null,
+    stripeLastSelfTestAt: null,
+    stripeSelfTestedFingerprint: null,
     squareLocationId: null,
     squareAccessTokenLast4: null,
     squareWebhookSignatureKeyLast4: null,
@@ -84,6 +99,19 @@ export const PAYMENTS_STRIPE_WEBHOOK_SECRET = defineSecret({
   exportable: false,
   writeCapability: "payments.manage",
   managedBy: { label: "Payments", href: "/admin/payments" },
+});
+
+export const PAYMENTS_STRIPE_WEBHOOK_SECRET_SECONDARY = defineSecret({
+  key: "payments.stripe.webhook_secret_secondary",
+  owner: "payments",
+  group: "compliance",
+  label: "Stripe secondary webhook signing secret",
+  description:
+    "Optional secondary Stripe signing secret (`whsec_...`) accepted during zero-downtime key rotation or Stripe CLI local webhook testing.",
+  schema: z.string().regex(/^whsec_[A-Za-z0-9_]{12,200}$/u),
+  exportable: false,
+  writeCapability: "payments.manage",
+  managedBy: { label: "Payments", href: "/admin/payments/setup" },
 });
 
 export const PAYMENTS_SQUARE_ACCESS_TOKEN = defineSecret({

@@ -47,3 +47,4 @@ export { CopyField, TagInput, type CopyFieldProps, type TagInputProps } from "./
 export { Countdown, formatRemaining, type CountdownProps } from "./Countdown";
 export { ConfirmSwitch, type ConfirmSwitchProps, type ConfirmSwitchStep } from "./ConfirmSwitch";
 export { ChartFrame, ChartPatterns, useChartIds, type ChartFrameProps, type ChartIds, type ChartLegendItem, type ChartSeries } from "./ChartFrame";
+export { OrderProgress, progressValueText, clampPercent, stageStates, type OrderProgressProps, type OrderProgressStage, type OrderProgressStageState } from "./OrderProgress";

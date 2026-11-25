@@ -3,6 +3,7 @@
  * slot never breaks navigation). Features never import each other; only the app composes them.
  */
 import { Component, Suspense, lazy, type ReactNode } from "react";
+import type { PhaseSlotName, PhaseSlotRenderer } from "@/ui/phases";
 
 class SlotBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
   override state = { failed: false };
@@ -93,3 +94,34 @@ export function PolicyRemediationSlot() {
   return PolicyRemediationImpl ? slot(<PolicyRemediationImpl />) : null;
 }
 
+
+/**
+ * Increment 07 package A: feature-owned regions of the shared phase form (see `@/ui/phases/slotTypes`).
+ * - Phase actions (siem_engineer, D5): `features/automations/phaseSlots.tsx` → `PhaseActionsSlot`, value = `stageActions`
+ *   without `webhookTargetKey` (preserve unknown keys).
+ * - Webhook selector (integrations_engineer, D7): `features/integrations/phaseSlots.tsx` → `PhaseWebhookSlot`,
+ *   value = `stageActions.webhookTargetKey` (string | null).
+ * - File sync (portable_ops_engineer, D12): `features/storage/phaseSlots.tsx` → `PhaseFileSyncSlot`,
+ *   value = `{ folders, fileSync }` of the stage.
+ * Missing module: the slot renders nothing and the phase form shows a neutral "not available" note.
+ */
+type AnySlot = (props: Record<string, unknown>) => ReactNode;
+const phaseSlotImpls: Record<PhaseSlotName, ReturnType<typeof optionalSlot<Record<string, unknown>>>> = {
+  actions: optionalSlot(import.meta.glob<Record<string, unknown>>("../features/automations/phaseSlots.tsx"), "PhaseActionsSlot"),
+  webhook: optionalSlot(import.meta.glob<Record<string, unknown>>("../features/integrations/phaseSlots.tsx"), "PhaseWebhookSlot"),
+  fileSync: optionalSlot(import.meta.glob<Record<string, unknown>>("../features/storage/phaseSlots.tsx"), "PhaseFileSyncSlot"),
+};
+/** True when the owning feature ships the slot module (the form shows a note otherwise). */
+export function hasPhaseSlot(name: PhaseSlotName): boolean {
+  return phaseSlotImpls[name] !== null;
+}
+/** Renders one phase-form slot; props follow `PhaseSlotProps` from `@/ui/phases/slotTypes`. */
+export function PhaseFormSlot({ name, ...props }: { name: PhaseSlotName } & Record<string, unknown>) {
+  const Impl = phaseSlotImpls[name] as unknown as AnySlot | null;
+  return Impl ? slot(<Impl {...props} />) : null;
+}
+/** Pass to `<PhaseEditor slots={PHASE_FORM_SLOTS} />` (orders' workflow designer). */
+export const PHASE_FORM_SLOTS: PhaseSlotRenderer = {
+  has: hasPhaseSlot,
+  render: (name, props) => <PhaseFormSlot name={name} {...(props as unknown as Record<string, unknown>)} />,
+};

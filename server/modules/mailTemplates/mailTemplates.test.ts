@@ -8,6 +8,7 @@ import { registerComplianceMailTemplates } from "../compliance/mail.js";
 import { registerEngagementMailTemplates } from "../engagement/mail.js";
 import { IDENTITY_MAIL_TEMPLATES } from "../identity/mail.js";
 import { users } from "../identity/schema.js";
+import { ORDER_PHASE_UPDATE_TEMPLATE } from "../jobs/mail.js";
 import type { MailTemplateStore } from "../jobs/mailPorts.js";
 import { registerOrderMailTemplates } from "../orders/mail.js";
 import { SEND_TEMPLATE_AUTOMATION_ACTION } from "./automationAction.js";
@@ -72,6 +73,7 @@ beforeEach(async () => {
 
   for (const tpl of IDENTITY_MAIL_TEMPLATES) h.deps.mailer.registerTemplate(tpl);
   registerOrderMailTemplates(h.deps.mailer);
+  h.deps.mailer.registerTemplate(ORDER_PHASE_UPDATE_TEMPLATE);
   registerComplianceMailTemplates(h.deps.mailer);
   registerEngagementMailTemplates(h.deps.mailer);
 
@@ -100,6 +102,32 @@ beforeEach(async () => {
 });
 
 describe("mailTemplates module (Package D)", () => {
+  it("limits phase actions to the approved contracts and compatible published custom mail", async () => {
+    async function create(templateKey: string, name: string, variable: string, sensitive = false) {
+      return mod.createCustom(adminPrincipal, {
+        templateKey, name, category: "orders",
+        declaredVars: [{ name: variable, label: "Test variable", required: true, sensitive, sampleValue: "RP-TEST" }],
+        format: "text", subject: "An update", bodyText: `Review {{${variable}}}.`,
+      });
+    }
+    const supported = await create("custom.phase_supported", "Supported phase template", "reference");
+    await create("custom.phase_draft", "Unpublished phase draft", "reference");
+    const unrelated = await create("custom.phase_unrelated", "Unrelated phase template", "recipient_name");
+    const sensitive = await create("custom.phase_sensitive", "Sensitive phase template", "reference", true);
+    for (const { templateKey, version } of [supported, unrelated, sensitive]) {
+      await mod.publish(adminPrincipal, { templateKey, expectedVersion: version });
+    }
+    expect((await mod.listForPhaseActions(adminPrincipal)).map(({ templateKey }) => templateKey).sort()).toEqual([
+      "custom.phase_supported", "orders.phase_update", "orders.status_changed",
+    ]);
+    expect(await mod.resolveForPhaseAction("orders.phase_update")).toMatchObject({ vars: ["reference", "link"] });
+    expect(await mod.resolveForPhaseAction("custom.phase_supported")).toMatchObject({ vars: ["reference"] });
+    for (const key of ["auth.password_reset", "custom.phase_draft", "custom.phase_unrelated", "custom.phase_sensitive"]) {
+      expect(await mod.resolveForPhaseAction(key)).toBeNull();
+    }
+    await expect(mod.listForPhaseActions(fakePrincipal({ role: "staff", userId: staffUserId }))).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
+
   it("syncs all shipped built-in system templates while excluding jobs.mail.verify_audit_copy", async () => {
     const { items } = await mod.list(adminPrincipal, {});
     const keys = items.map((i) => i.templateKey);

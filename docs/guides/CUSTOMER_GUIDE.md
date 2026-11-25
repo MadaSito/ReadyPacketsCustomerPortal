@@ -135,6 +135,8 @@ You cannot change your own email address or customer reference in the portal; co
 
 **Available** — `/orders`, `/orders/new`, `/orders/:orderId`.
 
+Orders organised into phases guide you through each step; see [Working through your order's phases](./ORDER_PHASES_HELP.md).
+
 - **List**: `/orders` lists every order you own or that is shared with you, with its status. Invitations to
   orders other people shared with you appear here too, where you accept or decline them.
 - **New order**: `/orders/new` is a step-by-step form. Choose products from the catalog, enter a project name and an

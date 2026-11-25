@@ -102,6 +102,15 @@ export const CAPABILITIES = [
   "reports.export",
   "policies.notices.send",
   "security.incidents.read",
+  // increment 07: phases-first workflow (stages, statuses, questions), operational alerts, order ZIP
+  "orders.stage.run",
+  "orders.stage.review",
+  "orders.stage.reopen",
+  "orders.questions.manage",
+  "orders.statuses.manage",
+  "ops.alerts.read",
+  "ops.alerts.manage",
+  "files.archive.order",
   // portable / backup
   "portable.export",
   "portable.import",
@@ -142,6 +151,11 @@ const STAFF_CAPABILITIES: readonly Capability[] = [
   "promotions.read",
   "policies.acceptances.read",
   "reports.read",
+  "orders.stage.run",
+  "orders.stage.review",
+  "orders.questions.manage",
+  "ops.alerts.read",
+  "ops.alerts.manage",
 ];
 
 /** Default role grants. Staff least-privilege by assignment is a recorded ADR target, not yet implemented. */
@@ -195,6 +209,10 @@ export const STEP_UP_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>
   "policies.acceptances.export",
   "reports.export",
   "policies.notices.send",
+  "orders.stage.run",
+  "orders.stage.reopen",
+  "orders.statuses.manage",
+  "files.archive.order",
   "portable.export",
   "portable.import",
   "backup.run",

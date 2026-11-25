@@ -37,22 +37,19 @@ function proof(row: ImportRow) {
 export function createImportWorker(deps: ModuleDeps) {
   async function authorizeWorker(tx: Tx, initial: ImportRow): Promise<SessionPrincipal> {
     const expected = proof(initial);
-    const user = await deps.services.identity.getUserByPublicId(expected.approverPublicId, { tx, forUpdate: true });
-    const session = await deps.services.identity.sessions.getState(expected.approverSessionId, { tx });
+    const refused = () => new DomainError("FORBIDDEN", "PORTABLE_APPROVAL_NO_LONGER_CURRENT", "The import approval is no longer current.");
     const age = deps.clock.now().getTime() - expected.approvalStepUpAt.getTime();
-    if (!user || user.id !== expected.approvedBy || user.role !== "admin" || user.status !== "active" ||
-      !session?.live || session.userId !== user.id || session.role !== "admin" || !session.mfaVerifiedAt ||
-      !session.stepUpAt || session.stepUpAt < expected.approvalStepUpAt || age < 0 || age > TRANSFER_STEP_UP_MS) {
-      throw new DomainError("FORBIDDEN", "PORTABLE_APPROVAL_NO_LONGER_CURRENT", "The import approval is no longer current.");
+    if (age < 0 || age > TRANSFER_STEP_UP_MS) throw refused();
+    let principal: SessionPrincipal;
+    try {
+      principal = await deps.services.identity.sessions.principalForJob(expected.approverSessionId, expected.approvedBy, { tx });
+    } catch (error) {
+      if (error instanceof DomainError && ["SESSION_NOT_CURRENT", "ACCOUNT_STEP_PENDING"].includes(error.reasonCode)) throw refused();
+      throw error;
     }
-    const pendingSteps = await deps.services.identity.transitions.derive(user.id, { mfaVerifiedAt: session.mfaVerifiedAt, authMethod: session.authMethod, tx });
-    if (pendingSteps.length) throw new DomainError("FORBIDDEN", "PORTABLE_APPROVAL_NO_LONGER_CURRENT", "The import approval is no longer current.");
-    // Internal proof only: this principal is never issued to a browser and cannot authenticate any request.
-    return {
-      sessionId: session.sessionId, userId: user.id, userPublicId: user.publicId, role: "admin", state: "full",
-      pendingSteps, authMethod: "local", authenticatedAt: session.mfaVerifiedAt, mfaVerifiedAt: session.mfaVerifiedAt,
-      stepUpAt: expected.approvalStepUpAt, csrfSecret: "",
-    };
+    if (principal.userPublicId !== expected.approverPublicId || principal.role !== "admin" || !principal.mfaVerifiedAt ||
+      !principal.stepUpAt || principal.stepUpAt < expected.approvalStepUpAt) throw refused();
+    return principal;
   }
 
   async function fenced<T>(job: ImportJob, initial: ImportRow, fn: (tx: Tx, row: ImportRow, principal: SessionPrincipal) => Promise<T>) {

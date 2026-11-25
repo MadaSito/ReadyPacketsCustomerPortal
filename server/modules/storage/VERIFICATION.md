@@ -33,3 +33,10 @@ All cloud tests use local protocol fakes. No live tenant, bucket or provider acc
 - **Folder contract**: [`orderFileFolder.test.ts`](../../../shared/orderFileFolder.test.ts) checks unsafe literals, traversal, provider-reserved names, controls, token expansion, and paths that become too long or reserved only after expansion.
 - **Service**: [`storage.test.ts`](storage.test.ts) uses real MySQL and synthetic files/provider responses for slot/workflow/default precedence, observed target paths, encrypted attempt metadata, order scope and cursors, missing local sources, stale retries and counts. The Jobs lock is exercised in the [Jobs suite](../jobs/VERIFICATION.md); these cases use a job port fake.
 - **Console**: [`copyLog.test.tsx`](../../../client/src/features/storage/copyLog.test.tsx) covers the order deep link, bounded target-path display, and light/dark axe checks in jsdom. These checks do not establish real-browser layout, screen reader behavior, or live SharePoint/OneDrive verification.
+
+## Increment 07: Managed Microsoft 365 phase files
+
+- [`orderStageFileSync.test.ts`](../../../shared/orderStageFileSync.test.ts) checks defaults-off parsing for omitted fields, template confinement, Unicode normalization and isolation of managed placeholders from legacy formats.
+- [`managedFileSync.test.ts`](managedFileSync.test.ts) uses isolated MySQL and a local Graph fake to check a denied write probe, fresh-admin and route authorization, deduplicated role fan-out, frozen customer folders, staff-only and pending audio limits, retry-after, blocked visibility changes, read-only ambiguous-final-write checks, resync confirmation and restricted receipts.
+- [`storage.test.ts`](storage.test.ts) and [`graphDriveRouting.test.ts`](adapters/graphDriveRouting.test.ts) regression-test the pre-existing copy path, retry and conflict behavior. The managed path does not reuse legacy QuickXor-based collision adoption.
+- Provider ACLs, rate limits, upload-session behavior and browser layout still need staging verification. No live tenant, production file or real-browser automation is used by these tests.

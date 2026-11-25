@@ -32,6 +32,9 @@ import {
   Wizard,
   type FlowSelection,
 } from "@/ui";
+import { PhaseEditor, type PhaseStatusOption } from "@/ui/phases";
+import { PHASE_FORM_SLOTS } from "@/app/slots";
+import { deriveStages, type WorkflowStage } from "@shared/workflowStages";
 import { OrderStatusBadge } from "../../shared";
 import { IssueList, StatusFields, TransitionNoticeFields, TransitionRouteFields, TransitionWhoFields } from "./fields";
 import {
@@ -104,7 +107,8 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
   const [publishable, setPublishable] = useState(initial.publishable);
   const [dirty, setDirty] = useState(false);
   const edits = useRef(0);
-  const [tab, setTab] = useState("wizard");
+  // Increment 07 QA: every draft opens on Phases (phases-first); a draft without phases shows how to start them.
+  const [tab, setTab] = useState("phases");
   const [step, setStep] = useState<WizardStepId>("statuses");
   const [visited, setVisited] = useState<WizardStepId[]>([]);
   const [stepBlocked, setStepBlocked] = useState(false);
@@ -276,9 +280,10 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
           value={tab}
           onValueChange={setTab}
           items={[
+            { value: "phases", label: "Phases", content: <PhasesView definition={work.definition} issues={issues} disabled={busy} setDefinition={setDefinition} /> },
             {
               value: "wizard",
-              label: "Wizard",
+              label: "Statuses wizard",
               content: (
                 <Wizard
                   steps={WIZARD_STEPS.map((s) => ({ id: s.id, label: s.label }))}
@@ -319,6 +324,109 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
   );
 }
 
+/**
+ * Increment 07 QA: phases derived from the statuses (or their classic groups); the classic groups are removed in the
+ * same step, since a draft may not use both (STAGES_WITH_PHASES). Exported for tests.
+ */
+export function startPhases(definition: DraftDefinition): DraftDefinition {
+  const stages = deriveStages(definition);
+  const { phases: _classic, ...rest } = definition;
+  return { ...rest, states: definition.states.map(({ phase: _group, ...state }) => state), stages } as DraftDefinition;
+}
+
+type CatalogStatus = { key: string; staffLabel: string; customerLabel: string; tone: string; category: string; retired: boolean };
+
+/**
+ * Increment 07 QA: a phase that names a catalogue status the draft does not have adds that status to the draft
+ * (labels and tone from the catalogue, no transitions). Publishing still reports it until it has transitions.
+ * Exported for tests.
+ */
+export function addCatalogStatuses(definition: DraftDefinition, catalog: readonly CatalogStatus[]): { definition: DraftDefinition; added: string[] } {
+  const have = new Set(definition.states.map((state) => state.key));
+  const wanted = ((definition.stages ?? []) as { statusKeys?: string[] }[]).flatMap((stage) => stage.statusKeys ?? []);
+  const added: string[] = [];
+  const states = [...definition.states];
+  for (const key of wanted) {
+    if (have.has(key)) continue;
+    const entry = catalog.find((item) => item.key === key && !item.retired);
+    if (!entry) continue;
+    have.add(key);
+    added.push(key);
+    const kind = entry.category === "done" || entry.category === "canceled" ? "terminal" : "active";
+    states.push({ key, label: entry.staffLabel, customerLabel: entry.customerLabel, kind, tone: entry.tone } as DraftDefinition["states"][number]);
+  }
+  return { definition: added.length ? ({ ...definition, states } as DraftDefinition) : definition, added };
+}
+
+/** Increment 07 (D1): the phase editor (package A) over `definition.stages`; the server validates on save. */
+function PhasesView(props: { definition: DraftDefinition; issues: WorkflowIssue[]; disabled: boolean; setDefinition: (definition: DraftDefinition) => void }) {
+  const { definition, issues, disabled, setDefinition } = props;
+  const trpc = useTRPC();
+  const catalog = useQuery(trpc.orders.statusCatalog.list.queryOptions({ includeRetired: true }, { retry: false, staleTime: 60_000 }));
+  const stages = (definition.stages ?? []) as WorkflowStage[];
+  // This workflow's statuses first, with this workflow's labels; then catalogue statuses the workflow does not have
+  // yet. Ticking one of those adds it to the draft (see addCatalogStatuses), so saving never fails on it.
+  const catalogItems = catalog.data ?? [];
+  const catalogByKey = new Map(catalogItems.map((entry) => [entry.key, entry]));
+  const used = new Set(definition.states.map((state) => state.key));
+  const statusOptions: PhaseStatusOption[] = [
+    ...definition.states
+      .filter((state) => state.key.trim())
+      .map((state) => {
+        const entry = catalogByKey.get(state.key);
+        return { key: state.key, label: state.label.trim() || entry?.staffLabel || state.key, ...(entry ? { category: entry.category, retired: entry.retired } : {}) };
+      }),
+    ...catalogItems
+      .filter((entry) => !entry.retired && !used.has(entry.key))
+      .map((entry) => ({ key: entry.key, label: `${entry.staffLabel} (not in this workflow yet)`, category: entry.category })),
+  ];
+  const [added, setAdded] = useState<string[]>([]);
+  const errors: Record<string, string> = {};
+  for (const issue of issues) if (issue.severity === "error" && /^stages(\.|$)/.test(issue.path) && !errors[issue.path]) errors[issue.path] = issue.message;
+  const setStages = (next: WorkflowStage[]) => {
+    const result = addCatalogStatuses({ ...definition, stages: next } as DraftDefinition, catalogItems);
+    if (result.added.length) setAdded((prior) => [...prior, ...result.added.filter((key) => !prior.includes(key))]);
+    setDefinition(result.definition);
+  };
+  const addedLabels = added.filter((key) => used.has(key)).map((key) => definition.states.find((state) => state.key === key)?.label || key);
+  if (!stages.length)
+    return (
+      <Card>
+        <div className="flex flex-col gap-3">
+          <h2 className="text-lg font-semibold text-ink">Phases</h2>
+          <p className="text-body">
+            This draft has no phases yet. Customers then see progress by status, as before. Start phases from the statuses below,
+            then review each phase before you publish. Existing orders keep the version they started with.
+          </p>
+          <div>
+            <Button variant="secondary" disabled={disabled || definition.states.length === 0} onClick={() => setDefinition(startPhases(definition))}>
+              Start phases from statuses
+            </Button>
+          </div>
+        </div>
+      </Card>
+    );
+  return (
+    <div className="flex flex-col gap-3">
+      <div aria-live="polite">
+        {addedLabels.length ? (
+          <Callout tone="info">{`${addedLabels.join(", ")}: added to this workflow's statuses. Add its transitions in the Statuses wizard.`}</Callout>
+        ) : null}
+      </div>
+      <PhaseEditor
+        value={stages}
+        onChange={setStages}
+        statusOptions={statusOptions}
+        errors={errors}
+        disabled={disabled}
+        slots={PHASE_FORM_SLOTS}
+        defaultView="canvas"
+        headingLevel={2}
+      />
+    </div>
+  );
+}
+
 interface StepBodyProps {
   step: WizardStepId;
   work: Editable;
@@ -344,7 +452,7 @@ function StepBody(props: StepBodyProps) {
     transitions: "Which moves are possible. Every status except a final one needs a way out.",
     who: "Who may make each move. The server enforces this for every request.",
     notices: "Whether the customer is told about each move, and whether the person moving it must write a note.",
-    rules: "Optional. Group statuses into phases and list what must be uploaded or accepted before an order can leave a status. Publishing these rules needs the workflow rules setting turned on in Settings.",
+    rules: "Optional. List what must be uploaded or accepted before an order can leave a status. Workflows without phases can also group statuses so a group locks when the order leaves it. Publishing these rules needs the workflow rules setting turned on in Settings.",
     review: "Check the summary, then publish. Orders already in progress keep the version they started on.",
   };
   const problems =
@@ -449,7 +557,11 @@ function StepBody(props: StepBodyProps) {
 
       {step === "rules" ? (
         <>
-          <PhasesEditor definition={definition} issues={issues} onChange={setDefinition} />
+          {definition.stages?.length ? (
+            <Callout tone="info">This workflow uses phases, so status groups and their locks are set on the Phases tab. The requirements below still apply to each status.</Callout>
+          ) : (
+            <PhasesEditor definition={definition} issues={issues} onChange={setDefinition} />
+          )}
           <AcceptanceGatesEditor definition={definition} issues={issues} onChange={setDefinition} />
           <StorageFolderEditor definition={definition} issues={issues} onChange={setDefinition} />
           <ol className="flex flex-col gap-4">
@@ -634,9 +746,11 @@ function CanvasView({ work, issues, edit, setDefinition }: { work: Editable; iss
             <p className="text-body">Select a status or a transition on the canvas to edit it here. You can also use the forms below instead of dragging.</p>
           </Card>
         ) : null}
-        <Card title="Phases" headingLevel={2}>
-          <PhasesEditor definition={definition} issues={issues} onChange={setDefinition} />
-        </Card>
+        {definition.stages?.length ? null : (
+          <Card title="Status groups (older workflows)" headingLevel={2}>
+            <PhasesEditor definition={definition} issues={issues} onChange={setDefinition} />
+          </Card>
+        )}
         <Card title="Acceptance and storage" headingLevel={2}>
           <div className="flex flex-col gap-4">
             <AcceptanceGatesEditor definition={definition} issues={issues} onChange={setDefinition} />

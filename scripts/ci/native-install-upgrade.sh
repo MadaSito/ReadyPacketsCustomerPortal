@@ -1,27 +1,28 @@
 #!/usr/bin/env bash
 # End-to-end native upgrade verification on a fresh Ubuntu 26.04 runner:
-#   1. Switch /opt/readypackets-src (prepared by native-install-prepare.sh) to the baseline release (89c5cb8)
+#   1. Switch /opt/readypackets-src (prepared by native-install-prepare.sh) to the selected baseline release
 #      and install it with deploy/auto-install.sh via native-install-run.sh.
 #   2. Over verified TLS, complete first-admin MFA enrollment + forced password change, create a customer
 #      and a real order, switch on Maintenance mode, and confirm queue_drained.
 #   3. Advance /opt/readypackets-src (root-owned, umask 022) to the commit under test, verify upgrade.sh
 #      refusal gates, and run deploy/upgrade.sh --yes <candidate-sha>.
-#   4. Verify release symlinks (previous -> 89c5cb8, current -> HEAD), verified pre-upgrade backup archive,
+#   4. Verify release symlinks (previous -> baseline, current -> HEAD), verified pre-upgrade backup archive,
 #      post-upgrade admin sign-in + MFA, Maintenance mode clear, pre-upgrade order + customer preservation,
-#      migrations 0003 through 0006 exactly once each, and existing integration endpoints.
+#      migrations 0003 through 0007 exactly once each, and existing integration endpoints.
 #   5. Run the full scripts/ci/native-install-smoke.sh suite against the upgraded installation.
 set -euo pipefail
 set +x
 
-[[ $EUID == 0 && $# == 3 ]] || {
-    printf 'usage: sudo native-install-upgrade.sh <portal-host> <alias-host> <admin-email>\n' >&2
+[[ $EUID == 0 && ( $# == 3 || $# == 4 ) ]] || {
+    printf 'usage: sudo native-install-upgrade.sh <portal-host> <alias-host> <admin-email> [baseline-commit]\n' >&2
     exit 64
 }
 
 readonly host=$1
 readonly alias_host=$2
 readonly requested_admin_email=$3
-readonly baseline_ref=89c5cb8
+readonly baseline_ref=${4:-89c5cb8}
+[[ $baseline_ref == 89c5cb8 || $baseline_ref == f251a10 ]] || { printf 'unexpected CI baseline\n' >&2; exit 64; }
 readonly origin="https://$host"
 readonly repo_dir=/opt/readypackets-src
 readonly ca_cert=/etc/readypackets/tls/fullchain.pem
@@ -64,7 +65,13 @@ bash "$ci_scripts_dir/native-install-run.sh" first \
     --print-credentials \
     --yes
 expect 'baseline current symlink' "$(readlink -f /opt/readypackets/current)" "/opt/readypackets/releases/$baseline_sha"
-[[ ! -x /usr/bin/ffmpeg && ! -e /var/lib/readypackets/geo ]] || fail 'baseline unexpectedly installed Increment 04 dependencies'
+if [[ $baseline_ref == 89c5cb8 ]]; then
+    [[ ! -x /usr/bin/ffmpeg && ! -e /var/lib/readypackets/geo ]] || fail 'baseline unexpectedly installed Increment 04 dependencies'
+else
+    query_baseline_journal() { mysql --no-defaults --protocol=socket --batch --skip-column-names --execute="$1"; }
+    assert_release_migrations /opt/readypackets/current/migrations query_baseline_journal 0006_increment_06
+    [[ ! -e /opt/readypackets/current/migrations/0007_increment_07.sql ]] || fail 'expected a pre-0007 baseline'
+fi
 
 admin_email=$(sed -n 's/^  Sign-in name   : //p' "$credentials")
 sed -n 's/^  Password       : \([^ ]*\) .*$/\1/p' "$credentials" > "$work/initial.password"
@@ -269,6 +276,11 @@ if bash "$repo_dir/deploy/upgrade.sh" --yes "$baseline_sha" >"$work/refusal.out"
 fi
 grep -qF 'does not match target commit' "$work/refusal.out" || fail 'unexpected HEAD mismatch refusal message'
 
+query_release_journal() { mysql --no-defaults --protocol=socket --batch --skip-column-names --execute="$1"; }
+order_pins_sql='SELECT id, workflow_version_id FROM readypackets.orders ORDER BY id'
+order_pins_before=$(query_release_journal "$order_pins_sql")
+[[ -n $order_pins_before ]] || fail 'baseline was not seeded with a pinned order'
+
 step "running deploy/upgrade.sh --yes $candidate_sha"
 upgrade_start=$SECONDS
 bash "$repo_dir/deploy/upgrade.sh" --yes "$candidate_sha" | tee "$work/upgrade.stdout"
@@ -286,9 +298,9 @@ pre_upgrade_backups=$(mysql --no-defaults --protocol=socket --batch --skip-colum
 expect 'verified pre_upgrade backup count' "$pre_upgrade_backups" 1
 
 step 'verifying each candidate migration after the baseline was applied exactly once'
-query_release_journal() { mysql --no-defaults --protocol=socket --batch --skip-column-names --execute="$1"; }
 assert_release_migrations "$repo_dir/migrations" query_release_journal \
-    0003_increment_04 0004_increment_04_part_b 0005_increment_05 0006_increment_06
+    0003_increment_04 0004_increment_04_part_b 0005_increment_05 0006_increment_06 0007_increment_07
+expect 'existing order workflow pins' "$(query_release_journal "$order_pins_sql")" "$order_pins_before"
 
 step 'verifying post-upgrade sign-in, MFA, Maintenance clear, pre-upgrade order survival and existing integration routes'
 python3 - "$origin" "$ca_cert" "$admin_email" "$work/permanent.password" "$work/state.json" <<'PY'

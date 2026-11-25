@@ -1,13 +1,14 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CreditCard, RefreshCw, ShieldCheck } from "lucide-react";
+import { CreditCard, RefreshCw, ShieldCheck, Wrench } from "lucide-react";
 import { useState, type ReactNode } from "react";
+import { Link } from "wouter";
 import type { ActivePaymentProvider, PaymentAttemptStatus, PaymentWebhookStatus } from "@server/modules/payments/schema";
 import { errorMessage, useTRPC, useTRPCClient } from "@/lib/trpc";
 import {
   Badge, Button, Callout, Card, ConfirmDialog, DataTable, DateTime, Dialog, EmptyState, ErrorState, Field, FilterBar,
   LoadMore, Money, PageHeader, Select, Skeleton, StepUpCancelledError, Tabs, useStepUp, useToast,
 } from "@/ui";
-import { PaymentSettings, providerLabels, type PaymentSettingsInput } from "./PaymentSettings";
+import { PaymentSettings, providerLabels, type PaymentSettingsInput, type PaymentSettingsView } from "./PaymentSettings";
 
 const providers = [{ value: "", label: "All providers" }, { value: "stripe", label: "Stripe" }, { value: "square", label: "Square" }];
 const attemptStates: Record<PaymentAttemptStatus, string> = {
@@ -15,6 +16,7 @@ const attemptStates: Record<PaymentAttemptStatus, string> = {
 };
 const webhookStates: Record<PaymentWebhookStatus, string> = {
   processed: "Processed", ignored: "Ignored", retry_pending: "Retry pending", verification_mismatch: "Verification mismatch",
+  awaiting_settlement: "Awaiting settlement", attention_required: "Attention required",
 };
 function options(states: Record<string, string>) {
   return [{ value: "", label: "All statuses" }, ...Object.entries(states).map(([value, label]) => ({ value, label }))];
@@ -24,8 +26,8 @@ function attemptBadge(status: PaymentAttemptStatus) {
     status === "redirected" ? "info" : "neutral"}>{attemptStates[status]}</Badge>;
 }
 function webhookBadge(status: PaymentWebhookStatus) {
-  return <Badge tone={status === "processed" ? "success" : status === "verification_mismatch" ? "danger" :
-    status === "retry_pending" ? "warning" : "neutral"}>{webhookStates[status]}</Badge>;
+  return <Badge tone={status === "processed" ? "success" : status === "verification_mismatch" || status === "attention_required" ? "danger" :
+    status === "retry_pending" || status === "awaiting_settlement" ? "warning" : "neutral"}>{webhookStates[status]}</Badge>;
 }
 function providerBadge(provider: ActivePaymentProvider, environment: "test" | "live") {
   return <span className="flex flex-wrap items-center gap-2">{providerLabels[provider]}
@@ -35,12 +37,36 @@ function providerBadge(provider: ActivePaymentProvider, environment: "test" | "l
 const publicId = /^[0-9A-HJKMNP-TV-Z]{26}$/u;
 const smallId = (id: string) => <span className="break-all font-mono text-xs">{id}</span>;
 
-export function PaymentsLayout({ configuration, attempts, webhooks, actions }: {
-  configuration: ReactNode; attempts: ReactNode; webhooks: ReactNode; actions?: ReactNode;
+function StripeReadinessBanner({ settings }: { settings: PaymentSettingsView }) {
+  if (settings.provider !== "stripe" || settings.onlineEnabled) return null;
+  const missing: string[] = [];
+  if (!settings.stripe.egressAllowlisted) missing.push("outbound HTTPS allowlist for api.stripe.com:443");
+  if (!settings.stripe.secretKeyConfigured) missing.push("Stripe API secret key");
+  if (!settings.stripe.webhookSecretConfigured) missing.push("Stripe webhook signing secret");
+  if (settings.stripe.lastApiVerifiedAt === null) missing.push("verified Stripe API connection");
+  if (settings.stripe.lastSelfTestWebhookAt === null) missing.push("passing signed webhook self-test");
+  return (
+    <div className="mb-5">
+      <Callout tone="warning" title="Stripe checkout is selected, but readiness checks are incomplete">
+        <p className="mb-2">
+          Hosted checkout stays inactive until every prerequisite is in place
+          {missing.length > 0 ? `: ${missing.join(", ")}.` : "."}
+        </p>
+        <Link href="/admin/payments/setup" className="font-semibold text-action underline underline-offset-2">
+          Open Stripe setup checklist
+        </Link>
+      </Callout>
+    </div>
+  );
+}
+
+export function PaymentsLayout({ configuration, attempts, webhooks, actions, banner }: {
+  configuration: ReactNode; attempts: ReactNode; webhooks: ReactNode; actions?: ReactNode; banner?: ReactNode;
 }) {
   return <>
     <PageHeader title="Payments" description="Configure hosted checkout, review payment attempts, and inspect verified webhook receipts."
       meta={<CreditCard className="size-5 text-action" aria-hidden />} actions={actions} />
+    {banner}
     <Tabs label="Payment administration" items={[
       { value: "configuration", label: "Configuration", content: configuration },
       { value: "attempts", label: "Payment attempts", content: attempts },
@@ -184,7 +210,17 @@ export default function PaymentsPage() {
   const config = settings.data;
   return <>
     <PaymentsLayout
-      actions={<Button variant="secondary" leadingIcon={<RefreshCw aria-hidden />} onClick={() => setReconcileOpen(true)}>Reconcile payments</Button>}
+      actions={
+        <div className="flex flex-wrap items-center gap-2">
+          <Button asChild variant="secondary" leadingIcon={<Wrench aria-hidden />}>
+            <Link href="/admin/payments/setup">Stripe setup</Link>
+          </Button>
+          <Button variant="secondary" leadingIcon={<RefreshCw aria-hidden />} onClick={() => setReconcileOpen(true)}>
+            Reconcile payments
+          </Button>
+        </div>
+      }
+      banner={config ? <StripeReadinessBanner settings={config} /> : null}
       configuration={config ? <PaymentSettings key={JSON.stringify(config)} settings={config} saving={saving} onSave={save} /> :
         settings.isPending ? <div role="status" aria-label="Loading payment settings"><Skeleton lines={6} /></div> :
           <ErrorState title="Could not load payment settings" error={settings.error} onRetry={() => { void settings.refetch(); }} />}

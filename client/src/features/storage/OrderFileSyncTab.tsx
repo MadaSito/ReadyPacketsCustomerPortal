@@ -38,6 +38,7 @@ import {
   type Tone,
 } from "@/ui";
 import type { StorageProviderKind } from "./model";
+import { ManagedOrderFileSync } from "./ManagedFileSyncPage";
 
 export type OrderFileSyncPage = inferRouterOutputs<AppRouter>["storage"]["copies"]["forOrder"];
 export type OrderFileSyncItem = OrderFileSyncPage["items"][number];
@@ -107,8 +108,8 @@ export function OrderFileSyncTabLabel({ orderId, area }: OrderFileSyncTabProps) 
   if (!canRead) return null;
   const firstPage = query.data?.pages[0];
   if (!firstPage) return "File sync";
-  const prefix = firstPage.hasSharePoint ? "SharePoint sync" : "File sync";
-  return `${prefix} (${firstPage.totals.total})`;
+  const prefix = firstPage.hasSharePoint || firstPage.managedCount ? "SharePoint sync" : "File sync";
+  return `${prefix} (${firstPage.totals.total + (firstPage.managedCount ?? 0)})`;
 }
 
 export function OrderFileSyncTab({ orderId, area }: OrderFileSyncTabProps) {
@@ -176,7 +177,7 @@ export function OrderFileSyncTab({ orderId, area }: OrderFileSyncTabProps) {
   const hasSharePoint = firstPage?.hasSharePoint ?? false;
   const hasAssignedConnection =
     firstPage?.hasAssignedConnection ?? (hasSharePoint || totals.total > 0);
-  const sectionTitle = hasSharePoint ? "SharePoint sync" : "File sync";
+  const sectionTitle = hasSharePoint || firstPage?.managedCount ? "SharePoint sync" : "File sync";
   const copyLogHref = `/admin/storage/copies?orderPublicId=${encodeURIComponent(orderId)}`;
 
   async function handleRetry(row: OrderFileSyncItem) {
@@ -269,6 +270,7 @@ export function OrderFileSyncTab({ orderId, area }: OrderFileSyncTabProps) {
       }
     >
       <div className="flex flex-col gap-4">
+        {firstPage?.managedCount ? <ManagedOrderFileSync orderId={orderId} canManage={canManageStorage} /> : null}
         {retryError ? (
           <Callout tone="danger" title="Could not queue retry" live="assertive">
             {retryError}
@@ -291,7 +293,7 @@ export function OrderFileSyncTab({ orderId, area }: OrderFileSyncTabProps) {
           </Callout>
         ) : null}
 
-        <StatGrid label={`${sectionTitle} totals`}>
+        {(!firstPage?.managedCount || rows.length > 0) ? <StatGrid label={firstPage?.managedCount ? "Legacy transfer totals" : `${sectionTitle} totals`}>
           <StatCard label="Total" value={totals.total} icon={HardDriveDownload} tone="neutral" />
           <StatCard label="Synced" value={totals.synced} icon={CheckCircle2} tone="success" />
           <StatCard label="In progress" value={totals.inProgress} icon={Clock} tone="info" />
@@ -301,10 +303,10 @@ export function OrderFileSyncTab({ orderId, area }: OrderFileSyncTabProps) {
             icon={AlertTriangle}
             tone={totals.failed > 0 ? "danger" : "neutral"}
           />
-        </StatGrid>
+        </StatGrid> : null}
 
         {rows.length === 0 ? (
-          !hasAssignedConnection ? (
+          firstPage?.managedCount ? null : !hasAssignedConnection ? (
             <EmptyState
               headingLevel={3}
               icon={HardDrive}

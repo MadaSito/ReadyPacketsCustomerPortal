@@ -5,6 +5,7 @@ import { z } from "zod";
 import { adminProcedure, publicProcedure, requireCapability, router, staffProcedure } from "../../trpc/trpc.js";
 import { EGRESS_PRESET_KEYS, EGRESS_PROTOCOLS, EGRESS_PURPOSES } from "./egress.js";
 import { WEBHOOK_DELIVERY_STATUSES, WEBHOOK_DIRECTIONS, WEBHOOK_SUBSCRIPTION_STATUSES } from "./webhooks/index.js";
+import { WORKFLOW_WEBHOOK_KINDS } from "./workflowWebhooks/types.js";
 
 const manageProcedure = adminProcedure.use(requireCapability("integrations.manage"));
 const webhooksManageProcedure = adminProcedure.use(requireCapability("webhooks.manage"));
@@ -50,6 +51,14 @@ const sendTestGraphSchema = z
   })
   .default({});
 
+const verifySitesSelectedWriteSchema = z
+  .strictObject({
+    siteUrlOrId: z.string().trim().min(3).max(500).optional(),
+    driveId: z.string().trim().min(3).max(200).optional(),
+    probeFolderPath: z.string().trim().min(1).max(200).optional(),
+  })
+  .default({});
+
 const updateAnalyticsInputSchema = z.strictObject({
   clarityEnabled: z.boolean(),
   clarityProjectId: z.string().trim().max(64),
@@ -65,17 +74,6 @@ const updateStripeInputSchema = z.strictObject({
   webhookToleranceSeconds: z.number().int().min(30).max(900).optional(),
   secretKey: z.string().max(256).nullable().optional(),
   webhookSecret: z.string().max(256).nullable().optional(),
-});
-
-const updateSamlInputSchema = z.strictObject({
-  idpEntityId: z.string().trim().max(255),
-  idpSsoUrl: z.string().trim().max(500),
-  spEntityId: z.string().trim().max(255),
-  nameIdFormat: z.enum([
-    "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
-    "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
-  ]),
-  enabled: z.boolean().optional(),
 });
 
 const createEgressRuleSchema = z.strictObject({
@@ -120,7 +118,16 @@ const setEgressPresetSchema = z.strictObject({
 });
 
 const productionPhaseSchema = z.enum(["P101", "P201", "P301", "P401"]);
-const productionDispatchStateSchema = z.enum(["queued", "sending", "delivered", "failed", "dead", "unknown"]);
+const productionDispatchFilterStateSchema = z.enum([
+  "queued",
+  "sending",
+  "delivered",
+  "retrying",
+  "failed",
+  "dead",
+  "stopped",
+  "unknown",
+]);
 
 const updateProductionSettingsSchema = z.strictObject({
   enabled: z.boolean(),
@@ -130,10 +137,32 @@ const updateProductionSettingsSchema = z.strictObject({
   p401Url: z.string().trim().max(2048).nullable().optional(),
   authHeaderName: z.string().trim().max(64).optional(),
   authHeaderValue: z.string().max(1024).nullable().optional(),
+  signingEnabled: z.boolean().optional(),
   canonVersion: z.string().trim().max(64),
   runMode: z.string().trim().max(32).optional(),
   timeoutMs: z.number().int().min(1000).max(30000).optional(),
 });
+
+const rotateProductionSigningSecretSchema = z
+  .strictObject({
+    overlapMinutes: z.number().int().min(0).max(1440).optional(),
+  })
+  .default({});
+
+const setProductionSigningEnabledSchema = z.strictObject({
+  signingEnabled: z.boolean(),
+});
+
+const setWorkflowAutoQueueSchema = z
+  .strictObject({
+    workflowPublicId: ulidParamSchema.optional(),
+    workflowKey: z.string().trim().min(2).max(64).optional(),
+    p101OnPaymentConfirmed: z.boolean(),
+    p201OnPhase1Locked: z.boolean(),
+  })
+  .refine((v) => Boolean(v.workflowPublicId || v.workflowKey), {
+    message: "Provide workflowPublicId or workflowKey.",
+  });
 
 const testProductionDestinationSchema = z.strictObject({
   phase: productionPhaseSchema,
@@ -163,6 +192,12 @@ const retryProductionDispatchSchema = z.strictObject({
   dispatchPublicId: ulidParamSchema,
 });
 
+const stopProductionDispatchSchema = z.strictObject({
+  orderPublicId: ulidParamSchema,
+  dispatchPublicId: ulidParamSchema,
+  reason: z.string().trim().max(280).nullable().optional(),
+});
+
 const redeliverProductionDispatchSchema = z.strictObject({
   orderPublicId: ulidParamSchema,
   dispatchPublicId: ulidParamSchema,
@@ -190,7 +225,7 @@ const productionOrderHistorySchema = z.strictObject({
 
 const listProductionDispatchesSchema = z.strictObject({
   phase: productionPhaseSchema.optional(),
-  state: productionDispatchStateSchema.optional(),
+  state: productionDispatchFilterStateSchema.optional(),
   orderReference: z.string().trim().max(64).optional(),
   fromDate: z.date().optional(),
   toDate: z.date().optional(),
@@ -200,6 +235,18 @@ const listProductionDispatchesSchema = z.strictObject({
 export const integrationsRouter = router({
   /** Public, minimal safe analytics configuration (`{ clarity: { enabled, projectId }, posthog: { enabled, key, host } }`). */
   publicAnalyticsConfig: publicProcedure.query(({ ctx }) => ctx.services.integrations.analytics.getPublicConfig()),
+
+  workflowWebhooks: router({
+    listOptions: staffProcedure
+      .input(
+        z
+          .strictObject({
+            kind: z.enum(["all", ...WORKFLOW_WEBHOOK_KINDS]).optional(),
+          })
+          .default({}),
+      )
+      .query(({ ctx, input }) => ctx.services.integrations.workflowWebhooks.listOptionsForActor(ctx.session, input)),
+  }),
 
   admin: router({
     providers: adminProcedure.query(({ ctx }) => ctx.services.integrations.providers.listStatuses()),
@@ -232,6 +279,11 @@ export const integrationsRouter = router({
         .meta({ rateLimit: "expensive" })
         .input(sendTestGraphSchema)
         .mutation(({ ctx, input }) => ctx.services.integrations.graphAdmin.sendTestMessage(ctx.session, input)),
+      verifySitesSelectedWrite: adminProcedure
+        .meta({ rateLimit: "expensive" })
+        .input(verifySitesSelectedWriteSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.graphAdmin.verifySitesSelectedWrite(ctx.session, input)),
+      entraRunbook: adminProcedure.query(({ ctx }) => ctx.services.integrations.graphAdmin.getEntraRunbook()),
     }),
 
     analytics: router({
@@ -246,17 +298,6 @@ export const integrationsRouter = router({
       update: manageProcedure
         .input(updateStripeInputSchema)
         .mutation(({ ctx, input }) => ctx.services.integrations.stripe.updateConfig(ctx.session, input)),
-    }),
-
-    saml: router({
-      get: adminProcedure.query(({ ctx }) => ctx.services.integrations.scaffolds.getSamlScaffold()),
-      updateMetadata: manageProcedure
-        .input(updateSamlInputSchema)
-        .mutation(({ ctx, input }) => ctx.services.integrations.scaffolds.updateSamlMetadata(ctx.session, input)),
-    }),
-
-    sharepoint: router({
-      get: adminProcedure.query(({ ctx }) => ctx.services.integrations.scaffolds.getSharePointScaffold()),
     }),
 
     egress: router({
@@ -328,6 +369,7 @@ export const integrationsRouter = router({
               targetUrl: z.string().trim().min(10).max(2048),
               events: z.array(z.string().trim().min(2).max(120)).min(1).max(200),
               paused: z.boolean().optional(),
+              signingEnabled: z.boolean().optional(),
             }),
           )
           .mutation(({ ctx, input }) => ctx.services.integrations.webhooks.createSubscription(ctx.session, input)),
@@ -340,6 +382,7 @@ export const integrationsRouter = router({
               description: z.string().trim().max(280).nullable().optional(),
               targetUrl: z.string().trim().min(10).max(2048).optional(),
               events: z.array(z.string().trim().min(2).max(120)).min(1).max(200).optional(),
+              signingEnabled: z.boolean().optional(),
             }),
           )
           .mutation(({ ctx, input }) => ctx.services.integrations.webhooks.updateSubscription(ctx.session, input)),
@@ -465,6 +508,7 @@ export const integrationsRouter = router({
                 direction: z.enum(WEBHOOK_DIRECTIONS).optional(),
                 subscriptionPublicId: ulidParamSchema.optional(),
                 inboundEndpointPublicId: ulidParamSchema.optional(),
+                orderPublicId: z.string().trim().max(26).optional(),
                 eventKey: z.string().trim().max(120).optional(),
                 status: z.enum(WEBHOOK_DELIVERY_STATUSES).optional(),
                 from: z.date().optional(),
@@ -485,6 +529,18 @@ export const integrationsRouter = router({
         get: adminProcedure
           .input(z.strictObject({ publicId: ulidParamSchema }))
           .query(({ ctx, input }) => ctx.services.integrations.webhooks.getDelivery(ctx.session, input.publicId)),
+        stop: adminProcedure
+          .input(
+            z.strictObject({
+              publicId: ulidParamSchema,
+              reason: z.string().trim().max(280).nullable().optional(),
+            }),
+          )
+          .mutation(({ ctx, input }) => ctx.services.integrations.webhooks.stopDelivery(ctx.session, input)),
+        retry: adminProcedure
+          .meta({ rateLimit: "expensive" })
+          .input(z.strictObject({ publicId: ulidParamSchema }))
+          .mutation(({ ctx, input }) => ctx.services.integrations.webhooks.retryDelivery(ctx.session, input)),
         redeliver: apiReplayProcedure
           .meta({ rateLimit: "expensive" })
           .input(z.strictObject({ publicId: ulidParamSchema }))
@@ -507,7 +563,40 @@ export const integrationsRouter = router({
         .meta({ rateLimit: "expensive" })
         .input(testProductionDestinationSchema)
         .mutation(({ ctx, input }) => ctx.services.integrations.production.testDestination(ctx.session, input)),
+      rotateSigningSecret: manageProcedure
+        .input(rotateProductionSigningSecretSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.production.rotateSigningSecret(ctx.session, input)),
+      setSigningEnabled: manageProcedure
+        .input(setProductionSigningEnabledSchema)
+        .mutation(({ ctx, input }) =>
+          ctx.services.integrations.production.setSigningEnabled(ctx.session, { enabled: input.signingEnabled }),
+        ),
     }),
+
+    rotateSigningSecret: manageProcedure
+      .input(rotateProductionSigningSecretSchema)
+      .mutation(({ ctx, input }) => ctx.services.integrations.production.rotateSigningSecret(ctx.session, input)),
+
+    setSigningEnabled: manageProcedure
+      .input(setProductionSigningEnabledSchema)
+      .mutation(({ ctx, input }) =>
+        ctx.services.integrations.production.setSigningEnabled(ctx.session, { enabled: input.signingEnabled }),
+      ),
+
+    workflowAutoQueue: router({
+      list: adminProcedure.query(({ ctx }) => ctx.services.integrations.production.listWorkflowAutoQueue(ctx.session)),
+      set: manageProcedure
+        .input(setWorkflowAutoQueueSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.production.setWorkflowAutoQueue(ctx.session, input)),
+    }),
+
+    stopDispatch: staffProcedure
+      .input(stopProductionDispatchSchema)
+      .mutation(({ ctx, input }) => ctx.services.integrations.production.stop(ctx.session, input)),
+
+    retryDispatch: productionTriggerProcedure
+      .input(retryProductionDispatchSchema)
+      .mutation(({ ctx, input }) => ctx.services.integrations.production.retry(ctx.session, input)),
 
     order: router({
       preview: productionTriggerProcedure
@@ -525,6 +614,9 @@ export const integrationsRouter = router({
       requestP401: productionTriggerProcedure
         .input(requestLaterPhaseSchema)
         .mutation(({ ctx, input }) => ctx.services.integrations.production.requestP401(ctx.session, input)),
+      stop: staffProcedure
+        .input(stopProductionDispatchSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.production.stop(ctx.session, input)),
       retry: productionTriggerProcedure
         .input(retryProductionDispatchSchema)
         .mutation(({ ctx, input }) => ctx.services.integrations.production.retry(ctx.session, input)),

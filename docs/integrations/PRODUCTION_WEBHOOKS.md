@@ -207,3 +207,29 @@ Field validation rules (`validateP201` / `validateP301` / `validateP401` and `bu
    - For `failed` or `dead` dispatches on the latest attempt of an undelivered phase, staff or administrators with `orders.production.trigger` can click **Retry** (`order.retry`) once the upstream endpoint or allowlist issue is resolved.
    - For `unknown` dispatches (`PRODUCTION_DELIVERY_INTERRUPTED`, `PRODUCTION_AMBIGUOUS_IN_FLIGHT`, `PRODUCTION_PRIOR_ATTEMPT_UNCERTAIN`), confirm downstream n8n/SharePoint state first before using admin step-up **Re-send** (`order.resend`).
    - To intentionally replay an already `delivered` dispatch, an administrator with `orders.production.redeliver` and fresh MFA step-up opens **Redeliver**, enters an audit reason, and types `REDELIVER` (`order.redeliver`), creating a new delivery row linked via `redeliveryOf`.
+
+---
+
+## 7. Increment 07 Additions — Optional HMAC Signing, Lifecycle Auto-Queue, Phase Triggers & Stop
+
+### 7.1 Optional HMAC-SHA256 Signing & Overlap Secret Rotation
+- **Backward-compatible default**: Production webhook signing (`integrations.production.config.signingEnabled`) ships **off** (`false`) so existing unsigned n8n receivers continue working unchanged after upgrade without altering canonical `P101`–`P401` JSON payload bytes.
+- **Rotating & enabling signing (`/admin/integrations/production`)**:
+  1. Click **Generate / Rotate Signing Secret** (`production.settings.rotateSigningSecret`, MFA step-up + `overlapMinutes: 0..1440`, default `60`). Copy the `whsec_<48-hex>` secret shown once; later views expose only `signingSecretLast4`.
+  2. Switch **Sign outbound payloads (`X-ReadyPackets-Signature`)** on (`production.settings.setSigningEnabled`).
+  3. While signed mode is active, every `P101`–`P401` HTTP `POST` carries `X-ReadyPackets-Timestamp: <unixSeconds>` and `X-ReadyPackets-Signature: t=<unixSeconds>,v1=<hexHmacSha256>` (plus a second `,v1=<overlapHexHmacSha256>` while `previousSigningSecretExpiresAt` is active so receivers can rotate secrets with zero downtime).
+  4. `destination_fingerprint` pins `(signingEnabled, signingSecret)` at queue time and accepts the active overlap secret fingerprint during secret rotation so in-flight dispatches are not spuriously aborted.
+
+### 7.2 Per-Workflow Opt-In Lifecycle Auto-Queue & Phase Webhook Triggers
+- **Per-workflow lifecycle switches (`production.workflowAutoQueue.list` / `.set`)**:
+  - Disabled (`false`) by default for every workflow; never fires retroactively on portal upgrade, workflow publish, workflow import, or startup payment backfill (`PAYMENT_BACKFILL`).
+  - When enabled by an administrator (MFA step-up) for a workflow on `/admin/integrations/production`:
+    - **`p101OnPaymentConfirmed`**: Automatically queues `P101` (`triggerSource = "lifecycle_payment_confirmed"`) inside the same DB transaction when `order.payment_state.changed` transitions `to_state = "paid"`.
+    - **`p201OnPhase1Locked`**: Automatically queues `P201` (`triggerSource = "lifecycle_phase1_locked"`) inside the same DB transaction when `order.stage.submitted` locks the workflow's Phase 1 intake stage (still enforcing delivered `P101` + locked Phase 1 preconditions).
+- **Workflow Phase & Automation Triggers (`services.integrations.workflowWebhooks`)**:
+  - Workflow Phase bundles (`triggerSource = "stage_bundle"`) and Automation rules (`triggerSource = "automation_rule"`) can target `production:P101`..`production:P401`. Unmet preconditions (such as `PHASE1_INTAKE_NOT_LOCKED` or `PRODUCTION_P101_NOT_DELIVERED`) record a durable `integration.production.dispatch.refused` audit event and return `outcome = "refused_precondition"` without rolling back the customer's payment or phase submission.
+
+### 7.3 Stopping Queued Dispatches (`production.order.stop`)
+- Staff and administrators with `orders.production.trigger` (or `integrations.manage`) can stop any `queued` dispatch from the Order Automation tab (`production.order.stop({ orderPublicId, dispatchPublicId, reason? })`), transitioning `state` to `"stopped"`, cancelling its `job_runs` outbox entry under the job fence, scrubbing `payload_enc`, and recording `integration.production.dispatch.stopped` (staff-only in Order Activity).
+- A `"stopped"` dispatch on an undelivered phase can be resumed later via **Retry** (`production.order.retry`, `resend_reason = "OPERATOR_RETRY_AFTER_STOP"`), preserving the root `Idempotency-Key` and exact payload SHA-256.
+

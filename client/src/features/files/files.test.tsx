@@ -9,9 +9,11 @@ import { expectNoAxeViolations, renderUi } from "@/ui/testing";
 import { FileUploadPanel } from "./FileUploadPanel";
 import { FilesAdminContent } from "./FilesAdminPage";
 import OrderFilesTab from "./OrderFilesTab";
+import { PhaseUploadedFiles, PhaseUploadPanel } from "./PhaseFiles";
 import { RecordingPreflight } from "./RecordingPreflight";
+import { formatAudioTimeRemaining } from "./format";
 
-const { fetchMock, view } = vi.hoisted(() => ({ fetchMock: vi.fn(), view: vi.fn() }));
+const { fetchMock, view, phasePolicy } = vi.hoisted(() => ({ fetchMock: vi.fn(), view: vi.fn(), phasePolicy: vi.fn() }));
 vi.mock("@/lib/agreementGate", () => ({
   AgreementDialog: ({ onAccepted }: { onAccepted: () => Promise<void> }) => <button type="button" onClick={() => { void onAccepted(); }}>Accept test agreement</button>,
   parseAgreementRequiredDetails: () => null,
@@ -20,9 +22,17 @@ vi.mock("@/lib/sessionTransport", async (original) => ({
   ...await original<typeof transportModule>(),
   sessionFetch: fetchMock,
 }));
+vi.mock("./archives/ArchiveAction", () => ({
+  OrderArchiveAction: () => <button type="button">Download all files (ZIP)</button>,
+  PhaseArchiveAction: ({ phaseName }: { phaseName: string }) => <button type="button">Download {phaseName} files (ZIP)</button>,
+}));
 vi.mock("@/lib/trpc", async (original) => ({
   ...await original<typeof trpcModule>(),
-  useTRPCClient: () => ({ files: { issueDownloadTicket: { mutate: async () => ({ ticket: "synthetic-test-ticket" }) } } }),
+  useTRPCClient: () => ({ files: {
+    issueDownloadTicket: { mutate: async () => ({ ticket: "synthetic-test-ticket" }) },
+    issuePlaybackTicket: { mutate: async () => ({ ticket: "synthetic-playback-ticket" }) },
+    readTranscript: { mutate: async () => ({ transcript: "Synthetic transcript" }) },
+  } }),
   useTRPC: () => {
     const mutation = { mutationOptions: () => ({ mutationFn: async () => ({}) }) };
     return {
@@ -35,6 +45,11 @@ vi.mock("@/lib/trpc", async (original) => ({
           }),
           pathKey: () => ["file-tabs"],
         },
+        phasePolicy: {
+          queryOptions: () => ({ queryKey: ["phase-policy"], queryFn: phasePolicy }),
+          pathKey: () => ["phase-policy"],
+        },
+        teamFiles: { pathKey: () => ["team-files"] },
         recording: { preflight: { queryOptions: () => ({ queryKey: ["preflight"], queryFn: async () => ({
           enabled: true, conversionAvailable: false, maxMinutes: 2, maxBytes: policy.maxFileBytes, acceptedTypes: ["wav"],
         }) }) } },
@@ -69,9 +84,64 @@ const sample: FileRecord = {
 beforeEach(() => {
   fetchMock.mockReset();
   view.mockReset().mockResolvedValue({ items: [sample], nextCursor: null, canUpload: false, uploadPolicy: null });
+  phasePolicy.mockReset().mockResolvedValue(null);
+});
+
+describe("phase uploader", () => {
+  const phaseDefaults = { enabled: true, disabledReason: null, maxSeconds: 60, policy,
+    remainingDocuments: 3, remainingAudio: 3, remainingAudioSeconds: 7200 };
+
+  it("reports queued and in-flight files until both results are definitive, and clears the count on unmount", async () => {
+    phasePolicy.mockResolvedValue(phaseDefaults);
+    let finish = (_response: Response) => {};
+    fetchMock.mockReturnValue(new Promise<Response>((resolve) => { finish = resolve; }));
+    const pending = vi.fn();
+    const user = userEvent.setup();
+    const props = { orderId, stageKey: "intake_phase", intent: "document", onPendingChange: pending } as const;
+    const { container, unmount } = renderUi(<PhaseUploadPanel {...props} />);
+    await screen.findByRole("button", { name: "Choose files" });
+    const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]')!;
+    const evidence = new File(["synthetic"], "evidence.pdf", { type: "application/pdf" });
+    await user.upload(fileInput, [evidence, new File(["synthetic"], "another.pdf", { type: "application/pdf" })]);
+    await waitFor(() => expect(pending).toHaveBeenLastCalledWith(2));
+    const queuedReports = pending.mock.calls.length;
+    await user.click(screen.getByRole("button", { name: "Upload 2 files" }));
+    await screen.findByRole("progressbar", { name: "Sending and validating selected files…" });
+    await waitFor(() => expect(pending).toHaveBeenLastCalledWith(2));
+    expect(pending.mock.calls.slice(queuedReports)).not.toContainEqual([0]);
+    finish(new Response(JSON.stringify({ results: [{ index: 0, outcome: "completed" }, { index: 1, outcome: "refused" }] })));
+    expect(await screen.findByText("1 of 2 uploads confirmed.")).toBeInTheDocument();
+    await waitFor(() => expect(pending).toHaveBeenLastCalledWith(0));
+    await user.upload(fileInput, evidence);
+    await waitFor(() => expect(pending).toHaveBeenLastCalledWith(1));
+    unmount();
+    await waitFor(() => expect(pending).toHaveBeenLastCalledWith(0));
+  });
+
+  it("shows the remaining audio allowance as hours and minutes", async () => {
+    phasePolicy.mockResolvedValue({ ...phaseDefaults, remainingAudioSeconds: 5400 });
+    renderUi(<PhaseUploadPanel orderId={orderId} stageKey="intake_phase" intent="prerecorded_audio" />);
+    expect(await screen.findByText("3 files remaining · 1 hour 30 minutes of audio remaining")).toBeInTheDocument();
+    expect([7200, 2700, 59, 0].map(formatAudioTimeRemaining)).toEqual(["2 hours", "45 minutes", "less than 1 minute", "0 minutes"]);
+  });
 });
 
 describe("file upload", () => {
+  it("keeps the phase and prerecorded intent distinct from microphone recording", async () => {
+    const user = userEvent.setup();
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ results: [{ index: 0, outcome: "completed" }] })));
+    const { container } = renderUi(<FileUploadPanel orderId={orderId} staff={false}
+      phase={{ key: "intake_phase", intent: "prerecorded_audio" }} policy={{ ...policy, extensions: ["wav"] }}
+      audio={{ enabled: true, maxMinutes: 5 }} onChanged={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: "Record" })).not.toBeInTheDocument();
+    await user.upload(container.querySelector("input[type=file]")!, new File(["synthetic"], "evidence.wav", { type: "audio/wav" }));
+    await user.click(screen.getByRole("button", { name: "Upload file" }));
+    expect(await screen.findByText("1 of 1 uploads confirmed.")).toBeInTheDocument();
+    const url = String(fetchMock.mock.calls[0]?.[0]);
+    expect(url).toContain("stageKey=intake_phase&intent=prerecorded_audio");
+    expect(url).not.toContain("source=recording");
+  });
+
   it("binds the selected workflow status and slot and sends the optional transcript only on explicit upload", async () => {
     const user = userEvent.setup();
     fetchMock.mockResolvedValue(new Response(JSON.stringify({ results: [{ index: 0, outcome: "completed" }] })));
@@ -105,6 +175,8 @@ describe("file upload", () => {
     ] }), { status: 200, headers: { "Content-Type": "application/json" } }));
     expect(await screen.findByText("1 of 2 uploads confirmed.")).toBeInTheDocument();
     expect(screen.getByText("Contents did not match the approved format.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Upload 2 files" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear results" })).toHaveFocus();
     expect(changed).toHaveBeenCalledOnce();
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining(`/api/files/upload/${orderId}?`),
       expect.objectContaining({ method: "POST", body: expect.any(FormData) }));
@@ -112,12 +184,16 @@ describe("file upload", () => {
 
   it("keeps a lost connection unknown rather than claiming the file was refused", async () => {
     const user = userEvent.setup();
+    const pending = vi.fn();
     fetchMock.mockRejectedValue(new Error("synthetic transport interruption"));
-    const { container } = renderUi(<FileUploadPanel orderId={orderId} staff policy={policy} onChanged={vi.fn()} />);
+    const { container } = renderUi(<FileUploadPanel orderId={orderId} staff policy={policy} onPendingChange={pending} onChanged={vi.fn()} />);
     await user.upload(container.querySelector("input[type=file]")!, new File(["synthetic"], "audio.wav"));
     await user.click(screen.getByRole("button", { name: "Upload file" }));
     expect(await screen.findByText("Unknown outcome")).toBeInTheDocument();
     expect(screen.getByText("0 of 1 uploads confirmed.")).toBeInTheDocument();
+    await waitFor(() => expect(pending).toHaveBeenLastCalledWith(1));
+    await user.click(screen.getByRole("button", { name: "Clear results" }));
+    await waitFor(() => expect(pending).toHaveBeenLastCalledWith(0));
   });
 
   it("uses the device capture control for a recording-only task when the browser has no recorder", async () => {
@@ -210,6 +286,144 @@ describe("file upload", () => {
 });
 
 describe("order file tab", () => {
+  it.each([true, false])("sends the right general upload binding with stageUploadsRequired=%s", async (stageUploadsRequired) => {
+    view.mockResolvedValue({ items: [], nextCursor: null, canUpload: true, uploadPolicy: policy, stageUploadsRequired,
+      currentStageKey: "intake_phase", phases: [{ key: "intake_phase", label: "Intake" }], uploadSlots: null });
+    phasePolicy.mockResolvedValue({ enabled: true, maxSeconds: 60, policy, remainingDocuments: 3, remainingAudio: 3,
+      remainingAudioSeconds: 7200 });
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ results: [{ index: 0, outcome: "completed" }] })));
+    const user = userEvent.setup();
+    const { container } = renderUi(<OrderFilesTab orderId={orderId} area="customer" />);
+    await screen.findByRole("button", { name: "Choose files" });
+    if (stageUploadsRequired) expect(screen.getByLabelText("Upload phase")).toHaveValue("intake_phase");
+    else expect(screen.queryByLabelText("Upload phase")).not.toBeInTheDocument();
+    await user.upload(container.querySelector("input[type=file]")!, new File(["synthetic"], "evidence.pdf", { type: "application/pdf" }));
+    await user.click(screen.getByRole("button", { name: "Upload file" }));
+    expect(await screen.findByText("1 of 1 uploads confirmed.")).toBeInTheDocument();
+    const { searchParams } = new URL(String(fetchMock.mock.calls[0]?.[0]), "https://example.test");
+    expect(searchParams.get("stageKey")).toBe(stageUploadsRequired ? "intake_phase" : null);
+    expect(searchParams.get("intent")).toBe(stageUploadsRequired ? "document" : null);
+  });
+
+  it("does not offer an unbound upload for a phased task without a current phase", async () => {
+    view.mockResolvedValue({ items: [], nextCursor: null, canUpload: true, uploadPolicy: policy, stageUploadsRequired: true,
+      currentStageKey: null, phases: [], uploadSlots: { statusKey: "intake", slots: [
+        { key: "voice_evidence", label: "Voice evidence", kind: "audio", maxCount: 1, allowedTypes: ["wav"] },
+      ] } });
+    const user = userEvent.setup();
+    const { container } = renderUi(<OrderFilesTab orderId={orderId} area="customer" />);
+    await user.selectOptions(await screen.findByLabelText("Upload to"), "voice_evidence");
+    expect(screen.getByText("No current phase is available for this requirement.")).toBeInTheDocument();
+    expect(container.querySelector("input[type=file]")).toBeNull();
+  });
+
+  it("includes the visible edit text and filename in the console document link name", async () => {
+    const file = { ...sample, displayName: "qa-synthetic.docx", extension: "docx" };
+    view.mockResolvedValue({ items: [file], nextCursor: null, canUpload: false, uploadPolicy: null });
+    const { container } = renderUi(<><h1>Order</h1><OrderFilesTab orderId={orderId} area="console" /></>);
+    const links = await screen.findAllByRole("link", { name: "Edit document: qa-synthetic.docx" });
+    for (const link of links) expect(link).toHaveTextContent("Edit document");
+    await expectNoAxeViolations(container);
+  });
+
+  it("binds a format-3 task upload to the current phase and keeps its status and slot", async () => {
+    view.mockResolvedValue({ items: [], nextCursor: null, canUpload: true, uploadPolicy: policy, stageUploadsRequired: true,
+      currentStageKey: "intake_phase", phases: [{ key: "intake_phase", label: "Intake evidence" }],
+      uploadSlots: { statusKey: "intake", slots: [
+        { key: "voice_evidence", label: "Voice evidence", kind: "audio", maxCount: 1, allowedTypes: ["wav"] },
+      ] } });
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ results: [{ index: 0, outcome: "completed" }] })));
+    const user = userEvent.setup();
+    const { container } = renderUi(<OrderFilesTab orderId={orderId} area="customer" />);
+    await user.selectOptions(await screen.findByLabelText("Upload to"), "voice_evidence");
+    await user.upload(container.querySelector("input[type=file]")!, new File(["synthetic"], "evidence.wav", { type: "audio/wav" }));
+    await user.click(screen.getByRole("button", { name: "Upload file" }));
+    expect(await screen.findByText("1 of 1 uploads confirmed.")).toBeInTheDocument();
+    const url = new URL(String(fetchMock.mock.calls[0]?.[0]), "https://example.test");
+    expect(Object.fromEntries(url.searchParams)).toMatchObject({
+      stageKey: "intake_phase", intent: "prerecorded_audio", slotKey: "voice_evidence", statusKey: "intake",
+    });
+  });
+
+  it("groups a mixed file library by phase and custody and orders versions newest first", async () => {
+    view.mockResolvedValue({ items: [
+      { ...sample, stageKey: "review", displayName: "Older version.pdf" },
+      { ...sample, publicId: `${sample.publicId.slice(0, -1)}2`, stageKey: "review", displayName: "Latest version.pdf", version: 2 },
+      { ...sample, publicId: `${sample.publicId.slice(0, -1)}3`, stageKey: "intake", displayName: "Team file.pdf", category: "deliverable" },
+    ], nextCursor: null, canUpload: false, uploadPolicy: null,
+    phases: [{ key: "intake", label: "Intake evidence" }, { key: "review", label: "Final review" }] });
+    const { container } = renderUi(<><h1>Order</h1><OrderFilesTab orderId={orderId} area="customer" /></>);
+    expect(await screen.findByRole("heading", { name: "Final review" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Intake evidence" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Download Final review files (ZIP)" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Download all files (ZIP)" })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Deliverable · Customer-visible" })).toBeInTheDocument();
+    const latest = screen.getAllByText("Latest version.pdf")[0]!;
+    const older = screen.getAllByText("Older version.pdf")[0]!;
+    expect(latest.compareDocumentPosition(older) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    await expectNoAxeViolations(container);
+  });
+
+  it("renders a completed phase as a read-only, downloadable list", async () => {
+    let finish = (_response: Response) => {};
+    fetchMock.mockReturnValue(new Promise<Response>((resolve) => { finish = resolve; }));
+    const { container } = renderUi(<><h1>Order</h1><h2>Phases</h2><h3>Completed phase</h3><h4>Documents</h4>
+      <PhaseUploadPanel orderId={orderId} stageKey="intake_phase" intent="document" readOnly /></>);
+    const list = await screen.findByRole("list", { name: "Uploaded in this phase" });
+    const download = within(list).getByRole("button", { name: `Download ${sample.displayName}` });
+    expect(within(list).getByText("PDF · 8 B ·", { exact: false })).toBeInTheDocument();
+    expect(list.querySelector("time")).toHaveAttribute("datetime", sample.createdAt.toISOString());
+    expect(screen.queryByRole("button", { name: "Choose files" })).not.toBeInTheDocument();
+    expect(container.querySelector("input[type=file]")).toBeNull();
+    await expectNoAxeViolations(container);
+    download.focus();
+    await userEvent.setup().keyboard("{Enter}");
+    expect(download).toHaveAttribute("aria-disabled", "true");
+    expect(download).toHaveFocus();
+    finish(new Response(null, { status: 404 }));
+    expect(await screen.findByText("Download not available")).toBeInTheDocument();
+    expect(download).toHaveFocus();
+  });
+
+  it("shows the uploaded audio list and launches the same ticket-based playback as the order library", async () => {
+    const file = { ...sample, displayName: "Recorded evidence.webm", contentType: "audio/webm", extension: "webm" };
+    const grantPublicId = `${sample.publicId.slice(0, -1)}4`;
+    view.mockResolvedValue({ items: [file, { ...sample, displayName: "Staff note.wav", contentType: "audio/wav", visibility: "staff_only" }],
+      nextCursor: null, canUpload: false, uploadPolicy: null });
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ grantPublicId })));
+    const user = userEvent.setup();
+    renderUi(<PhaseUploadedFiles orderId={orderId} stageKey="intake_phase" intent="recording" />);
+    expect(screen.getByRole("heading", { level: 5, name: "Uploaded in this phase" })).toBeInTheDocument();
+    await user.click(await screen.findByRole("button", { name: `Listen to ${file.displayName}` }));
+    expect(screen.queryByText("Staff note.wav")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Load audio and transcript" }));
+    expect(await screen.findByLabelText(`Play ${file.displayName}`)).toHaveAttribute("src", expect.stringContaining(`/api/files/playback/${grantPublicId}`));
+  });
+
+  it("shows an empty state for a phase with no uploads", async () => {
+    view.mockResolvedValue({ items: [], nextCursor: null, canUpload: false, uploadPolicy: null });
+    renderUi(<PhaseUploadedFiles orderId={orderId} stageKey="intake_phase" intent="document" />);
+    expect(await screen.findByText("Nothing uploaded yet.")).toBeInTheDocument();
+  });
+
+  it("uses the playback grant handle as the media URL without putting the ticket in it", async () => {
+    const grantPublicId = `${sample.publicId.slice(0, -1)}4`;
+    const file = { ...sample, displayName: "Voice clip.wav", contentType: "audio/wav", extension: "wav" };
+    view.mockResolvedValue({ items: [file], nextCursor: null, canUpload: false, uploadPolicy: null });
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ grantPublicId })));
+    const user = userEvent.setup();
+    renderUi(<OrderFilesTab orderId={orderId} area="customer" />);
+    await user.click((await screen.findAllByRole("button", { name: `Listen to ${file.displayName}` }))[0]!);
+    await user.click(screen.getByRole("button", { name: "Load audio and transcript" }));
+    const player = await screen.findByLabelText(`Play ${file.displayName}`);
+    expect(player.getAttribute("src")).toContain(`/api/files/playback/${grantPublicId}`);
+    expect(player.getAttribute("src")).not.toContain("synthetic-playback-ticket");
+    expect(screen.getByText("Synthetic transcript")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/files/playback"), expect.objectContaining({
+      method: "POST", body: JSON.stringify({ ticket: "synthetic-playback-ticket" }),
+    }));
+  });
+
   it("preselects a task from the Files tab link and focuses the task heading", async () => {
     view.mockResolvedValue({ items: [], nextCursor: null, canUpload: true, uploadPolicy: policy,
       uploadSlots: { statusKey: "intake", slots: [

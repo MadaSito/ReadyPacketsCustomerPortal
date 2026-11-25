@@ -73,3 +73,16 @@ All three actions are on the console order page in the **Administration** card. 
 | PHASE_LOCKED | The phase is locked. Unlock it with a reason if a change is really needed. |
 | FEATURE_DISABLED on Grant access | Turn on **Console access grants**. |
 | TOO_MANY_ORDERS | A customer-wide grant covers at most 500 orders. Grant access per order instead. |
+
+## Phases-first workflows (increment 07)
+
+New installations start with the **ReadyPackets standard workflow**: Payment, Phase 1 intake, Phase 2 synthesis, Phase 3 review, Phase 4 delivery, Delivered and Closed. On an existing installation nothing changes by itself. While the default workflow has no phases, **Workflows** shows a notice with two choices: **Add the ReadyPackets phases workflow** (a new draft) or **Convert … to phases** (a draft of the default in which its statuses are grouped into phases; an open draft without phases is converted only after you confirm). Check each phase and publish when you are ready. Orders that already exist keep the version they started with.
+
+- **Phases view.** In the designer, a draft with phases opens on **Phases**. Each phase lists its statuses (each status belongs to at most one phase), the customer actions it allows (documents, questions, recording, audio upload, team file review), its acknowledgement, and how it ends. **Next** finishes the phase. **Submit and lock** records the customer's submission and locks it. For a draft without phases, choose **Start phases from statuses**.
+- **Targets.** Webhook targets and file sync targets are checked when you save and when you publish. If a target no longer exists, the save is refused and the phase field shows why.
+- **Customer progress.** Customers see a progress bar and their current phase on the order and in their order list. Progress only goes forward. The one exception is when an administrator reopens a phase.
+- **Review.** When a customer submits a phase, the order shows **Needs staff review**. Staff with the review permission accept the submission or ask for changes. Asking for changes requires a note for the customer.
+- **Reopen.** Only an administrator can reopen a locked or accepted phase, after confirming their identity again. A reason of 10–500 characters is required. The reason is kept as an internal note and audited. **Unlock a phase** is not used for workflows with phases.
+- **Payment.** An order with an amount due starts as **Unpaid**. When its invoice is paid, the payment phase completes and the order moves to Phase 1 if the workflow allows it. Otherwise staff move it.
+- **Attention filter.** On the orders list, filter by **Needs staff review** or **Waiting for customer**.
+- **Export and import.** Exports that contain phases use file version 3. On import, file sync targets and webhook subscriptions from the other installation are cleared, and the import lists them as warnings so you can choose local ones.

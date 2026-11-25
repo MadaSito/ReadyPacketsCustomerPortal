@@ -22,10 +22,15 @@ import {
   AUTOMATION_RUN_STATES,
   AUTOMATION_STEP_STATES,
   AUTOMATION_TRIGGER_MODES,
+  COMPLETION_JOB_SOURCES,
+  COMPLETION_JOB_STATES,
+  COMPLETION_POLICY_KINDS,
+  ORDER_STAGE_RUN_STATES,
 } from "./contracts.js";
 
 /**
- * Automation definitions. Additive Increment 03 table (`automations`).
+ * Automation definitions. Additive Increment 03 table (`automations`), extended in Increment 07
+ * with `sort_order` for deterministic evaluation order (`sort_order ASC, id ASC`).
  * Action configurations live in `actions_json` while step secrets live separately in `automation_secrets`
  * so neither `automations` nor `automation_versions` snapshots ever echo secret material.
  */
@@ -37,6 +42,7 @@ export const automations = mysqlTable(
     name: varchar("name", { length: 160 }).notNull(),
     description: varchar("description", { length: 500 }),
     enabled: boolean("enabled").notNull().default(false),
+    sortOrder: int("sort_order").notNull().default(0),
     version: versionColumn(),
     triggerMode: mysqlEnum("trigger_mode", AUTOMATION_TRIGGER_MODES).notNull(),
     triggerKey: varchar("trigger_key", { length: 80 }),
@@ -56,6 +62,7 @@ export const automations = mysqlTable(
   },
   (t) => [
     index("automations_enabled_event_idx").on(t.enabled, t.triggerMode, t.triggerEventName),
+    index("automations_sort_order_idx").on(t.enabled, t.triggerMode, t.sortOrder, t.id),
     index("automations_schedule_due_idx").on(t.enabled, t.triggerMode, t.nextScheduledAt),
     index("automations_updated_id_idx").on(t.updatedAt, t.id),
   ],
@@ -179,5 +186,82 @@ export const automationRunSteps = mysqlTable(
   (t) => [
     uniqueIndex("automation_run_steps_run_idx_uq").on(t.runId, t.stepIndex),
     index("automation_run_steps_state_idx").on(t.state, t.updatedAt),
+  ],
+);
+
+/**
+ * Increment 07 (D5): Human-confirmed workflow phase action bundle runs (`order_stage_runs`).
+ * Stores an immutable snapshot of the pinned `StageActions` bundle and per-slot execution outcomes
+ * without any raw URLs, secret material, or personal data.
+ */
+export const orderStageRuns = mysqlTable(
+  "order_stage_runs",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    orderId: refColumn("order_id").notNull(),
+    orderPublicId: char("order_public_id", { length: 26 }).notNull(),
+    workflowVersionId: refColumn("workflow_version_id").notNull(),
+    stageKey: varchar("stage_key", { length: 48 }).notNull(),
+    stageLabel: varchar("stage_label", { length: 60 }).notNull(),
+    triggeredByUserId: refColumn("triggered_by_user_id").notNull(),
+    idempotencyKey: varchar("idempotency_key", { length: 64 }).notNull(),
+    correlationId: varchar("correlation_id", { length: 64 }).notNull(),
+    state: mysqlEnum("state", ORDER_STAGE_RUN_STATES).notNull(),
+    reasonCode: varchar("reason_code", { length: 64 }),
+    bundleSnapshotJson: text("bundle_snapshot_json").notNull(),
+    resultsJson: text("results_json").notNull(),
+    createdAt: createdAtColumn(),
+    finishedAt: utcDateTime("finished_at").notNull(),
+  },
+  (t) => [
+    uniqueIndex("order_stage_runs_order_idem_uq").on(t.orderId, t.idempotencyKey),
+    index("order_stage_runs_order_created_idx").on(t.orderPublicId, t.createdAt, t.id),
+    index("order_stage_runs_stage_idx").on(t.orderPublicId, t.stageKey, t.id),
+  ],
+);
+
+/**
+ * Increment 07 (D5): Immediate and scheduled order completion percentage updates (`order_completion_jobs`).
+ * Range percentages are drawn once on the server (`crypto.randomInt`) and persisted in `resolved_percent`;
+ * delayed applications execute as one-shot jobs fenced by `expected_revision` (`orders.completion_revision`).
+ */
+export const orderCompletionJobs = mysqlTable(
+  "order_completion_jobs",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    orderId: refColumn("order_id").notNull(),
+    orderPublicId: char("order_public_id", { length: 26 }).notNull(),
+    workflowVersionId: refColumn("workflow_version_id").notNull(),
+    stageKey: varchar("stage_key", { length: 48 }),
+    sourceKind: mysqlEnum("source_kind", COMPLETION_JOB_SOURCES).notNull(),
+    sourcePublicId: char("source_public_id", { length: 26 }).notNull(),
+    idempotencyKey: varchar("idempotency_key", { length: 120 }).notNull(),
+    correlationId: varchar("correlation_id", { length: 64 }).notNull(),
+    policyKind: mysqlEnum("policy_kind", COMPLETION_POLICY_KINDS).notNull(),
+    minPercent: int("min_percent", { unsigned: true }).notNull(),
+    maxPercent: int("max_percent", { unsigned: true }).notNull(),
+    resolvedPercent: int("resolved_percent", { unsigned: true }).notNull(),
+    delayMinutes: int("delay_minutes", { unsigned: true }).notNull().default(0),
+    dueAt: utcDateTime("due_at").notNull(),
+    expectedRevision: int("expected_revision", { unsigned: true }).notNull(),
+    appliedRevision: int("applied_revision", { unsigned: true }),
+    jobPublicId: varchar("job_public_id", { length: 40 }),
+    state: mysqlEnum("state", COMPLETION_JOB_STATES).notNull(),
+    attemptCount: int("attempt_count", { unsigned: true }).notNull().default(0),
+    reasonCode: varchar("reason_code", { length: 64 }),
+    createdByUserId: refColumn("created_by_user_id"),
+    canceledByUserId: refColumn("canceled_by_user_id"),
+    canceledAt: utcDateTime("canceled_at"),
+    completedAt: utcDateTime("completed_at"),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (t) => [
+    uniqueIndex("order_completion_jobs_idem_uq").on(t.idempotencyKey),
+    index("order_completion_jobs_order_created_idx").on(t.orderPublicId, t.createdAt, t.id),
+    index("order_completion_jobs_order_state_idx").on(t.orderId, t.state, t.dueAt),
+    index("order_completion_jobs_stage_idx").on(t.orderPublicId, t.stageKey, t.id),
   ],
 );

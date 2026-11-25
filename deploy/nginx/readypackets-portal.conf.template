@@ -68,7 +68,7 @@ server {
         try_files $uri =404;
     }
     # Sensitive callbacks are canonical HTTPS only; never put their queries in a redirect.
-    location ~* ^/(?:api/identity/sso/callback/?$|api/storage/oauth/callback(?:/|$)|api/(?:webhooks/inbound|payments/(?:webhooks|return))(?:/|$)) {
+    location ~* ^/(?:api/identity/(?:sso/callback/?$|saml(?:/|$))|api/storage/oauth/callback(?:/|$)|api/(?:webhooks/inbound|payments/(?:webhooks|return))(?:/|$)) {
         return 404;
     }
     location / {
@@ -86,7 +86,7 @@ server {
     # No app response here. Canonical vhost passes the application's own HSTS unchanged.
     add_header Strict-Transport-Security "max-age=31536000" always;
     # Sensitive callbacks are canonical HTTPS only; never put their queries in a redirect.
-    location ~* ^/(?:api/identity/sso/callback/?$|api/storage/oauth/callback(?:/|$)|api/(?:webhooks/inbound|payments/(?:webhooks|return))(?:/|$)) {
+    location ~* ^/(?:api/identity/(?:sso/callback/?$|saml(?:/|$))|api/storage/oauth/callback(?:/|$)|api/(?:webhooks/inbound|payments/(?:webhooks|return))(?:/|$)) {
         return 404;
     }
     location / {
@@ -136,6 +136,36 @@ server {
     proxy_cache off;
     # No nginx asset cache or Expires override. App publishes immutable hashed assets and revalidates
     # index.html/sw.js (authenticated responses are no-store). Never serve the private storage tree.
+
+    location = /api/identity/saml/metadata {
+        if ($request_method != GET) { return 404; }
+        if ($request_uri !~ "^/api/identity/saml/metadata([?]|$)") { return 404; }
+        proxy_pass http://127.0.0.1:5000;
+    }
+    location = /api/identity/saml/start {
+        if ($request_method != GET) { return 404; }
+        if ($request_uri !~ "^/api/identity/saml/start([?]|$)") { return 404; }
+        proxy_pass http://127.0.0.1:5000;
+    }
+    location = /api/identity/saml/acs {
+        if ($request_method != POST) { return 404; }
+        if ($request_uri != /api/identity/saml/acs) { return 404; }
+        client_max_body_size 256k;
+        proxy_cache off;
+        proxy_pass http://127.0.0.1:5000;
+    }
+    location ~* ^/api/identity/saml(?:/|$) { return 404; }
+
+    location ~ "^/api/files/playback/[0-9A-HJKMNP-TV-Z]{26}$" {
+        if ($request_method !~ "^(GET|HEAD)$") { return 404; }
+        # Files alone decides whether to serve a range. Never turn an upstream 200 into a synthetic 206.
+        max_ranges 0;
+        gzip off;
+        proxy_buffering off;
+        proxy_ignore_headers X-Accel-Buffering;
+        proxy_cache off;
+        proxy_pass http://127.0.0.1:5000;
+    }
 
     location = /api/portable/imports {
         client_max_body_size 192m;

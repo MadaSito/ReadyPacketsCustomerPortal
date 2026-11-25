@@ -8,6 +8,7 @@
  * Data only: no code, scripts, expressions or URLs.
  */
 import { z } from "zod";
+import { deriveStages, MAX_STAGES, validateStages, workflowStagesSchema } from "../../../shared/workflowStages.js";
 import { isOrderFileFolderTemplate } from "../../../shared/orderFileFolder.js";
 import {
   ACK_BODY_MAX,
@@ -113,6 +114,8 @@ export const draftDefinitionSchema = z.strictObject({
   phases: z.array(z.strictObject({ key: draftText(48), label: draftText(60) })).max(MAX_PHASES).optional(),
   acceptanceGates: z.array(draftGateSchema).max(MAX_ACCEPTANCE_GATES).optional(),
   storageFolder: draftText(FOLDER_TEMPLATE_MAX).optional(),
+  /** Increment 07 (D1): format-3 phases. Drafts may hold unfinished phases; validateDraft reports them by path. */
+  stages: z.array(z.unknown()).max(MAX_STAGES).optional(),
 });
 export type WorkflowDraftDefinition = z.output<typeof draftDefinitionSchema>;
 
@@ -238,6 +241,7 @@ export function validateDraft(definition: WorkflowDraftDefinition): WorkflowIssu
       warn("NO_CUSTOMER_NOTICE", "transitions", "No transition notifies the customer. Customers will only see changes when they open the order.");
   }
   validateRules(definition, firstIndexByKey, error, warn);
+  validateDraftStages(definition, firstIndexByKey, error);
   return issues;
 }
 
@@ -417,6 +421,7 @@ export function toPublishable(definition: WorkflowDraftDefinition): WorkflowDefi
     ...(phases.length ? { phases } : {}),
     ...(gates.length ? { acceptanceGates: gates } : {}),
     ...(definition.storageFolder?.trim() ? { storageFolder: definition.storageFolder.trim() } : {}),
+    ...(definition.stages?.length ? { stages: definition.stages } : {}),
     transitions: definition.transitions.map(({ actionLabel, ...transition }) => ({
       ...transition,
       from: transition.from.trim(),
@@ -426,9 +431,37 @@ export function toPublishable(definition: WorkflowDraftDefinition): WorkflowDefi
   });
 }
 
+/** Increment 07 (D1): format-3 phases — shape (zod, by path), then the cross-field rules of shared/workflowStages.ts. */
+function validateDraftStages(definition: WorkflowDraftDefinition, statusIndex: Map<string, number>, error: (code: string, path: string, message: string) => void) {
+  const raw = definition.stages;
+  if (raw === undefined) return;
+  if (raw.length === 0) {
+    error("STAGES_EMPTY", "stages", "Add at least one phase, or remove phases to keep the classic status workflow.");
+    return;
+  }
+  if ((definition.phases?.length ?? 0) > 0 || definition.states.some((state) => state.phase?.trim()))
+    error("STAGES_WITH_PHASES", "stages", "Use either phases (new) or phase groups on statuses (classic), not both.");
+  const parsed = workflowStagesSchema.safeParse(raw);
+  if (!parsed.success) {
+    for (const issue of parsed.error.issues.slice(0, 50)) error("STAGE_FIELD_INVALID", ["stages", ...issue.path].join("."), issue.message);
+    return;
+  }
+  for (const issue of validateStages(parsed.data, new Set(statusIndex.keys()))) error(issue.code, issue.path.join("."), issue.message);
+}
+
 /** A published definition as an editable draft (deep copy; requiresNote made explicit). */
 export function toDraft(definition: WorkflowDefinition): WorkflowDraftDefinition {
   return draftDefinitionSchema.parse(JSON.parse(JSON.stringify(definition)));
+}
+
+/**
+ * Increment 07 QA: a classic definition converted to phases. Stages are derived from the phase groups (or statuses),
+ * and the classic groups are removed in the same step: a draft may not use both (STAGES_WITH_PHASES).
+ */
+export function toPhasesDraft(definition: WorkflowDefinition): WorkflowDraftDefinition {
+  const stages = deriveStages(definition);
+  const { phases: _classic, ...rest } = definition;
+  return toDraft({ ...rest, states: definition.states.map(({ phase: _group, ...state }) => state), stages } as WorkflowDefinition);
 }
 
 /** Drops layout entries for keys that are not states (stale positions after renames/removals). */

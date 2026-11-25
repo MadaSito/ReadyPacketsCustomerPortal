@@ -1,6 +1,6 @@
 /**
  * Typed tRPC proxy bridge for `trpc.integrations.production.*`.
- * Keeps `client/src/features/integrations/production/**` strictly typed against the Part B T1 server surface.
+ * Keeps `client/src/features/integrations/production/**` strictly typed against the server surface.
  */
 import type { UseMutationOptions, UseQueryOptions } from "@tanstack/react-query";
 import { useTRPC, useTRPCClient } from "@/lib/trpc";
@@ -12,6 +12,8 @@ import type {
   ProductionPhase,
   ProductionSettingsUpdateInput,
   ProductionSettingsView,
+  SetWorkflowAutoQueueInput,
+  WorkflowAutoQueueItemView,
 } from "./model";
 
 interface QueryProcedure<TInput, TOutput> {
@@ -40,12 +42,32 @@ export interface ProductionRedeliverInput {
   idempotencyKey: string;
 }
 
+export interface ProductionStopInput {
+  orderPublicId: string;
+  dispatchPublicId: string;
+  reason?: string | null;
+}
+
+export interface ProductionRotateSigningSecretResult {
+  settings: ProductionSettingsView;
+  signingSecretOnce: string;
+}
+
 export interface ProductionTRPCProxy {
   pathKey: () => readonly unknown[];
   settings: {
     get: VoidQueryProcedure<ProductionSettingsView>;
     update: MutationProcedure<ProductionSettingsUpdateInput, ProductionSettingsView>;
     test: MutationProcedure<{ phase: ProductionPhase }, ProductionDestinationTestResult>;
+    rotateSigningSecret: MutationProcedure<
+      { overlapMinutes?: number } | undefined,
+      ProductionRotateSigningSecretResult
+    >;
+    setSigningEnabled: MutationProcedure<{ signingEnabled: boolean }, ProductionSettingsView>;
+  };
+  workflowAutoQueue: {
+    list: VoidQueryProcedure<{ items: WorkflowAutoQueueItemView[] }>;
+    set: MutationProcedure<SetWorkflowAutoQueueInput, { items: WorkflowAutoQueueItemView[] }>;
   };
   order: {
     pathKey: () => readonly unknown[];
@@ -63,6 +85,7 @@ export interface ProductionTRPCProxy {
     >;
     requestP301: MutationProcedure<{ orderPublicId: string }, ProductionDispatchItem>;
     requestP401: MutationProcedure<{ orderPublicId: string }, ProductionDispatchItem>;
+    stop: MutationProcedure<ProductionStopInput, ProductionDispatchItem>;
     retry: MutationProcedure<
       { orderPublicId: string; dispatchPublicId: string },
       ProductionDispatchItem
@@ -94,6 +117,19 @@ export interface ProductionTRPCClient {
     test: {
       mutate: (input: { phase: ProductionPhase }) => Promise<ProductionDestinationTestResult>;
     };
+    rotateSigningSecret: {
+      mutate: (
+        input?: { overlapMinutes?: number },
+      ) => Promise<ProductionRotateSigningSecretResult>;
+    };
+    setSigningEnabled: {
+      mutate: (input: { signingEnabled: boolean }) => Promise<ProductionSettingsView>;
+    };
+  };
+  workflowAutoQueue: {
+    set: {
+      mutate: (input: SetWorkflowAutoQueueInput) => Promise<{ items: WorkflowAutoQueueItemView[] }>;
+    };
   };
   order: {
     requestP101: {
@@ -113,6 +149,9 @@ export interface ProductionTRPCClient {
     };
     requestP401: {
       mutate: (input: { orderPublicId: string }) => Promise<ProductionDispatchItem>;
+    };
+    stop: {
+      mutate: (input: ProductionStopInput) => Promise<ProductionDispatchItem>;
     };
     retry: {
       mutate: (input: {

@@ -43,6 +43,9 @@ TLS, upgrades, and go-live checks are in the [deployment profiles](../../deploy/
 - [Policy acceptances](#policy-acceptances)
 - [Reports](#reports)
 - [Security incidents](#security-incidents)
+- [Increment 07: phases, payments and sign-in](#increment-07-phases-payments-and-sign-in)
+- [Alerts](#alerts)
+- [Microsoft 365 file sync](#microsoft-365-file-sync)
 - [Customer tasks and the order agreement](./WORKFLOW_CUSTOMER_TASKS.md)
 
 ## Increment 04 operating guides
@@ -53,6 +56,7 @@ Use these chapters alongside the existing console guide. Installing a dependency
 - [Native upgrade and migration `0003`](../operations/UPGRADE.md#increment-04-and-migration-0003): the pre-upgrade backup, traffic fence, and recovery after a partially applied migration.
 - [Files and media](../../server/modules/files/ADMIN_GUIDE.md): configure uploads and review file and media behavior.
 - [Upgrade to increment 06 and migration `0006`](../operations/UPGRADE.md#increment-06-and-migration-0006): new headers for the installable app, and larger upload limits for recordings.
+- [Work with customer phases](../../server/modules/orders/questions/ADMIN_GUIDE.md) (increment 07): console phase selection, required questions, answer history, review and reopen, and the administrator checklist.
 - [Customer tasks and the order agreement (MNDA)](./WORKFLOW_CUSTOMER_TASKS.md) (increment 06): tasks per status, designer findings, the export/import switch and the agreement gate.
 - [Security incidents help](./SECURITY_INCIDENTS_HELP.md) (increment 06).
 - [Cart suggestions](#cart-suggestions), [Discount codes](#discount-codes) and [Policy acceptances](#policy-acceptances) (increment 05): see the sections below.
@@ -382,6 +386,118 @@ The portal correlates security events every minute and opens an incident when a 
 - **Break-glass.** A server command lists and clears bans without the web UI ([ADR 0050](../adr/0050-signin-bans-backoff-correlation.md)).
 - **SIEM.** Incidents and bans are audit events (`security.incident.*`, `security.ban.*`), so SIEM and syslog receivers get them.
 
+## Increment 07: phases, payments and sign-in
+
+These features have detailed guides from the teams that built them. The summaries below give the rules you most need to know.
+
+### Phases, review and progress
+
+- **Phase editor.** On upgrade, the default workflow gets a phases draft derived from its statuses. Review it in **Workflows** (`/admin/workflows`) and publish it when ready. Running orders keep their version. See [Workflow phases, requirements and console order actions](../../server/modules/orders/ADMIN_GUIDE_WORKFLOW_RULES.md).
+- **Statuses.** Add, rename, reorder, retire and restore statuses on `/admin/workflows/statuses`. A status that an open draft uses cannot be retired. Orders already in a retired status keep it.
+- **Review and reopen.** See [Work with customer phases](../../server/modules/orders/questions/ADMIN_GUIDE.md). **Request changes** needs a note and keeps the phase locked. **Reopen phase** needs an administrator, a reason of 10–500 characters, a confirmation and step-up.
+- **Progress.**
+  - Each phase counts by its weight (1–100, default 1).
+  - The bar stays at 99 or below until the order reaches a status in the `done` category.
+  - It shows the higher of that value and any explicit completion update.
+  - It goes down only when an administrator reopens a phase, and that is audited.
+- **Phase actions.** See [Phase actions](../../server/modules/automations/ADMIN_GUIDE_PHASE_ACTIONS.md). A bundle runs only when a person previews and confirms it with step-up. Unattended rules never change an order's status.
+
+### Downloading files as a ZIP
+
+- **Who can download.** Customers and staff can download every current file of a phase they can see as one ZIP. Administrators can also download all files of an order. This needs a fresh identity check and is offered on the order's Files tab.
+- **Limits.** Each archive holds at most 250 files and 500 MiB. It is built in the background, and the same person can download it for 30 minutes in the same session.
+- **What it contains.** Placeholders, removed files and older versions are never included. Audio is the WebM/Opus copy, not the original.
+- **If files change.** If files change after an archive is prepared, the download is refused and the archive must be prepared again.
+- **Audit.** Every request, build, download and refusal is recorded in the audit log under the File category.
+
+### Stripe setup
+
+Use **Stripe setup** (`/admin/payments/setup`), described in [Hosted online payments](../../server/modules/payments/ADMIN_GUIDE.md).
+
+- **Activation requirements.** All of these must be met for the current staged key and mode:
+  - the Stripe egress preset is switched on;
+  - **Test Stripe API** succeeded;
+  - **Send self-test webhook** succeeded.
+- **Activating.** You then confirm in a dialog. Live mode also needs the typed words `ACTIVATE LIVE PAYMENTS`.
+- **Events.** Subscribe the nine events listed on the page.
+- **Unmatched payments.** A paid session that carries portal metadata but matches no order raises a warning alert for staff.
+- **Small amounts.** Card payments below Stripe's minimum charge still follow the small-totals setting.
+
+### SAML single sign-on with Entra ID
+
+Use **Single sign-on** (`/admin/sso`), described in [SAML 2.0 single sign-on with Microsoft Entra ID](./SSO_SAML_ENTRA.md).
+
+- **Choosing an MFA mode:**
+  - an upgraded existing configuration starts in `portal` mode;
+  - `claim` is recommended for new setups;
+  - `entra` hands MFA to Entra entirely. It needs the typed words `ENTRA MANAGES MFA`, and a Conditional Access policy requiring MFA is recommended.
+- **Switching protocol.** Switching between OIDC and SAML disables SSO until you enable it again.
+- **Not supported:** IdP-initiated sign-on, single logout and encrypted assertions.
+- **Keep a way in.** Always keep at least one local administrator with MFA.
+
+### Webhooks and the production pipeline
+
+See [Webhooks administration](../integrations/WEBHOOKS_ADMIN_GUIDE.md) and [Production webhooks](../integrations/PRODUCTION_WEBHOOKS.md).
+
+- **Auto-queue.** The P101 / P201 auto-queue is off by default, per workflow. P101 is queued when a real payment is recorded, either a Stripe webhook or a recorded manual payment. It is not queued when an administrator's status change only passes the payment phase. P201 is queued when the intake phase is submitted, after P101 was delivered.
+- **Signing.** Production pipeline payload signing is off until you generate a secret. New webhook subscriptions are signed by default and start paused.
+- **Retry and Redeliver.** **Retry** re-sends the same delivery record. **Redeliver** creates a new, linked record and needs step-up.
+
+## Alerts
+
+<!-- platform_engineer: from jobs_engineer's D6 handoff; acknowledge and resolve checked in the lead's QA of 2026-11-25. -->
+
+Operational alerts collect failures that need a person ([ADR 0058](../adr/0058-outbound-webhooks-and-operational-alerts.md)). They come from:
+
+- phase action bundles and completion jobs;
+- webhooks;
+- Microsoft Graph and file sync;
+- payments;
+- certificate expiry.
+
+Each failure raises one alert, not one per retry.
+
+- **Dashboard.** The `/admin` dashboard counts open alerts by severity (warning, error, critical) and links to them.
+- **Alerts page.** Open **Alerts** (`/admin/alerts`). Staff and administrators can read alerts with `ops.alerts.read` and filter them by severity, source and state. Staff and administrators with `ops.alerts.manage` can **Acknowledge** or **Resolve** an alert.
+- **Audit and SIEM.** Alerts go to the audit trail and SIEM with safe codes only.
+- **Waiting order reminders.** This card on `/admin/alerts` is for administrators only. It is **off** by default.
+  - **Threshold.** The default is 48 hours (`orders.attention_alert_hours`), and you can set 1–8,760. Saving needs step-up.
+  - **How it runs.** A daily sweep raises one staff warning per waiting episode, for orders awaiting staff review or a customer response. No e-mail goes to the customer.
+  - **Switching it off** does not clear existing alerts; resolve those after review.
+
+## Microsoft 365 file sync
+
+<!-- platform_engineer: from portable_ops_engineer's D12 handoff. Lead QA 2026-11-25: covered by peer-reported tests against mocked Graph only; no real SharePoint site. -->
+
+File sync copies order files from the portal to SharePoint, one way, phase by phase ([ADR 0061](../adr/0061-microsoft-365-file-sync.md)). The portal stays authoritative: nothing done in SharePoint changes the portal. Remote deletes and moves are never made, and files from before you switch sync on are not copied (no historical backfill).
+
+### Setting it up
+
+1. On **Storage connections**, add a dedicated **private SharePoint** connection. Prefer SharePoint with the `Sites.Selected` permission on a private, dedicated site. OneDrive needs tenant-wide application file permissions, so it is not recommended.
+2. On **Integrations → Egress** (`/admin/integrations/egress`), switch on the **Graph** and **Graph upload** presets.
+3. Run the ordinary read test and enable the connection. Then run the session-based **write check**. It proves the portal may write, without creating a file.
+4. Open **File sync** (`/admin/storage/file-sync`, linked from Storage connections) and approve the destination explicitly. Approve it either for phase files, or as the only, restricted **Receipts** target.
+5. In the workflow's phase editor, choose for each phase:
+   - the document folder and audio folder (defaults `{phase_key}/Docs` and `{phase_key}/Audio`);
+   - the originals, conversion staging and intake delivery targets.
+
+   These selectors default to **off** ("Do not transfer").
+
+### What goes to each target
+
+- **Intake delivery** receives only customer-visible phase files that the portal has admitted, plus verified audio derivatives, and only when they are published. Nothing is sent when a phase is submitted.
+  Admitted means the file passed the portal's byte and file-type checks, and the configured scanner if one is set up. The default production setup does not configure an external antivirus scanner.
+- **Originals** receives staff-only files and originals that are still pending or not yet converted. These never go to intake delivery.
+
+Files land under `CustomerName-CustomerID/OrderNumber/<phase folder>`. The first two segments are fixed when an order is first exported.
+
+### Running and repairing
+
+- **Uploads never fail because Graph is offline.** Copies wait and retry.
+- **Resync.** **Dry run** first shows the count. Then queue a bounded resync of at most 100 existing failed or blocked items.
+- **Uncertain uploads.** An upload whose outcome is unknown is inspected and reconciled, never replayed blindly.
+- **Health and alerts.** Health shows the last success, the backlog and blocked items, and problems raise alerts on `/admin/alerts`. The order's **File sync** tab shows each file's role, destination and state.
+
 ## Storage copy log
 
 Open **Storage → Copy log** (`/admin/storage/copies`) as an administrator. The log tracks attempts to copy order files, off-site backup archives and SharePoint order data. History begins at rollout; it does not reconstruct older attempts.
@@ -393,7 +509,7 @@ Open **Storage → Copy log** (`/admin/storage/copies`) as an administrator. The
 
 ## Where to switch things on
 
-<!-- platform_engineer: paths checked against the client route definitions on feat/increment-06. -->
+<!-- platform_engineer: paths checked against the client route definitions on feat/increment-07. -->
 
 Each feature's switch is on the page where you use it and in **Platform → Settings** (`/admin/settings`). Every switch needs step-up and is audited. Turning a feature off breaks nothing; existing records stay.
 
@@ -414,6 +530,12 @@ These features are on after the increment 06 upgrade, because they need no confi
 | Relaxed discount limits | `promotions.policy` (`maxDiscountPercent` 100, `allowZeroTotal` true) | Discount codes (`/admin/promotions`) → Limits |
 | Automatic sign-in bans | `protection.signin_bans` (`enabled`) | Protection → Bans (`/admin/protection/bans`) |
 | Rate-limit back-off | rate-limit back-off settings | Protection → Rate limits (`/admin/protection/rate-limits`) |
+| Phase list and progress bar (increment 07) | none needed; older workflows show derived phases | Every order page, list and the console |
+| Status catalogue and attention filters (increment 07) | none needed; `orders.statuses.manage` to edit | Workflows → Statuses (`/admin/workflows/statuses`); filters on `/admin/orders` |
+| Phase editor (increment 07) | none needed; publish the prepared phases draft when ready | Workflows (`/admin/workflows`) |
+| Running phase actions (increment 07) | `automations.stageBundlesEnabled` (on); a phase has no actions until you add them | Order console → Phases → **Run phase actions** |
+| Audio playback with seeking, phase ZIP (increment 07) | none needed; the whole-order ZIP needs `files.archive.order` and step-up | Order page and console Files tab |
+| Payment state on orders (increment 07) | none needed | Order page and console header |
 
 ### Off until you configure them
 
@@ -436,6 +558,13 @@ These features are off until you configure them, because they can lock people ou
 | Cookies and consent | `feature.privacy.consent` | Privacy (`/admin/privacy`) |
 | PostHog / Microsoft Clarity | `feature.integrations.posthog` / `feature.integrations.clarity` | Integrations → Analytics (`/admin/integrations/analytics`), after consent is configured |
 | Online payments | `payments.config.provider` (`none`) | Payments (`/admin/payments`) |
+| Stripe completion (increment 07) | activation needs the egress preset, an API check and a self-test; live mode needs `ACTIVATE LIVE PAYMENTS` | Stripe setup (`/admin/payments/setup`) |
+| P101 / P201 lifecycle auto-queue (increment 07) | `integrations.production.workflow_auto_queue`, per workflow | Production pipeline (`/admin/integrations/production`) |
+| Production pipeline payload signing (increment 07) | generate a signing secret first | Production pipeline (`/admin/integrations/production`) |
+| Egress presets for Stripe and Microsoft Graph (increment 07) | one-click presets | Integrations → Egress (`/admin/integrations/egress`) |
+| Microsoft 365 file sync and receipts to Microsoft 365 (increment 07) | approve a destination; the phase selectors default to "Do not transfer" | File sync (`/admin/storage/file-sync`) and the phase editor |
+| SAML single sign-on (increment 07) | protocol `saml`; an upgraded configuration starts in `portal` MFA mode | Single sign-on (`/admin/sso`) |
+| Waiting-order reminders (increment 07) | `orders.attention_alerts_enabled` (`orders.attention_alert_hours` 48) | Alerts (`/admin/alerts`) |
 
 ## Step-up verification
 

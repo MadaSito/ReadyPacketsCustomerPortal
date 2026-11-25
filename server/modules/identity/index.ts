@@ -10,6 +10,7 @@ import type { AuthMethod, TransitionStep, UserRole } from "../../../shared/domai
 import { createAdminService, type AdminService, type CustomerListItem, type Page } from "./admin.js";
 import { createBreakGlassService } from "./breakGlass.js";
 import { createSsoService, type SsoService } from "./sso/service.js";
+import { registerSamlMetadataCheck } from "../jobs/samlMetadata.js";
 import { createAuthService, PASSWORD_RESET_JOB, type PasswordResetJob, type AuthService } from "./auth.js";
 import { createCredentialService } from "./credentials.js";
 import { IDENTITY_MAIL_TEMPLATES } from "./mail.js";
@@ -78,6 +79,8 @@ export interface IdentityModule extends ModuleLifecycle {
       tx: Tx,
     ): Promise<{ pendingSteps: TransitionStep[]; role: UserRole; stepUpAt: Date | null; mfaVerifiedAt: Date | null }>;
     getState(sessionId: string, opts?: { tx?: DbOrTx }): Promise<SessionState | null>;
+    /** Server-side only (background jobs; never tRPC/HTTP). Full principal of a live session, or throws. See API.md. */
+    principalForJob(sessionId: string, expectedUserId: number, opts?: { tx?: Tx }): Promise<SessionPrincipal>;
     /** Idle policy + effective absolute expiry for identity.me. */
     timing(sessionId: string, opts?: { tx?: DbOrTx }): Promise<{ idleTimeoutSeconds: number; absoluteExpiresAt: Date } | null>;
     /** Service-internal (ops scripts only; never on tRPC/HTTP). See API.md "Ops sessions". */
@@ -138,6 +141,11 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
     return { outcome: "completed", safeCounts: { removed } };
   }, { retrySafe: true });
   deps.jobs.registerSchedule({ name: "identity.sso.prune", type: "identity.sso.prune", everyMs: 60 * 60_000 });
+  // Increment 07 (D10): daily SAML certificate expiry / metadata rollover check. No-op unless SAML is selected.
+  registerSamlMetadataCheck(deps.jobs, async () => {
+    const result = await sso.saml.dailyCheck();
+    return { outcome: "completed", safeCounts: { added: result.added, alerts: result.alerts, skipped: result.skipped ? 1 : 0 } };
+  });
 
   for (const template of IDENTITY_MAIL_TEMPLATES) deps.mailer.registerTemplate(template);
   // Public forgot-password work runs here, off the request path (review ID-04). One transaction of pure
@@ -178,6 +186,7 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
       revoke: sessions.revoke,
       revokeAllForUser: sessions.revokeAllForUser,
       assertCurrent: sessions.assertCurrent,
+      principalForJob: sessions.principalForJob,
       getState: sessions.getState,
       timing: sessions.timing,
       openOpsSession: sessions.openOpsSession,

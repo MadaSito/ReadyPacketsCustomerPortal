@@ -194,6 +194,17 @@ still enrols at first sign-in), and re-checks profile + origin every call. Audit
 (actor system, attributes { reason, user_public_id, ttl_seconds }) in the same tx. Revoke with
 `sessions.revoke(sessionId, "demo_seed_complete")`.
 
+## Job principals (background jobs only)
+`sessions.principalForJob(sessionId, expectedUserId, { tx? }) → Promise<SessionPrincipal>` re-hydrates the FULL
+principal of the session that requested a job (e.g. files' ZIP archive build), so the job can call services that run
+`assertCurrent`. Server-side only: never exposed on tRPC/HTTP, never returned to a browser, and the CSRF secret is
+never logged or audited. Same liveness rules as `assertCurrent`: user active, idle/absolute policy live, not revoked,
+session belongs to `expectedUserId`, role/authMethod/authenticatedAt/mfaVerifiedAt/stepUpAt from the persisted rows,
+real decrypted CSRF secret (ops rows: same origin check and waived steps). Throws UNAUTHENTICATED
+`SESSION_NOT_CURRENT` otherwise, or REMEDIATION_REQUIRED `ACCOUNT_STEP_PENDING` when account steps are pending. Does
+not update `lastSeenAt`. With `tx` it locks `users` then `user_sessions` (lock order below); the job still calls
+`assertCurrent` in its own transaction before acting.
+
 ## Lock ordering (all modules)
 `users` row(s) → `user_sessions` row(s) → `identity_tokens` → other modules' rows (e.g. assurance account).
 Exception (orders/files, agreed with http_security): order-scoped mutations lock the `orders` row FIRST, then
@@ -353,3 +364,77 @@ disables enforcement.
 - Route `/accept-policy` (transition) and guard `STEP_PATHS.accept_policy`. The page owns the h1 and an always-visible Sign
   out. The compliance forms mount through `PolicyRemediationSlot` (app/slots.tsx). The only possible actions are reading/accepting
   or signing out (the server enforces this: only sessionProcedure endpoints that check `pendingSteps[0] === "accept_policy"`).
+
+## Increment 07 — SAML 2.0 for Microsoft Entra ID and the Entra MFA mode (D10, package N; ADR 0062)
+
+One tenant, one active protocol (`sso_configuration.protocol`: `oidc` default | `saml`). Both resolve to the same
+identity row (`sso_identities`: provider `entra`, tenant id, object id), so links and sessions survive a switch
+(the switch bumps `epoch`, so only in-flight attempts die). SP-initiated only; no single logout; no encrypted
+assertions; no group claims; no IdP-initiated responses (a response without a stored InResponseTo is refused).
+
+### HTTP (server/modules/identity/http.ts)
+| Route | Handler | Notes |
+| --- | --- | --- |
+| `GET /api/identity/saml/metadata` | in `registerIdentityHttpRoutes` | public SP metadata XML (no keys), `Cache-Control: public, max-age=3600`; 404 unless protocol = saml |
+| `GET /api/identity/saml/start?next=…` / `?ticket=…` | in `registerIdentityHttpRoutes` | same contract as `/sso/start` (Lax binder cookie, 303 to Entra HTTP-Redirect AuthnRequest). The Entra "Sign-on URL" / My Apps tile |
+| `POST /api/identity/saml/acs` | `createSamlAcsHandler(services): RequestHandler` (mounted isolated by http_security_engineer) | expects `req.body = { SAMLResponse: string, RelayState?: string }` (flat urlencoded ≤ 256 KiB, the only CSRF/Origin exemption). No session resolution, sets no cookie, `no-store`, `no-referrer`; always 303 to `/sso/complete?attempt=<publicId>` or `/sso/refused?reason=<SSO_*>` |
+`/sso/start` also dispatches to SAML when the protocol is saml, so existing buttons keep working.
+
+### Validation (sso/saml.ts; every failure = generic refusal + audit `identity.sso.callback_refused` reason code + D7 signal)
+DTD refused; base64 ≤ 256 KiB; Response status Success; exactly one Assertion in the document, a direct child, no
+EncryptedAssertion; assertion signed (enveloped, one Reference), RSA-SHA256/384/512 + SHA-256/384/512 only;
+signature verified by node-saml against the pinned certificates only; then, from the VERIFIED assertion bytes:
+Issuer `https://sts.windows.net/<tenant>/`, `tenantid` claim = configured tenant, every AudienceRestriction contains
+our Entity ID, bearer SubjectConfirmationData Recipient = ACS URL (and Response Destination when sent), exactly
+one InResponseTo, Conditions NotBefore / NotOnOrAfter and IssueInstant (≤ 5 min old) with 2 min skew (deps.clock),
+one AuthnStatement, `objectidentifier` GUID required. InResponseTo is consumed atomically (conditional UPDATE on
+`sso_auth_requests.state_hash` = hash(request ID), status pending, protocol saml, unexpired); the assertion ID hash
+is unique. ForceAuthn requests need AuthnInstant ≥ request time − skew. E-mail / NameID never find or link accounts.
+
+### MFA mode (`entra_mfa_mode`; NULL on old rows = `trust_entra_mfa ? claim : portal`)
+- `claim` (default): no portal MFA when Entra proves MFA — OIDC `amr` contains `mfa`; SAML `authnmethodsreferences`
+  contains `http://schemas.microsoft.com/claims/multipleauthn` or AuthnContextClassRef ∈ `accepted_authn_contexts`.
+- `entra`: the portal never asks SSO users for its factor (owner's request). Selecting it needs the typed
+  confirmation `ENTRA MANAGES MFA`, a local administrator with MFA must remain, audit `identity.sso.mfa_mode_changed`
+  severity WARN. The page recommends a Conditional Access "require MFA" policy for the application.
+- `portal`: always the portal factor.
+A stricter mode revokes live Entra sessions. Step-up for SSO users without a portal factor: OIDC `max_age=0` /
+SAML `ForceAuthn="true"`, then `assurance.completeEntraStepUp` (in `entra` mode a fresh re-authentication suffices).
+
+### Who may use SSO (`sso_allowed_roles`; NULL on old rows = every role, unchanged)
+New configurations default to `["admin","staff"]`; customers opt in. A disallowed role is refused with
+`SSO_ROLE_NOT_ALLOWED`; narrowing revokes live Entra sessions of the removed roles. JIT never creates an administrator:
+`sso_role_mappings` (app-role value → staff | customer, ≤ 20; staff wins), plus the legacy `jit_staff_app_role`.
+
+### Status summary (service-internal, for other modules' status cards / health)
+`deps.services.identity.sso.statusSummary(tx?) → SsoStatusSummary` — unprivileged, read-only, not on tRPC/HTTP:
+`{ configured, enabled, complete, availableInThisDeployment, protocol, entraMfaMode, trustedCertificates,
+nearestCertificateExpiry (SAML only), metadataStatus, metadataCheckedAt, lastSignInAt, settingsPath: "/admin/sso" }`.
+Never contains secrets, tenant/client ids, certificate material or user identifiers. Callers must not audit it.
+
+### tRPC (`trpc.identity.admin.sso.*`, admin + `identity.sso.manage`, step-up as before)
+- `get` → `SsoAdminView` + `protocol`, `entraMfaMode`, `acceptedAuthnContexts[]`, `allowedRoles[]`,
+  `saml: { entityId, entityIdIsDefault, acsUrl, signOnUrl, metadataUrl, idpIssuer, requiredClaims[], metadataSourceUrl,
+  metadataRefreshedAt, metadataStatus, certificates: SamlCertificateView[] }`, `roleMappings[]`.
+- `update(input)` — `ssoConfigInput` gains `protocol`, `samlEntityId: string|null`, `entraMfaMode`,
+  `entraModeConfirmation?: string`, `acceptedAuthnContexts: string[] (≤ 10 URIs)`, `allowedRoles: Role[] (≥ 1)`;
+  `trustEntraMfa` is dropped from the input (still in the view, derived).
+- `saml.importMetadata({ expectedVersion, url? | xml? })` — exactly one; URL https on login.microsoftonline.com for
+  the configured tenant (egress purpose `entra_oidc`), XML ≤ 512 KiB; adds new signing certificates (max 2 trusted).
+- `saml.addCertificate({ expectedVersion, pem })`, `saml.retireCertificate({ expectedVersion, certificateId })`.
+- `roleMappings.set({ expectedVersion, mappings: [{ appRoleValue, role: "staff"|"customer" }] })`.
+- `SamlCertificateView = { id, fingerprintSha256, subject, notBefore, notAfter, source, state: "trusted"|"not_yet_valid"|"expired"|"retired", daysLeft }`.
+- `SsoTestResult` gains `protocol`, `claimNames[]` (names only), `mfaProven`, `mfaSkippedByMode`, `roleAllowed`, `jitRole`.
+
+### Jobs and alerts
+`identity.saml.metadata_check` (daily, via `jobs/samlMetadata.registerSamlMetadataCheck`): no-op unless protocol =
+saml; refreshes the metadata URL when set (adds a rotated certificate as the second trusted one, never removes),
+then emits `opsAlerts` source `certificate`, dedup key `saml_cert:<fingerprint>:<30d|7d|1d|expired>` (warning / error /
+critical / critical) and `saml_metadata:refresh` on failure; resolves them when the certificate is retired or the
+refresh succeeds.
+
+### Audit (category admin unless stated)
+`identity.sso.config_updated` (+ `protocol`, `mfa_mode`, `allowed_roles`), `identity.sso.mfa_mode_changed` (WARN for
+`entra`), `identity.sso.saml_certificate_added|retired`, `identity.sso.saml_metadata_imported|refreshed|refresh_failed`,
+`identity.sso.role_mappings_updated`; security: `identity.sso.callback_refused` (`protocol: saml`), `auth.login.succeeded`
+(+ `mfa_basis: claim|entra_mode|none`).

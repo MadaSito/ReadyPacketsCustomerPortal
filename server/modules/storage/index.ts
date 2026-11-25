@@ -15,6 +15,7 @@ import type {
 import { StorageAdapterError } from "./contracts.js";
 import { copyLogHealth, createCopyLogService } from "./copyLog.js";
 import { registerFileCopies } from "./fileCopies.js";
+import { createManagedFileSync } from "./managedFileSync.js";
 import { createOrderCopies } from "./orderCopies.js";
 import { storageAssignments, storageConnections } from "./schema.js";
 import { copyMetadata, storageAssignment, storageCreate, storageGet, storageList, storagePublicId, storageTest, storageUpdate } from "./validation.js";
@@ -157,6 +158,8 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
         destinationVersion: changedAuth ? row.destinationVersion + 1 : row.destinationVersion,
         lastTestAt: changedAuth ? null : row.lastTestAt,
         lastTestCode: changedAuth ? null : row.lastTestCode,
+        fileSyncMode: changedAuth ? null : row.fileSyncMode,
+        fileSyncWriteTestVersion: changedAuth ? null : row.fileSyncWriteTestVersion,
         updatedAt: now,
       }).where(eq(storageConnections.id, row.id));
       await audit.record(adminEvent(principal, changedAuth ? "storage.connection.configuration_changed" : "storage.connection.updated",
@@ -165,9 +168,17 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
     }, tx);
   }
 
+  const fileSync = createManagedFileSync(deps, (row) => {
+    const credentials = secret(row);
+    if (!credentials) throw notFound("STORAGE_FILE_SYNC_TARGET_INACTIVE");
+    return provider(row.kind).instantiate(row, credentials);
+  });
   const service: StorageModule = {
     copies: createCopyLogService(deps),
     orderCopies: createOrderCopies(deps, (publicId, tx, version) => assigned("order_files", publicId, tx, version)),
+    fileSync,
+    stageReceiptPdf: fileSync.stageReceiptPdf,
+    validateStageFileSyncTargets: fileSync.validateStageFileSyncTargets,
     registerAdapter<C extends StorageConfig, S extends StorageCredentials>(
       kind: StorageProviderKind, def: StorageAdapterDefinition<C, S>,
     ) {
@@ -260,9 +271,12 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
           const updatedAt = clock.now();
           await tx.insert(storageAssignments).values({ purpose, connectionPublicIds: [], updatedAt })
             .onDuplicateKeyUpdate({ set: { purpose } });
+          const receipts = connectionPublicIds.length ? await tx.select({ config: storageConnections.config })
+            .from(storageConnections).where(eq(storageConnections.fileSyncMode, "receipts")) : [];
           for (const publicId of [...connectionPublicIds].sort()) {
             const row = await find(publicId, tx, true);
-            if (!provider(row.kind).purposes.includes(purpose)) {
+            if (row.fileSyncMode === "receipts" || receipts.some((receipt) => receipt.config.driveId === row.config.driveId) ||
+                !provider(row.kind).purposes.includes(purpose)) {
               throw validation("STORAGE_PURPOSE_UNSUPPORTED", "This provider does not support the selected purpose.");
             }
           }
@@ -348,6 +362,8 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
       return result;
     },
     async stageOrderFile(filePublicId, tx, metadata) {
+      if (metadata?.orderPublicId && await fileSync.stageFile(filePublicId, metadata.orderPublicId, tx)) return;
+      if (metadata?.managedOnly) return;
       await copies.stage(filePublicId, await activeRows("order_files", tx), tx, metadata?.orderPublicId);
     },
     async stageOrderFilesForAutomation(input) {

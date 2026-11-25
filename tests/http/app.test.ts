@@ -3,7 +3,8 @@ import { fileURLToPath } from "node:url";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Router } from "express";
+import { gzipSync } from "node:zlib";
+import { Router, type Request } from "express";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
@@ -15,6 +16,10 @@ import { createApp, type AppOptions } from "../../server/http/app.js";
 import { sendPrivateDownload } from "../../server/http/downloads.js";
 import { EDGE_REQUESTS_PER_WINDOW, EDGE_STATIC_PER_WINDOW, edgeAdmissionBucket } from "../../server/http/edgeAdmission.js";
 import { getHttpState } from "../../server/http/requestState.js";
+import { registerFileArchiveHttpRoutes } from "../../server/modules/files/archivesHttp.js";
+import { compilePolicy, defaultPolicy, type ProtectionPolicy } from "../../server/modules/protection/policy.js";
+import { requestSignals } from "../../server/modules/protection/request.js";
+import { isSignInRequest } from "../../server/modules/protection/signInBans.js";
 import { ANONYMOUS_CSRF_MAX_AGE_MS, deriveSessionCsrfToken } from "../../server/security/csrf.js";
 import { protectedProcedure, publicProcedure, router } from "../../server/trpc/trpc.js";
 import {
@@ -517,6 +522,223 @@ describe("HTTP edge: isolated preview controls", () => {
 });
 
 describe("HTTP edge: bounds, errors, static assets and rendering", () => {
+  const archivePath = "/api/files/archives/download";
+  const archiveTicket = "synthetic-download-ticket".padEnd(43, "A");
+  const archiveForm = { ticket: archiveTicket, csrf: csrfA };
+  const archiveNavigation = {
+    "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document",
+  };
+
+  it("accepts a bounded native ZIP form with canonical Origin or same-origin navigation and full-session CSRF", async () => {
+    const payload = vi.fn();
+    const moduleRouter = Router({ caseSensitive: true, strict: true });
+    moduleRouter.post("/files/archives/download", (req, res) => { payload(req.body); res.status(204).end(); });
+    const h = harness({ moduleRouter }, { aliasHosts: ["portal.readypackets.test"] });
+    const { ticket } = archiveForm;
+    const post = (url = archivePath, session = TOKEN_A, proof = csrfA) => h.http.post(url).set("Host", HOST)
+      .set("Origin", ORIGIN).set("Sec-Fetch-Site", "same-origin").set("Cookie", requestCookies(h.config, session, proof));
+    const refused = async (pending: ReturnType<typeof post>, denialReasonCode: string) => {
+      const response = await pending.expect(204, "");
+      expect(h.access).toHaveBeenCalledWith("http request", expect.objectContaining({
+        status: 204, denialReasonCode, requestId: response.headers["x-request-id"],
+      }));
+    };
+
+    await post().type("form").send(archiveForm).expect(204);
+    await post().type("form").set("Origin", "null").set(archiveNavigation).send(archiveForm).expect(204);
+    await post().type("form").set("Origin", "null").set({ ...archiveNavigation, "Sec-Fetch-Dest": "empty" })
+      .send(archiveForm).expect(204);
+    await post().type("json").set(HEADER_CSRF, csrfA).send({ ticket }).expect(204);
+    expect(payload.mock.calls).toEqual(Array.from({ length: 4 }, () => [{ ticket }]));
+    await refused(post().type("form").set("Origin", "https://external.example.test").send(archiveForm), "ORIGIN_NOT_ALLOWED");
+    await refused(post().type("form").set("Host", "portal.readypackets.test").send(archiveForm), "NOT_FOUND");
+    await refused(post(archivePath, "", csrfA).type("form").set("Origin", "null").set(archiveNavigation).send(archiveForm), "NO_SESSION");
+    await refused(post(archivePath, TOKEN_B).type("form").set("Origin", "null").set(archiveNavigation).send(archiveForm), "CSRF_INVALID");
+    await refused(post(archivePath, TOKEN_A, csrfB).type("form").send(archiveForm), "CSRF_INVALID");
+    await refused(post().type("form").set(HEADER_CSRF, csrfA).send({ ticket }), "CSRF_INVALID");
+    await refused(post().type("form").send({ csrf: csrfA, other: ticket }), "DOWNLOAD_TICKET_INVALID");
+    await post().type("json").send(archiveForm).expect(403);
+    await refused(post().type("form").send(`ticket=${ticket}&csrf=${csrfA}&csrf=${csrfA}`), "TOO_MANY_FORM_FIELDS");
+    await refused(post().type("form").send({ csrf: csrfA, ticket: "A".repeat(1024) }), "BODY_TOO_LARGE");
+    await refused(post().type("form").set("Content-Encoding", "gzip")
+      .send(gzipSync(`ticket=${ticket}&csrf=${csrfA}`)), "UNSUPPORTED_ENCODING");
+    for (const url of [`${archivePath}/`, `${archivePath}?alternate=1`, "/api/files/Archives/download", "/api/files/download"]) {
+      await post(url).type("form").send(archiveForm).expect(403);
+      await post(url).type("form").set("Origin", "null").set(archiveNavigation).send(archiveForm).expect(403);
+    }
+    await post().type("json").set("Origin", "null").set(archiveNavigation).set(HEADER_CSRF, csrfA).send({ ticket }).expect(403);
+    const preview = harness({ moduleRouter }, { deploymentProfile: "preview" });
+    await preview.http.post(archivePath).set("Host", HOST).type("form").send(archiveForm).expect(204, "");
+    expect(payload).toHaveBeenCalledTimes(4);
+    expect(h.audit.notes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ eventName: "http.csrf.denied", reasonCode: "CSRF_INVALID" }),
+    ]));
+    const access = JSON.stringify(h.access.mock.calls);
+    expect(access).not.toContain(ticket);
+    expect(access).not.toContain(csrfA);
+  });
+
+  it.each([
+    ["missing fetch site", { "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document" }],
+    ["cross-site", { ...archiveNavigation, "Sec-Fetch-Site": "cross-site" }],
+    ["same-site", { ...archiveNavigation, "Sec-Fetch-Site": "same-site" }],
+    ["CORS mode", { ...archiveNavigation, "Sec-Fetch-Mode": "cors" }],
+    ["missing mode", { "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Dest": "document" }],
+    ["missing destination", { "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "navigate" }],
+    ["framed navigation", { ...archiveNavigation, "Sec-Fetch-Dest": "iframe" }],
+  ] as const)("audits and silently refuses a null-origin ZIP form with %s", async (_name, metadata) => {
+    const h = harness();
+    const response = await h.http.post(archivePath).set("Host", HOST).set("Origin", "null").set({ ...metadata })
+      .set("Cookie", requestCookies(h.config, TOKEN_A, csrfA)).type("form").send(archiveForm).expect(204, "");
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+    expect(h.audit.notes).toEqual([expect.objectContaining({
+      eventName: "http.origin.denied", reasonCode: "ORIGIN_NOT_ALLOWED", outcome: "denied",
+    })]);
+    expect(h.access).toHaveBeenCalledWith("http request", expect.objectContaining({
+      status: 204, denialReasonCode: "ORIGIN_NOT_ALLOWED", requestId: response.headers["x-request-id"],
+    }));
+  });
+
+  it("preserves the page and Files audit on a malformed native ticket without changing JSON refusals", async () => {
+    const moduleRouter = Router({ caseSensitive: true, strict: true });
+    const files = Router({ caseSensitive: true, strict: true });
+    moduleRouter.use("/files", files);
+    const h = harness({ moduleRouter });
+    const recordDenied = vi.fn(async () => undefined);
+    const redeemDownloadTicket = vi.fn();
+    Object.assign(h.services, { fileArchives: { recordDenied, redeemDownloadTicket } });
+    registerFileArchiveHttpRoutes(files, h.services);
+    const post = () => h.http.post(archivePath).set("Host", HOST).set("Cookie", requestCookies(h.config, TOKEN_A, csrfA));
+    await post().set("Origin", "null").set(archiveNavigation).type("form")
+      .send({ csrf: csrfA, ticket: "invalid" }).expect(204, "");
+    await post().set("Origin", ORIGIN).set(HEADER_CSRF, csrfA).type("json").send({ ticket: "invalid" }).expect(400);
+    expect(recordDenied.mock.calls).toEqual([[a, "DOWNLOAD_TICKET_INVALID"], [a, "DOWNLOAD_TICKET_INVALID"]]);
+    expect(redeemDownloadTicket).not.toHaveBeenCalled();
+  });
+
+  it("admits only the literal ACS POST without browser credentials and applies the form cap before dispatch", async () => {
+    const payload = vi.fn();
+    const h = harness({ samlAcs: (req, res) => {
+      payload(req.body);
+      expect(getRequestContext()?.actor).toBeUndefined();
+      res.redirect(303, "/sign-in");
+    } }, { aliasHosts: ["portal.readypackets.test"] });
+    const consume = vi.fn<RateLimiter["consume"]>(async () => ({ allowed: true, retryAfterSeconds: 0 }));
+    h.services.rateLimiter = { consume };
+    const path = "/api/identity/saml/acs";
+    const form = "SAMLResponse=assertion-marker&RelayState=state-marker";
+    const post = (url = path) => h.http.post(url).set("Host", HOST)
+      .set("Origin", "https://provider.example.test").set("Sec-Fetch-Site", "cross-site")
+      .set("User-Agent", "private-header-marker");
+    const success = await post().type("form").set("Cookie", requestCookies(h.config, TOKEN_A)).send(form)
+      .expect(303).expect("Cache-Control", "no-store").expect("Location", "/sign-in");
+    expect(success.headers["set-cookie"]).toBeUndefined();
+    expect(payload).toHaveBeenCalledWith({ SAMLResponse: "assertion-marker", RelayState: "state-marker" });
+    expect(consume.mock.calls[0]?.[0]).toBe("auth_high_risk");
+    for (const spelling of [`${path}/`, `${path}?RelayState=state-marker`, "/api/identity/saml/ACS", "/api/identity/saml/%61cs",
+      "/api/identity/saml/start", "/api/identity/saml/metadata"]) {
+      await post(spelling).type("form").send(form).expect(404);
+    }
+    await h.http.get(path).set("Host", HOST).expect(404);
+    const alias = await post().set("Host", "portal.readypackets.test").type("form").send(form).expect(404);
+    expect(alias.headers.location).toBeUndefined();
+    await post().type("json").send({}).expect(415);
+    await post().type("form").set("Content-Encoding", "gzip").send(gzipSync(form)).expect(415);
+    await post().type("form").send(`SAMLResponse=${"A".repeat(262_145)}`).expect(413);
+    await post().type("form").send(`${form}&extra=ignored`).expect(413);
+    await post("/api/mutate").type("form").send(form).expect(403);
+    await post("/api/identity/sso/complete").type("json").send({ attempt: "synthetic" }).expect(403);
+    expect(payload).toHaveBeenCalledOnce();
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+    const access = JSON.stringify(h.access.mock.calls);
+    for (const marker of ["assertion-marker", "state-marker", "private-header-marker"]) expect(access).not.toContain(marker);
+
+    const preview = harness({ samlAcs: vi.fn() }, { deploymentProfile: "preview" });
+    await preview.http.post(path).set("Host", HOST).type("form").send(form).expect(404);
+    expect(preview.sessionResolver).not.toHaveBeenCalled();
+  });
+
+  it("keeps the credential ban and durable rate budget on the isolated ACS path", async () => {
+    const handler = vi.fn();
+    const h = harness({ samlAcs: handler });
+    let banned = true;
+    h.services.protection = {
+      credentialRetryAfter: async (req: Request) => banned && isSignInRequest(req) ? 85 : 0,
+      inspect: async () => ({ action: "allow" }), recordRateLimit: async () => undefined,
+    } as unknown as typeof h.services.protection;
+    h.services.rateLimiter = { consume: async () => ({ allowed: false, retryAfterSeconds: 30 }) };
+    const post = () => h.http.post("/api/identity/saml/acs").set("Host", HOST).type("form").send("SAMLResponse=synthetic");
+    await post().expect(429).expect("Retry-After", "85");
+    banned = false;
+    await post().expect(429).expect("Retry-After", "30");
+    expect(handler).not.toHaveBeenCalled();
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+  });
+
+  it("exempts only the canonical Stripe POST from the built-in country allow-list", async () => {
+    const seen = vi.fn();
+    const paymentWebhooks = () => {
+      const r = Router({ caseSensitive: true, strict: true });
+      r.post("/stripe", (req, res) => { seen(req.body); res.status(204).end(); });
+      return r;
+    };
+    const h = harness({ isolatedRouters: { paymentWebhooks } }, { trustedProxies: ["127.0.0.1/32", "::1/128"] });
+    const policy: ProtectionPolicy = { ...defaultPolicy, mode: "enforce", countries: { mode: "allow", codes: ["CA"] } };
+    h.services.protection = {
+      inspect: async (req: Request) => {
+        const decision = compilePolicy(policy)(requestSignals(req, "US"), h.clock.now().getTime());
+        return { action: decision.action === "block" ? "block" : "allow" };
+      }, recordRateLimit: async () => undefined,
+    } as unknown as typeof h.services.protection;
+    const raw = '{\n "event":"synthetic"\n}';
+    const path = "/api/payments/webhooks/stripe";
+    const post = (url = path, body = raw) => h.http.post(url).set("Host", HOST)
+      .set("X-Forwarded-For", "192.0.2.7").type("json").send(body);
+    await post().expect(204);
+    expect(seen).toHaveBeenCalledWith(Buffer.from(raw));
+    await post(`${path}/`).expect(403);
+    await post("/api/payments/webhooks/Stripe").expect(403);
+    await post("/api/payments/webhooks/other").expect(403);
+    await h.http.get(path).set("Host", HOST).expect(403);
+    await post(path, JSON.stringify({ data: "A".repeat(262_145) })).expect(413);
+    policy.ipLists = [{ network: "192.0.2.7/32", action: "deny", reason: "Synthetic policy fixture", expiresAt: null }];
+    await post().expect(403);
+    policy.ipLists = [];
+    policy.countries = { mode: "deny", codes: ["US"] };
+    await post().expect(403);
+    policy.countries = { mode: "allow", codes: ["CA"] };
+    policy.custom = [{
+      id: "33333333-3333-4333-8333-333333333333", label: "Synthetic policy fixture",
+      field: "country", operator: "exact", value: "US", action: "block",
+    }];
+    await post().expect(403);
+    policy.custom = [];
+    h.services.rateLimiter = { consume: async () => ({ allowed: false, retryAfterSeconds: 30 }) };
+    await post().expect(429).expect("Retry-After", "30");
+    expect(seen).toHaveBeenCalledOnce();
+  });
+
+  it("dispatches the isolated SAML POST to Identity by default and refuses an invalid form", async () => {
+    const h = harness();
+    const acs = vi.fn(async ({ samlResponse }: { samlResponse: unknown }) =>
+      samlResponse === undefined ? "/sso/refused?reason=SSO_FAILED" : "/sso/complete?attempt=synthetic-attempt");
+    h.services.identity = { sso: { acs } } as unknown as typeof h.services.identity;
+    const post = (form: string) => h.http.post("/api/identity/saml/acs").set("Host", HOST)
+      .set("Origin", "https://idp.example.test").set("Sec-Fetch-Site", "cross-site")
+      .set("Cookie", requestCookies(h.config, TOKEN_A)).type("form").send(form);
+    const accepted = await post("SAMLResponse=synthetic-assertion&RelayState=synthetic-state").expect(303)
+      .expect("Location", "/sso/complete?attempt=synthetic-attempt")
+      .expect("Cache-Control", "no-store").expect("Referrer-Policy", "no-referrer");
+    expect(accepted.headers["set-cookie"]).toBeUndefined();
+    expect(acs).toHaveBeenCalledWith({ samlResponse: "synthetic-assertion" });
+    expect(acs).toHaveBeenCalledOnce();
+    await post("RelayState=synthetic-state").expect(303).expect("Location", "/sso/refused?reason=SSO_FAILED");
+    expect(acs).toHaveBeenNthCalledWith(2, { samlResponse: undefined });
+    expect(acs).toHaveBeenCalledTimes(2);
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+    expect(JSON.stringify(h.access.mock.calls)).not.toMatch(/synthetic-(?:assertion|state|attempt)/);
+  });
+
   it("isolates increment 04 routers, preserves signed bytes and refuses alias, preview and alternate methods", async () => {
     const inbound = vi.fn();
     const returns = vi.fn();

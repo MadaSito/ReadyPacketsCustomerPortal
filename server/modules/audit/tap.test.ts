@@ -12,7 +12,7 @@ import { EVENT_NAME_RE } from "./envelope.js";
 import * as auditSchema from "./schema.js";
 import { auditEvents } from "./schema.js";
 import { abortsTransaction, automationCorrelationId, isAutomationOrigin, type AuditTap, type AuditTapEvent } from "./tap.js";
-import { CATALOGUE_EVENT_NAMES, TRIGGER_CATALOGUE, entriesForEvent } from "./triggerCatalogue.js";
+import { CATALOGUE_EVENT_NAMES, TRIGGER_CATALOGUE, catalogueEntry, entriesForEvent } from "./triggerCatalogue.js";
 
 const things = mysqlTable("test_tap_things", { id: idColumn(), label: varchar("label", { length: 40 }).notNull() });
 const RUN_ID = "01JD0000000000000000000RUN";
@@ -241,6 +241,22 @@ describe("trigger catalogue", () => {
       "order.status_changed", "order.assigned", "file.uploaded", "message.posted", "ticket.opened", "ticket.replied", "ticket.closed",
       "invoice.issued", "invoice.paid", "maintenance.enabled", "backup.completed", "backup.failed", "mail.delivery_failed",
     ]));
+  });
+
+  it("increment 07: payment, intake and phase triggers match only their outcome and resource", () => {
+    const keysFor = (eventName: string, outcome: AuditTapEvent["outcome"], type: string) =>
+      entriesForEvent(tapEvent({ eventName, outcome, resource: { type, publicId: "01JD0000000000000000000002" } })).map((e) => e.key);
+    expect(keysFor("invoice.payment.recorded", "completed", "invoice_payment")).toEqual(["invoice.paid", "payment.succeeded"]);
+    expect(keysFor("payments.attempt.failed", "failed", "payment_attempt")).toEqual(["payment.failed"]);
+    expect(keysFor("payment.refund.succeeded", "completed", "payment_refund")).toEqual(["payment.refunded"]);
+    expect(keysFor("payment.refund.succeeded", "completed", "invoice_refund")).toEqual(["payment.refunded"]);
+    expect(keysFor("intake.submission.submitted", "completed", "intake_submission")).toEqual(["intake.submitted"]);
+    expect(keysFor("intake.submission.draft_saved", "completed", "intake_submission")).toEqual([]);
+    expect(keysFor("intake.submission.reviewed", "completed", "intake_submission")).toEqual(["intake.reviewed"]);
+    expect(keysFor("order.stage.submitted", "completed", "order")).toEqual(["order.stage_submitted"]);
+    expect(keysFor("order.stage.submitted", "refused", "order")).toEqual([]);
+    expect(catalogueEntry("payment.failed")?.staffOnly).toBe(true);
+    for (const key of ["intake.submitted", "intake.reviewed"]) expect(catalogueEntry(key)?.fields.some((f) => /answer/.test(f.key))).toBe(false);
   });
 
   it("never triggers on a refused registration for an existing address", () => {

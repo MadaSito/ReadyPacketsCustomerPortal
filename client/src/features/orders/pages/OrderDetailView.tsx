@@ -12,11 +12,15 @@ import { AgreementDialog, parseAgreementRequiredDetails, type AgreementRequiredD
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import {
   Badge, Breadcrumbs, Button, Callout, Card, DataTable, DateTime, Dialog, ErrorState, Field, KeyValueList, Money, PageHeader, Select,
-  RouteTabPanel, RouteTabs, Skeleton, Spinner, Textarea, formatDateTime, useToast, type Tone,
+  OrderProgress, RouteTabPanel, RouteTabs, Skeleton, Spinner, Textarea, formatDateTime, useToast, type Tone,
 } from "@/ui";
 import { ConsoleActions, ReferenceHistory } from "../ConsoleActions";
 import { SharingPanel } from "../SharingPanel";
 import { WorkflowRulesPanel } from "../WorkflowRulesPanel";
+import { CustomerPhaseWizard } from "../stages/CustomerPhaseWizard";
+// ── increment 07 panel imports (other owners: one import line each, below this anchor) ──
+import { OrderPhaseConsolePanel } from "../stages/OrderPhaseConsolePanel";
+// ── end increment 07 panel imports ──
 import { ACCESS_ROLE_LABELS, LOCK_DESCRIPTIONS, LockBadge, OrderStatusBadge, money, type LockState } from "../shared";
 
 type Area = "customer" | "console";
@@ -83,6 +87,7 @@ export function OrderDetailView({ area }: { area: Area }) {
       />
       {consoleArea ? (
         <div className="mb-6 flex flex-col gap-2">
+          <ConsoleOrderProgress orderId={order.publicId} />
           <ConsoleActions orderId={order.publicId} version={order.version} lockState={lockState} reference={order.reference} name={order.projectName} />
           <TransitionControl order={order} />
         </div>
@@ -103,7 +108,9 @@ export function OrderDetailView({ area }: { area: Area }) {
         );
       })}
       {/* Banners (e.g. a blocking acceptance gate) come before the checklist they pause. */}
-      {consoleArea ? null : <WorkflowRulesPanel orderId={order.publicId} area={area} />}
+      {/* ── increment 07 customer phase mount (audit_engineer replaces the next line only) ── */}
+      {consoleArea ? null : <CustomerPhaseWizard orderId={order.publicId} fallback={<WorkflowRulesPanel orderId={order.publicId} area={area} />} />}
+      {/* ── end increment 07 customer phase mount ── */}
       <RouteTabs
         idBase="order-tabs"
         label="Order sections"
@@ -161,9 +168,11 @@ function orderTabItems(order: OrderDetail, area: Area): TabEntry[] {
   const lockState = order.lockState as LockState;
   const builtIn: TabEntry[] = [
     { order: BUILT_IN_TAB_ORDER.overview, value: "overview", label: "Overview", content: <Overview order={order} area={area} /> },
+    // ── increment 07 console phase mount (assurance_engineer replaces the `content` of the next entry only) ──
     ...(consoleArea
-      ? [{ order: BUILT_IN_TAB_ORDER.phases, value: "phases", label: "Phases", content: <WorkflowRulesPanel orderId={order.publicId} area={area} /> }]
+      ? [{ order: BUILT_IN_TAB_ORDER.phases, value: "phases", label: "Phases", content: <OrderPhaseConsolePanel orderId={order.publicId} /> }]
       : []),
+    // ── end increment 07 console phase mount ──
     { order: BUILT_IN_TAB_ORDER.notes, value: "notes", label: "Notes", content: <Activity order={order} area={area} /> },
     {
       order: BUILT_IN_TAB_ORDER.sharing,
@@ -396,6 +405,30 @@ function Activity({ order, area }: { order: OrderDetail; area: Area }) {
         </ol>
       </Card>
     </div>
+  );
+}
+
+/**
+ * Increment 07 lead QA (7): dense progress (bar, percent, current phase) under the console order header on every
+ * tab. Staff labels; nothing when the order has no phase model or the workspace cannot be read (fails quietly).
+ */
+function ConsoleOrderProgress({ orderId }: { orderId: string }) {
+  const trpc = useTRPC();
+  const workspace = useQuery(trpc.orders.stages.workspace.queryOptions({ orderId }));
+  const data = workspace.data;
+  if (!data || data.stages.length === 0) return null;
+  return (
+    <Card>
+      <OrderProgress
+        variant="compact"
+        caption={null}
+        label="Order progress"
+        percent={data.progress.percent}
+        stages={data.stages.map((stage) => ({ key: stage.key, label: stage.staffLabel?.trim() || stage.customerLabel }))}
+        currentIndex={data.progress.currentIndex}
+        canceled={data.progress.canceled}
+      />
+    </Card>
   );
 }
 

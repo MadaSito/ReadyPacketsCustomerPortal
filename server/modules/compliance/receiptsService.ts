@@ -597,6 +597,8 @@ export function createReceiptsService(deps: ModuleDeps) {
       );
     }
 
+    await stageReceiptInStorageInTx(tx, { receiptPublicId, orderPublicId: inv.orderPublicId });
+
     return { receiptPublicId, receiptNumber };
   }
 
@@ -791,6 +793,8 @@ export function createReceiptsService(deps: ModuleDeps) {
         tx,
       );
     }
+
+    await stageReceiptInStorageInTx(tx, { receiptPublicId, orderPublicId: inv.orderPublicId });
 
     return { receiptPublicId, receiptNumber };
   }
@@ -1569,6 +1573,51 @@ export function createReceiptsService(deps: ModuleDeps) {
     );
   }
 
+  async function stageReceiptInStorageInTx(
+    tx: Tx,
+    input: { receiptPublicId: string; orderPublicId: string },
+  ): Promise<void> {
+    const storageConnectionsSvc = (
+      deps.services as unknown as {
+        storageConnections?: {
+          stageReceiptPdf?: (
+            arg: { receiptPublicId: string; orderPublicId: string },
+            txArg: Tx,
+          ) => Promise<void>;
+        };
+      }
+    ).storageConnections;
+    if (storageConnectionsSvc && typeof storageConnectionsSvc.stageReceiptPdf === "function") {
+      await storageConnectionsSvc.stageReceiptPdf(input, tx);
+    }
+  }
+
+  /**
+   * Internal port for `storageConnections` managed file sync (Decision D12).
+   * Decrypts and returns the immutable receipt PDF bytes iff the receipt belongs to `orderPublicId`
+   * and was issued by this portal (`origin === "portal"`).
+   */
+  async function getFileSyncPdf(
+    input: { receiptPublicId: string; orderPublicId: string },
+    tx: Tx,
+  ): Promise<Buffer | null> {
+    const [row] = await tx
+      .select({
+        publicId: compliancePaymentReceipts.publicId,
+        orderPublicId: compliancePaymentReceipts.orderPublicId,
+        origin: compliancePaymentReceipts.origin,
+        pdfEnc: compliancePaymentReceipts.pdfEnc,
+      })
+      .from(compliancePaymentReceipts)
+      .where(eq(compliancePaymentReceipts.publicId, input.receiptPublicId))
+      .limit(1);
+    if (!row || row.origin !== "portal" || row.orderPublicId !== input.orderPublicId || !row.pdfEnc) {
+      return null;
+    }
+    const base64 = deps.crypto.decrypt(row.pdfEnc, receiptPdfAad(row.publicId));
+    return Buffer.from(base64, "base64");
+  }
+
   async function findLatestReceiptPublicIdForInvoice(
     dbOrTx: DbOrTx,
     invoiceId: number,
@@ -1587,6 +1636,7 @@ export function createReceiptsService(deps: ModuleDeps) {
     issueReceiptForZeroInvoiceInTx,
     onPaymentRefundedInTx,
     findLatestReceiptPublicIdForInvoice,
+    getFileSyncPdf,
     myList,
     forOrder,
     get,

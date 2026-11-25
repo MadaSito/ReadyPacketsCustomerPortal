@@ -7,13 +7,18 @@ import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { ulid } from "../../core/ids.js";
 import { DomainError } from "../../core/errors.js";
+import { newRequestContext } from "../../core/requestContext.js";
 import type { JobResult, SessionPrincipal } from "../../core/types.js";
+import { createCallerFactory } from "../../trpc/trpc.js";
 import { examplePdf } from "../files/fixtures.test-support.js";
 import { createFilesModule } from "../files/index.js";
 import * as filesSchema from "../files/schema.js";
 import { createIdentityModule } from "../identity/index.js";
 import * as identitySchema from "../identity/schema.js";
 import { createOrdersModule } from "../orders/index.js";
+import { ordersRouter } from "../orders/router.js";
+import { fakeIdentity, insertUser, ordersTestSchema } from "../orders/testSupport.js";
+import { workflowDefinitionSchema } from "../orders/workflowTypes.js";
 import * as ordersSchema from "../orders/schema.js";
 import { copyExact, inPrivateWorkspace } from "./custody.js";
 import { buildPlan, type PortableInputRecord } from "./importPlanning.js";
@@ -28,6 +33,7 @@ const CUSTOMER_EMAIL = "case.owner@example.test";
 const AUTH_MARKER = "source-password-hash-must-not-travel";
 const PDF = examplePdf();
 const PASSPHRASE = randomBytes(26).toString("base64url");
+const ADMIN_PASSWORD = "synthetic portable verifier password";
 const FILE_HASH = createHash("sha256").update(PDF).digest("hex");
 const OFFERING_SNAPSHOT = {
   packetNumber: 2, tier: "Standard" as const, outcome: "Documented findings",
@@ -52,38 +58,30 @@ function distinctKeyConfig() {
 async function environment(t: TestDb, installationId: string) {
   const h = createTestDeps({ db: t.db, config: { ...distinctKeyConfig(), installationId, canonicalOrigin: `https://${installationId}.example.test` } });
   const admins: SessionPrincipal[] = [];
+  const assuranceFixture: Pick<TestHarness["services"]["assurance"], "getAssuranceState"> = {
+    getAssuranceState: async () => ({ mfaEnrolled: true, recoveryCodesAcknowledged: true, passkeyCount: 0, totpEnrolled: true }),
+  };
+  h.services.assurance = assuranceFixture as TestHarness["services"]["assurance"];
   const identity = createIdentityModule(h.deps);
-  h.services.identity = {
-    ...identity,
-    sessions: {
-      ...identity.sessions,
-      assertCurrent: async (principal) => ({
-        pendingSteps: [], role: principal.role, stepUpAt: principal.stepUpAt, mfaVerifiedAt: principal.mfaVerifiedAt,
-      }),
-      getState: async (sessionId) => {
-        const value = admins.find((principal) => principal.sessionId === sessionId);
-        return value ? {
-          sessionId, userId: value.userId, userPublicId: value.userPublicId, role: "admin", userStatus: "active", live: true,
-          revokedAt: null, mfaVerifiedAt: value.mfaVerifiedAt, stepUpAt: value.stepUpAt,
-          absoluteExpiresAt: new Date(h.clock.now().getTime() + 24 * 60 * 60_000), authMethod: "local" as const,
-        } : null;
-      },
-    },
-    transitions: { derive: async () => [] },
+  h.services.identity = identity;
+  const signInAdmin = async (email: string): Promise<SessionPrincipal> => {
+    const signed = await identity.auth.signIn({ email, password: ADMIN_PASSWORD }, { userAgent: "vitest" });
+    await identity.sessions.markMfaVerified(signed.sessionId);
+    const issued = await identity.sessions.markStepUp(signed.sessionId);
+    const principal = await identity.sessionResolver.resolve({ token: issued.token, transport: "cookie" });
+    if (!principal || principal.state !== "full" || !principal.stepUpAt) throw new Error("Expected a full stepped-up admin session");
+    return principal;
   };
   h.services.jobAdmin = { isDraining: async () => false } as TestHarness["services"]["jobAdmin"];
   h.services.orders = createOrdersModule(h.deps);
   h.services.files = createFilesModule(h.deps);
   h.services.portable = createPortableModule(h.deps);
   for (const email of ["first.admin@example.test", "second.admin@example.test"]) {
-    const publicId = ulid(h.clock.now().getTime());
-    const [inserted] = await t.db.insert(identitySchema.users).values({
-      publicId, role: "admin", status: "active",
-      emailEnc: h.deps.crypto.encrypt(email, `users.email:${publicId}`),
-      emailIndex: h.deps.crypto.blindIndex(email, "users.email"),
-      nameEnc: h.deps.crypto.encrypt("Synthetic administrator", `users.name:${publicId}`),
-    }).$returningId();
-    admins.push(fakePrincipal({ role: "admin", userId: inserted!.id, userPublicId: publicId, stepUpAt: h.clock.now() }));
+    const user = await t.db.transaction((tx) => identity.auth.insertUser(tx, {
+      email, name: "Synthetic administrator", role: "admin", status: "active", origin: "test", emailVerifiedAt: h.clock.now(),
+    }));
+    await identity.setPassword(user.id, ADMIN_PASSWORD, { mustChange: false });
+    admins.push(await signInAdmin(email));
   }
   return { ...h, admins };
 }
@@ -162,7 +160,8 @@ describe("portable transfer across isolated MySQL installations", () => {
           discountLabel: OFFERING_PRICE.discountLabel, total: { amountMinor: OFFERING_PRICE.totalMinor, currency: "USD" },
           promoDiscount: { amountMinor: OFFERING_PRICE.promoDiscountMinor, currency: "USD" }, promoLabel: OFFERING_PRICE.promoLabel,
         });
-        expect(pkg.manifest.exclusions.map((entry) => entry.category)).toEqual(expect.arrayContaining(["promotions", "cart-upsell-offers", "security-operations", "policy-notices", "report-definitions"]));
+        expect(pkg.manifest.exclusions.map((entry) => entry.category)).toEqual(expect.arrayContaining(["promotions", "cart-upsell-offers", "security-operations", "policy-notices", "report-definitions",
+          "ephemeral-access", "phase-workspace", "operational-diagnostics", "installation-configuration"]));
         expect(records.find((entry) => entry.type === "order-items")?.record).toMatchObject({
           ...OFFERING_SNAPSHOT, tier: "standard", lineTotal: { amountMinor: OFFERING_PRICE.subtotalMinor, currency: "USD" },
         });
@@ -263,6 +262,49 @@ describe("portable transfer across isolated MySQL installations", () => {
     expect(await targetDb.db.select().from(ordersSchema.orders)).toHaveLength(1);
     expect(await targetDb.db.select().from(filesSchema.orderFiles)).toHaveLength(1);
   });
+
+  it("passes real downstream session revalidation for a live import approver and refuses a revoked approval", async () => {
+    const sessionDb = await createTestDb({ schema: testSchema });
+    try {
+      const env = await environment(sessionDb, "portable-real-sessions");
+      const [revoked, live] = env.admins;
+      if (!revoked || !live) throw new Error("Missing admin fixtures");
+      const data = env.services.portable;
+      const payload = archive ?? await capture();
+      const queue = async (admin: SessionPrincipal) => {
+        const uploaded = await data.upload(admin, Readable.from(payload));
+        const planned = await data.verifyAndPlan(admin, { importId: uploaded.importId, passphrase: PASSPHRASE });
+        await data.approve(admin, { importId: uploaded.importId, planDigest: planned.planDigest! });
+        return uploaded.importId;
+      };
+
+      const revokedImport = await queue(revoked);
+      await env.services.identity.sessions.revoke(revoked.sessionId, "test_revoked");
+      expect(await env.jobs.runAll(PORTABLE_IMPORT_JOB)).toEqual([
+        { outcome: "failed", reasonCode: "PORTABLE_APPLY_REFUSED", retryable: false },
+      ]);
+      expect(await data.getImport(live, revokedImport)).toMatchObject({ phase: "failed", state: "refused", reconciliation: null });
+      expect(await sessionDb.db.select().from(ordersSchema.orders)).toHaveLength(0);
+      expect(await sessionDb.db.select().from(filesSchema.orderFiles)).toHaveLength(0);
+
+      const adopt = env.services.files.adoptVerifiedObject.bind(env.services.files);
+      const recheck = vi.spyOn(env.services.files, "adoptVerifiedObject").mockImplementation(async (input, tx) => {
+        await env.services.identity.sessions.assertCurrent(input.principal, tx);
+        return adopt(input, tx);
+      });
+      try {
+        const liveImport = await queue(live);
+        expect(await env.jobs.runAll(PORTABLE_IMPORT_JOB)).toEqual([expect.objectContaining({ outcome: "completed" })]);
+        expect((await data.getImport(live, liveImport)).phase).toBe("reconciled");
+        expect(recheck).toHaveBeenCalledTimes(1);
+        expect(await sessionDb.db.select().from(filesSchema.orderFiles)).toHaveLength(1);
+      } finally {
+        recheck.mockRestore();
+      }
+    } finally {
+      await sessionDb.cleanup();
+    }
+  }, 20_000);
 
   it("refuses tampering before planning or writing business rows", async () => {
     const admin = target.admins[0]!;
@@ -385,4 +427,60 @@ describe("portable transfer across isolated MySQL installations", () => {
     expect(() => projectedOrder(order, [{ ...line, packetNumber: 2, tier: "unrecognized" }], []))
       .toThrow("VALIDATION:PORTABLE_TARGET_POLICY");
   });
+});
+
+describe("imported order on a format-3 workflow (increment 07, no phase-workspace rows travel)", () => {
+  it("opens the phase workspace with no order_stage_progress rows and derives the current phase and progress", async () => {
+    const db = await createTestDb({ schema: ordersTestSchema });
+    try {
+      const h = createTestDeps({ db: db.db });
+      const mod = createOrdersModule(h.deps);
+      Object.assign(h.services, { orders: mod, identity: fakeIdentity(h, db.db) });
+      const admin = await insertUser(h, db.db, { role: "admin", stepUp: true });
+      const customer = await insertUser(h, db.db);
+      const [{ id: workflowId }] = (await db.db.insert(ordersSchema.orderWorkflows).values({
+        publicId: ulid(), workflowKey: "synthetic_phased", name: "Synthetic phased", isDefault: true,
+      }).$returningId()) as [{ id: number }];
+      const [{ id: workflowVersionId }] = (await db.db.insert(ordersSchema.orderWorkflowVersions).values({
+        publicId: ulid(), workflowId, versionNumber: 1, createdByUserId: admin.id,
+        definition: workflowDefinitionSchema.parse({
+          states: [
+            { key: "start", label: "Intake", customerLabel: "Intake", kind: "initial", tone: "neutral" },
+            { key: "middle", label: "Review", customerLabel: "Review", kind: "active", tone: "neutral" },
+            { key: "finish", label: "Finished", customerLabel: "Finished", kind: "terminal", tone: "success" },
+          ],
+          transitions: [
+            { from: "start", to: "middle", allowedBy: ["staff", "admin"], notifyCustomer: false },
+            { from: "middle", to: "finish", allowedBy: ["staff", "admin"], notifyCustomer: false },
+          ],
+          stages: [
+            { key: "intake", customerLabel: "Intake", staffLabel: "Intake", statusKeys: ["start"], actions: {} },
+            { key: "review", customerLabel: "Review", staffLabel: "Review", statusKeys: ["middle"], actions: {} },
+            { key: "delivery", customerLabel: "Delivery", staffLabel: "Delivery", statusKeys: ["finish"], actions: {} },
+          ],
+        }),
+      }).$returningId()) as [{ id: number }];
+      await db.db.update(ordersSchema.orderWorkflows).set({ currentVersionId: workflowVersionId }).where(eq(ordersSchema.orderWorkflows.id, workflowId));
+      const imported = await db.db.transaction((tx) => mod.importOrder({
+        importId: ulid(), sourceInstallationId: "synthetic-source-fixture", sourceOrderPublicId: ulid(),
+        targetOwnerUserId: customer.id, projectName: "Synthetic imported order", statusKey: "middle",
+        ...OFFERING_PRICE, currency: "USD", createdAt: CREATED, submittedAt: CREATED, editable: false,
+        lineItems: [{ sourcePublicId: ulid(), productPublicId: null, productVersion: null, name: "Fixture line",
+          description: "", features: [], ...OFFERING_SNAPSHOT, unitPriceMinor: 2500, currency: "USD", quantity: 1, lineTotalMinor: 2500 }],
+        statusHistory: [{ sourcePublicId: ulid(), fromStatus: null, toStatus: "middle", actorRole: "system", reasonCode: "SOURCE_FIXTURE", occurredAt: CREATED }],
+      }, tx));
+      const [row] = await db.db.select().from(ordersSchema.orders).where(eq(ordersSchema.orders.id, imported.id));
+      expect(row).toMatchObject({ workflowVersionId, statusKey: "middle", progressPercent: null, attention: "none", paymentState: "not_required" });
+      const progressRows = () => db.db.select().from(ordersSchema.orderStageProgress).where(eq(ordersSchema.orderStageProgress.orderId, imported.id));
+      expect(await progressRows()).toHaveLength(0);
+      const caller = createCallerFactory(ordersRouter)({ services: h.services, session: customer.principal, request: newRequestContext("test"), transport: { issue() {}, clear() {} } });
+      const workspace = await caller.stages.workspace({ orderId: imported.publicId });
+      expect(workspace.workflowFormat).toBe(3);
+      expect(workspace.currentStageKey).toBe("review");
+      expect(workspace.progress.percent).toBeGreaterThan(0);
+      expect(workspace.stages.map((stage) => stage.state)).toEqual([expect.not.stringMatching(/future/), expect.not.stringMatching(/future/), "future"]);
+    } finally {
+      await db.cleanup();
+    }
+  }, 20_000);
 });

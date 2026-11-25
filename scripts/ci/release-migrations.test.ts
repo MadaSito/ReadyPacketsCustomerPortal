@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 const validator = resolve(import.meta.dirname, "../../deploy/check-migration-bundle.mjs");
 const assertion = resolve(import.meta.dirname, "assert-release-migrations.sh");
-const tags = ["0000_baseline", "0001_contract", "0002_contract", "0003_contract", "0004_contract", "0005_increment_05", "0006_increment_06"];
+const tags = ["0000_baseline", "0001_contract", "0002_contract", "0003_contract", "0004_contract", "0005_increment_05", "0006_increment_06", "0007_increment_07"];
 const sql = "SELECT 1;\n";
 const digest = createHash("sha256").update(sql).digest("hex");
 let fixture: string;
@@ -28,7 +28,7 @@ function assertJournal(count: string) {
       printf '%s\\n' "$mock_rows"
     }
     digest=$2 mock_rows=$3
-    assert_release_migrations "$4" query 0006_increment_06
+    assert_release_migrations "$4" query 0007_increment_07
   `, "release-migrations-test", assertion, digest, count, fixture], { encoding: "utf8" });
 }
 
@@ -42,22 +42,22 @@ afterEach(() => rmSync(fixture, { force: true, recursive: true }));
 
 describe("native and Docker release migration bundle", () => {
   it("accepts the complete release bundle", () => expect(validate().status).toBe(0));
-  it("rejects SQL with a missing 0006 journal entry", () => {
+  it("rejects SQL with a missing 0007 journal entry", () => {
     journal(tags.slice(0, -1));
     expect(validate().status).toBe(1);
   });
   it("rejects a journal entry whose SQL is missing", () => {
-    rmSync(join(fixture, "0006_increment_06.sql"));
+    rmSync(join(fixture, "0007_increment_07.sql"));
     expect(validate().status).toBe(1);
   });
   it("rejects a file not covered by the journal", () => {
-    writeFileSync(join(fixture, "0006_other.sql"), sql);
+    writeFileSync(join(fixture, "0007_other.sql"), sql);
     expect(validate().status).toBe(1);
   });
   it("rejects a replaced migration SQL symlink", () => {
-    const newest = join(fixture, "0006_increment_06.sql");
+    const newest = join(fixture, "0007_increment_07.sql");
     rmSync(newest);
-    symlinkSync("0005_increment_05.sql", newest);
+    symlinkSync("0006_increment_06.sql", newest);
     expect(validate().status).toBe(1);
   });
   it("rejects a replaced migration journal symlink", () => {
@@ -72,7 +72,7 @@ describe("deployment CI database journal assertion", () => {
   it("queries the SQL digest and accepts exactly one journal row", () => expect(assertJournal("1").status).toBe(0));
   it.each(["0", "2"])("rejects a journal count of %s", (count) => {
     expect(assertJournal(count)).toMatchObject({
-      status: 1, stderr: expect.stringContaining(`0006_increment_06 journal entries: expected 1, got ${count}`),
+      status: 1, stderr: expect.stringContaining(`0007_increment_07 journal entries: expected 1, got ${count}`),
     });
   });
 });

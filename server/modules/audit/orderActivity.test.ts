@@ -279,4 +279,12 @@ describe("order activity port (real MySQL)", () => {
     expect(classifyOrderEvent("promotion.released")).toMatchObject({ category: "payments", customer: true });
     expect(classifyOrderEvent("promotion.attempts_blocked")).toBeNull();
   });
+
+  it("increment 07: customers see phase steps, questions and payment state; runs, completions and checklists stay staff-only", () => {
+    for (const name of ["order.stage.advanced", "order.stage.submitted", "order.stage.reviewed", "order.stage.reopened", "order.question.asked", "order.question.answered"])
+      expect(classifyOrderEvent(name)).toMatchObject({ category: "phases", customer: true });
+    expect(classifyOrderEvent("order.payment_state.changed")).toMatchObject({ category: "payments", customer: true });
+    for (const name of ["order.question.withdrawn", "order.admin_task.unchecked", "order.stage_run.failed", "order.completion.scheduled", "order.stage.status_overridden", "order.stage.passed_by_status", "order.progress.lowered", "file.archive.built", "storage.file_sync.failed"])
+      expect(classifyOrderEvent(name)).toMatchObject({ customer: false });
+  });
 });

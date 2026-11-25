@@ -15,17 +15,31 @@
  */
 import { and, asc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
+import {
+  STAGE_COMPLETION_DELAY_MAX_MINUTES,
+  STAGE_WEBHOOK_TARGET,
+  type StageCompletion,
+} from "../../../shared/workflowStages.js";
+import type { ModuleDeps } from "../../container.js";
 import { DomainError, validation } from "../../core/errors.js";
-import type { Mailer } from "../../core/types.js";
+import { ULID_PATTERN } from "../../core/ids.js";
+import type { Mailer, Tx } from "../../core/types.js";
 import { users } from "../identity/schema.js";
 import type { EgressFetchResponse } from "../integrations/egress.js";
+import { lockBlocks } from "../orders/policy.js";
+import { orders } from "../orders/schema.js";
+import { findState } from "../orders/workflowTypes.js";
+import { admitOrderCompletionInTx, sanitizeOpsAlertCopy } from "./completionJobs.js";
 import {
   getStaticAutomationRegistrations,
   registerAutomationAction,
+  registerAutomationTrigger,
   type AutomationActionRegistration,
   type AutomationActionRunContext,
   type AutomationActionRunResult,
+  type AutomationScalarValue,
   type AutomationStarterRecipe,
+  type AutomationTriggerResolveInput,
 } from "./contracts.js";
 import {
   extractAndValidateTemplateVars,
@@ -36,6 +50,7 @@ import {
 /** Default-deny allowlist of actions permitted when a trigger has `staffOnly: true` (`J-A01`). */
 export const STAFF_ONLY_ALLOWED_ACTION_KEYS: ReadonlySet<string> = new Set([
   "notification.send_in_app",
+  "dashboard.create_alert",
 ]);
 
 /** Trigger recipient keys that address customers and MUST NEVER be used on `staffOnly: true` triggers. */
@@ -785,6 +800,550 @@ const webhookCallAction: AutomationActionRegistration<
   },
 };
 
+/* ------------------------------------------- Increment 07 (D5) built-in actions */
+
+interface OrderSetCompletionConfig {
+  kind: "fixed" | "range";
+  percent?: number | undefined;
+  minPercent?: number | undefined;
+  maxPercent?: number | undefined;
+  delayMinutes?: number | undefined;
+}
+
+const orderSetCompletionConfigSchema: z.ZodType<OrderSetCompletionConfig> = z
+  .strictObject({
+    kind: z.enum(["fixed", "range"]),
+    percent: z.number().int().min(0).max(100).optional(),
+    minPercent: z.number().int().min(0).max(100).optional(),
+    maxPercent: z.number().int().min(0).max(100).optional(),
+    delayMinutes: z.number().int().min(0).max(STAGE_COMPLETION_DELAY_MAX_MINUTES).optional(),
+  })
+  .superRefine((val, ctx) => {
+    if (val.kind === "fixed") {
+      if (typeof val.percent !== "number") {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["percent"],
+          message: "Completion percent (0–100) is required when kind is fixed.",
+        });
+      }
+    } else {
+      if (typeof val.minPercent !== "number" || typeof val.maxPercent !== "number") {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["minPercent"],
+          message: "Minimum and maximum percent (0–100) are required when kind is range.",
+        });
+      } else if (val.minPercent > val.maxPercent) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["minPercent"],
+          message: "Minimum percent must not exceed maximum percent.",
+        });
+      }
+    }
+  });
+
+const orderSetCompletionAction: AutomationActionRegistration<OrderSetCompletionConfig> = {
+  key: "order.set_completion",
+  label: "Update order completion percentage",
+  description:
+    "Updates an order's completion percentage immediately or after a delay, using a fixed value or single-roll server range. Never changes order status.",
+  category: "Order progress",
+  owner: "automations",
+  configSchema: orderSetCompletionConfigSchema,
+  requiresOrderContext: true,
+  forbidOnStaffOnlyTrigger: true,
+  retrySafe: true,
+  configFields: [
+    {
+      key: "kind",
+      label: "Policy mode",
+      type: "enum",
+      required: true,
+      enumOptions: [
+        { value: "fixed", label: "Fixed percentage" },
+        { value: "range", label: "Bounded random range (drawn once)" },
+      ],
+    },
+    {
+      key: "percent",
+      label: "Completion percentage (0–100)",
+      type: "number",
+      required: false,
+      min: 0,
+      max: 100,
+    },
+    {
+      key: "minPercent",
+      label: "Minimum percentage (0–100)",
+      type: "number",
+      required: false,
+      min: 0,
+      max: 100,
+    },
+    {
+      key: "maxPercent",
+      label: "Maximum percentage (0–100)",
+      type: "number",
+      required: false,
+      min: 0,
+      max: 100,
+    },
+    {
+      key: "delayMinutes",
+      label: "Delay before applying (minutes, 0 = immediate)",
+      type: "number",
+      required: false,
+      min: 0,
+      max: STAGE_COMPLETION_DELAY_MAX_MINUTES,
+    },
+  ],
+  async run(ctx: AutomationActionRunContext<OrderSetCompletionConfig>) {
+    if (ctx.staffOnlyTrigger) {
+      return {
+        outcome: "failed",
+        retryable: false,
+        reasonCode: "AUTOMATION_STAFF_ONLY_TRIGGER_ACTION_FORBIDDEN",
+        safeSummary: "Staff-only triggers cannot modify customer-visible order completion.",
+      };
+    }
+    if (!ctx.orderPublicId || !ULID_PATTERN.test(ctx.orderPublicId)) {
+      return {
+        outcome: "skipped",
+        reasonCode: "NO_ORDER_CONTEXT",
+        safeSummary: "Trigger did not include an order context.",
+      };
+    }
+
+    const policy: StageCompletion =
+      ctx.config.kind === "fixed"
+        ? {
+            kind: "fixed",
+            percent: ctx.config.percent ?? 0,
+            delayMinutes: ctx.config.delayMinutes ?? 0,
+          }
+        : {
+            kind: "range",
+            min: ctx.config.minPercent ?? 0,
+            max: ctx.config.maxPercent ?? 100,
+            delayMinutes: ctx.config.delayMinutes ?? 0,
+          };
+
+    if (ctx.dryRun) {
+      return {
+        outcome: "completed",
+        safeSummary:
+          policy.kind === "fixed"
+            ? `[Dry run] Would set completion to ${policy.percent}% (delay ${policy.delayMinutes}m).`
+            : `[Dry run] Would draw completion in ${policy.min}%–${policy.max}% (delay ${policy.delayMinutes}m).`,
+      };
+    }
+
+    const ordersSvc = ctx.deps.services.orders;
+    if (!ordersSvc?.stages?.contextForRun) {
+      return {
+        outcome: "failed",
+        retryable: false,
+        reasonCode: "ORDERS_STAGES_PORT_UNAVAILABLE",
+        safeSummary: "Order stages port is unavailable.",
+      };
+    }
+
+    const orderPublicId = ctx.orderPublicId;
+    return ctx.deps.db.transaction(async (tx: Tx) => {
+      await ctx.assertStillOwned(tx);
+      const [lockedOrder] = await tx
+        .select({
+          id: orders.id,
+          publicId: orders.publicId,
+          lockState: orders.lockState,
+          workflowVersionId: orders.workflowVersionId,
+          completionRevision: orders.completionRevision,
+        })
+        .from(orders)
+        .where(eq(orders.publicId, orderPublicId))
+        .for("update");
+
+      if (!lockedOrder) {
+        return {
+          outcome: "skipped",
+          reasonCode: "ORDER_NOT_FOUND",
+          safeSummary: "Target order no longer exists.",
+        };
+      }
+      if (lockBlocks(lockedOrder.lockState, true, "order")) {
+        return {
+          outcome: "skipped",
+          reasonCode: "ORDER_LOCKED",
+          safeSummary: `Order is locked (${lockedOrder.lockState}); completion update skipped.`,
+        };
+      }
+
+      const stageCtx = await ordersSvc.stages.contextForRun(lockedOrder.publicId, tx);
+      const fullDeps: ModuleDeps = {
+        ...(ctx.deps as unknown as ModuleDeps),
+      };
+
+      const res = await admitOrderCompletionInTx(fullDeps, tx, {
+        orderId: lockedOrder.id,
+        orderPublicId: lockedOrder.publicId,
+        workflowVersionId: lockedOrder.workflowVersionId,
+        stageKey: stageCtx.currentStageKey,
+        expectedRevision: lockedOrder.completionRevision,
+        policy,
+        sourceKind: "automation_run",
+        sourcePublicId: ctx.runPublicId,
+        idempotencyKey: ctx.idempotencyKey,
+        correlationId: ctx.correlationId,
+        createdByUserId: null,
+      });
+
+      if (res.jobRow.delayMinutes > 0) {
+        return {
+          outcome: "completed",
+          safeSummary: `Scheduled ${res.jobRow.resolvedPercent}% completion update in ${res.jobRow.delayMinutes} min.`,
+          externalRef: res.jobRow.publicId,
+          safeCounts: {
+            resolved_percent: res.jobRow.resolvedPercent,
+            delay_minutes: res.jobRow.delayMinutes,
+          },
+        };
+      }
+      if (res.immediateApplied) {
+        return {
+          outcome: "completed",
+          safeSummary: `Updated order completion to ${res.jobRow.resolvedPercent}%.`,
+          externalRef: res.jobRow.publicId,
+          safeCounts: {
+            resolved_percent: res.jobRow.resolvedPercent,
+            delay_minutes: 0,
+          },
+        };
+      }
+      return {
+        outcome: "skipped",
+        reasonCode: res.supersededReasonCode ?? "REVISION_MISMATCH",
+        safeSummary: "Completion update was superseded by a newer order revision.",
+        externalRef: res.jobRow.publicId,
+      };
+    });
+  },
+};
+
+interface WebhookEnqueueSubscriptionConfig {
+  targetKey: string;
+  eventKey?: string | undefined;
+  includeEvaluatedFields?: boolean | undefined;
+}
+
+const webhookEnqueueSubscriptionConfigSchema: z.ZodType<WebhookEnqueueSubscriptionConfig> =
+  z.strictObject({
+    targetKey: z
+      .string()
+      .trim()
+      .regex(
+        STAGE_WEBHOOK_TARGET,
+        "Select a configured webhook subscription or production webhook target (raw URLs and secrets are not permitted).",
+      ),
+    eventKey: z
+      .string()
+      .trim()
+      .regex(/^[a-z][a-z0-9_.-]{1,79}$/)
+      .optional(),
+    includeEvaluatedFields: z.boolean().optional(),
+  });
+
+const webhookEnqueueSubscriptionAction: AutomationActionRegistration<WebhookEnqueueSubscriptionConfig> =
+  {
+    key: "webhook.enqueue_subscription",
+    label: "Enqueue workflow webhook",
+    description:
+      "Enqueues a signed outbound webhook delivery via a configured subscription or production webhook target without exposing URLs or secrets in rules.",
+    category: "Integrations",
+    owner: "integrations",
+    configSchema: webhookEnqueueSubscriptionConfigSchema,
+    requiresOrderContext: false,
+    forbidOnStaffOnlyTrigger: true,
+    retrySafe: true,
+    configFields: [
+      {
+        key: "targetKey",
+        label: "Webhook target",
+        type: "webhook_subscription",
+        required: true,
+        helpText: "Managed under Integrations -> Webhooks. Raw URLs and secrets are never stored in rules.",
+      },
+      {
+        key: "eventKey",
+        label: "Event name override (optional)",
+        type: "string",
+        required: false,
+        maxLength: 80,
+        helpText: "Defaults to the trigger key (for example order.stage_submitted).",
+      },
+      {
+        key: "includeEvaluatedFields",
+        label: "Include safe non-personal event fields",
+        type: "boolean",
+        required: false,
+      },
+    ],
+    async run(ctx: AutomationActionRunContext<WebhookEnqueueSubscriptionConfig>) {
+      if (ctx.staffOnlyTrigger) {
+        return {
+          outcome: "failed",
+          retryable: false,
+          reasonCode: "AUTOMATION_STAFF_ONLY_TRIGGER_ACTION_FORBIDDEN",
+          safeSummary: "Staff-only triggers cannot dispatch outbound webhooks.",
+        };
+      }
+
+      const whPort = ctx.deps.services.integrations?.workflowWebhooks;
+      if (!whPort?.enqueueStageWebhook || !whPort.validateTargetKey) {
+        return {
+          outcome: "failed",
+          retryable: false,
+          reasonCode: "WEBHOOK_PORT_UNAVAILABLE",
+          safeSummary: "Workflow webhooks port is unavailable.",
+        };
+      }
+
+      if (ctx.dryRun) {
+        const check = await whPort.validateTargetKey(ctx.config.targetKey);
+        return {
+          outcome: "completed",
+          safeSummary: check.valid
+            ? `[Dry run] Would enqueue webhook delivery to "${ctx.config.targetKey}".`
+            : `[Dry run] Target "${ctx.config.targetKey}": ${check.message}`,
+        };
+      }
+
+      const safeFields: Record<string, unknown> = {};
+      if (ctx.config.includeEvaluatedFields !== false) {
+        for (const [k, v] of Object.entries(ctx.fields)) {
+          if (k === "recipient_name") continue;
+          safeFields[k] = v;
+        }
+      }
+
+      const res = await whPort.enqueueStageWebhook({
+        targetKey: ctx.config.targetKey,
+        orderPublicId: ctx.orderPublicId ?? null,
+        stageKey: typeof ctx.fields.stage_key === "string" ? ctx.fields.stage_key : null,
+        triggerSource: "automation_rule",
+        idempotencyKey: ctx.idempotencyKey,
+        correlationId: ctx.correlationId,
+        eventKey: ctx.config.eventKey ?? ctx.triggerKey ?? "automation.rule.executed",
+        payload: {
+          automation_public_id: ctx.automationPublicId,
+          run_public_id: ctx.runPublicId,
+          trigger_key: ctx.triggerKey ?? "manual",
+          ...(ctx.orderPublicId ? { order_public_id: ctx.orderPublicId } : {}),
+          ...(ctx.config.includeEvaluatedFields !== false ? { fields: safeFields } : {}),
+        },
+      });
+
+      if (res.outcome === "queued" || res.outcome === "already_queued_or_delivered") {
+        return {
+          outcome: "completed",
+          safeSummary: res.message,
+          externalRef: res.deliveryPublicId ?? res.dispatchPublicId ?? ctx.config.targetKey,
+        };
+      }
+      if (res.outcome === "disabled") {
+        return {
+          outcome: "skipped",
+          reasonCode: res.reasonCode ?? "WEBHOOK_DISABLED",
+          safeSummary: res.message,
+          externalRef: ctx.config.targetKey,
+        };
+      }
+      return {
+        outcome: "failed",
+        retryable: false,
+        reasonCode: res.reasonCode ?? "WEBHOOK_REFUSED",
+        safeSummary: res.message,
+        externalRef: ctx.config.targetKey,
+      };
+    },
+  };
+
+interface DashboardCreateAlertConfig {
+  severity: "warning" | "error" | "critical";
+  titleTemplate: string;
+  bodyTemplate?: string | undefined;
+  code?: string | undefined;
+}
+
+const dashboardCreateAlertConfigSchema: z.ZodType<DashboardCreateAlertConfig> = z.strictObject({
+  severity: z.enum(["warning", "error", "critical"]),
+  titleTemplate: z.string().trim().min(1).max(120),
+  bodyTemplate: z.string().trim().max(500).optional(),
+  code: z
+    .string()
+    .trim()
+    .regex(/^[A-Z][A-Z0-9_]{1,63}$/)
+    .optional(),
+});
+
+const dashboardCreateAlertAction: AutomationActionRegistration<DashboardCreateAlertConfig> = {
+  key: "dashboard.create_alert",
+  label: "Create operational dashboard alert",
+  description:
+    "Opens or escalates an operational alert on the Background Jobs & Operational Alerts centre for staff and administrators.",
+  category: "Operations",
+  owner: "automations",
+  configSchema: dashboardCreateAlertConfigSchema,
+  requiresOrderContext: false,
+  forbidOnStaffOnlyTrigger: false,
+  retrySafe: true,
+  configFields: [
+    {
+      key: "severity",
+      label: "Severity",
+      type: "enum",
+      required: true,
+      enumOptions: [
+        { value: "warning", label: "Warning" },
+        { value: "error", label: "Error" },
+        { value: "critical", label: "Critical" },
+      ],
+    },
+    {
+      key: "titleTemplate",
+      label: "Alert title",
+      type: "string",
+      required: true,
+      maxLength: 120,
+      helpText: "Supports safe non-personal trigger variables such as {{order_reference}}.",
+    },
+    {
+      key: "bodyTemplate",
+      label: "Alert details (optional)",
+      type: "textarea",
+      required: false,
+      maxLength: 500,
+      helpText: "Plain text details shown to operators.",
+    },
+    {
+      key: "code",
+      label: "Alert code (optional)",
+      type: "string",
+      required: false,
+      maxLength: 64,
+      helpText: "Defaults to AUTOMATION_RULE_ALERT.",
+    },
+  ],
+  async run(ctx: AutomationActionRunContext<DashboardCreateAlertConfig>) {
+    const nonPersonalFields: Record<string, AutomationScalarValue> = {};
+    for (const [k, v] of Object.entries(ctx.fields)) {
+      if (k === "recipient_name") continue;
+      nonPersonalFields[k] =
+        typeof v === "string" || typeof v === "number" || typeof v === "boolean" ? v : null;
+    }
+
+    const renderedTitle = sanitizeOpsAlertCopy(
+      renderPlainTemplate(ctx.config.titleTemplate, nonPersonalFields),
+      120,
+    );
+    const renderedBodyRaw = ctx.config.bodyTemplate
+      ? renderPlainTemplate(ctx.config.bodyTemplate, nonPersonalFields).trim()
+      : "";
+    const renderedBody = renderedBodyRaw ? sanitizeOpsAlertCopy(renderedBodyRaw, 500) : undefined;
+
+    if (ctx.dryRun) {
+      return {
+        outcome: "completed",
+        safeSummary: `[Dry run] Would open ${ctx.config.severity} alert: "${renderedTitle}".`,
+      };
+    }
+
+    if (!ctx.deps.services.opsAlerts?.emit) {
+      return {
+        outcome: "failed",
+        retryable: false,
+        reasonCode: "OPS_ALERTS_UNAVAILABLE",
+        safeSummary: "Operational alerts port is unavailable.",
+      };
+    }
+
+    const alertRes = await ctx.deps.services.opsAlerts.emit({
+      source: "automation",
+      severity: ctx.config.severity,
+      dedupKey: `auto_rule_alert:${ctx.runPublicId}:${ctx.stepKey}`,
+      correlationId: ctx.correlationId,
+      code: ctx.config.code ?? "AUTOMATION_RULE_ALERT",
+      title: renderedTitle,
+      ...(renderedBody ? { text: renderedBody } : {}),
+      ...(ctx.orderPublicId && ULID_PATTERN.test(ctx.orderPublicId)
+        ? { orderPublicId: ctx.orderPublicId }
+        : {}),
+      ...(ULID_PATTERN.test(ctx.runPublicId) ? { runPublicId: ctx.runPublicId } : {}),
+    });
+
+    return {
+      outcome: "completed",
+      safeSummary: `Opened ${ctx.config.severity} operational alert (${alertRes.state}).`,
+      externalRef: alertRes.publicId,
+    };
+  },
+};
+
+async function resolveStageSubmittedTriggerContext({
+  event,
+  db,
+  services,
+  signal,
+}: AutomationTriggerResolveInput) {
+  signal.throwIfAborted();
+  const rawOrderPublicId =
+    event.resource?.type === "order" && typeof event.resource.publicId === "string"
+      ? event.resource.publicId
+      : typeof event.attributes.order_public_id === "string"
+        ? event.attributes.order_public_id
+        : null;
+  if (!rawOrderPublicId || !ULID_PATTERN.test(rawOrderPublicId)) {
+    return {};
+  }
+  const [orderRow] = await db
+    .select({
+      publicId: orders.publicId,
+      reference: orders.reference,
+      ownerUserId: orders.ownerUserId,
+      statusKey: orders.statusKey,
+      workflowVersionId: orders.workflowVersionId,
+    })
+    .from(orders)
+    .where(eq(orders.publicId, rawOrderPublicId))
+    .limit(1);
+  if (!orderRow) return {};
+
+  const bound = services.orders?.workflows?.byVersionId
+    ? await services.orders.workflows.byVersionId(db, orderRow.workflowVersionId)
+    : null;
+  const state = bound ? findState(bound.definition, orderRow.statusKey) : null;
+  const stageKeyAttr =
+    typeof event.attributes.stage_key === "string" ? event.attributes.stage_key : null;
+  const matchedStage =
+    bound && stageKeyAttr && Array.isArray(bound.definition.stages)
+      ? bound.definition.stages.find((s) => s.key === stageKeyAttr)
+      : null;
+
+  return {
+    orderPublicId: orderRow.publicId,
+    fields: {
+      order_reference: orderRow.reference,
+      order_status_label: state?.customerLabel ?? orderRow.statusKey,
+      ...(matchedStage ? { stage_label: matchedStage.customerLabel } : {}),
+    },
+    recipients: {
+      order_owner: [orderRow.ownerUserId],
+      order_assignee: [],
+    },
+  };
+}
+
 /* ----------------------------------------------- Template validation helper */
 
 export function validateBuiltInActionTemplates(
@@ -855,6 +1414,21 @@ export function validateBuiltInActionTemplates(
           `Field '${String(f)}' is not permitted in webhook payloads for this trigger.`,
         );
       }
+    }
+  } else if (actionKey === "dashboard.create_alert") {
+    const nonPersonalAllowed = new Set(
+      [...allowedTemplateFieldKeys].filter((k) => k !== "recipient_name"),
+    );
+    if (typeof config.titleTemplate === "string") {
+      extractAndValidateTemplateVars(config.titleTemplate, nonPersonalAllowed, {
+        singleLine: true,
+        fieldLabel: "Alert title",
+      });
+    }
+    if (typeof config.bodyTemplate === "string" && config.bodyTemplate.length > 0) {
+      extractAndValidateTemplateVars(config.bodyTemplate, nonPersonalAllowed, {
+        fieldLabel: "Alert details",
+      });
     }
   }
 }
@@ -975,4 +1549,19 @@ if (!getStaticAutomationRegistrations().actions.has("support.create_ticket")) {
 }
 if (!getStaticAutomationRegistrations().actions.has("webhook.call")) {
   registerAutomationAction(webhookCallAction);
+}
+if (!getStaticAutomationRegistrations().actions.has("order.set_completion")) {
+  registerAutomationAction(orderSetCompletionAction);
+}
+if (!getStaticAutomationRegistrations().actions.has("webhook.enqueue_subscription")) {
+  registerAutomationAction(webhookEnqueueSubscriptionAction);
+}
+if (!getStaticAutomationRegistrations().actions.has("dashboard.create_alert")) {
+  registerAutomationAction(dashboardCreateAlertAction);
+}
+if (!getStaticAutomationRegistrations().triggers.has("order.stage_submitted")) {
+  registerAutomationTrigger({
+    key: "order.stage_submitted",
+    resolveContext: resolveStageSubmittedTriggerContext,
+  });
 }

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Route } from "wouter";
@@ -5,9 +6,11 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import type * as transportModule from "@/lib/sessionTransport";
 import type * as trpcModule from "@/lib/trpc";
 import { expectNoAxeViolations, renderUi } from "@/ui/testing";
+import { pageA11y } from "@/test/a11y";
 import AutomationDetailPage from "./AutomationDetailPage";
 import { CanvasBuilder, Editor } from "./AutomationEditorPage";
 import AutomationsPage from "./AutomationsPage";
+import { PhaseActionsSlot, type PhaseActionsSlotValue } from "./phaseSlots";
 import {
   addAction, addCondition, addGroup, connect, draftFromRecipe, emptyDraft, moveAction, setTrigger, toGraph, toSaveInput, updateAction, updateCondition,
   validateDraft, type TriggerEntry, type AutomationDetailView, type AutomationRunView, type AutomationSummaryView, type Catalogue, type Draft,
@@ -111,7 +114,7 @@ const catalogue: Catalogue = {
 } as unknown as Catalogue;
 
 const summary = (patch: Partial<AutomationSummaryView> = {}): AutomationSummaryView => ({
-  publicId: AID, name: "Order confirmation", description: null, enabled: false, version: 3, trigger: { kind: "event", triggerKey: "order.created" },
+  publicId: AID, name: "Order confirmation", description: null, enabled: false, sortOrder: 0, version: 3, trigger: { kind: "event", triggerKey: "order.created" },
   conditionGroupCount: 0, actionCount: 1, maxRunsPerHour: 30, lastRun: { publicId: "ar_1", state: "completed", triggerMode: "event", startedAt: NOW, finishedAt: NOW, createdAt: NOW },
   createdAt: NOW, updatedAt: NOW, ...patch,
 });
@@ -344,3 +347,304 @@ describe("AutomationDetailPage", () => {
     expect(await screen.findByRole("button", { name: "Try again" })).toBeInTheDocument();
   });
 });
+
+/* ---- Increment 07: rule ordering, stageBundlesEnabled, real pickers, D5 actions, PhaseActionsSlot ---- */
+
+const INC07_CATALOGUE: Catalogue = {
+  ...catalogue,
+  stageBundlesEnabled: false,
+  triggers: [
+    ...TRIGGER_CATALOGUE,
+    {
+      key: "order.status_changed",
+      label: "Order status changed",
+      group: "Orders",
+      owner: "orders",
+      description: "An order moved to a status.",
+      eventName: "order.status.changed",
+      outcomes: ["completed"],
+      resourceType: "order",
+      fields: [
+        { key: "to_status", label: "New status", type: "string", from: "event" },
+        { key: "stage_key", label: "Phase", type: "string", from: "event" },
+      ],
+      recipients: [OWNER, ADMINS],
+    },
+    {
+      key: "questionnaire.submitted",
+      label: "Questionnaire submitted",
+      group: "Compliance",
+      owner: "compliance",
+      description: "Customer submitted a questionnaire.",
+      eventName: "compliance.questionnaire.submitted",
+      outcomes: ["completed"],
+      resourceType: "order",
+      fields: [{ key: "questionnaire_key", label: "Questionnaire", type: "string", from: "event" }],
+      recipients: [ADMINS],
+    },
+  ] as unknown as readonly TriggerEntry[],
+  actions: [
+    ...catalogue.actions,
+    {
+      key: "order.set_completion",
+      label: "Set order completion percentage",
+      description: "Sets a fixed or random-range completion percentage immediately or after a delay.",
+      category: "order",
+      owner: "automations",
+      configFields: [],
+      requiresOrderContext: true,
+      forbidOnStaffOnlyTrigger: false,
+      supportedTriggerModes: ["event", "manual"],
+      retrySafe: true,
+    },
+    {
+      key: "webhook.enqueue_subscription",
+      label: "Queue webhook delivery",
+      description: "Queues delivery through a managed webhook subscription.",
+      category: "integration",
+      owner: "integrations",
+      configFields: [],
+      requiresOrderContext: false,
+      forbidOnStaffOnlyTrigger: true,
+      supportedTriggerModes: ["event", "manual", "schedule"],
+      retrySafe: true,
+    },
+    {
+      key: "dashboard.create_alert",
+      label: "Create dashboard alert",
+      description: "Raises an operational alert in the dashboard.",
+      category: "notification",
+      owner: "ops",
+      configFields: [],
+      requiresOrderContext: false,
+      forbidOnStaffOnlyTrigger: false,
+      supportedTriggerModes: ["event", "manual", "schedule"],
+      retrySafe: true,
+    },
+  ] as unknown as Catalogue["actions"],
+  pickerOptions: {
+    statuses: [
+      { value: "review", label: "In review", secondaryLabel: "review" },
+      { value: "approved", label: "Approved", secondaryLabel: "approved" },
+    ],
+    stages: [
+      { value: "intake", label: "Intake", secondaryLabel: "Getting started" },
+      { value: "review_stage", label: "Packet review", secondaryLabel: "Review" },
+    ],
+    workflows: [{ value: "standard", label: "Standard" }],
+    paymentMethods: [{ value: "card", label: "Card" }],
+    paymentProviders: [{ value: "stripe", label: "Stripe" }, { value: "square", label: "Square" }],
+    intakeQuestionnaires: [{ value: "entity_intake", label: "Entity intake" }],
+    intakeDecisions: [{ value: "approved", label: "Approved" }],
+    emailTemplates: [{ templateKey: "order.confirmation", name: "Order confirmation" }],
+    webhookSubscriptions: [
+      {
+        targetKey: "subscription:01JSVB00000000000000000001",
+        kind: "subscription",
+        publicId: "01JSVB00000000000000000001",
+        label: "Fulfillment webhook",
+        endpointDisplay: "https://hooks.example.test/fulfill",
+        enabled: true,
+      },
+    ],
+    webhookTargets: [
+      {
+        targetKey: "subscription:01JSVB00000000000000000001",
+        kind: "subscription",
+        publicId: "01JSVB00000000000000000001",
+        label: "Fulfillment webhook",
+        endpointDisplay: "https://hooks.example.test/fulfill",
+        enabled: true,
+      },
+    ],
+  },
+} as unknown as Catalogue;
+
+describe("Increment 07: rule ordering, stageBundlesEnabled, scope pickers, and D5 actions", () => {
+  it("toggles administrator-run phase bundles independently and reorders rules deterministically", async () => {
+    const update = vi.fn((input: unknown) => ({
+      enabled: true,
+      stageBundlesEnabled: false,
+      globalRunsPerMinute: 120,
+      defaultPerAutomationRunsPerHour: 60,
+      maxPerAutomationRunsPerHour: 600,
+      runRetentionDays: 90,
+      ...(input as object),
+    }));
+    const reorder = vi.fn((input: { orderedPublicIds: string[] }) => input);
+    handlers["automations.settings.get"] = () => ({
+      enabled: true,
+      stageBundlesEnabled: false,
+      globalRunsPerMinute: 120,
+      defaultPerAutomationRunsPerHour: 60,
+      maxPerAutomationRunsPerHour: 600,
+      runRetentionDays: 90,
+    });
+    handlers["automations.settings.update"] = update;
+    handlers["automations.list"] = () => ({
+      items: [
+        summary({ publicId: "au_first", name: "First rule", sortOrder: 0 }),
+        summary({ publicId: "au_second", name: "Second rule", sortOrder: 1 }),
+      ],
+      nextCursor: null,
+    });
+    handlers["automations.reorder"] = reorder as (input: unknown) => unknown;
+
+    renderUi(<AutomationsPage />);
+    expect(await screen.findByText(/Phase bundles: Off/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Turn phase bundles on" }));
+    await waitFor(() => expect(update).toHaveBeenCalledWith({ stageBundlesEnabled: true }));
+
+    const moveFirstUp = screen.getAllByRole("button", { name: "Move First rule up" })[0]!;
+    const moveSecondUp = screen.getAllByRole("button", { name: "Move Second rule up" })[0]!;
+    expect(moveFirstUp).toBeDisabled();
+    await userEvent.click(moveSecondUp);
+    await waitFor(() => expect(reorder).toHaveBeenCalledWith({ orderedPublicIds: ["au_second", "au_first"] }));
+  });
+
+  it("supports All occurrences vs Specific value pickers and preserves complex multi-group condition trees", async () => {
+    handlers["automations.catalogue"] = () => INC07_CATALOGUE;
+    const { container } = renderUi(<Editor catalogue={INC07_CATALOGUE} initial={emptyDraft()} />);
+
+    await userEvent.type(screen.getByLabelText(/^Name/), "Approved notice");
+    await userEvent.click(screen.getByLabelText(/An event/));
+    await userEvent.selectOptions(screen.getByLabelText(/^Event/), "order.status_changed");
+
+    expect(await screen.findByText("Occurrences (New status)")).toBeInTheDocument();
+    await userEvent.click(screen.getByLabelText(/Specific value/));
+    const statusPicker = await screen.findByLabelText(/^New status/i);
+    await userEvent.selectOptions(statusPicker, "approved");
+    await expectNoAxeViolations(container);
+
+    await userEvent.click(screen.getAllByRole("button", { name: "Continue" })[0]!);
+    expect(await screen.findByDisplayValue("Approved (approved)")).toBeInTheDocument();
+
+    /* Complex multi-group condition tree on the scope field is preserved without loss when re-opened in Trigger step */
+    let complex = setTrigger({ ...emptyDraft(), name: "Multi-group" }, { kind: "event", triggerKey: "order.status_changed" }, INC07_CATALOGUE);
+    complex = addGroup(addGroup(complex));
+    complex = updateCondition(complex, complex.groups[0]!.conditions[0]!.id, { field: "to_status", operator: "eq", value: "review" });
+    complex = updateCondition(complex, complex.groups[1]!.conditions[0]!.id, { field: "to_status", operator: "eq", value: "approved" });
+    const savedBefore = toSaveInput(complex, INC07_CATALOGUE).conditions;
+    expect(savedBefore.groups).toHaveLength(2);
+
+    const { unmount } = renderUi(<Editor catalogue={INC07_CATALOGUE} initial={complex} />);
+    expect(await screen.findByText(/Filtered in Conditions/)).toBeInTheDocument();
+    unmount();
+  });
+
+  it("validates and edits D5 actions: set_completion (fixed/range + 30-day delay), webhook subscription, and dashboard alert", async () => {
+    let d = setTrigger({ ...emptyDraft(), name: "D5 rule" }, { kind: "event", triggerKey: "order.status_changed" }, INC07_CATALOGUE);
+    d = addAction(d, "order.set_completion");
+    d = addAction(d, "webhook.enqueue_subscription");
+    d = addAction(d, "dashboard.create_alert");
+    const [compStep, hookStep, alertStep] = d.actions.map((a) => a.stepKey) as [string, string, string];
+
+    /* Invalid range (min > max), excessive delay (> 43,200m), raw URL in subscription, invalid alert code */
+    d = updateAction(d, compStep, { config: { kind: "range", minPercent: 80, maxPercent: 40, delayMinutes: 50_000 } });
+    d = updateAction(d, hookStep, { config: { targetKey: "https://evil.example.test/raw" } });
+    d = updateAction(d, alertStep, { config: { severity: "critical", titleTemplate: "Order stalled", code: "bad-lowercase" } });
+    const bad = validateDraft(d, INC07_CATALOGUE).actions;
+    expect(bad[`${compStep}.minPercent`]).toMatch(/lowest percentage must not be above/i);
+    expect(bad[`${compStep}.delayMinutes`]).toMatch(/43200/);
+    expect(bad[`${hookStep}.targetKey`]).toMatch(/managed webhook subscription/i);
+    expect(bad[`${alertStep}.code`]).toMatch(/uppercase/i);
+
+    /* Valid configurations pass validation cleanly */
+    d = updateAction(d, compStep, { config: { kind: "range", minPercent: 40, maxPercent: 65, delayMinutes: 43_200 } });
+    d = updateAction(d, hookStep, { config: { targetKey: "subscription:01JSVB00000000000000000001", includeEvaluatedFields: true } });
+    d = updateAction(d, alertStep, { config: { severity: "warning", titleTemplate: "Order moved to {{to_status}}", bodyTemplate: "Review required.", code: "ORDER_STAGE_NOTICE" } });
+    expect(validateDraft(d, INC07_CATALOGUE).actions).toEqual({});
+
+    /* Staff-only trigger forbids webhook.enqueue_subscription */
+    const staffDraft = setTrigger(d, { kind: "event", triggerKey: "message.internal_note" }, INC07_CATALOGUE);
+    expect(validateDraft(staffDraft, INC07_CATALOGUE).actions[`${hookStep}.action`]).toMatch(/staff-only/i);
+
+    /* Render interactive action editors and check axe */
+    const { container } = renderUi(<Editor catalogue={INC07_CATALOGUE} initial={d} />);
+    await userEvent.click(screen.getAllByRole("button", { name: "Continue" })[0]!);
+    await userEvent.click(screen.getAllByRole("button", { name: "Continue" })[0]!);
+    expect(await screen.findByText(/Fulfillment webhook/)).toBeInTheDocument();
+    expect(screen.getByDisplayValue("Order moved to {{to_status}}")).toBeInTheDocument();
+    await expectNoAxeViolations(container);
+  });
+});
+
+describe("PhaseActionsSlot (D5 phase editor slot)", () => {
+  beforeEach(() => {
+    handlers["orders.statusCatalog.list"] = () => [
+      { key: "review", staffLabel: "In review", customerLabel: "In review", retired: false },
+      { key: "complete", staffLabel: "Complete", customerLabel: "Complete", retired: false },
+    ];
+    handlers["mailTemplates.listForPhaseActions"] = () => [
+      { templateKey: "order.phase_ready", name: "Phase ready notice" },
+    ];
+  });
+
+  it("edits all four phase action slots while preserving unknown keys and displaying field errors", async () => {
+    let latest: PhaseActionsSlotValue = { futureUnknownKey: "keep-me" } as PhaseActionsSlotValue;
+
+    function Harness() {
+      const [val, setVal] = useState<PhaseActionsSlotValue>(latest);
+      return (
+        <PhaseActionsSlot
+          stageKey="intake"
+          stageIndex={0}
+          stageStatusKeys={["review"]}
+          workflowStatusKeys={["review", "complete"]}
+          idPrefix="phase-0"
+          disabled={false}
+          headingLevel={3}
+          errors={{ "completion.max": "Maximum must exceed minimum." }}
+          value={val}
+          onChange={(next) => {
+            latest = next;
+            setVal(next);
+          }}
+        />
+      );
+    }
+
+    renderUi(<Harness />);
+
+    const statusSelect = await screen.findByLabelText(/Order status update/i);
+    await userEvent.selectOptions(statusSelect, "complete");
+    expect(latest).toMatchObject({ futureUnknownKey: "keep-me", setStatusKey: "complete" });
+
+    await userEvent.selectOptions(screen.getByLabelText(/Completion update/i), "range");
+    expect(latest.completion).toMatchObject({ kind: "range" });
+    expect((latest as Record<string, unknown>).futureUnknownKey).toBe("keep-me");
+    expect(await screen.findByText("Maximum must exceed minimum.")).toBeInTheDocument();
+
+    await userEvent.selectOptions(screen.getByLabelText(/^Dashboard alert/i), "alert");
+    expect(latest.dashboardAlert).toMatchObject({ severity: "warning" });
+  });
+
+  pageA11y("phase actions editor slot", async () => {
+    document.title = "Edit phase";
+    renderUi(
+      <main id="main">
+        <h1>Edit phase</h1>
+        <h2>Administrator-run phase actions</h2>
+        <PhaseActionsSlot
+          stageKey="intake"
+          stageIndex={0}
+          stageStatusKeys={["review"]}
+          workflowStatusKeys={["review", "complete"]}
+          idPrefix="phase-a11y"
+          disabled={false}
+          headingLevel={3}
+          errors={{}}
+          value={{
+            emailTemplateKey: "order.phase_ready",
+            setStatusKey: "complete",
+            completion: { kind: "fixed", percent: 50, delayMinutes: 120 },
+            dashboardAlert: { severity: "warning", text: "Verify packet attachments." },
+          }}
+          onChange={() => undefined}
+        />
+      </main>,
+    );
+    await screen.findByDisplayValue("Verify packet attachments.");
+  });
+});
+

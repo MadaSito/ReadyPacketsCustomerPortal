@@ -28,16 +28,22 @@ import type { TransitionService } from "../transitions.js";
 import type { UserRepo } from "../users.js";
 import { toView } from "../users.js";
 import { createSignInSignals } from "../signals.js";
+import { USER_ROLES, type UserRole } from "../../../../shared/domain.js";
 import {
+  ENTRA_MFA_MODES,
   SSO_JIT_MODES,
+  SSO_PROTOCOLS,
   ssoAuthRequests,
   ssoConfiguration,
   ssoIdentities,
   users,
   userSessions,
   type SsoAuthRequestRow,
+  type EntraMfaMode,
   type SsoConfigurationRow,
   type SsoJitMode,
+  type SsoMappedRole,
+  type SsoProtocol,
   type SsoPurpose,
   type UserRow,
 } from "../schema.js";
@@ -54,6 +60,20 @@ import {
   type Jwk,
   type VerifiedEntraClaims,
 } from "./oidc.js";
+import {
+  buildAuthnRequestUrl,
+  isValidEntityId,
+  REQUIRED_SAML_CLAIMS,
+  SAML_CLOCK_SKEW_MS,
+  SAML_START_PATH,
+  samlEndpoints,
+  samlMfaFacts,
+  SamlValidationError,
+  serviceProviderMetadata,
+  spUrls,
+  verifySamlResponse,
+} from "./saml.js";
+import { createSamlAdmin, type SamlCertificateView } from "./samlAdmin.js";
 
 /** Egress purpose for login.microsoftonline.com (owned by integrations_engineer). */
 export const ENTRA_EGRESS_PURPOSE: EgressPurpose = "entra_oidc";
@@ -85,6 +105,7 @@ export const SSO_REFUSALS = [
   "SSO_ROLE_NOT_ASSIGNED",
   "SSO_MAINTENANCE",
   "SSO_RESTRICTED",
+  "SSO_ROLE_NOT_ALLOWED",
 ] as const;
 export type SsoRefusal = (typeof SSO_REFUSALS)[number];
 
@@ -106,7 +127,14 @@ const REFUSAL_MESSAGES: Record<SsoRefusal, string> = {
   SSO_ROLE_NOT_ASSIGNED: "Your Microsoft account is not assigned to this application.",
   SSO_MAINTENANCE: "Customer sign-in is paused for scheduled maintenance. Please try again later.",
   SSO_RESTRICTED: "Sign-in is not allowed from your current network or location. Contact your administrator.",
+  SSO_ROLE_NOT_ALLOWED: "Single sign-on is not offered for your account type. Sign in with your e-mail address and password.",
 };
+
+/** Typed confirmation required to select `entra` (the portal never asks SSO users for its factor). */
+export const ENTRA_MODE_CONFIRMATION = "ENTRA MANAGES MFA";
+/** Strictness order: a move to a higher rank revokes live Entra sessions. */
+const MFA_MODE_RANK: Record<EntraMfaMode, number> = { entra: 0, claim: 1, portal: 2 };
+export const NEW_CONFIG_ALLOWED_ROLES: readonly UserRole[] = ["admin", "staff"];
 
 export const refusal = (code: SsoRefusal, detail?: string) =>
   new DomainError(code === "SSO_UNAVAILABLE" ? "UNAVAILABLE" : "FORBIDDEN", code, REFUSAL_MESSAGES[code], detail ? { detail } : undefined);
@@ -133,10 +161,35 @@ export interface SsoConfigInput {
   clientSecret?: string | null;
   buttonLabel: string | null;
   allowedDomains: string[];
-  trustEntraMfa: boolean;
   jitMode: SsoJitMode;
   jitStaffAppRole: string | null;
   jitDailyLimit: number;
+  /* increment 07 */
+  protocol: SsoProtocol;
+  samlEntityId: string | null;
+  entraMfaMode: EntraMfaMode;
+  entraModeConfirmation?: string;
+  acceptedAuthnContexts: string[];
+  allowedRoles: UserRole[];
+}
+
+/** Unprivileged status summary (see statusSummary). */
+export interface SsoStatusSummary {
+  configured: boolean;
+  enabled: boolean;
+  complete: boolean;
+  availableInThisDeployment: boolean;
+  protocol: SsoProtocol;
+  entraMfaMode: EntraMfaMode;
+  trustedCertificates: number;
+  /** SAML only: earliest notAfter among trusted certificates. */
+  nearestCertificateExpiry: Date | null;
+  /** Safe outcome code of the last metadata/certificate check (OK, FETCH_FAILED, ROLLOVER_BLOCKED, …). */
+  metadataStatus: string | null;
+  metadataCheckedAt: Date | null;
+  /** Most recent successful Entra sign-in by any linked account. */
+  lastSignInAt: Date | null;
+  settingsPath: "/admin/sso";
 }
 
 export interface SsoAdminView {
@@ -156,6 +209,25 @@ export interface SsoAdminView {
   availableInThisDeployment: boolean;
   linkedAccounts: number;
   breakGlass: { localMfaAdministrators: number; soleLocalMfaAdministratorHasPasskey: boolean | null } | null;
+  /* increment 07 */
+  protocol: SsoProtocol;
+  entraMfaMode: EntraMfaMode;
+  acceptedAuthnContexts: string[];
+  allowedRoles: UserRole[];
+  saml: {
+    entityId: string;
+    entityIdIsDefault: boolean;
+    acsUrl: string;
+    signOnUrl: string;
+    metadataUrl: string;
+    idpIssuer: string | null;
+    requiredClaims: string[];
+    metadataSourceUrl: string | null;
+    metadataRefreshedAt: Date | null;
+    metadataStatus: string | null;
+    certificates: SamlCertificateView[];
+  };
+  roleMappings: Array<{ appRoleValue: string; role: SsoMappedRole }>;
 }
 
 export interface SsoTestResult {
@@ -170,6 +242,14 @@ export interface SsoTestResult {
   staffRoleAssigned: boolean;
   linkedToYou: boolean;
   linkedToAnotherAccount: boolean;
+  /* increment 07 */
+  protocol: SsoProtocol;
+  /** Claim / attribute NAMES present (never values). */
+  claimNames: string[];
+  mfaProven: boolean;
+  mfaSkippedByMode: boolean;
+  roleAllowed: boolean;
+  jitRole: SsoMappedRole | null;
 }
 
 export interface SignInMethods {
@@ -191,6 +271,8 @@ interface StoredResult {
   email: string | null;
   name: string | null;
   roles: string[];
+  /* SAML only (increment 07) */
+  saml?: { multipleAuthn: boolean; authnContext: string | null; claimNames: string[] };
 }
 
 const resultAad = (publicId: string) => `sso_auth_requests.result:${publicId}`;
@@ -235,7 +317,10 @@ export function createSsoService(i: SsoInternals) {
   }
 
   async function lockConfig(tx: Tx): Promise<SsoConfigurationRow> {
-    await tx.insert(ssoConfiguration).values({ id: CONFIG_ID }).onDuplicateKeyUpdate({ set: { id: sql`${ssoConfiguration.id}` } });
+    // A NEW row is written with the increment-07 defaults; an existing (older) row keeps its NULLs (= old behaviour).
+    await tx.insert(ssoConfiguration)
+      .values({ id: CONFIG_ID, entraMfaMode: "claim", allowedRoles: JSON.stringify(NEW_CONFIG_ALLOWED_ROLES) })
+      .onDuplicateKeyUpdate({ set: { id: sql`${ssoConfiguration.id}` } });
     return (await loadConfig(tx, true))!;
   }
 
@@ -248,16 +333,62 @@ export function createSsoService(i: SsoInternals) {
       return [];
     }
   };
-  const isComplete = (row: SsoConfigurationRow | null): row is SsoConfigurationRow & { tenantId: string; clientId: string; clientSecretEnc: string } =>
+  const isOidcComplete = (row: SsoConfigurationRow | null): row is SsoConfigurationRow & { tenantId: string; clientId: string; clientSecretEnc: string } =>
     !!row && !!row.tenantId && isTenantGuid(row.tenantId) && !!row.clientId && isTenantGuid(row.clientId) && !!row.clientSecretEnc;
-  const usable = (row: SsoConfigurationRow | null, purpose: SsoPurpose) =>
+  /** SAML additionally needs a trusted certificate; that (async) check is made at start, ACS and enable. */
+  const isComplete = (row: SsoConfigurationRow | null): row is SsoConfigurationRow & { tenantId: string } =>
+    !!row && (row.protocol === "saml" ? !!row.tenantId && isTenantGuid(row.tenantId) : isOidcComplete(row));
+  const usable = (row: SsoConfigurationRow | null, purpose: SsoPurpose): row is SsoConfigurationRow & { tenantId: string } =>
     availableInDeployment() && isComplete(row) && (purpose === "test" || row.enabled);
+  const jsonList = (raw: string | null | undefined): string[] | null => {
+    if (!raw) return null;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : null;
+    } catch {
+      return null;
+    }
+  };
+  /** NULL on a pre-increment-07 row ⇒ the boolean it replaced. */
+  const mfaModeOf = (row: SsoConfigurationRow | null): EntraMfaMode =>
+    row?.entraMfaMode ?? (row ? (row.trustEntraMfa ? "claim" : "portal") : "claim");
+  /** NULL on a pre-increment-07 row ⇒ every role (unchanged behaviour); a new row is written with admin + staff. */
+  const allowedRolesOf = (row: SsoConfigurationRow | null): UserRole[] => {
+    const list = jsonList(row?.allowedRoles);
+    if (!row) return [...NEW_CONFIG_ALLOWED_ROLES];
+    return list === null ? [...USER_ROLES] : USER_ROLES.filter((r) => list.includes(r));
+  };
+  const acceptedContextsOf = (row: SsoConfigurationRow | null): string[] => jsonList(row?.acceptedAuthnContexts) ?? [];
+  const sp = (row: SsoConfigurationRow | null) => spUrls(deps.config.canonicalOrigin, row?.samlEntityId ?? null);
+  /** Did Entra prove MFA for this sign-in (claim mode)? Values never leave the server. */
+  const mfaProven = (row: SsoConfigurationRow, result: StoredResult): boolean =>
+    result.saml
+      ? result.saml.multipleAuthn || (result.saml.authnContext !== null && acceptedContextsOf(row).includes(result.saml.authnContext))
+      : result.amr?.includes("mfa") === true;
+  /** Portal MFA is skipped when the mode says so: claim ⇒ proven; entra ⇒ always; portal ⇒ never. */
+  const entraMfaSatisfied = (row: SsoConfigurationRow, result: StoredResult): boolean => {
+    const mode = mfaModeOf(row);
+    return mode === "entra" ? true : mode === "claim" ? mfaProven(row, result) : false;
+  };
   const domainAllowed = (row: SsoConfigurationRow, email: string | null) => {
     const allowed = domainsOf(row);
     if (allowed.length === 0) return true;
     const domain = emailDomain(email);
     return domain !== null && allowed.includes(domain);
   };
+
+  const samlAdmin = createSamlAdmin({
+    deps,
+    lockConfig,
+    authorize: (tx, principal) => i.authorizeInTx(tx, principal, "identity.sso.manage"),
+    fetchMetadata: async (url) => {
+      const response = await egress().fetchPinned(url, ENTRA_EGRESS_PURPOSE, {
+        method: "GET", headers: { Accept: "application/samlmetadata+xml, application/xml, text/xml" }, timeoutMs: 10_000, maxResponseBytes: 512 * 1024,
+      });
+      if (response.status !== 200) throw new Error("metadata fetch failed");
+      return response.body.toString("utf8");
+    },
+  });
 
   async function auditDenied(eventName: string, reasonCode: string, extra: Record<string, string> = {}) {
     try {
@@ -295,10 +426,20 @@ export function createSsoService(i: SsoInternals) {
     }
     if (input.jitStaffAppRole !== null && !/^[A-Za-z0-9._-]{1,120}$/.test(input.jitStaffAppRole)) throw bad("jitStaffAppRole", "App role values may contain letters, digits, dots, dashes and underscores.");
     if (!Number.isInteger(input.jitDailyLimit) || input.jitDailyLimit < 1 || input.jitDailyLimit > 500) throw bad("jitDailyLimit", "The daily limit must be between 1 and 500.");
+    if (!SSO_PROTOCOLS.includes(input.protocol)) throw bad("protocol", "Choose OpenID Connect or SAML 2.0.");
+    if (input.samlEntityId !== null && !isValidEntityId(input.samlEntityId.trim())) {
+      throw bad("samlEntityId", "The Identifier must be an https URL, a urn: value or an api:// value (8–255 characters).");
+    }
+    if (!ENTRA_MFA_MODES.includes(input.entraMfaMode)) throw bad("entraMfaMode", "Choose how multi-factor authentication is handled.");
+    if (input.acceptedAuthnContexts.length > 10 || !input.acceptedAuthnContexts.every((v) => /^(urn:|https?:\/\/)[\x21-\x7e]{3,250}$/.test(v.trim()))) {
+      throw bad("acceptedAuthnContexts", "Enter up to 10 authentication context URIs.");
+    }
+    if (input.allowedRoles.length === 0 || !input.allowedRoles.every((r) => USER_ROLES.includes(r))) throw bad("allowedRoles", "Choose at least one role that may use single sign-on.");
   }
 
   async function adminView(tx?: Tx): Promise<SsoAdminView> {
     const row = await loadConfig(tx);
+    const certificates = await samlAdmin.listCertificates(tx);
     const [linked] = await (tx ?? deps.db).select({ n: sql<number>`count(*)` }).from(ssoIdentities).where(eq(ssoIdentities.provider, "entra"));
     // Same transaction (never a second pool connection while locks are held). Advisory only: a failure hides the card.
     const breakGlass: SsoAdminView["breakGlass"] = await deps.services.assurance.breakGlassHealth(tx).catch(() => null);
@@ -309,16 +450,59 @@ export function createSsoService(i: SsoInternals) {
       clientSecret: { configured: !!row?.clientSecretEnc, last4: row?.clientSecretEnc ? row.clientSecretLast4 : null },
       buttonLabel: row?.buttonLabel ?? null,
       allowedDomains: domainsOf(row),
-      trustEntraMfa: row?.trustEntraMfa === true,
+      trustEntraMfa: mfaModeOf(row) !== "portal",
       jitMode: row?.jitMode ?? "off",
       jitStaffAppRole: row?.jitStaffAppRole ?? null,
       jitDailyLimit: row?.jitDailyLimit ?? 25,
       redirectUri: redirectUri(),
       version: row?.version ?? 1,
-      complete: isComplete(row),
+      complete: isComplete(row) && (row.protocol !== "saml" || certificates.some((c) => c.state === "trusted")),
       availableInThisDeployment: availableInDeployment(),
       linkedAccounts: Number(linked?.n ?? 0),
       breakGlass,
+      protocol: row?.protocol ?? "oidc",
+      entraMfaMode: mfaModeOf(row),
+      acceptedAuthnContexts: acceptedContextsOf(row),
+      allowedRoles: allowedRolesOf(row),
+      saml: {
+        ...sp(row),
+        entityIdIsDefault: !row?.samlEntityId,
+        idpIssuer: row?.tenantId && isTenantGuid(row.tenantId) ? samlEndpoints(row.tenantId).issuer : null,
+        requiredClaims: [...REQUIRED_SAML_CLAIMS],
+        metadataSourceUrl: row?.samlMetadataUrl ?? null,
+        metadataRefreshedAt: row?.samlMetadataRefreshedAt ?? null,
+        metadataStatus: row?.samlMetadataStatus ?? null,
+        certificates,
+      },
+      roleMappings: await samlAdmin.roleMappings(tx),
+    };
+  }
+
+  /**
+   * Read-only, unprivileged status summary for other modules' status cards / health (integrations hub).
+   * Never contains secrets, tenant/client ids, certificate material or user identifiers. Not on tRPC/HTTP.
+   */
+  async function statusSummary(tx?: Tx): Promise<SsoStatusSummary> {
+    const row = await loadConfig(tx);
+    const certificates = await samlAdmin.listCertificates(tx);
+    const trusted = certificates.filter((c) => c.state === "trusted");
+    const nearest = trusted.reduce<Date | null>((min, c) => (min === null || c.notAfter < min ? c.notAfter : min), null);
+    const [last] = await (tx ?? deps.db).select({ at: sql<Date | null>`max(${ssoIdentities.lastSignInAt})` }).from(ssoIdentities).where(eq(ssoIdentities.provider, "entra"));
+    const lastAt = last?.at ? new Date(last.at) : null;
+    const protocol = row?.protocol ?? "oidc";
+    return {
+      configured: (row?.tenantId ?? null) !== null,
+      enabled: row?.enabled === true,
+      complete: isComplete(row) && (protocol !== "saml" || trusted.length > 0),
+      availableInThisDeployment: availableInDeployment(),
+      protocol,
+      entraMfaMode: mfaModeOf(row),
+      trustedCertificates: trusted.length,
+      nearestCertificateExpiry: protocol === "saml" ? nearest : null,
+      metadataStatus: row?.samlMetadataStatus ?? null,
+      metadataCheckedAt: row?.samlMetadataRefreshedAt ?? null,
+      lastSignInAt: lastAt && !Number.isNaN(lastAt.getTime()) ? lastAt : null,
+      settingsPath: "/admin/sso",
     };
   }
 
@@ -397,7 +581,21 @@ export function createSsoService(i: SsoInternals) {
 
   /* ------------------------------------------------------------------ request lifecycle */
 
-  async function newAuthorization(row: SsoConfigurationRow & { tenantId: string; clientId: string }, purpose: SsoPurpose, publicId: string) {
+  /** Protocol dispatch: SAML requests are found later by their (signed) InResponseTo, stored as stateHash. */
+  async function newAuthorization(row: SsoConfigurationRow & { tenantId: string }, purpose: SsoPurpose, publicId: string) {
+    const forceAuthn = purpose === "step_up" || purpose === "link";
+    if (row.protocol === "saml") {
+      const certificates = await samlAdmin.trustedPems();
+      if (certificates.length === 0) throw refusal("SSO_UNAVAILABLE", "NO_TRUSTED_CERTIFICATE");
+      const requestId = `_${randomToken(32)}`;
+      const url = await buildAuthnRequestUrl({ tenantId: row.tenantId, sp: sp(row), certificates, requestId, forceAuthn });
+      return { url, columns: { stateHash: hash(requestId), nonceHash: null, verifierEnc: null, protocol: "saml" as const, forceAuthn } };
+    }
+    if (!isOidcComplete(row)) throw refusal("SSO_UNAVAILABLE", "CONFIG_INCOMPLETE");
+    return oidcAuthorization(row, purpose, publicId);
+  }
+
+  function oidcAuthorization(row: SsoConfigurationRow & { tenantId: string; clientId: string }, purpose: SsoPurpose, publicId: string) {
     const state = randomToken(32);
     const nonce = randomToken(32);
     const verifier = randomToken(48); // 64 base64url chars (RFC 7636: 43–128)
@@ -405,44 +603,91 @@ export function createSsoService(i: SsoInternals) {
       tenantId: row.tenantId, clientId: row.clientId, redirectUri: redirectUri(), state, nonce, verifier,
       forceReauthentication: purpose === "step_up" || purpose === "link",
     });
-    return { url, columns: { stateHash: hash(state), nonceHash: hash(nonce), verifierEnc: deps.crypto.encrypt(verifier, verifierAad(publicId)) } };
+    return {
+      url,
+      columns: {
+        stateHash: hash(state), nonceHash: hash(nonce), verifierEnc: deps.crypto.encrypt(verifier, verifierAad(publicId)),
+        protocol: "oidc" as const, forceAuthn: purpose === "step_up" || purpose === "link",
+      },
+    };
   }
 
   const service = {
     redirectUri,
     adminView,
+    statusSummary,
 
-    async publicConfig(): Promise<{ enabled: boolean; buttonLabel: string; providerName: string }> {
+    async publicConfig(): Promise<{ enabled: boolean; buttonLabel: string; providerName: string; protocol: SsoProtocol; startPath: string; customersAllowed: boolean }> {
       const row = await loadConfig();
-      return { enabled: usable(row, "sign_in"), buttonLabel: row?.buttonLabel ?? "Sign in with SSO", providerName: "Microsoft Entra ID" };
+      const protocol = row?.protocol ?? "oidc";
+      return {
+        enabled: usable(row, "sign_in"), buttonLabel: row?.buttonLabel ?? "Sign in with SSO", providerName: "Microsoft Entra ID",
+        protocol, startPath: protocol === "saml" ? SAML_START_PATH : SSO_START_PATH, customersAllowed: allowedRolesOf(row).includes("customer"),
+      };
     },
+
+    /** Public SP metadata (only while SAML is the selected protocol). */
+    async samlMetadata(): Promise<string | null> {
+      const row = await loadConfig();
+      return row?.protocol === "saml" ? serviceProviderMetadata(sp(row)) : null;
+    },
+
+    saml: samlAdmin,
 
     async updateConfig(principal: SessionPrincipal, input: SsoConfigInput): Promise<SsoAdminView> {
       validateConfigInput(input);
       return deps.db.transaction(async (tx) => {
-        // Lock order: sso_configuration → users (see complete()).
+        // Lock order: [policy] → sso_configuration → users (see complete()). The policy lock is taken only when
+        // the break-glass rule must be re-checked (selecting `entra`).
+        const peek = await loadConfig(tx);
+        const choosingEntra = input.entraMfaMode === "entra" && mfaModeOf(peek) !== "entra";
+        if (choosingEntra) await deps.services.assurance.lockLocalAdministratorPolicy(tx);
         const row = await lockConfig(tx);
         await i.authorizeInTx(tx, principal, "identity.sso.manage");
         if (row.version !== input.expectedVersion) {
           throw conflict("STALE_VERSION", "Single sign-on settings were changed by someone else. Reload and try again.");
         }
+        const oldMode = mfaModeOf(row);
+        if (input.entraMfaMode === "entra" && oldMode !== "entra") {
+          if (input.entraModeConfirmation !== ENTRA_MODE_CONFIRMATION) {
+            throw validation("SSO_ENTRA_MODE_CONFIRMATION", `Type ${ENTRA_MODE_CONFIRMATION} to confirm that Microsoft Entra ID enforces multi-factor authentication.`, { field: "entraModeConfirmation" });
+          }
+          // Break-glass: local sign-in keeps MFA; at least one local administrator with MFA must remain.
+          await deps.services.assurance.assertLocalAdministratorRemains(tx);
+        }
         const tenantId = input.tenantId?.trim().toLowerCase() ?? null;
         const clientId = input.clientId?.trim().toLowerCase() ?? null;
         const secretChanged = input.clientSecret !== undefined;
         const bindingChanged = tenantId !== row.tenantId || clientId !== row.clientId || secretChanged;
-        const disablesTrust = row.trustEntraMfa && !input.trustEntraMfa;
+        const protocolChanged = input.protocol !== row.protocol;
+        const entityId = input.samlEntityId?.trim() || null;
+        const entityChanged = entityId !== row.samlEntityId;
+        const stricterMfa = MFA_MODE_RANK[input.entraMfaMode] > MFA_MODE_RANK[oldMode];
+        const oldRoles = allowedRolesOf(row);
+        const newRoles = USER_ROLES.filter((r) => input.allowedRoles.includes(r));
+        const removedRoles = oldRoles.filter((r) => !newRoles.includes(r));
+        const oldContexts = acceptedContextsOf(row);
+        const contexts = [...new Set(input.acceptedAuthnContexts.map((v) => v.trim()))];
+        const contextsNarrowed = oldContexts.some((v) => !contexts.includes(v));
         const patch: Partial<SsoConfigurationRow> = {
           tenantId,
           clientId,
           buttonLabel: input.buttonLabel?.trim() || null,
           allowedDomains: JSON.stringify([...new Set(input.allowedDomains.map((d) => d.trim().toLowerCase()))]),
-          trustEntraMfa: input.trustEntraMfa,
+          // Deprecated column, still written so a rolled-back release reads a matching value.
+          trustEntraMfa: input.entraMfaMode !== "portal",
+          entraMfaMode: input.entraMfaMode,
+          acceptedAuthnContexts: JSON.stringify(contexts),
+          allowedRoles: JSON.stringify(newRoles),
+          protocol: input.protocol,
+          samlEntityId: entityId,
           jitMode: input.jitMode,
           jitStaffAppRole: input.jitStaffAppRole,
           jitDailyLimit: input.jitDailyLimit,
           updatedByUserId: principal.userId,
           version: row.version + 1,
-          ...(bindingChanged ? { epoch: row.epoch + 1 } : {}),
+          // In-flight attempts die with any binding, protocol or Identifier change; links do not.
+          ...(bindingChanged || protocolChanged || entityChanged ? { epoch: row.epoch + 1 } : {}),
           ...(secretChanged
             ? input.clientSecret === null
               ? { clientSecretEnc: null, clientSecretLast4: null }
@@ -452,29 +697,49 @@ export function createSsoService(i: SsoInternals) {
         // A configuration without the essentials cannot stay enabled.
         const next = { ...row, ...patch } as SsoConfigurationRow;
         if (row.enabled && !isComplete(next)) patch.enabled = false;
+        if (row.enabled && next.protocol === "saml" && (await samlAdmin.trustedPems(tx)).length === 0) patch.enabled = false;
         await tx.update(ssoConfiguration).set(patch).where(eq(ssoConfiguration.id, CONFIG_ID));
         let revoked = 0;
-        // Pending grants die with the binding (epoch); Entra-trusted MFA sessions die when trust is withdrawn
-        // or the tenant / application changes.
-        if (bindingChanged || disablesTrust) {
+        // Entra sessions end when the tenant / application changes, or when the MFA rule becomes stricter
+        // (sessions may rest on an Entra MFA the new rule no longer accepts). A protocol switch keeps them.
+        if (bindingChanged || stricterMfa || (contextsNarrowed && input.entraMfaMode === "claim")) {
           const [result] = (await tx
             .update(userSessions)
             .set({ revokedAt: now(), revokeReason: "sso_config_changed" })
             .where(and(eq(userSessions.authMethod, "entra"), isNull(userSessions.revokedAt)))) as unknown as [{ affectedRows?: number }];
           revoked = result?.affectedRows ?? 0;
+        } else if (removedRoles.length > 0) {
+          const affected = await tx.select({ id: users.id }).from(users).where(inArray(users.role, removedRoles));
+          if (affected.length > 0) {
+            const [result] = (await tx
+              .update(userSessions)
+              .set({ revokedAt: now(), revokeReason: "sso_config_changed" })
+              .where(and(eq(userSessions.authMethod, "entra"), isNull(userSessions.revokedAt), inArray(userSessions.userId, affected.map((u) => u.id))))) as unknown as [{ affectedRows?: number }];
+            revoked = result?.affectedRows ?? 0;
+          }
         }
         await deps.audit.record(
           {
             category: "admin", eventName: "identity.sso.config_updated", action: "update", outcome: "completed",
             resource: { type: "sso_configuration" }, provider: "entra",
-            safeCounts: { allowed_domains: input.allowedDomains.length, entra_sessions_revoked: revoked },
+            safeCounts: { allowed_domains: input.allowedDomains.length, entra_sessions_revoked: revoked, accepted_contexts: contexts.length },
             attributes: {
-              binding_changed: bindingChanged, secret_changed: secretChanged, trust_entra_mfa: input.trustEntraMfa,
-              jit_mode: input.jitMode, auto_disabled: patch.enabled === false,
+              binding_changed: bindingChanged, secret_changed: secretChanged, protocol: input.protocol, protocol_changed: protocolChanged,
+              mfa_mode: input.entraMfaMode, allowed_roles: newRoles.join(","), jit_mode: input.jitMode, auto_disabled: patch.enabled === false,
             },
           },
           tx,
         );
+        if (input.entraMfaMode !== oldMode) {
+          await deps.audit.record(
+            {
+              category: "admin", eventName: "identity.sso.mfa_mode_changed", action: "update", outcome: "completed",
+              severity: input.entraMfaMode === "entra" ? "WARN" : "INFO", reasonCode: input.entraMfaMode === "entra" ? "PORTAL_MFA_DELEGATED_TO_ENTRA" : undefined,
+              resource: { type: "sso_configuration" }, provider: "entra", attributes: { from: oldMode, to: input.entraMfaMode },
+            },
+            tx,
+          );
+        }
         return adminView(tx);
       });
     },
@@ -489,7 +754,14 @@ export function createSsoService(i: SsoInternals) {
         if (row.enabled === enabled) return adminView(tx);
         if (enabled) {
           if (!availableInDeployment()) throw new DomainError("FORBIDDEN", "SSO_NOT_AVAILABLE_IN_PREVIEW", "Single sign-on cannot be enabled in the preview deployment.");
-          if (!isComplete(row)) throw validation("SSO_CONFIG_INCOMPLETE", "Enter the tenant ID, client ID and client secret before enabling single sign-on.");
+          if (!isComplete(row)) {
+            throw validation("SSO_CONFIG_INCOMPLETE", row.protocol === "saml"
+              ? "Enter the tenant ID before enabling single sign-on."
+              : "Enter the tenant ID, client ID and client secret before enabling single sign-on.");
+          }
+          if (row.protocol === "saml" && (await samlAdmin.trustedPems(tx)).length === 0) {
+            throw validation("SSO_SAML_CERTIFICATE_REQUIRED", "Import the Entra federation metadata or add the signing certificate before enabling single sign-on.");
+          }
           await deps.services.assurance.assertLocalAdministratorRemains(tx);
         }
         await tx.update(ssoConfiguration).set({ enabled, version: row.version + 1, updatedByUserId: principal.userId, ...(enabled ? {} : { epoch: row.epoch + 1 }) }).where(eq(ssoConfiguration.id, CONFIG_ID));
@@ -506,7 +778,7 @@ export function createSsoService(i: SsoInternals) {
       const row = await loadConfig();
       if (!usable(row, "sign_in")) throw refusal("SSO_UNAVAILABLE");
       const publicId = ulid(now().getTime());
-      const authz = await newAuthorization(row as SsoConfigurationRow & { tenantId: string; clientId: string }, "sign_in", publicId);
+      const authz = await newAuthorization(row, "sign_in", publicId);
       const t = now();
       await deps.db.insert(ssoAuthRequests).values({
         publicId, purpose: "sign_in", status: "pending", ...authz.columns, browserHash: hash(input.browser),
@@ -548,7 +820,7 @@ export function createSsoService(i: SsoInternals) {
       const row = await loadConfig();
       if (!usable(row, req.purpose) || row!.epoch !== req.configEpoch) throw refusal("SSO_EXPIRED");
       // Request time for auth_time freshness is the moment the browser leaves for Entra.
-      const authz = await newAuthorization(row as SsoConfigurationRow & { tenantId: string; clientId: string }, req.purpose, req.publicId);
+      const authz = await newAuthorization(row, req.purpose, req.publicId);
       const [result] = (await deps.db
         .update(ssoAuthRequests)
         .set({ status: "pending", ...authz.columns, ticketHash: null, browserHash: hash(input.browser), requestedAt: t, expiresAt: new Date(t.getTime() + PENDING_TTL_MS) })
@@ -577,7 +849,7 @@ export function createSsoService(i: SsoInternals) {
         .set({ status: "refused", refusalCode: "IN_PROGRESS", callbackAt: t })
         .where(and(
           eq(ssoAuthRequests.stateHash, stateHash), eq(ssoAuthRequests.status, "pending"), eq(ssoAuthRequests.browserHash, hash(input.browser)),
-          gt(ssoAuthRequests.expiresAt, t),
+          eq(ssoAuthRequests.protocol, "oidc"), gt(ssoAuthRequests.expiresAt, t),
         ))) as unknown as [{ affectedRows?: number }];
       if ((claim?.affectedRows ?? 0) !== 1) {
         await auditDenied("identity.sso.callback_refused", "STATE_INVALID_OR_REPLAYED");
@@ -622,6 +894,74 @@ export function createSsoService(i: SsoInternals) {
     },
 
     /**
+     * SAML Assertion Consumer Service (Entra's cross-site form POST; no session or cookie is read — the browser
+     * binder is checked later in complete(), on the same-site POST). The signed InResponseTo selects the
+     * pending request atomically (single use); the assertion ID is stored under a unique key (replay defence).
+     * Returns a same-origin SPA path carrying only the opaque attempt handle.
+     */
+    async acs(input: { samlResponse: unknown }): Promise<string> {
+      const refused = (code: SsoRefusal) => `/sso/refused?reason=${code}`;
+      const row = await loadConfig();
+      if (!row || row.protocol !== "saml" || !availableInDeployment() || !isComplete(row)) {
+        await auditDenied("identity.sso.callback_refused", "SAML_NOT_CONFIGURED", { protocol: "saml" });
+        return refused("SSO_UNAVAILABLE");
+      }
+      let assertion;
+      try {
+        assertion = await verifySamlResponse(input.samlResponse, {
+          tenantId: row.tenantId, sp: sp(row), certificates: await samlAdmin.trustedPems(), nowMs: now().getTime(),
+        });
+      } catch (error) {
+        const reason = error instanceof SamlValidationError ? error.reasonCode : "VALIDATION_ERROR";
+        await auditDenied("identity.sso.callback_refused", reason, { protocol: "saml" });
+        return refused(reason === "IDP_STATUS_NOT_SUCCESS" ? "SSO_CANCELLED" : "SSO_FAILED");
+      }
+      const t = now();
+      const stateHash = hash(assertion.inResponseTo);
+      const [claim] = (await deps.db
+        .update(ssoAuthRequests)
+        .set({ status: "refused", refusalCode: "IN_PROGRESS", callbackAt: t })
+        .where(and(
+          eq(ssoAuthRequests.stateHash, stateHash), eq(ssoAuthRequests.status, "pending"), eq(ssoAuthRequests.protocol, "saml"),
+          gt(ssoAuthRequests.expiresAt, t),
+        ))) as unknown as [{ affectedRows?: number }];
+      if ((claim?.affectedRows ?? 0) !== 1) {
+        await auditDenied("identity.sso.callback_refused", "IN_RESPONSE_TO_INVALID_OR_REPLAYED", { protocol: "saml" });
+        return refused("SSO_EXPIRED");
+      }
+      const [req] = await deps.db.select().from(ssoAuthRequests).where(eq(ssoAuthRequests.stateHash, stateHash)).limit(1);
+      if (!req) return refused("SSO_EXPIRED");
+      const fail = async (publicCode: SsoRefusal, detail: string) => {
+        await deps.db.update(ssoAuthRequests).set({ refusalCode: detail.slice(0, 40), stateHash: null }).where(eq(ssoAuthRequests.id, req.id));
+        await auditDenied("identity.sso.callback_refused", detail, { purpose: req.purpose, protocol: "saml" });
+        return refused(publicCode);
+      };
+      if (!usable(row, req.purpose)) return fail("SSO_UNAVAILABLE", "SSO_DISABLED");
+      if (row.epoch !== req.configEpoch) return fail("SSO_EXPIRED", "CONFIG_CHANGED");
+      // ForceAuthn (link / step-up): the Entra authentication must be fresh for THIS request.
+      if (req.forceAuthn && assertion.authnInstantMs < req.requestedAt.getTime() - SAML_CLOCK_SKEW_MS) return fail("SSO_FAILED", "AUTHN_NOT_FRESH");
+      const facts = samlMfaFacts(assertion, acceptedContextsOf(row));
+      const stored: StoredResult = {
+        tid: assertion.tenantId, oid: assertion.objectId, amr: null, authTime: Math.floor(assertion.authnInstantMs / 1000),
+        email: assertion.email, name: assertion.name, roles: assertion.roles,
+        saml: { multipleAuthn: facts.multipleAuthn, authnContext: assertion.authnContextClassRef, claimNames: assertion.attributeNames },
+      };
+      try {
+        await deps.db
+          .update(ssoAuthRequests)
+          .set({
+            status: "verified", refusalCode: null, stateHash: null, assertionIdHash: hash(`${row.tenantId}:${assertion.assertionId}`),
+            resultEnc: deps.crypto.encrypt(JSON.stringify(stored), resultAad(req.publicId)), expiresAt: new Date(now().getTime() + VERIFIED_TTL_MS),
+          })
+          .where(and(eq(ssoAuthRequests.id, req.id), eq(ssoAuthRequests.status, "refused"), eq(ssoAuthRequests.refusalCode, "IN_PROGRESS")));
+      } catch (error) {
+        if (isDuplicateKey(error)) return fail("SSO_EXPIRED", "ASSERTION_REPLAYED");
+        throw error;
+      }
+      return `/sso/complete?attempt=${req.publicId}`;
+    },
+
+    /**
      * Step 2 (POST, CSRF-protected, same-site ⇒ Strict session cookie present). Requires the same browser
      * binder and the opaque attempt handle; the attempt is burned (single use) before any other check. Link /
      * step-up / test also require the LIVE session to be exactly the initiating session and actor; only then
@@ -644,7 +984,14 @@ export function createSsoService(i: SsoInternals) {
       try {
         if ((claimed?.affectedRows ?? 0) !== 1) throw refusal("SSO_EXPIRED", "ATTEMPT_REPLAYED_OR_EXPIRED");
         let result: StoredResult;
-        if (req.purpose === "sign_in") {
+        if (req.protocol === "saml") {
+          if (req.purpose !== "sign_in") {
+            const principal = requireSameSession(req, input.session);
+            if (principal.state !== "full") throw refusal("SSO_SESSION_CHANGED", "SESSION_NOT_FULL");
+          }
+          if (!req.resultEnc) throw refusal("SSO_EXPIRED", "RESULT_MISSING");
+          result = JSON.parse(deps.crypto.decrypt(req.resultEnc, resultAad(req.publicId))) as StoredResult;
+        } else if (req.purpose === "sign_in") {
           if (!req.resultEnc) throw refusal("SSO_EXPIRED", "RESULT_MISSING");
           result = JSON.parse(deps.crypto.decrypt(req.resultEnc, resultAad(req.publicId))) as StoredResult;
         } else {
@@ -666,7 +1013,9 @@ export function createSsoService(i: SsoInternals) {
           // changes, so a policy change either fully precedes (refusal) or fully follows (its revocation
           // sees the new session) — I-A02.
           const config = await lockConfig(tx);
-          if (!usable(config, req.purpose) || config.epoch !== req.configEpoch || config.tenantId !== result.tid) throw refusal("SSO_EXPIRED", "CONFIG_CHANGED");
+          if (!usable(config, req.purpose) || config.epoch !== req.configEpoch || config.tenantId !== result.tid || config.protocol !== req.protocol) {
+            throw refusal("SSO_EXPIRED", "CONFIG_CHANGED");
+          }
           switch (req.purpose) {
             case "sign_in":
               return await completeSignIn(tx, req, result, config, input.userAgent);
@@ -683,7 +1032,7 @@ export function createSsoService(i: SsoInternals) {
           await deps.db.update(ssoAuthRequests).set({ status: "refused", refusalCode: error.reasonCode.slice(0, 40), resultEnc: null, codeEnc: null, completedAt: t }).where(eq(ssoAuthRequests.id, req.id));
           const detail = typeof error.details?.detail === "string" ? error.details.detail : error.reasonCode;
           if (req.purpose === "sign_in") {
-            const refusedKinds = ["SSO_MAINTENANCE", "SSO_RESTRICTED", "SSO_DOMAIN_NOT_ALLOWED", "SSO_ACCOUNT_INACTIVE", "SSO_PROVISIONING_LIMIT", "SSO_ROLE_NOT_ASSIGNED"];
+            const refusedKinds = ["SSO_MAINTENANCE", "SSO_RESTRICTED", "SSO_DOMAIN_NOT_ALLOWED", "SSO_ACCOUNT_INACTIVE", "SSO_PROVISIONING_LIMIT", "SSO_ROLE_NOT_ASSIGNED", "SSO_ROLE_NOT_ALLOWED"];
             await i.signInLog.note({ kind: refusedKinds.includes(error.reasonCode) ? "refused" : "failure", reasonCode: detail, authMethod: "entra" });
             try {
               await deps.audit.record({
@@ -708,7 +1057,7 @@ export function createSsoService(i: SsoInternals) {
       const user = await repo.byId(principal.userId);
       const config = await loadConfig();
       return {
-        available: usable(config, "link"),
+        available: usable(config, "link") && allowedRolesOf(config).includes(principal.role),
         linked: !!link?.verifiedAt,
         pendingAdministratorBinding: !!link && !link.verifiedAt,
         linkedAt: link?.linkedAt ?? null,
@@ -833,7 +1182,7 @@ export function createSsoService(i: SsoInternals) {
   }
 
   async function exchangeAndVerify(row: SsoConfigurationRow, req: SsoAuthRequestRow, code: string): Promise<VerifiedEntraClaims> {
-    if (!isComplete(row) || !req.verifierEnc || !req.nonceHash) throw new OidcValidationError("REQUEST_INCOMPLETE");
+    if (!isOidcComplete(row) || req.protocol !== "oidc" || !req.verifierEnc || !req.nonceHash) throw new OidcValidationError("REQUEST_INCOMPLETE");
     const verifier = deps.crypto.decrypt(req.verifierEnc, verifierAad(req.publicId));
     const idToken = await postToken(row, code, verifier);
     const key = await keyFor(row.tenantId, peekKeyId(idToken));
@@ -879,6 +1228,8 @@ export function createSsoService(i: SsoInternals) {
     if (!user || !lockedLink || lockedLink.userId !== user.id) throw refusal("SSO_NOT_LINKED", "LINK_CHANGED");
     link = lockedLink;
     if (user.status !== "active") throw refusal("SSO_ACCOUNT_INACTIVE", `ACCOUNT_${user.status.toUpperCase()}`.slice(0, 40));
+    // Increment 07: only the roles the administrator allows may use SSO (also rolls back a just-provisioned user).
+    if (!allowedRolesOf(config).includes(user.role)) throw refusal("SSO_ROLE_NOT_ALLOWED", "ROLE_NOT_ALLOWED");
     // Host recovery / forced change: Entra cannot skip the local remediation.
     if (user.mustChangePassword) throw refusal("SSO_LOCAL_SIGN_IN_REQUIRED", "LOCAL_REMEDIATION_PENDING");
     // Increment 04: customer maintenance (package E) — authoritative, after the users row lock. Also rolls
@@ -900,7 +1251,8 @@ export function createSsoService(i: SsoInternals) {
       );
     }
     await tx.update(ssoIdentities).set({ lastSignInAt: t }).where(eq(ssoIdentities.id, link.id));
-    const { mfaVerified } = deps.services.assurance.assessEntraSignIn(result.amr ?? undefined, config.trustEntraMfa);
+    const mfaVerified = entraMfaSatisfied(config, result);
+    const mfaBasis = mfaVerified ? (mfaModeOf(config) === "entra" ? "entra_mode" : result.saml ? "saml_claim" : "amr") : "none";
     const created = await sessions.create(tx, user, { authMethod: "entra", userAgent, mfaVerifiedAt: mfaVerified ? t : null }).catch((error: unknown) => {
       if (error instanceof DomainError && error.reasonCode === "SESSION_RESTRICTED") {
         throw refusal("SSO_RESTRICTED", String(error.details?.restriction ?? "SESSION_RESTRICTED"));
@@ -912,11 +1264,30 @@ export function createSsoService(i: SsoInternals) {
       {
         category: "security", eventName: "auth.login.succeeded", action: "login", outcome: "completed",
         actor: { userId: user.id, role: user.role }, resource: { type: "session", publicId: created.sessionId }, provider: "entra",
-        attributes: { next_step: steps[0] ?? "none", auth_method: "entra", entra_mfa_trusted: mfaVerified, provisioned },
+        attributes: {
+          next_step: steps[0] ?? "none", auth_method: "entra", entra_mfa_trusted: mfaVerified, provisioned,
+          protocol: result.saml ? "saml" : "oidc", mfa_mode: mfaModeOf(config), mfa_basis: mfaBasis,
+        },
       },
       tx,
     );
     return { purpose: "sign_in", next: req.nextPath, nextStep: steps[0] ?? null, issued: created.issued, provisioned };
+  }
+
+  /**
+   * The role a JIT account would get. Never admin. jitMode staff: a staff mapping (or the legacy single app role)
+   * ⇒ staff, else a customer mapping ⇒ customer. jitMode customers: customer (when customer mappings exist, one
+   * of them must match).
+   */
+  function jitRoleFor(config: SsoConfigurationRow, roles: readonly string[], mappings: Array<{ appRoleValue: string; role: SsoMappedRole }>): SsoMappedRole | null {
+    const has = (r: SsoMappedRole) => mappings.some((m) => m.role === r && roles.includes(m.appRoleValue));
+    const customerMappings = mappings.some((m) => m.role === "customer");
+    if (config.jitMode === "staff") {
+      if (has("staff") || (!!config.jitStaffAppRole && roles.includes(config.jitStaffAppRole))) return "staff";
+      return has("customer") ? "customer" : null;
+    }
+    if (config.jitMode === "customers") return !customerMappings || has("customer") ? "customer" : null;
+    return null;
   }
 
   /** Runs under the configuration lock taken by complete() (serializes the bounded daily count). */
@@ -925,13 +1296,9 @@ export function createSsoService(i: SsoInternals) {
     // No privilege from an e-mail address, and no silent linking to an existing account.
     if (!result.email) throw refusal("SSO_NOT_LINKED", "JIT_EMAIL_MISSING");
     if (await repo.byEmail(result.email, { tx })) throw refusal("SSO_ACCOUNT_EXISTS", "EMAIL_COLLISION_WITHOUT_LINK");
-    let role: "customer" | "staff";
-    if (config.jitMode === "staff") {
-      if (!config.jitStaffAppRole || !result.roles.includes(config.jitStaffAppRole)) throw refusal("SSO_ROLE_NOT_ASSIGNED", "JIT_APP_ROLE_MISSING");
-      role = "staff";
-    } else {
-      role = "customer";
-    }
+    const role = jitRoleFor(config, result.roles, await samlAdmin.roleMappings(tx));
+    if (!role) throw refusal("SSO_ROLE_NOT_ASSIGNED", "JIT_APP_ROLE_MISSING");
+    if (!allowedRolesOf(config).includes(role)) throw refusal("SSO_ROLE_NOT_ALLOWED", "JIT_ROLE_NOT_ALLOWED");
     const since = new Date(now().getTime() - 24 * 60 * 60_000);
     const [count] = await tx.select({ n: sql<number>`count(*)` }).from(ssoIdentities).where(and(eq(ssoIdentities.linkMethod, "jit"), gt(ssoIdentities.createdAt, since)));
     if (Number(count?.n ?? 0) >= config.jitDailyLimit) throw refusal("SSO_PROVISIONING_LIMIT", "JIT_DAILY_LIMIT");
@@ -960,6 +1327,7 @@ export function createSsoService(i: SsoInternals) {
     const age = current.stepUpAt ? now().getTime() - current.stepUpAt.getTime() : -1;
     if (!(age >= 0 && age <= STEP_UP_MAX_AGE_MS)) throw new DomainError("STEP_UP_REQUIRED", "STEP_UP_REQUIRED", "Please confirm your identity again, then link your Microsoft account.");
     if (!domainAllowed(config, result.email)) throw refusal("SSO_DOMAIN_NOT_ALLOWED", "DOMAIN_NOT_ALLOWED");
+    if (!allowedRolesOf(config).includes(user.role)) throw refusal("SSO_ROLE_NOT_ALLOWED", "ROLE_NOT_ALLOWED");
     const existing = await findIdentity(tx, result.tid, result.oid, true);
     if (existing && existing.userId !== user.id) throw refusal("SSO_IDENTITY_IN_USE", "IDENTITY_LINKED_ELSEWHERE");
     const [own] = await tx.select().from(ssoIdentities).where(and(eq(ssoIdentities.userId, user.id), eq(ssoIdentities.provider, "entra"))).limit(1).for("update");
@@ -978,12 +1346,16 @@ export function createSsoService(i: SsoInternals) {
     const principal = requireSameSession(req, session);
     const link = await findIdentity(tx, result.tid, result.oid);
     if (!link || link.userId !== principal.userId || !link.verifiedAt) throw refusal("SSO_WRONG_ACCOUNT", "STEP_UP_IDENTITY_MISMATCH");
-    if (result.authTime === null || !deps.services.assurance.assessEntraSignIn(result.amr ?? undefined, config.trustEntraMfa).mfaVerified) {
+    if (result.authTime === null || !entraMfaSatisfied(config, result)) {
       throw refusal("SSO_MFA_REQUIRED", result.authTime === null ? "AUTH_TIME_MISSING" : "MFA_NOT_ASSERTED");
     }
+    // The per-mode verdict is made here; assurance receives it as a proven "mfa" (it enforces no pre-request
+    // skew, so the SAML instant — already checked against requestedAt − 2 min in acs() — is clamped).
+    const requestedSec = Math.floor(req.requestedAt.getTime() / 1000);
+    const authTime = result.saml ? Math.min(Math.max(result.authTime, requestedSec), Math.floor(now().getTime() / 1000)) : result.authTime;
     let issued: IssuedSession;
     try {
-      issued = await deps.services.assurance.completeEntraStepUp(principal, { amr: result.amr ?? undefined, trustEntraMfa: config.trustEntraMfa, authTime: result.authTime, requestedAt: req.requestedAt }, tx);
+      issued = await deps.services.assurance.completeEntraStepUp(principal, { amr: ["mfa"], trustEntraMfa: true, authTime, requestedAt: req.requestedAt }, tx);
     } catch (error) {
       if (error instanceof DomainError) {
         if (error.reasonCode === "AUTHENTICATION_PROOF_INVALID") throw refusal("SSO_MFA_REQUIRED", "STEP_UP_PROOF_REJECTED");
@@ -998,9 +1370,13 @@ export function createSsoService(i: SsoInternals) {
     const principal = requireSameSession(req, session);
     await i.authorizeInTx(tx, principal, "identity.sso.manage");
     const link = await findIdentity(tx, result.tid, result.oid);
+    const linkedUser = link ? await repo.byId(link.userId, { tx }) : null;
+    const jitRole = jitRoleFor(config, result.roles, await samlAdmin.roleMappings(tx));
+    const proven = mfaProven(config, result);
+    const mode = mfaModeOf(config);
     const test: SsoTestResult = {
       signatureVerified: true, tenantMatches: true, audienceMatches: true,
-      mfaClaimPresent: result.amr?.includes("mfa") === true,
+      mfaClaimPresent: proven,
       authTimePresent: result.authTime !== null,
       emailDomain: emailDomain(result.email),
       domainAllowed: domainAllowed(config, result.email),
@@ -1008,11 +1384,20 @@ export function createSsoService(i: SsoInternals) {
       staffRoleAssigned: !!config.jitStaffAppRole && result.roles.includes(config.jitStaffAppRole),
       linkedToYou: link?.userId === principal.userId,
       linkedToAnotherAccount: !!link && link.userId !== principal.userId,
+      protocol: result.saml ? "saml" : "oidc",
+      claimNames: result.saml ? result.saml.claimNames.slice(0, 40) : [],
+      mfaProven: proven,
+      mfaSkippedByMode: mode === "entra" ? true : mode === "claim" ? proven : false,
+      roleAllowed: linkedUser ? allowedRolesOf(config).includes(linkedUser.role) : jitRole !== null && allowedRolesOf(config).includes(jitRole),
+      jitRole: link ? null : jitRole,
     };
     await deps.audit.record(
       {
         category: "admin", eventName: "identity.sso.tested", action: "test", outcome: "completed", resource: { type: "sso_configuration" }, provider: "entra",
-        attributes: { mfa_claim_present: test.mfaClaimPresent, domain_allowed: test.domainAllowed, linked_to_you: test.linkedToYou },
+        attributes: {
+          mfa_claim_present: test.mfaClaimPresent, domain_allowed: test.domainAllowed, linked_to_you: test.linkedToYou,
+          protocol: test.protocol, mfa_mode: mode, role_allowed: test.roleAllowed,
+        },
       },
       tx,
     );
@@ -1024,3 +1409,8 @@ export function createSsoService(i: SsoInternals) {
 }
 
 export type SsoService = ReturnType<typeof createSsoService>;
+
+function isDuplicateKey(error: unknown): boolean {
+  const code = (e: unknown) => (typeof e === "object" && e !== null && "code" in e ? (e as { code?: unknown }).code : undefined);
+  return code(error) === "ER_DUP_ENTRY" || (typeof error === "object" && error !== null && "cause" in error && code((error as { cause?: unknown }).cause) === "ER_DUP_ENTRY");
+}

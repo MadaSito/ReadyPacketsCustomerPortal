@@ -3,7 +3,7 @@
  * Owner: Package J server (`server/modules/automations/**`).
  */
 import { createHash } from "node:crypto";
-import { and, asc, count, desc, eq, gte, inArray, isNotNull, lt, lte } from "drizzle-orm";
+import { and, asc, count, desc, eq, gt, gte, inArray, isNotNull, lt, lte, or, sql } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, conflict, notFound, validation } from "../../core/errors.js";
@@ -85,20 +85,44 @@ import {
   type AutomationTriggerRegistration,
   type AutomationVersionView,
   type AutomationsModule,
+  type CompletionJobState,
+  type OrderCompletionJobView,
   type OrderStageActionsRunResult,
   type OrderStageActionsView,
   type OrderStageBoundAutomationView,
+  type OrderStageBundlePreviewView,
   type OrderStageRunActorView,
+  type OrderStageRunView,
   type OrderStageStepView,
+  type RunOrderStageBundleResult,
 } from "./contracts.js";
+import { buildCataloguePickerOptions } from "./catalogueOptions.js";
+import {
+  JOB_APPLY_COMPLETION,
+  cancelOrderCompletionJobByAdmin,
+  handleApplyCompletionJob,
+  handleOrderChangeForCompletionJobs,
+  listOrderCompletionJobsForOrder,
+  sanitizeOpsAlertCopy,
+  type ApplyCompletionJobPayload,
+} from "./completionJobs.js";
 import {
   automationRunSteps,
   automationRuns,
   automationSecrets,
   automationVersions,
   automations,
+  orderCompletionJobs,
+  orderStageRuns,
 } from "./schema.js";
 import { AUTOMATIONS_CONFIG, automationsConfigSchema } from "./settings.js";
+import {
+  STAGE_BUNDLES_DISABLED_MESSAGE,
+  buildOrderPhaseBundleSection,
+  executeOrderStageBundle,
+  listOrderStageBundleRuns,
+  previewOrderStageBundle,
+} from "./stageBundles.js";
 import { renderPlainTemplate } from "./templates.js";
 
 export const JOB_EVALUATE_EVENT = "automations.evaluate_event";
@@ -785,6 +809,7 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       name: row.name,
       description: row.description,
       enabled: row.enabled,
+      sortOrder: row.sortOrder ?? 0,
       version: row.version,
       trigger: rowToTriggerConfig(row),
       conditionGroupCount: conditions.groups.length,
@@ -1170,11 +1195,23 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
           inArray(automations.triggerKey, [...entryByKey.keys()]),
         ),
       )
-      .orderBy(asc(automations.id));
+      .orderBy(asc(automations.sortOrder), asc(automations.id));
 
     if (candidateRows.length === 0) {
       return { outcome: "completed", safeCounts: { matched: 0 } };
     }
+
+    const attrOrderPublicId =
+      typeof event.attributes.order_public_id === "string" &&
+      ULID_PATTERN.test(event.attributes.order_public_id)
+        ? event.attributes.order_public_id
+        : null;
+    const inferredOrderPublicId =
+      event.resource?.type === "order" &&
+      typeof event.resource.publicId === "string" &&
+      ULID_PATTERN.test(event.resource.publicId)
+        ? event.resource.publicId
+        : attrOrderPublicId;
 
     let queuedRuns = 0;
     for (const autoRow of candidateRows) {
@@ -1199,7 +1236,7 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
         const snapshot: TransientRunSnapshot = {
           event,
           parentCorrelationId: event.correlationId,
-          orderPublicId: event.resource?.type === "order" ? event.resource.publicId : null,
+          orderPublicId: inferredOrderPublicId,
           filePublicId: event.resource?.type === "file" ? event.resource.publicId : null,
         };
 
@@ -1209,6 +1246,7 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
           triggerMode: "event",
           triggerKey: entry.key,
           triggerEventId: event.eventId,
+          orderPublicId: inferredOrderPublicId,
           dedupKey: `event:${event.eventId}`,
           isTest: false,
           snapshot,
@@ -1356,6 +1394,38 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
         },
         tx,
       );
+
+      if (
+        !runRow.isTest &&
+        (finalState === "failed" || finalState === "partial_unknown") &&
+        deps.services.opsAlerts?.emit
+      ) {
+        await deps.services.opsAlerts.emit(
+          {
+            source: "automation",
+            severity: "error",
+            dedupKey: `automation_run_fail:${runRow.publicId}`,
+            correlationId: runRow.correlationId,
+            code:
+              finalState === "partial_unknown"
+                ? "AUTOMATION_RUN_AMBIGUOUS"
+                : "AUTOMATION_RUN_FAILED",
+            title: sanitizeOpsAlertCopy(
+              `Automation "${autoRow?.name ?? runRow.automationName}" ${finalState === "partial_unknown" ? "ended with unknown outcome" : "failed"}`,
+              120,
+            ),
+            text: sanitizeOpsAlertCopy(
+              `Automation run ${runRow.publicId} finished in state ${finalState}${reasonCode ? ` (${reasonCode})` : ""}.`,
+              500,
+            ),
+            ...(runRow.orderPublicId && ULID_PATTERN.test(runRow.orderPublicId)
+              ? { orderPublicId: runRow.orderPublicId }
+              : {}),
+            runPublicId: runRow.publicId,
+          },
+          tx,
+        );
+      }
     }
   }
 
@@ -2114,24 +2184,66 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       .orderBy(asc(automationRuns.id))
       .limit(200);
 
-    if (oldRuns.length === 0) {
+    const oldStageRuns = await db
+      .select({ id: orderStageRuns.id })
+      .from(orderStageRuns)
+      .where(lt(orderStageRuns.finishedAt, cutoff))
+      .orderBy(asc(orderStageRuns.id))
+      .limit(200);
+
+    const oldCompJobs = await db
+      .select({ id: orderCompletionJobs.id })
+      .from(orderCompletionJobs)
+      .where(
+        and(
+          isNotNull(orderCompletionJobs.completedAt),
+          lt(orderCompletionJobs.completedAt, cutoff),
+          inArray(orderCompletionJobs.state, ["applied", "superseded", "canceled", "failed"]),
+        ),
+      )
+      .orderBy(asc(orderCompletionJobs.id))
+      .limit(200);
+
+    if (oldRuns.length === 0 && oldStageRuns.length === 0 && oldCompJobs.length === 0) {
       return { outcome: "completed", safeCounts: { purged_runs: 0 } };
     }
 
     const ids = oldRuns.map((r) => r.id);
+    const stageRunIds = oldStageRuns.map((r) => r.id);
+    const compJobIds = oldCompJobs.map((r) => r.id);
     await db.transaction(async (tx) => {
       await job.assertStillOwned(tx);
-      await tx.delete(automationRunSteps).where(inArray(automationRunSteps.runId, ids));
-      await tx.delete(automationRuns).where(inArray(automationRuns.id, ids));
+      if (ids.length > 0) {
+        await tx.delete(automationRunSteps).where(inArray(automationRunSteps.runId, ids));
+        await tx.delete(automationRuns).where(inArray(automationRuns.id, ids));
+      }
+      if (stageRunIds.length > 0) {
+        await tx.delete(orderStageRuns).where(inArray(orderStageRuns.id, stageRunIds));
+      }
+      if (compJobIds.length > 0) {
+        await tx.delete(orderCompletionJobs).where(inArray(orderCompletionJobs.id, compJobIds));
+      }
     });
 
-    return { outcome: "completed", safeCounts: { purged_runs: ids.length } };
+    return {
+      outcome: "completed",
+      safeCounts: {
+        purged_runs: ids.length,
+        purged_stage_runs: stageRunIds.length,
+        purged_completion_jobs: compJobIds.length,
+      },
+    };
   }
 
   jobs.register(JOB_EVALUATE_EVENT, handleEvaluateEventJob, { retrySafe: true });
   jobs.register(JOB_EXECUTE_RUN, handleExecuteRunJob, { retrySafe: true });
   jobs.register(JOB_SCHEDULE_TICK, handleScheduleTickJob, { retrySafe: true });
   jobs.register(JOB_PURGE_RUNS, handlePurgeRunsJob, { retrySafe: true });
+  jobs.register(
+    JOB_APPLY_COMPLETION,
+    (job: ClaimedJob<ApplyCompletionJobPayload>) => handleApplyCompletionJob(deps, job),
+    { retrySafe: true },
+  );
 
   jobs.registerSchedule({
     name: "automations.schedule_tick",
@@ -2163,8 +2275,11 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       retrySafe: a.retrySafe,
     }));
 
+    const pickerOptions = await buildCataloguePickerOptions(deps, principal);
+
     return {
       globallyEnabled: cfg.enabled,
+      stageBundlesEnabled: cfg.stageBundlesEnabled,
       limits: {
         globalRunsPerMinute: cfg.globalRunsPerMinute,
         defaultPerAutomationRunsPerHour: cfg.defaultPerAutomationRunsPerHour,
@@ -2180,6 +2295,7 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       actions,
       operatorsByFieldType: OPERATORS_BY_FIELD_TYPE,
       starterRecipes: STARTER_RECIPES,
+      pickerOptions,
     };
   }
 
@@ -2218,6 +2334,7 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
           resource: { type: "automation_settings" },
           attributes: {
             enabled: merged.data.enabled,
+            stage_bundles_enabled: merged.data.stageBundlesEnabled,
             global_runs_per_minute: merged.data.globalRunsPerMinute,
             default_runs_per_hour: merged.data.defaultPerAutomationRunsPerHour,
             max_runs_per_hour: merged.data.maxPerAutomationRunsPerHour,
@@ -2229,6 +2346,13 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       await refreshTapCache(tx);
       return merged.data;
     });
+  }
+
+  async function nextSortOrderInTx(tx: Tx): Promise<number> {
+    const [row] = await tx
+      .select({ maxSort: sql<number | null>`MAX(${automations.sortOrder})` })
+      .from(automations);
+    return (Number(row?.maxSort ?? 0) || 0) + 10;
   }
 
   async function list(
@@ -2243,8 +2367,20 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
   ): Promise<{ items: AutomationSummaryView[]; nextCursor: string | null }> {
     await assertAutomationsCapabilityPreflight(deps, principal, "automations.read");
     const limit = Math.min(Math.max(input.limit ?? 25, 1), 100);
-    const beforeId = decodeIdCursor(input.cursor);
+    const afterId = decodeIdCursor(input.cursor);
     const q = input.query?.trim().toLowerCase() ?? "";
+
+    let afterAnchor: { id: number; sortOrder: number } | undefined;
+    if (afterId !== undefined) {
+      const [anchorRow] = await db
+        .select({ id: automations.id, sortOrder: automations.sortOrder })
+        .from(automations)
+        .where(eq(automations.id, afterId))
+        .limit(1);
+      afterAnchor = anchorRow
+        ? { id: anchorRow.id, sortOrder: anchorRow.sortOrder }
+        : { id: afterId, sortOrder: Number.MAX_SAFE_INTEGER };
+    }
 
     const rows = await db
       .select()
@@ -2255,10 +2391,18 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
           input.triggerMode !== undefined
             ? eq(automations.triggerMode, input.triggerMode)
             : undefined,
-          beforeId !== undefined ? lt(automations.id, beforeId) : undefined,
+          afterAnchor !== undefined
+            ? or(
+                gt(automations.sortOrder, afterAnchor.sortOrder),
+                and(
+                  eq(automations.sortOrder, afterAnchor.sortOrder),
+                  gt(automations.id, afterAnchor.id),
+                ),
+              )
+            : undefined,
         ),
       )
-      .orderBy(desc(automations.id))
+      .orderBy(asc(automations.sortOrder), asc(automations.id))
       .limit(q ? 200 : limit + 1);
 
     const filtered = q
@@ -2428,11 +2572,13 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       const actionsJson = JSON.stringify(validated.persistedActions);
       const canvasLayoutJson = sanitizedLayout ? JSON.stringify(sanitizedLayout) : null;
 
+      const sortOrder = await nextSortOrderInTx(tx);
       const [autoIns] = await tx.insert(automations).values({
         publicId: autoPublicId,
         name: validated.normalizedName,
         description: validated.normalizedDescription,
         enabled,
+        sortOrder,
         version: 1,
         triggerMode: validated.triggerMode,
         triggerKey: validated.triggerKey,
@@ -2856,11 +3002,13 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       const now = clock.now();
       const copyPublicId = ulid(now.getTime());
 
+      const sortOrder = await nextSortOrderInTx(tx);
       const [ins] = await tx.insert(automations).values({
         publicId: copyPublicId,
         name: copyName,
         description: source.description,
         enabled: false,
+        sortOrder,
         version: 1,
         triggerMode: source.triggerMode,
         triggerKey: source.triggerKey,
@@ -2969,6 +3117,88 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
 
       await refreshTapCache(tx);
       return { deleted: true };
+    });
+  }
+
+  async function reorder(
+    principal: SessionPrincipal,
+    input: { orderedPublicIds: readonly string[] },
+  ): Promise<{ orderedPublicIds: string[] }> {
+    await assertAutomationsCapabilityPreflight(deps, principal, "automations.manage");
+    if (input.orderedPublicIds.length > 500) {
+      throw validation("TOO_MANY_AUTOMATIONS", "Cannot reorder more than 500 rules at once.");
+    }
+    const seen = new Set<string>();
+    for (const pid of input.orderedPublicIds) {
+      if (!ULID_PATTERN.test(pid)) {
+        throw validation("INVALID_AUTOMATION_ID", "Automation identifier is invalid.");
+      }
+      if (seen.has(pid)) {
+        throw validation("DUPLICATE_AUTOMATION_ID", "Duplicate automation identifier in order.");
+      }
+      seen.add(pid);
+    }
+
+    return db.transaction(async (tx) => {
+      await assertAutomationsActorInTx(deps, principal, tx, "automations.manage");
+      const allRows = await tx
+        .select({
+          id: automations.id,
+          publicId: automations.publicId,
+          sortOrder: automations.sortOrder,
+        })
+        .from(automations)
+        .orderBy(asc(automations.sortOrder), asc(automations.id))
+        .for("update");
+
+      const rowByPublicId = new Map(allRows.map((r) => [r.publicId, r]));
+      for (const pid of input.orderedPublicIds) {
+        if (!rowByPublicId.has(pid)) {
+          throw notFound("AUTOMATION_NOT_FOUND");
+        }
+      }
+
+      const orderedRows: typeof allRows = [];
+      for (const pid of input.orderedPublicIds) {
+        orderedRows.push(rowByPublicId.get(pid)!);
+      }
+      for (const r of allRows) {
+        if (!seen.has(r.publicId)) {
+          orderedRows.push(r);
+        }
+      }
+
+      const now = clock.now();
+      for (let idx = 0; idx < orderedRows.length; idx += 1) {
+        const target = orderedRows[idx]!;
+        const nextSort = (idx + 1) * 10;
+        if (target.sortOrder !== nextSort) {
+          await tx
+            .update(automations)
+            .set({
+              sortOrder: nextSort,
+              updatedByUserId: principal.userId,
+              updatedAt: now,
+            })
+            .where(eq(automations.id, target.id));
+        }
+      }
+
+      const finalIds = orderedRows.map((r) => r.publicId);
+      await audit.record(
+        {
+          category: "admin",
+          eventName: "automation.rules.reordered",
+          action: "update",
+          outcome: "completed",
+          actor: { userId: principal.userId, role: principal.role },
+          resource: { type: "automation" },
+          safeCounts: { rule_count: finalIds.length },
+        },
+        tx,
+      );
+
+      return { orderedPublicIds: finalIds };
     });
   }
 
@@ -3576,7 +3806,7 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
           inArray(automations.triggerKey, ["order.created", "order.status_changed"]),
         ),
       )
-      .orderBy(asc(automations.id));
+      .orderBy(asc(automations.sortOrder), asc(automations.id));
 
     const verByAutoId = await loadLatestVersionsByAutomationId(db, candidateAutos);
 
@@ -3614,18 +3844,38 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       .orderBy(desc(automationRuns.id))
       .limit(runLimit);
     const recentRuns = await hydrateRunViews(runRows);
+    const phaseSection = await buildOrderPhaseBundleSection(
+      deps,
+      access.publicId,
+      bound,
+      runLimit,
+    );
 
     return {
       orderPublicId: access.publicId,
       orderReference: access.reference,
       currentStatusKey: access.statusKey,
+      currentStageKey: phaseSection.currentStageKey,
+      progressPercent: phaseSection.progressPercent,
+      completionRevision: phaseSection.completionRevision,
       workflowKey: bound.workflowKey,
       workflowVersionNumber: bound.versionNumber,
+      workflowFormat: phaseSection.workflowFormat,
       engineEnabled: cfg.enabled,
       engineDisabledReason: cfg.enabled ? null : ENGINE_DISABLED_STAGE_MESSAGE,
+      stageBundlesEnabled: cfg.stageBundlesEnabled,
+      stageBundlesDisabledReason: cfg.stageBundlesEnabled ? null : STAGE_BUNDLES_DISABLED_MESSAGE,
       settingsPath: "/admin/automations",
       canManageAutomations: roleHasCapability(principal.role, "automations.manage"),
+      canRunStageBundles: roleHasCapability(principal.role, "orders.stage.run"),
+      canTransitionOrder: roleHasCapability(principal.role, "orders.transition"),
+      canOverrideStatus: principal.role === "admin",
+      canCancelCompletionJobs: principal.role === "admin",
+      requiresStepUp: true,
+      stages: phaseSection.stages,
       steps,
+      recentStageRuns: phaseSection.recentStageRuns,
+      recentCompletionJobs: phaseSection.recentCompletionJobs,
       recentRuns,
     };
   }
@@ -3715,7 +3965,7 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
             inArray(automations.triggerKey, ["order.created", "order.status_changed"]),
           ),
         )
-        .orderBy(asc(automations.id))
+        .orderBy(asc(automations.sortOrder), asc(automations.id))
         .for("update");
 
       const verByAutoId = await loadLatestVersionsByAutomationId(tx, candidateAutos);
@@ -3889,6 +4139,55 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
     };
   }
 
+  async function previewStageBundle(
+    principal: SessionPrincipal,
+    input: { orderPublicId: string; stageKey: string },
+  ): Promise<OrderStageBundlePreviewView> {
+    return previewOrderStageBundle(deps, principal, input);
+  }
+
+  async function runStageBundle(
+    principal: SessionPrincipal,
+    input: {
+      orderPublicId: string;
+      stageKey: string;
+      idempotencyKey: string;
+      confirmationToken: string;
+      statusOverrideReason?: string | null;
+    },
+  ): Promise<RunOrderStageBundleResult> {
+    return executeOrderStageBundle(deps, principal, input);
+  }
+
+  async function listStageBundleRuns(
+    principal: SessionPrincipal,
+    input: { orderPublicId: string; stageKey?: string; cursor?: string; limit?: number },
+  ): Promise<{ items: OrderStageRunView[]; nextCursor: string | null }> {
+    return listOrderStageBundleRuns(deps, principal, input);
+  }
+
+  async function listOrderCompletionJobs(
+    principal: SessionPrincipal,
+    input: {
+      orderPublicId: string;
+      stageKey?: string;
+      state?: CompletionJobState;
+      cursor?: string;
+      limit?: number;
+    },
+  ): Promise<{ items: OrderCompletionJobView[]; nextCursor: string | null }> {
+    return listOrderCompletionJobsForOrder(deps, principal, input);
+  }
+
+  async function cancelOrderCompletionJob(
+    principal: SessionPrincipal,
+    input: { completionJobPublicId: string; reason?: string | null },
+  ): Promise<OrderCompletionJobView> {
+    return cancelOrderCompletionJobByAdmin(deps, principal, input);
+  }
+
+  let orderListenerRegistered = false;
+
   return {
     registerAutomationTrigger,
     registerAutomationAction,
@@ -3906,6 +4205,7 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
     setEnabled,
     duplicate,
     remove,
+    reorder,
     triggerManual,
     testRun,
     listRuns,
@@ -3913,10 +4213,34 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
     getOrderStageActions,
     listOrderStageRuns,
     runForOrder,
+    previewStageBundle,
+    runStageBundle,
+    listStageBundleRuns,
+    listOrderCompletionJobs,
+    cancelOrderCompletionJob,
 
     init() {
       syncStaticRegistrations();
       ensureAutomationMailTemplateRegistered(deps.mailer);
+
+      // Idempotent startup backfill of automations.sort_order = id * 10 where sort_order = 0.
+      void Promise.resolve()
+        .then(async () => {
+          if (typeof (db as { update?: unknown }).update !== "function") return;
+          await db
+            .update(automations)
+            .set({ sortOrder: sql`${automations.id} * 10` })
+            .where(eq(automations.sortOrder, 0));
+        })
+        .catch(() => undefined);
+
+      if (!orderListenerRegistered && deps.services.orders?.registerChangeListener) {
+        deps.services.orders.registerChangeListener((event, tx) =>
+          handleOrderChangeForCompletionJobs(deps, event, tx),
+        );
+        orderListenerRegistered = true;
+      }
+
       if (!tapRegistered && deps.services.auditCenter?.registerTap) {
         deps.services.auditCenter.registerTap({
           listens(eventName: string): boolean {

@@ -1,12 +1,28 @@
 import { adminProcedure, requireCapability, router, staffProcedure } from "../../trpc/trpc.js";
 import { copyLogConnections, copyLogDetail, copyLogFilters, copyLogList } from "./copyLog.js";
 import { orderCopyList, orderCopyRetry } from "./orderCopies.js";
+import { managedOrderInput, managedResyncInput, managedResyncScope, managedTargetUpdate } from "./managedFileSync.js";
 import { storageAssignment, storageCreate, storageGet, storageList, storageTest, storageUpdate } from "./validation.js";
 
 const admin = adminProcedure.use(requireCapability("storage.manage"));
 const copyReader = adminProcedure.use(requireCapability("storage.copies.read"));
 
 export const storageRouter = router({
+  fileSync: router({
+    listTargets: adminProcedure.use(requireCapability("workflows.manage"))
+      .query(({ ctx }) => ctx.services.storageConnections.fileSync.listTargets(ctx.session)),
+    health: admin.query(({ ctx }) => ctx.services.storageConnections.fileSync.health(ctx.session)),
+    forOrder: staffProcedure.use(requireCapability("orders.read_all")).input(managedOrderInput)
+      .query(({ ctx, input }) => ctx.services.storageConnections.fileSync.forOrder(ctx.session, input)),
+    testTarget: admin.meta({ rateLimit: "expensive" }).input(storageTest)
+      .mutation(({ ctx, input }) => ctx.services.storageConnections.fileSync.testTarget(ctx.session, input, ctx.request.requestId)),
+    setTarget: admin.meta({ rateLimit: "expensive" }).input(managedTargetUpdate)
+      .mutation(({ ctx, input }) => ctx.services.storageConnections.fileSync.setTarget(ctx.session, input, ctx.request.requestId)),
+    previewResync: admin.meta({ rateLimit: "expensive" }).input(managedResyncScope)
+      .mutation(({ ctx, input }) => ctx.services.storageConnections.fileSync.previewResync(ctx.session, input)),
+    resync: admin.meta({ rateLimit: "expensive" }).input(managedResyncInput)
+      .mutation(({ ctx, input }) => ctx.services.storageConnections.fileSync.resync(ctx.session, input, ctx.request.requestId)),
+  }),
   copies: router({
     forOrder: staffProcedure.use(requireCapability("orders.read_all")).input(orderCopyList)
       .query(({ ctx, input }) => ctx.services.storageConnections.orderCopies.forOrder(ctx.session, input)),

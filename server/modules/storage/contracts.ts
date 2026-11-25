@@ -3,6 +3,7 @@ import type { z } from "zod";
 import type { DbOrTx, ModuleLifecycle, SessionPrincipal, Tx } from "../../core/types.js";
 import type { CopyLogService } from "./copyLog.js";
 import type { OrderCopiesService } from "./orderCopies.js";
+import type { ManagedFileSync } from "./managedFileSync.js";
 
 export const STORAGE_PROVIDER_KINDS = ["s3", "azure_blob", "dropbox", "google_drive", "sharepoint", "onedrive"] as const;
 export type StorageProviderKind = (typeof STORAGE_PROVIDER_KINDS)[number];
@@ -20,6 +21,8 @@ export interface StoragePutInput {
   signal?: AbortSignal;
   /** Call before each externally visible write, including upload session commits. */
   beforeWrite?: () => Promise<void>;
+  /** Managed intents never adopt by weak checksum or try a different filename. */
+  exactCreate?: true;
 }
 
 export interface StoragePutResult {
@@ -45,7 +48,7 @@ export type StorageAdapterErrorCode = Exclude<StorageTestCode, "OK"> | "DESTINAT
   "INTEGRITY_MISMATCH" | "INVALID_INPUT" | "TOO_LARGE" | "OUTCOME_UNKNOWN";
 /** Use fixed codes only. Retryable means a retry cannot duplicate the prior external effect. */
 export class StorageAdapterError extends Error {
-  constructor(readonly code: StorageAdapterErrorCode, readonly retryable = false) {
+  constructor(readonly code: StorageAdapterErrorCode, readonly retryable = false, readonly retryAfterSeconds?: number) {
     super(code);
     this.name = "StorageAdapterError";
   }
@@ -55,6 +58,8 @@ export interface StorageAdapter {
   /** When set, put validates the full target and creates any folders behind its own write fences. */
   putCreatesFolders?: true;
   test(signal?: AbortSignal): Promise<StorageTestResult>;
+  testWrite?(beforeWrite: () => Promise<void>, signal: AbortSignal): Promise<StorageTestResult>;
+  inspectExact?(path: readonly string[], name: string, signal: AbortSignal): Promise<"missing" | "present">;
   ensureFolder(path: readonly string[], signal?: AbortSignal, beforeWrite?: () => Promise<void>): Promise<void>;
   put(input: StoragePutInput): Promise<StoragePutResult>;
   /** Explicit removal only. Never called by an automatic copy, retry, retention or assignment change. */
@@ -129,6 +134,9 @@ export interface StorageCopyInput extends StoragePutInput {
 export interface StorageModule extends ModuleLifecycle {
   copies: CopyLogService;
   orderCopies: OrderCopiesService;
+  fileSync: ManagedFileSync;
+  validateStageFileSyncTargets: ManagedFileSync["validateStageFileSyncTargets"];
+  stageReceiptPdf: ManagedFileSync["stageReceiptPdf"];
   registerAdapter<C extends StorageConfig, S extends StorageCredentials>(
     kind: StorageProviderKind, definition: StorageAdapterDefinition<C, S>,
   ): void;
@@ -158,7 +166,7 @@ export interface StorageModule extends ModuleLifecycle {
   /** Worker-side: fail closed if disabled/unassigned; verify provider-reported size and digest. */
   copy(input: StorageCopyInput): Promise<StoragePutResult>;
   /** Called inside file publication; stages durable jobs for the active order-file assignments. */
-  stageOrderFile(filePublicId: string, tx: Tx, metadata?: { orderPublicId: string }): Promise<void>;
+  stageOrderFile(filePublicId: string, tx: Tx, metadata?: { orderPublicId: string; managedOnly?: boolean }): Promise<void>;
   /** Automation-only bulk staging, bounded and constrained to the current order_files assignment. */
   stageOrderFilesForAutomation(input: {
     orderPublicId: string; filePublicId?: string; connectionPublicId?: string; correlationId: string; signal: AbortSignal;

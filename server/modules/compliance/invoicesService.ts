@@ -493,7 +493,101 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     return (prior?.total ?? 0) === 0;
   }
 
+  async function syncOrderAndCartOnPaidInTx(
+    tx: Tx,
+    input: {
+      orderPublicId: string;
+      invoicePublicId: string;
+      paidAt: Date;
+      method: "stripe" | "manual";
+      amountMinor: number;
+      currency: string;
+    },
+  ): Promise<void> {
+    const cartSvc = (
+      deps.services as unknown as {
+        cart?: {
+          onInvoicePaidInTx?: (
+            arg: { invoicePublicId: string; orderPublicId?: string; paidAt?: Date },
+            txArg: Tx,
+          ) => Promise<unknown>;
+        };
+      }
+    ).cart;
+    if (cartSvc && typeof cartSvc.onInvoicePaidInTx === "function") {
+      await cartSvc.onInvoicePaidInTx(
+        {
+          invoicePublicId: input.invoicePublicId,
+          orderPublicId: input.orderPublicId,
+          paidAt: input.paidAt,
+        },
+        tx,
+      );
+    }
+
+    const ordersPaymentsSvc = (
+      deps.services as unknown as {
+        orders?: {
+          payments?: {
+            onInvoicePaidInTx?: (
+              arg: {
+                orderPublicId: string;
+                invoicePublicId: string;
+                paidAt: Date;
+                method: "stripe" | "manual";
+                amountMinor: number;
+                currency: string;
+              },
+              txArg: Tx,
+            ) => Promise<unknown>;
+          };
+        };
+      }
+    ).orders?.payments;
+    if (ordersPaymentsSvc && typeof ordersPaymentsSvc.onInvoicePaidInTx === "function") {
+      await ordersPaymentsSvc.onInvoicePaidInTx(input, tx);
+    }
+  }
+
+  async function syncOrderPaymentEventInTx(
+    tx: Tx,
+    input: {
+      orderPublicId: string;
+      kind: "pending_async" | "failed" | "refunded" | "partially_refunded";
+      eventRef: string;
+    },
+  ): Promise<void> {
+    const ordersPaymentsSvc = (
+      deps.services as unknown as {
+        orders?: {
+          payments?: {
+            onPaymentEventInTx?: (
+              arg: {
+                orderPublicId: string;
+                kind: "pending_async" | "failed" | "refunded" | "partially_refunded";
+                eventRef: string;
+              },
+              txArg: Tx,
+            ) => Promise<unknown>;
+          };
+        };
+      }
+    ).orders?.payments;
+    if (ordersPaymentsSvc && typeof ordersPaymentsSvc.onPaymentEventInTx === "function") {
+      await ordersPaymentsSvc.onPaymentEventInTx(input, tx);
+    }
+  }
+
   async function dispatchInvoicePaidInTx(tx: Tx, event: InvoicePaidEvent): Promise<void> {
+    await syncOrderAndCartOnPaidInTx(tx, {
+      orderPublicId: event.orderPublicId,
+      invoicePublicId: event.invoicePublicId,
+      paidAt: event.paidAt,
+      method: event.provider ? "stripe" : "manual",
+      amountMinor: event.netPaidMinor,
+      currency: event.currency,
+    });
+
     const referralsSvc = (
       deps.services as unknown as {
         referrals?: {
@@ -1708,6 +1802,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           outcome: "completed",
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "invoice_payment", publicId: paymentPublicId },
+          orderPublicId: orderView.publicId,
           attributes: {
             invoice_public_id: inv.publicId,
             order_public_id: orderView.publicId,
@@ -1715,10 +1810,22 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
             amount_minor: input.amountMinor,
             currency,
             derived_invoice_status: nextStatus,
+            payment_state: nextStatus === "paid" ? "paid" : "unpaid",
           },
         },
         tx,
       );
+
+      if (nextStatus === "paid" && inv.status !== "paid" && input.method === "waiver") {
+        await syncOrderAndCartOnPaidInTx(tx, {
+          orderPublicId: orderView.publicId,
+          invoicePublicId: inv.publicId,
+          paidAt: receivedAt,
+          method: "manual",
+          amountMinor: 0,
+          currency,
+        });
+      }
 
       if (nextStatus === "paid" && inv.status !== "paid" && input.method !== "waiver") {
         const engagementSvc = (deps.services as Partial<typeof deps.services>).engagement;
@@ -2019,6 +2126,15 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           .where(eq(complianceInvoices.id, inv.id));
       }
 
+      const fullyRefunded = sums.grossPaidMinor > 0 && sums.refundedMinor >= sums.grossPaidMinor;
+      const refundPaymentState = fullyRefunded ? "refunded" : "partially_refunded";
+
+      await syncOrderPaymentEventInTx(tx, {
+        orderPublicId: orderView.publicId,
+        kind: refundPaymentState,
+        eventRef: refundPublicId,
+      });
+
       await deps.audit.record(
         {
           category: "business",
@@ -2027,6 +2143,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           outcome: "completed",
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "invoice_refund", publicId: refundPublicId },
+          orderPublicId: orderView.publicId,
           attributes: {
             invoice_public_id: inv.publicId,
             payment_public_id: pmt.publicId,
@@ -2035,12 +2152,33 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
             amount_minor: input.amountMinor,
             currency,
             derived_invoice_status: nextStatus,
+            payment_state: refundPaymentState,
           },
         },
         tx,
       );
 
-      if (sums.grossPaidMinor > 0 && sums.refundedMinor >= sums.grossPaidMinor) {
+      await deps.audit.record(
+        {
+          category: "business",
+          eventName: "payment.refund.succeeded",
+          action: "create",
+          outcome: "completed",
+          actor: { userId: liveActor.userId, role: liveActor.role },
+          resource: { type: "invoice_refund", publicId: refundPublicId },
+          orderPublicId: orderView.publicId,
+          attributes: {
+            order_public_id: orderView.publicId,
+            invoice_public_id: inv.publicId,
+            provider: "manual",
+            execution_kind: "manual_invoice_refund",
+            payment_state: refundPaymentState,
+          },
+        },
+        tx,
+      );
+
+      if (fullyRefunded) {
         const orderRef =
           typeof ordersSvc.getOrderRefById === "function"
             ? await ordersSvc.getOrderRefById(inv.orderId, tx)
@@ -2780,6 +2918,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         outcome: "completed",
         actor: { role: "system" },
         resource: { type: "invoice_payment", publicId: paymentPublicId },
+        orderPublicId: inv.orderPublicId,
         attributes: {
           invoice_public_id: inv.publicId,
           order_public_id: inv.orderPublicId,
@@ -2790,6 +2929,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           amount_minor: input.amountMinor,
           currency,
           derived_invoice_status: nextStatus,
+          payment_state: nextStatus === "paid" ? "paid" : "unpaid",
         },
       },
       tx,
@@ -2926,6 +3066,14 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       const receiptRes = receiptsSvc
         ? await receiptsSvc.issueReceiptForZeroInvoiceInTx(tx, { invoiceId: inv.id })
         : null;
+      await syncOrderAndCartOnPaidInTx(tx, {
+        orderPublicId: orderRef.publicId,
+        invoicePublicId: inv.publicId,
+        paidAt: inv.issuedAt,
+        method: "manual",
+        amountMinor: 0,
+        currency: inv.currency,
+      });
       return {
         settlementKind: "zero_total",
         invoiceId: inv.id,
@@ -3036,6 +3184,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         outcome: "completed",
         actor: { role: "system" },
         resource: { type: "invoice_payment", publicId: paymentPublicId },
+        orderPublicId: inv.orderPublicId,
         attributes: {
           invoice_public_id: inv.publicId,
           order_public_id: inv.orderPublicId,
@@ -3045,10 +3194,20 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           provider_minimum_minor: input.providerMinimumMinor,
           currency: inv.currency,
           derived_invoice_status: "paid",
+          payment_state: "paid",
         },
       },
       tx,
     );
+
+    await syncOrderAndCartOnPaidInTx(tx, {
+      orderPublicId: orderRef.publicId,
+      invoicePublicId: inv.publicId,
+      paidAt: now,
+      method: "manual",
+      amountMinor: 0,
+      currency: inv.currency,
+    });
 
     const engagementSvc = (deps.services as Partial<typeof deps.services>).engagement;
     if (engagementSvc && typeof engagementSvc.notify === "function") {
@@ -3598,6 +3757,15 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         .where(eq(complianceInvoices.id, inv.id));
     }
 
+    const fullyRefundedInvoice = sums.grossPaidMinor > 0 && sums.refundedMinor >= sums.grossPaidMinor;
+    const orderRefundKind = fullyRefundedInvoice ? "refunded" : "partially_refunded";
+
+    await syncOrderPaymentEventInTx(tx, {
+      orderPublicId: inv.orderPublicId,
+      kind: orderRefundKind,
+      eventRef: complianceRefundPublicId,
+    });
+
     await deps.audit.record(
       {
         category: "business",
@@ -3608,6 +3776,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           ? { userId: input.recordedByUserId, role: "admin" }
           : { role: "system" },
         resource: { type: "invoice_refund", publicId: complianceRefundPublicId },
+        orderPublicId: inv.orderPublicId,
         attributes: {
           invoice_public_id: inv.publicId,
           payment_public_id: pmt.publicId,
@@ -3618,12 +3787,12 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           provider: input.provider ?? "manual",
           derived_invoice_status: nextStatus,
           derived_payment_state: nextPaymentState,
+          payment_state: orderRefundKind,
         },
       },
       tx,
     );
 
-    const fullyRefundedInvoice = sums.grossPaidMinor > 0 && sums.refundedMinor >= sums.grossPaidMinor;
     if (fullyRefundedInvoice) {
       const ordersSvc = requireOrdersService();
       const orderRef =

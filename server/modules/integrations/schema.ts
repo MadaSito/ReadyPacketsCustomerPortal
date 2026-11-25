@@ -120,6 +120,15 @@ export const integrationProductionDispatches = mysqlTable(
     /** ULID of an already-delivered dispatch redelivered via `orders.production.redeliver` step-up (Increment 04 Part B T1). */
     redeliveryOfPublicId: varchar("redelivery_of_public_id", { length: 26 }),
     phase1ArtifactsConfirmed: boolean("phase1_artifacts_confirmed").notNull().default(false),
+    /** Increment 07 (D7): origin of dispatch (`manual` | `stage_bundle` | `lifecycle_payment_confirmed` | `lifecycle_phase1_locked` | `automation_rule`). */
+    triggerSource: varchar("trigger_source", { length: 32 }).notNull().default("manual"),
+    /** Increment 07 (D7): workflow stage key when queued from a phase action or lifecycle transition. */
+    stageKey: varchar("stage_key", { length: 64 }),
+    /** Increment 07 (D7): operator stop metadata when a queued/retrying dispatch is halted. */
+    stoppedAt: utcDateTime("stopped_at"),
+    stoppedByUserId: refColumn("stopped_by_user_id"),
+    stoppedByPublicId: varchar("stopped_by_public_id", { length: 26 }),
+    stopReason: varchar("stop_reason", { length: 280 }),
     requestedByUserId: refColumn("requested_by_user_id"),
     requestedByPublicId: varchar("requested_by_public_id", { length: 26 }),
     correlationId: varchar("correlation_id", { length: 64 }).notNull(),
@@ -156,6 +165,8 @@ export const integrationWebhookSubscriptions = mysqlTable(
     targetUrlMasked: varchar("target_url_masked", { length: 320 }).notNull(),
     eventsJson: text("events_json").notNull(),
     status: varchar("status", { length: 24 }).notNull(), // "active" | "paused" | "disabled_failing"
+    /** Increment 07 (D7): HMAC-SHA256 signing switch; defaults true so existing subscriptions stay signed. */
+    signingEnabled: boolean("signing_enabled").notNull().default(true),
     signingSecretEnc: text("signing_secret_enc").notNull(),
     signingSecretLast4: varchar("signing_secret_last4", { length: 4 }).notNull(),
     previousSecretEnc: text("previous_secret_enc"),
@@ -241,6 +252,17 @@ export const integrationWebhookDeliveries = mysqlTable(
     isReplay: boolean("is_replay").notNull().default(false),
     replayOfPublicId: varchar("replay_of_public_id", { length: 26 }),
     isTest: boolean("is_test").notNull().default(false),
+    /** Increment 07 (D7): linked order public ID for order-filtered delivery log queries and stage runs. */
+    orderPublicId: varchar("order_public_id", { length: 26 }),
+    /** Increment 07 (D7): workflow stage key when queued from a phase action. */
+    stageKey: varchar("stage_key", { length: 64 }),
+    /** Increment 07 (D7): count of eligible operator retries along the same delivery record chain (distinct from replay/redeliver). */
+    manualRetryCount: int("manual_retry_count", { unsigned: true }).notNull().default(0),
+    /** Increment 07 (D7): operator stop metadata when a queued/retrying delivery is halted. */
+    stoppedAt: utcDateTime("stopped_at"),
+    stoppedByUserId: refColumn("stopped_by_user_id"),
+    stoppedByPublicId: varchar("stopped_by_public_id", { length: 26 }),
+    stopReason: varchar("stop_reason", { length: 280 }),
     searchText: varchar("search_text", { length: 512 }).notNull(),
     expiresAt: utcDateTime("expires_at").notNull(),
     completedAt: utcDateTime("completed_at"),
@@ -254,6 +276,7 @@ export const integrationWebhookDeliveries = mysqlTable(
     index("idx_webhook_delivery_sub_created").on(table.subscriptionPublicId, table.createdAt, table.id),
     index("idx_webhook_delivery_inb_created").on(table.inboundEndpointPublicId, table.createdAt, table.id),
     index("idx_webhook_delivery_event_created").on(table.eventKey, table.createdAt, table.id),
+    index("idx_webhook_delivery_order_created").on(table.orderPublicId, table.createdAt, table.id),
     index("idx_webhook_delivery_status_next").on(table.status, table.nextAttemptAt, table.id),
     index("idx_webhook_delivery_corr").on(table.correlationId),
     index("idx_webhook_delivery_expiry").on(table.bodyPurged, table.expiresAt, table.id),

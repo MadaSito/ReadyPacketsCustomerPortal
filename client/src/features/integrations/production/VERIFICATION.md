@@ -19,6 +19,8 @@ All views in `client/src/features/integrations/production/**` are designed and t
 | Optional Phase III (`P301`) / Phase IV (`P401`) endpoint fields + destination allowlist tests on `/admin/integrations/production`, and conditional `"Start Phase III"` / `"Start Phase IV"` buttons on the order Automation tab | `production.test.tsx` | Checked |
 | `"This order's pipeline history"` with staff/admin `Retry` (`orders.production.trigger`) and admin-only step-up `Redeliver` (`orders.production.redeliver`, required reason + exact typed `REDELIVER`, `Redelivery of …` badge) | `production.test.tsx` | Checked |
 | `pageA11y` light & dark document scans (`/admin/integrations/production` ready, `/admin/orders/:orderId/automation` ready, and Redeliver `<Dialog>` open) | `production.test.tsx` (`@/test/a11y`) | Checked |
+| Increment 07 D7: Outbound HMAC-SHA256 signing switch (`settings.setSigningEnabled`), once-only signing secret rotation dialog (`settings.rotateSigningSecret`), per-workflow lifecycle auto-queue switches (`workflowAutoQueue.list` / `workflowAutoQueue.update` for `p101OnPaymentConfirmed` & `p201OnPhase1Locked` with non-retroactive callout), and `Stopped` history filter | `production.test.tsx` | Checked |
+| Increment 07 D7: Order Automation tab `order.stop` dialog with optional reason on `queued` dispatches, truthful `"In flight (cannot stop)"` label on `sending` rows, and `order.retry` on `stopped` dispatches | `production.test.tsx` | Checked |
 
 ---
 

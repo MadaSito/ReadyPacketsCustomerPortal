@@ -208,6 +208,9 @@ describe("order page rules", () => {
       rules({ canUnlock: true, phases: [{ key: "intake", label: "Intake", position: "done", locked: true, lockedAt: now.toISOString() }, { key: "delivery", label: "Delivery", position: "current", locked: false, lockedAt: null }] }),
     );
     handlers.set("orders.phases.unlock", () => ({ ok: true }));
+    // Increment 07: the console Phases tab reads the phase workspace first; for a classic ("derived") workflow it then
+    // shows the increment-04 rules panel below it.
+    handlers.set("orders.stages.workspace", () => ({ workflowFormat: 2, derived: true, currentStageKey: null, stages: [] }));
     const user = userEvent.setup();
     // Part B: in the console the rules panel lives on the Phases tab.
     renderUi(
@@ -254,6 +257,9 @@ describe("customer tasks (increment 06, D8)", () => {
     session.role = "staff";
     handlers.set("orders.admin.get", () => ({ ...detail, accessRole: "staff", transitions: [] }));
     handlers.set("orders.admin.referenceHistory", () => []);
+    // Increment 07: the console Phases tab reads the phase workspace first; for a classic ("derived") workflow it then
+    // shows the increment-04 rules panel below it.
+    handlers.set("orders.stages.workspace", () => ({ workflowFormat: 2, derived: true, currentStageKey: null, stages: [] }));
   };
 
   it("customer: record link opens the recorder, document links go to the right slot, note shows in the dialog", async () => {

@@ -39,7 +39,7 @@ export function providerStatus({ state, verified = false, scaffoldOnly = false }
     case "failing":
       return { label: "Configured — failing", tone: "danger", icon: XCircle };
     case "disabled":
-      return { label: "Not configured (switched off)", tone: "neutral", icon: CircleDashed };
+      return { label: "Switched off", tone: "neutral", icon: CircleDashed };
     case "not_configured":
     default:
       return { label: "Not configured", tone: "neutral", icon: CircleDashed };
@@ -56,6 +56,7 @@ export function ProviderStatusBadge(props: ProviderStatusInput) {
 export const INTEGRATION_PATHS = {
   overview: "/admin/integrations",
   smtp: "/admin/integrations/smtp",
+  graph: "/admin/integrations/graph",
   analytics: "/admin/integrations/analytics",
   egress: "/admin/integrations/egress",
 } as const;

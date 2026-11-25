@@ -1,6 +1,7 @@
 import { HardDrive, HardDriveDownload, RefreshCw } from "lucide-react";
 import type { FeatureRoutes } from "@/lib/routes";
 import { CopyLogPage } from "./CopyLogPage";
+import { ManagedFileSyncPage } from "./ManagedFileSyncPage";
 import { OrderFileSyncTab, OrderFileSyncTabLabel } from "./OrderFileSyncTab";
 import { SharePointOrderSyncPage } from "./SharePointOrderSyncPage";
 import { StorageConnectionWizardPage } from "./StorageConnectionWizardPage";
@@ -22,6 +23,12 @@ export const storageFeature: FeatureRoutes = {
       path: "/admin/storage",
       title: "Storage connections",
       component: StorageConnectionsPage,
+    },
+    {
+      ...guard,
+      path: "/admin/storage/file-sync",
+      title: "Microsoft 365 file sync",
+      component: ManagedFileSyncPage,
     },
     {
       ...guard,

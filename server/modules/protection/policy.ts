@@ -118,6 +118,7 @@ export interface RequestSignals {
   country: string | null;
   oversize: boolean;
   recovery?: boolean;
+  skipCountryAllowList?: boolean;
 }
 
 export function inspectedHeaderNames() { return inspectedHeaders; }
@@ -154,7 +155,7 @@ export function compilePolicy(policy: ProtectionPolicy) {
       if (blocked) return blocked;
     }
     const listed = signals.country !== null && codes.has(signals.country);
-    if ((policy.countries.mode === "allow" && !listed) || (policy.countries.mode === "deny" && listed)) {
+    if ((policy.countries.mode === "allow" && !listed && !signals.skipCountryAllowList) || (policy.countries.mode === "deny" && listed)) {
       const blocked = match("country.policy", true);
       if (blocked) return blocked;
     }

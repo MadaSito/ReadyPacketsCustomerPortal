@@ -1,6 +1,8 @@
 /**
  * Console workflows (/admin/workflows). Owner: orders_engineer.
- * Lists workflows and open drafts; starts drafts (standard, blank, copy) that the designer edits. Publishing happens
+ * Lists workflows and open drafts; starts drafts (ReadyPackets phases, standard, blank, copy) that the designer edits.
+ * Increment 07 QA: while the DEFAULT workflow's current version has no phases, a dismissible notice offers "add" and
+ * "convert" drafts (an open phase-less draft of the default is converted in place only after a confirm naming it). Publishing happens
  * in the designer and always creates a new version; orders stay bound to the version they started on.
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -26,6 +28,10 @@ export default function AdminWorkflowsPage() {
   const [creating, setCreating] = useState(false);
   const [discarding, setDiscarding] = useState<DraftListRow | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
+  const [noticeDismissed, setNoticeDismissed] = useState(() => phasesNoticeDismissed);
+  const addPhases = useMutation(trpc.orders.admin.workflows.phases.addStandard.mutationOptions());
+  const convertDefault = useMutation(trpc.orders.admin.workflows.phases.convertDefault.mutationOptions());
+  const [convertAsk, setConvertAsk] = useState<{ draftId: string; draftName: string } | null>(null);
 
   const refresh = () =>
     Promise.all([
@@ -60,11 +66,55 @@ export default function AdminWorkflowsPage() {
     }
   };
 
+  const openPhases = (draftId: string) => navigate(`/admin/workflows/drafts/${draftId}`);
+  const startPhases = async (kind: "add" | "convert") => {
+    setProblem(null);
+    try {
+      if (kind === "add") {
+        const result = await addPhases.mutateAsync();
+        toast.show({ tone: result.created ? "success" : "info", title: result.created ? "Phases draft started" : "Opening the existing phases draft" });
+        await refresh();
+        return openPhases(result.draftId);
+      }
+      const result = await convertDefault.mutateAsync({});
+      // An open draft of the default without phases is only converted after an explicit confirm naming it.
+      if (result.outcome === "needs_confirm") return setConvertAsk({ draftId: result.draftId, draftName: result.draftName });
+      toast.show({
+        tone: result.outcome === "created" ? "success" : "info",
+        title: result.outcome === "created" ? `Started a phases draft of ${result.draftName}` : `Opened the draft “${result.draftName}”: it already has phases`,
+      });
+      await refresh();
+      openPhases(result.draftId);
+    } catch (err) {
+      setProblem(errorMessage(err));
+    }
+  };
+  const convertInPlace = async (draftId: string) => {
+    const result = await convertDefault.mutateAsync({ convertDraftId: draftId });
+    toast.show({ tone: "success", title: `Converted the draft “${result.draftName}” to phases` });
+    await refresh();
+    openPhases(result.draftId);
+  };
+  const dismissNotice = () => {
+    phasesNoticeDismissed = true;
+    setNoticeDismissed(true);
+  };
+
   const header = (
     <PageHeader
       title="Workflows"
       description="Order statuses and who may move an order between them. Publishing creates a new version; existing orders keep theirs."
-      actions={workflows.data ? <><Button onClick={() => setCreating(true)}>New workflow</Button>{transfer.importAction}</> : null}
+      actions={
+        workflows.data ? (
+          <>
+            <Button asChild variant="secondary">
+              <Link href="/admin/workflows/statuses">Statuses</Link>
+            </Button>
+            <Button onClick={() => setCreating(true)}>New workflow</Button>
+            {transfer.importAction}
+          </>
+        ) : null
+      }
     />
   );
   if (workflows.isPending)
@@ -83,6 +133,9 @@ export default function AdminWorkflowsPage() {
     );
   const rows = workflows.data;
   const draftRows = drafts.data ?? [];
+  const defaultWorkflow = rows.find((wf) => wf.isDefault && wf.currentVersionPublicId) ?? null;
+  // Lead QA (8): keyed on the default workflow, so new orders can't silently keep using a phase-less default.
+  const showPhasesNotice = !noticeDismissed && defaultWorkflow !== null && (defaultWorkflow.definition?.stages?.length ?? 0) === 0;
   return (
     <>
       {header}
@@ -92,6 +145,32 @@ export default function AdminWorkflowsPage() {
           <Callout tone="danger" live="assertive">
             {problem}
           </Callout>
+        ) : null}
+        {showPhasesNotice ? (
+          <section aria-labelledby="phases-notice-title" className="flex flex-col gap-3 rounded-[var(--radius-card)] border border-line bg-surface p-4 sm:p-5">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <h2 id="phases-notice-title" className="text-lg font-semibold text-ink">
+                Your default workflow does not use phases yet
+              </h2>
+              <Button size="sm" variant="ghost" aria-label="Dismiss the phases notice" onClick={dismissNotice}>
+                Dismiss
+              </Button>
+            </div>
+            <p className="max-w-3xl text-body">
+              Phases group statuses into the steps a customer recognises, such as payment, intake, review and delivery. Customers see a progress bar, each phase can ask for uploads or answers, and staff
+              review and accept each phase. Both choices below only start a draft: nothing changes for orders until you publish, and existing orders keep the version they started on.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <Button loading={addPhases.isPending} disabled={convertDefault.isPending} onClick={() => void startPhases("add")}>
+                Add the ReadyPackets phases workflow
+              </Button>
+              {defaultWorkflow ? (
+                <Button variant="secondary" loading={convertDefault.isPending} disabled={addPhases.isPending} onClick={() => void startPhases("convert")}>
+                  {`Convert ${defaultWorkflow.name} to phases`}
+                </Button>
+              ) : null}
+            </div>
+          </section>
         ) : null}
         {rows.length === 0 ? (
           <EmptyState
@@ -183,10 +262,35 @@ export default function AdminWorkflowsPage() {
         />
       </div>
       {creating ? <NewWorkflowDialog workflows={rows} onClose={() => setCreating(false)} onCreated={(id) => void refresh().then(() => navigate(`/admin/workflows/drafts/${id}`))} /> : null}
+      {convertAsk ? (
+        <ConfirmDialog
+          open
+          onOpenChange={(open) => (open ? undefined : setConvertAsk(null))}
+          title={`Convert the draft “${convertAsk.draftName}” to phases?`}
+          description="This draft has no phases yet. Converting it groups its statuses into phases and removes the older status groups. The draft stays unpublished and orders are not affected."
+          confirmLabel="Convert draft"
+          onConfirm={async () => {
+            try {
+              await convertInPlace(convertAsk.draftId);
+              setConvertAsk(null);
+            } catch (err) {
+              setProblem(errorMessage(err));
+              setConvertAsk(null);
+            }
+          }}
+        />
+      ) : null}
       {discarding ? <DiscardDialog draft={discarding} onClose={() => setDiscarding(null)} onDone={() => void refresh()} /> : null}
       {transfer.dialog}
     </>
   );
+}
+
+/** No browser storage for portal data (lint rule): a dismissal lasts until the page is reloaded. */
+let phasesNoticeDismissed = false;
+/** Tests only. */
+export function resetPhasesNoticeForTests() {
+  phasesNoticeDismissed = false;
 }
 
 function NewWorkflowDialog({ workflows, onClose, onCreated }: { workflows: WorkflowListRow[]; onClose: () => void; onCreated: (draftId: string) => void }) {
@@ -196,7 +300,7 @@ function NewWorkflowDialog({ workflows, onClose, onCreated }: { workflows: Workf
   const [name, setName] = useState("");
   const [key, setKey] = useState("");
   const [keyTouched, setKeyTouched] = useState(false);
-  const [from, setFrom] = useState<"standard" | "blank" | "copy">("standard");
+  const [from, setFrom] = useState<"phases" | "standard" | "blank" | "copy">("phases");
   const [copyFrom, setCopyFrom] = useState(copyable[0]?.currentVersionPublicId ?? "");
   const [errors, setErrors] = useState<{ name?: string; key?: string; copy?: string; form?: string }>({});
   const taken = new Set(workflows.map((wf) => wf.workflowKey));
@@ -271,7 +375,8 @@ function NewWorkflowDialog({ workflows, onClose, onCreated }: { workflows: Workf
           value={from}
           onValueChange={(value) => setFrom(value as typeof from)}
           options={[
-            { value: "standard", label: "The standard workflow", description: "Submitted, In review, Waiting on customer, Completed, Cancelled." },
+            { value: "phases", label: "ReadyPackets phases (recommended)", description: "Seven phases from payment to delivery, with customer uploads, review and a progress bar." },
+            { value: "standard", label: "The standard workflow (statuses)", description: "Submitted, In review, Waiting on customer, Completed, Cancelled. No phases." },
             { value: "blank", label: "Blank", description: "Only a start status and a final status." },
             { value: "copy", label: "A copy of an existing workflow", description: "Its current published version.", disabled: copyable.length === 0 },
           ]}

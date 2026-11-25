@@ -108,7 +108,8 @@ refuse_callback 'OIDC callback on plain HTTP' "http://$host/api/identity/sso/cal
 refuse_callback 'OIDC callback mixed-case trailing slash on plain HTTP' "http://$host/API/identity/sso/callback/?code=callback-canary-81a4&state=state-canary-92b5"
 refuse_callback 'storage OAuth callback on plain HTTP' "http://$host/api/storage/oauth/callback/dropbox?code=callback-canary-81a4&state=state-canary-92b5"
 refuse_callback 'bare storage OAuth callback on plain HTTP' "http://$host/API/storage/oauth/callback?code=callback-canary-81a4&state=state-canary-92b5"
-for callback in 'api/webhooks/inbound/demo' 'api/payments/webhooks' 'API/payments/return/'; do
+for callback in 'api/webhooks/inbound/demo' 'api/payments/webhooks' 'API/payments/return/' \
+    'api/identity/saml/metadata' 'api/identity/saml/start' 'api/identity/saml/acs' 'API/identity/saml/acs/'; do
     refuse_callback "$callback on plain HTTP" "http://$host/$callback?token=callback-canary-81a4"
     if [[ -n $alias ]]; then
         refuse_callback "$callback on HTTPS alias" "https://$alias/$callback?token=callback-canary-81a4"
@@ -165,6 +166,9 @@ step 'oversized request bodies are refused; upload allowances only on the exact 
 head -c 400000 /dev/zero | tr '\0' 'a' > "$work/large"
 expect 'large body' "$(web -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
     --data-binary "@$work/large" "$origin/api/trpc/identity.signIn")" 413
+expect 'oversized SAML ACS form' "$(web -o /dev/null -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/x-www-form-urlencoded' --data-binary "@$work/large" "$origin/api/identity/saml/acs")" 413
+expect 'wrong ACS method' "$(web -o /dev/null -w '%{http_code}' "$origin/api/identity/saml/acs")" 404
 expect 'mixed-case upload path keeps the default limit' "$(web -o /dev/null -w '%{http_code}' -X POST \
     -H 'Content-Type: application/octet-stream' --data-binary "@$work/large" "$origin/api/Files/upload/01J00000000000000000000001")" 413
 upload_status=$(web -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/octet-stream' \
@@ -181,8 +185,8 @@ grep -qx '127.0.0.1:5000' <<<"$listeners" || fail 'the application does not list
 ! grep -E ':(5000|3306|33060)$' <<<"$listeners" | grep -qv '^127\.0\.0\.1:' || fail 'the application or the database listens beyond 127.0.0.1'
 grep -qx '127.0.0.1:3306' <<<"$listeners" || fail 'MySQL does not listen on 127.0.0.1:3306'
 expect 'MySQL settings' "$(sql "SELECT CONCAT_WS(' ', @@bind_address, @@skip_name_resolve, @@local_infile)")" '127.0.0.1 1 0'
-step 'release migration 0005 is applied exactly once'
-assert_release_migrations /opt/readypackets/current/migrations sql 0005_increment_05 0006_increment_06
+step 'release migrations are applied exactly once'
+assert_release_migrations /opt/readypackets/current/migrations sql 0005_increment_05 0006_increment_06 0007_increment_07
 
 step 'service sandbox and secrets'
 for unit in readypackets-portal.service readypackets-worker.service; do

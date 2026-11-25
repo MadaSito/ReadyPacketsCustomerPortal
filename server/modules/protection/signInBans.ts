@@ -66,6 +66,8 @@ const credentialProcedures = new Set([
 ]);
 
 export function isSignInRequest(req: Pick<Request, "path" | "method">): boolean {
+  if ((req.method === "GET" && req.path === "/api/identity/saml/start") ||
+    (req.method === "POST" && req.path === "/api/identity/saml/acs")) return true;
   const path = req.path.toLowerCase();
   if ((req.method === "GET" || req.method === "HEAD") && /^\/api\/identity\/sso\/(?:start|callback)\/?$/.test(path)) return true;
   if (req.method === "POST" && /^\/api\/identity\/sso\/complete\/?$/.test(path)) return true;

@@ -45,6 +45,15 @@ import { readSetting, writeSetting } from "../platform/index.js";
 import { ORDER_AGREEMENT_GATE, ORDER_WORKFLOW_RULES_ENABLED, ORDER_WORKFLOW_TRANSFER_ENABLED, parseAgreementGate } from "./settings.js";
 import { createWorkflowTransferService, type WorkflowTransferService } from "./workflowTransferService.js";
 export type { TransferApplyInput, TransferApplyResult, TransferPreview, TransferSelection, TransferStatus } from "./workflowTransferService.js";
+import { createOrderStatusCatalogService, type OrderStatusCatalogService } from "./statusCatalog.js";
+export type { AttentionCountsView, OrderStatusCatalogService } from "./statusCatalog.js";
+import { createStageRuntime } from "./stageRuntime.js";
+import { createOrderPaymentsPort, createStagesService } from "./stages.js";
+export type { StageWorkspace, StageViewState } from "./stages.js";
+import { createPhaseWorkServices } from "./questionsRouter.js";
+import { createStageStartup, STAGE_STARTUP_JOB } from "./stageStartup.js";
+import { ulid } from "../../core/ids.js";
+import { checkStageTargets } from "./stageTargets.js";
 
 export type * from "./types.js";
 
@@ -114,6 +123,14 @@ export interface OrdersModule extends ModuleLifecycle {
   workflowTransfer: WorkflowTransferService;
   /** Increment 06 (D14): order agreement (MNDA) setting administration and customer status. */
   agreementGate: AgreementGateService;
+  /** Increment 07 (D2): admin-managed order status catalogue (`orders.statusCatalog.*`). */
+  statusCatalog: OrderStatusCatalogService;
+  /** Increment 07 (D1/D3/D8): `orders.stages.*` and the stage ports (resolveStageForUpload, listForOrder, ...). */
+  stages: ReturnType<typeof createStagesService>;
+  /** Increment 07 (D9): payment state writes (compliance calls these in its own tx). */
+  payments: ReturnType<typeof createOrderPaymentsPort>;
+  /** Increment 07 (D4/D5): phase questions and admin tasks (assurance). */
+  phaseWork: ReturnType<typeof createPhaseWorkServices>;
   orders: OrderService;
   sharing: SharingService;
 }
@@ -129,6 +146,7 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     audit: deps.audit,
     actorCheck,
     rulesEnabled: (tx) => readSetting(deps.settings, ORDER_WORKFLOW_RULES_ENABLED, tx),
+    checkStageTargets: (stages, tx) => checkStageTargets(deps.services, stages, tx),
   });
   const gates = createGatesService({
     db: deps.db,
@@ -139,7 +157,40 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
   const requirements = createRequirementsService({ ...deps, policy, workflows, actorCheck, gates });
   const access = createAccessService({ ...deps, policy, actorCheck });
   let paymentProvider: OrderPaymentSummaryProvider | null = null;
-  const orders = createOrderService({ ...deps, policy, catalog, workflows, requirements, access, gates, paymentSummary: () => paymentProvider });
+  const stageRuntime = createStageRuntime({ db: deps.db, clock: deps.clock, services: deps.services, workflows });
+  const orders = createOrderService({ ...deps, policy, catalog, workflows, requirements, access, gates, stageRuntime, paymentSummary: () => paymentProvider });
+  const stages = createStagesService({
+    db: deps.db,
+    clock: deps.clock,
+    audit: deps.audit,
+    crypto: deps.crypto,
+    logger: deps.logger,
+    policy,
+    actorCheck,
+    workflows,
+    requirements,
+    gates,
+    orders,
+    runtime: stageRuntime,
+  });
+  const payments = createOrderPaymentsPort({ clock: deps.clock, audit: deps.audit, logger: deps.logger, workflows, orders, runtime: stageRuntime });
+  const phaseWork = createPhaseWorkServices({
+    db: deps.db,
+    audit: deps.audit,
+    clock: deps.clock,
+    crypto: deps.crypto,
+    policy,
+    actorCheck,
+    gates,
+    resolveStage: stages.resolveQuestionStage,
+    refreshAttentionInTx: stages.refreshAttentionInTx,
+  });
+  const stageStartup = createStageStartup({ db: deps.db, clock: deps.clock, audit: deps.audit, logger: deps.logger, paymentSummary: () => paymentProvider, recalcStoredProgress: stageRuntime.recalcStored });
+  deps.jobs.register(STAGE_STARTUP_JOB, async (job) => {
+    await job.assertStillOwned();
+    return stageStartup.job();
+  });
+  deps.jobs.registerSchedule({ name: STAGE_STARTUP_JOB, type: STAGE_STARTUP_JOB, everyMs: 10 * 60_000 });
   const getOrderFileFolderRouting = createFolderRouting({ workflows });
   const sharing = createSharingService({ ...deps, policy });
   const portable = createPortableHooks({ ...deps, workflows });
@@ -158,6 +209,7 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
   });
 
   const agreementGate = createAgreementGateService({ db: deps.db, audit: deps.audit, settings: deps.settings, services: deps.services, actorCheck, gates });
+  const statusCatalog = createOrderStatusCatalogService({ db: deps.db, clock: deps.clock, audit: deps.audit, actorCheck });
 
   const apiProvider = createOrdersApiProvider({ db: deps.db, services: deps.services, workflows, catalog, orders });
 
@@ -166,6 +218,18 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
       // Increment 04 (package H): /api/v1 orders provider. Absent public API module ⇒ nothing to register.
       const publicApi = (deps.services as Partial<Services>).publicApi as unknown as { registerProvider?: (key: "orders", provider: unknown) => void } | undefined;
       publicApi?.registerProvider?.("orders", apiProvider);
+      // Lead QA: run the increment-07 start-up work once right after boot as well (the 10-minute schedule stays), so an
+      // upgraded install shows recalculated progress immediately. Per-boot idempotency key; the job itself is idempotent.
+      void deps.jobs
+        .enqueue(STAGE_STARTUP_JOB, {}, { idempotencyKey: `${STAGE_STARTUP_JOB}:boot:${ulid(deps.clock.now().getTime())}` })
+        .catch((err: unknown) => {
+          deps.logger.warn("orders increment 07 start-up enqueue deferred", { errorName: err instanceof Error ? err.name : "unknown" });
+        });
+      void statusCatalog.ensureSeeded().catch((err: unknown) => {
+        deps.logger.warn("orders status catalogue startup seed deferred", {
+          errorName: err instanceof Error ? err.name : "unknown",
+        });
+      });
     },
     assertCanReadOrder: policy.assertCanReadOrder,
     assertCanWriteOrder: policy.assertCanWriteOrder,
@@ -205,6 +269,10 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     workflows,
     workflowTransfer,
     agreementGate,
+    statusCatalog,
+    stages,
+    payments,
+    phaseWork,
     orders,
     sharing,
     async health(): Promise<ModuleHealth[]> {

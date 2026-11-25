@@ -81,3 +81,10 @@ f17c9c41b15deb040cb73926cd239982b6bf2158:server/modules/compliance/receiptsAndSm
 82430006150dff06ea7c7745d4555115c100eeb7:server/modules/cart/cartIncrement06.test.ts:generic-api-key:1013
 82430006150dff06ea7c7745d4555115c100eeb7:server/modules/cart/cartIncrement06.test.ts:generic-api-key:1064
 82430006150dff06ea7c7745d4555115c100eeb7:server/modules/cart/cartIncrement06.test.ts:generic-api-key:1152
+# Increment 07, reviewed one by one on 2026-11-25: synthetic Stripe-style test fixtures (never issued by Stripe),
+# a synthetic signing-secret fixture, an idempotency key, and the phase key "phase_4_delivery". None is a credential.
+e081da273fadc355ae21dd8e5f9d824b05b5f649:server/modules/payments/payments.test.ts:generic-api-key:749
+d049499ffec3e9e519ba24b5aa28c241e8b9023d:server/modules/payments/stripeCompletion.e2e.test.ts:generic-api-key:1175
+2267869408893da1849bee235015fb44ce158ad0:client/src/features/integrations/production/production.test.tsx:generic-api-key:1260
+14bc58a30e3872774031e6b095a945c05bbf04bc:tests/integration/isolation.test.ts:generic-api-key:369
+77cdfc3ba04327926381f1c41a8bbc4e378d3ebc:server/modules/orders/stageModel.ts:generic-api-key:181

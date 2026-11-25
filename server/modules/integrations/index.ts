@@ -4,6 +4,7 @@
  */
 import type { ModuleDeps } from "../../container.js";
 import type { HealthState, ModuleHealth, ModuleLifecycle } from "../../core/types.js";
+import type { SsoStatusSummary } from "../identity/sso/service.js";
 import {
   createAnalyticsService,
   type AdminAnalyticsConfig,
@@ -51,20 +52,15 @@ import {
   type GraphReadiness,
   type GraphRequestInput,
   type GraphResponse,
+  type GraphEntraRunbookView,
+  type GraphSitesSelectedWriteCheckInput,
+  type GraphSitesSelectedWriteCheckResult,
   type GraphUploadChunkInput,
   type GraphUploadChunkResult,
   type GraphUploadSessionControlInput,
   type UpdateGraphConfigInput,
 } from "./graph/index.js";
-import { createProviderChecksStore } from "./providerChecks.js";
-import {
-  createScaffoldsService,
-  SAML_RELEASE_BANNER,
-  type SamlScaffoldView,
-  type ScaffoldsService,
-  type SharePointScaffoldView,
-  type UpdateSamlScaffoldInput,
-} from "./scaffolds.js";
+import { createProviderChecksStore, type ProviderCheckRecord } from "./providerChecks.js";
 import {
   createSmtpService,
   type ProviderState,
@@ -81,7 +77,7 @@ import {
 import {
   createStripeService,
   STRIPE_LEDGER_MUTATION_ENABLED,
-  STRIPE_RELEASE_BANNER,
+  STRIPE_PAYMENTS_SETUP_NOTICE,
   type StripeConfigView,
   type StripeService,
   type StripeWebhookResult,
@@ -121,7 +117,9 @@ import {
   type RequestP201Input,
   type ResendProductionInput,
   type RetryProductionDispatchInput,
+  type StopProductionDispatchInput,
   type UpdateProductionSettingsInput,
+  type WorkflowAutoQueueItemView,
 } from "./production/index.js";
 import {
   createInboundWebhooksHttpRouter,
@@ -153,6 +151,21 @@ import {
   type WebhooksService,
   type WebhooksSettingsView,
 } from "./webhooks/index.js";
+import {
+  createWorkflowWebhooksService,
+  STAGE_WEBHOOK_TRIGGER_SOURCES,
+  WORKFLOW_WEBHOOK_KINDS,
+  type EnqueueStageWebhookInput,
+  type EnqueueStageWebhookOutcome,
+  type EnqueueStageWebhookResult,
+  type ListWorkflowWebhookOptionsInput,
+  type StageWebhookTriggerSource,
+  type WorkflowLifecycleAutoQueuePolicy,
+  type WorkflowWebhookOptionView,
+  type WorkflowWebhooksService,
+  type WorkflowWebhookTargetKind,
+  type WorkflowWebhookValidationResult,
+} from "./workflowWebhooks/index.js";
 
 // Ensure all `integrations.*` settings/secrets/flags register on module import.
 import "./settings.js";
@@ -172,16 +185,27 @@ export {
   PRODUCTION_SENDING_GRACE_MS,
   PRODUCTION_SETTINGS_HREF,
   PRODUCTION_STALE_QUEUED_MS,
-  SAML_RELEASE_BANNER,
   STRIPE_LEDGER_MUTATION_ENABLED,
-  STRIPE_RELEASE_BANNER,
+  STRIPE_PAYMENTS_SETUP_NOTICE,
   WEBHOOK_DELIVER_JOB,
   WEBHOOK_DELIVERY_STATUSES,
   WEBHOOK_DIRECTIONS,
   WEBHOOK_MAX_ATTEMPTS,
   WEBHOOK_PURGE_JOB,
   WEBHOOK_SUBSCRIPTION_STATUSES,
+  WORKFLOW_WEBHOOK_KINDS,
+  STAGE_WEBHOOK_TRIGGER_SOURCES,
   type AdminAnalyticsConfig,
+  type EnqueueStageWebhookInput,
+  type EnqueueStageWebhookOutcome,
+  type EnqueueStageWebhookResult,
+  type ListWorkflowWebhookOptionsInput,
+  type StageWebhookTriggerSource,
+  type WorkflowLifecycleAutoQueuePolicy,
+  type WorkflowWebhookOptionView,
+  type WorkflowWebhooksService,
+  type WorkflowWebhookTargetKind,
+  type WorkflowWebhookValidationResult,
   type AnalyticsCspPolicy,
   type AnalyticsService,
   type ControlledResendReason,
@@ -211,6 +235,9 @@ export {
   type GraphReadiness,
   type GraphRequestInput,
   type GraphResponse,
+  type GraphEntraRunbookView,
+  type GraphSitesSelectedWriteCheckInput,
+  type GraphSitesSelectedWriteCheckResult,
   type GraphUploadChunkInput,
   type GraphUploadChunkResult,
   type GraphUploadSessionControlInput,
@@ -243,11 +270,9 @@ export {
   type RequestP201Input,
   type ResendProductionInput,
   type RetryProductionDispatchInput,
+  type StopProductionDispatchInput,
   type ResolveEgressInput,
-  type SamlScaffoldView,
-  type ScaffoldsService,
   type SetEgressPresetInput,
-  type SharePointScaffoldView,
   type SmtpConfigView,
   type SmtpReadiness,
   type SmtpSenderIdentity,
@@ -263,7 +288,6 @@ export {
   type UpdateEgressRuleInput,
   type UpdateGraphConfigInput,
   type UpdateProductionSettingsInput,
-  type UpdateSamlScaffoldInput,
   type UpdateSmtpConfigInput,
   type UpdateStripeConfigInput,
   type UpdateWebhookInboundEndpointInput,
@@ -281,6 +305,7 @@ export {
   type WebhookSubscriptionView,
   type WebhooksService,
   type WebhooksSettingsView,
+  type WorkflowAutoQueueItemView,
 };
 
 export const PROVIDER_KEYS = ["smtp", "graph", "clarity", "posthog", "stripe", "saml", "sharepoint"] as const;
@@ -320,11 +345,407 @@ export interface IntegrationsModule extends Omit<ModuleLifecycle, "health"> {
   ): GraphClient;
   analytics: AnalyticsService;
   stripe: StripeService;
-  scaffolds: ScaffoldsService;
   production: ProductionWebhookService;
   webhooks: WebhooksService;
+  workflowWebhooks: WorkflowWebhooksService;
   /** Convenience hook consumed by `server/http` CSP middleware (`services.integrations.analyticsCsp(pathname)`). */
   analyticsCsp(pathname: string): Promise<AnalyticsCspPolicy | null>;
+}
+
+const SSO_CERT_EXPIRY_WARNING_MS = 30 * 24 * 60 * 60 * 1000;
+
+interface DerivedCardFields {
+  state: ProviderState;
+  verified: boolean;
+  lastCheckedAt: Date | null;
+  summary: string;
+}
+
+interface FileSyncStatusSummarySnapshot {
+  totalConnections: number;
+  enabledConnections: number;
+  approvedConnections: number;
+  writeTestedConnections: number;
+  readyConnections: number;
+  failingConnections: number;
+  blockedTransfers: number;
+  lastCheckedAt: Date | null;
+  lastSuccessAt: Date | null;
+}
+
+interface PaymentsHealthSnapshot {
+  provider: "none" | "stripe" | "square";
+  onlineEnabled: boolean;
+  redirectedAttempts: number;
+  retryPendingWebhooks: number;
+}
+
+interface PaymentsConfigSnapshot {
+  provider?: string;
+  mode?: string;
+  stripeSecretKeyLast4?: string | null;
+  stripeWebhookSecretLast4?: string | null;
+  stripeLastApiVerifiedAt?: string | null;
+  stripeLastSelfTestAt?: string | null;
+}
+
+function latestValidDate(...candidates: (Date | null | undefined)[]): Date | null {
+  let latest: Date | null = null;
+  for (const candidate of candidates) {
+    if (candidate instanceof Date && !Number.isNaN(candidate.getTime())) {
+      if (!latest || candidate.getTime() > latest.getTime()) {
+        latest = candidate;
+      }
+    }
+  }
+  return latest;
+}
+
+function parseOptionalIsoDate(raw: unknown): Date | null {
+  if (typeof raw !== "string" || raw.trim() === "") return null;
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function formatSsoProtocolLabel(protocol: SsoStatusSummary["protocol"]): string {
+  return protocol === "saml" ? "SAML 2.0" : "OpenID Connect (Entra ID)";
+}
+
+function formatSsoMfaModeWords(mode: SsoStatusSummary["entraMfaMode"]): string {
+  switch (mode) {
+    case "portal":
+      return "Portal MFA always";
+    case "claim":
+      return "MFA claim required";
+    case "entra":
+      return "Entra manages MFA";
+  }
+}
+
+function deriveSamlCardStatus(ssoSummary: SsoStatusSummary | null, now: Date): DerivedCardFields {
+  if (!ssoSummary) {
+    return {
+      state: "not_configured",
+      verified: false,
+      lastCheckedAt: null,
+      summary: "Single sign-on is not configured — set up SAML 2.0 or Microsoft Entra ID in Single Sign-On settings.",
+    };
+  }
+
+  const modeHeadline = `${formatSsoProtocolLabel(ssoSummary.protocol)} · ${formatSsoMfaModeWords(ssoSummary.entraMfaMode)}`;
+  const lastCheckedAt = latestValidDate(ssoSummary.lastSignInAt, ssoSummary.metadataCheckedAt);
+  const verificationSucceeded =
+    ssoSummary.lastSignInAt !== null ||
+    (ssoSummary.metadataCheckedAt !== null && ssoSummary.metadataStatus === "OK");
+  const metadataFailed =
+    ssoSummary.protocol === "saml" &&
+    ssoSummary.metadataStatus !== null &&
+    ssoSummary.metadataStatus !== "OK";
+  const certExpiringSoon =
+    ssoSummary.protocol === "saml" &&
+    ssoSummary.nearestCertificateExpiry !== null &&
+    ssoSummary.nearestCertificateExpiry.getTime() - now.getTime() <= SSO_CERT_EXPIRY_WARNING_MS;
+  const hadPriorSamlCheck = ssoSummary.metadataCheckedAt !== null || ssoSummary.lastSignInAt !== null;
+
+  if (
+    ssoSummary.protocol === "saml" &&
+    ssoSummary.trustedCertificates === 0 &&
+    (ssoSummary.enabled || (ssoSummary.configured && hadPriorSamlCheck))
+  ) {
+    return {
+      state: "failing",
+      verified: false,
+      lastCheckedAt,
+      summary: `${modeHeadline} — no valid active signing certificate; upload or refresh the IdP certificate in Single Sign-On settings.`,
+    };
+  }
+
+  if (ssoSummary.enabled && (!ssoSummary.complete || !ssoSummary.availableInThisDeployment)) {
+    return {
+      state: "failing",
+      verified: false,
+      lastCheckedAt,
+      summary: !ssoSummary.availableInThisDeployment
+        ? `${modeHeadline} — HTTPS callback origin is required in this deployment.`
+        : `${modeHeadline} — enabled with incomplete provider configuration.`,
+    };
+  }
+
+  if (!ssoSummary.configured || (!ssoSummary.enabled && !ssoSummary.complete)) {
+    return {
+      state: "not_configured",
+      verified: false,
+      lastCheckedAt,
+      summary: !ssoSummary.configured
+        ? `${modeHeadline} — no directory tenant or signing certificate configured.`
+        : ssoSummary.protocol === "saml"
+          ? `${modeHeadline} — add SAML entity/SSO URLs and an active signing certificate to complete setup.`
+          : `${modeHeadline} — add client credentials in Single Sign-On settings to complete setup.`,
+    };
+  }
+
+  if (!ssoSummary.enabled) {
+    return {
+      state: "disabled",
+      verified: false,
+      lastCheckedAt,
+      summary: `${modeHeadline} — configured and switched off.`,
+    };
+  }
+
+  if (!verificationSucceeded) {
+    return {
+      state: "degraded",
+      verified: false,
+      lastCheckedAt,
+      summary: `${modeHeadline} — enabled, awaiting first verified sign-in or certificate check.`,
+    };
+  }
+
+  if (certExpiringSoon && ssoSummary.nearestCertificateExpiry) {
+    const daysRemaining = Math.max(
+      0,
+      Math.ceil((ssoSummary.nearestCertificateExpiry.getTime() - now.getTime()) / (24 * 60 * 60 * 1000)),
+    );
+    return {
+      state: "degraded",
+      verified: false,
+      lastCheckedAt,
+      summary: `${modeHeadline} — active signing certificate expires within 30 days (${daysRemaining} day${daysRemaining === 1 ? "" : "s"} remaining).`,
+    };
+  }
+
+  if (metadataFailed) {
+    return {
+      state: "degraded",
+      verified: false,
+      lastCheckedAt,
+      summary: `${modeHeadline} — last metadata refresh reported ${ssoSummary.metadataStatus}; active certificate remains valid.`,
+    };
+  }
+
+  return {
+    state: "configured",
+    verified: true,
+    lastCheckedAt,
+    summary:
+      ssoSummary.protocol === "saml"
+        ? `${modeHeadline} — enabled and verified (${ssoSummary.trustedCertificates} active signing certificate${ssoSummary.trustedCertificates === 1 ? "" : "s"}).`
+        : `${modeHeadline} — enabled and verified.`,
+  };
+}
+
+function deriveSharePointCardStatus(
+  fileSyncSummary: FileSyncStatusSummarySnapshot | null,
+  graphPresetEnabled: boolean,
+  graphUploadPresetEnabled: boolean,
+  sharepointCheck: ProviderCheckRecord | null,
+): DerivedCardFields {
+  const bothPresetsEnabled = graphPresetEnabled && graphUploadPresetEnabled;
+
+  if (!fileSyncSummary) {
+    const verified = bothPresetsEnabled && sharepointCheck?.lastOutcome === "succeeded";
+    const state: ProviderState =
+      !graphPresetEnabled && !graphUploadPresetEnabled
+        ? "disabled"
+        : sharepointCheck?.lastOutcome === "failed"
+          ? "failing"
+          : bothPresetsEnabled
+            ? "configured"
+            : "degraded";
+    const summary =
+      !graphPresetEnabled && !graphUploadPresetEnabled
+        ? "Microsoft 365 SharePoint & OneDrive sync is switched off until both Graph egress presets and an Entra Sites.Selected connection are configured."
+        : !bothPresetsEnabled
+          ? `Enable both Microsoft Graph (${graphPresetEnabled ? "on" : "off"}) and SharePoint Upload Session (${graphUploadPresetEnabled ? "on" : "off"}) egress presets before syncing files.`
+          : verified
+            ? "Graph + upload egress presets enabled and Entra Sites.Selected write check passed."
+            : sharepointCheck?.lastOutcome === "failed"
+              ? "The most recent Entra Sites.Selected check failed — verify site grant and re-test in Storage."
+              : "Graph + upload egress presets enabled — run the Entra Sites.Selected write check in Storage.";
+    return {
+      state,
+      verified,
+      lastCheckedAt: sharepointCheck?.lastCheckedAt ?? null,
+      summary,
+    };
+  }
+
+  const lastCheckedAt = latestValidDate(
+    fileSyncSummary.lastCheckedAt,
+    fileSyncSummary.lastSuccessAt,
+    sharepointCheck?.lastCheckedAt,
+  );
+
+  if (fileSyncSummary.totalConnections === 0) {
+    if (sharepointCheck?.lastOutcome === "failed") {
+      return {
+        state: "failing",
+        verified: false,
+        lastCheckedAt,
+        summary:
+          "The most recent Entra Sites.Selected probe failed and no SharePoint or OneDrive connection is configured in Storage.",
+      };
+    }
+    if (bothPresetsEnabled && sharepointCheck?.lastOutcome === "succeeded") {
+      return {
+        state: "degraded",
+        verified: false,
+        lastCheckedAt,
+        summary:
+          "Graph egress presets and Entra Sites.Selected probe passed — add and approve a SharePoint or OneDrive connection in Storage.",
+      };
+    }
+    return {
+      state: "not_configured",
+      verified: false,
+      lastCheckedAt,
+      summary:
+        "No SharePoint or OneDrive storage connection is configured — add a connection in Storage and approve a destination in File sync.",
+    };
+  }
+
+  if (fileSyncSummary.enabledConnections === 0) {
+    return {
+      state: "disabled",
+      verified: false,
+      lastCheckedAt,
+      summary: `${fileSyncSummary.totalConnections} Microsoft 365 connection${fileSyncSummary.totalConnections === 1 ? "" : "s"} configured in Storage, currently switched off${fileSyncSummary.blockedTransfers > 0 ? ` (${fileSyncSummary.blockedTransfers} retained transfer${fileSyncSummary.blockedTransfers === 1 ? "" : "s"} awaiting review)` : ""}.`,
+    };
+  }
+
+  if (fileSyncSummary.failingConnections > 0) {
+    return {
+      state: "failing",
+      verified: false,
+      lastCheckedAt,
+      summary: `${fileSyncSummary.failingConnections} enabled Microsoft 365 connection${fileSyncSummary.failingConnections === 1 ? " requires" : "s require"} attention in File sync${fileSyncSummary.blockedTransfers > 0 ? ` (${fileSyncSummary.blockedTransfers} blocked or failed transfer${fileSyncSummary.blockedTransfers === 1 ? "" : "s"})` : ""}.`,
+    };
+  }
+
+  if (!bothPresetsEnabled) {
+    return {
+      state: "degraded",
+      verified: false,
+      lastCheckedAt,
+      summary: `Microsoft 365 connection enabled, but outbound presets require both Microsoft Graph (${graphPresetEnabled ? "on" : "off"}) and SharePoint Upload Session (${graphUploadPresetEnabled ? "on" : "off"}).`,
+    };
+  }
+
+  if (fileSyncSummary.readyConnections === 0) {
+    return {
+      state: "degraded",
+      verified: false,
+      lastCheckedAt,
+      summary:
+        fileSyncSummary.approvedConnections === 0
+          ? "Microsoft 365 connection enabled in Storage — run the write test and approve a destination in File sync."
+          : "Microsoft 365 file-sync destination needs a current write test in File sync.",
+    };
+  }
+
+  if (fileSyncSummary.blockedTransfers > 0) {
+    return {
+      state: "degraded",
+      verified: false,
+      lastCheckedAt,
+      summary: `${fileSyncSummary.readyConnections} Microsoft 365 file-sync destination${fileSyncSummary.readyConnections === 1 ? "" : "s"} ready, with ${fileSyncSummary.blockedTransfers} transfer${fileSyncSummary.blockedTransfers === 1 ? "" : "s"} awaiting review in File sync.`,
+    };
+  }
+
+  return {
+    state: "configured",
+    verified: true,
+    lastCheckedAt,
+    summary: `${fileSyncSummary.readyConnections} Microsoft 365 file-sync destination${fileSyncSummary.readyConnections === 1 ? "" : "s"} enabled, approved, and write-tested${fileSyncSummary.lastSuccessAt ? " (managed copies verified)" : ""}.`,
+  };
+}
+
+function deriveStripeCardStatus(
+  paymentsHealth: PaymentsHealthSnapshot | null,
+  paymentsCfg: PaymentsConfigSnapshot | null,
+  stripePresetEnabled: boolean,
+  stripeView: StripeConfigView,
+): DerivedCardFields {
+  const modeLabel = paymentsCfg?.mode === "live" ? "live" : "test";
+  const paymentsCheckedAt = latestValidDate(
+    parseOptionalIsoDate(paymentsCfg?.stripeLastApiVerifiedAt),
+    parseOptionalIsoDate(paymentsCfg?.stripeLastSelfTestAt),
+    stripeView.lastCheckedAt,
+  );
+
+  if (paymentsHealth?.provider === "stripe" && paymentsHealth.onlineEnabled) {
+    if (paymentsHealth.retryPendingWebhooks > 0) {
+      return {
+        state: "degraded",
+        verified: false,
+        lastCheckedAt: paymentsCheckedAt,
+        summary: `Stripe (${modeLabel} mode) online checkout is active with ${paymentsHealth.retryPendingWebhooks} webhook retr${paymentsHealth.retryPendingWebhooks === 1 ? "y" : "ies"} pending.`,
+      };
+    }
+    return {
+      state: "configured",
+      verified: true,
+      lastCheckedAt: paymentsCheckedAt,
+      summary: `Stripe (${modeLabel} mode) online checkout and signed webhooks are active and verified.`,
+    };
+  }
+
+  if (paymentsCfg?.provider === "stripe") {
+    return {
+      state: !stripePresetEnabled ? "failing" : "degraded",
+      verified: false,
+      lastCheckedAt: paymentsCheckedAt,
+      summary: !stripePresetEnabled
+        ? "Stripe is selected in Payment Setup, but the api.stripe.com:443 outbound preset is switched off."
+        : "Stripe is selected in Payment Setup — complete API and webhook verification in Payment Setup.",
+    };
+  }
+
+  const hasStagedStripeCredentials = Boolean(
+    paymentsCfg?.stripeSecretKeyLast4 ||
+      paymentsCfg?.stripeWebhookSecretLast4 ||
+      stripeView.secretKeyConfigured ||
+      stripeView.webhookSecretConfigured ||
+      stripeView.publishableKey,
+  );
+
+  if (hasStagedStripeCredentials) {
+    return {
+      state: "disabled",
+      verified: false,
+      lastCheckedAt: paymentsCheckedAt,
+      summary:
+        paymentsHealth?.provider === "square"
+          ? "Stripe credentials are staged in Payment Setup, while Square is the active payment provider."
+          : "Stripe credentials are staged in Payment Setup, with Stripe online checkout switched off.",
+    };
+  }
+
+  if (stripeView.state !== "disabled") {
+    return {
+      state: stripeView.state,
+      verified: stripeView.verified,
+      lastCheckedAt: stripeView.lastCheckedAt,
+      summary: stripeView.summary,
+    };
+  }
+
+  if (stripePresetEnabled) {
+    return {
+      state: "configured",
+      verified: false,
+      lastCheckedAt: stripeView.lastCheckedAt,
+      summary: "Outbound api.stripe.com:443 preset is enabled — manage keys, webhooks and readiness in Payment Setup.",
+    };
+  }
+
+  return {
+    state: "not_configured",
+    verified: false,
+    lastCheckedAt: stripeView.lastCheckedAt,
+    summary: "No Stripe credentials configured — open Payment Setup to configure online checkout.",
+  };
 }
 
 export function createIntegrationsModule(
@@ -338,18 +759,46 @@ export function createIntegrationsModule(
   const graphRuntime = createGraphModuleRuntime(deps, egress, checks, graphTokenCache);
   const analytics = createAnalyticsService(deps);
   const stripe = createStripeService(deps, checks);
-  const scaffolds = createScaffoldsService(deps);
   const production = createProductionWebhookService(deps, egress, checks);
   const webhooks = createWebhooksService(deps, egress);
+  const workflowWebhooks = createWorkflowWebhooksService(deps, { production, webhooks });
 
   async function buildAllStatuses(): Promise<ProviderStatus[]> {
-    const [smtpView, graphView, analyticsView, stripeView, samlView, sharepointView] = await Promise.all([
+    const now = deps.clock.now();
+    const ssoStatusSummaryFn = deps.services.identity?.sso?.statusSummary;
+    const fileSyncStatusSummaryFn = deps.services.storageConnections?.fileSync?.statusSummary;
+    const paymentsHealthCountsFn = deps.services.payments?.healthCounts;
+
+    const [
+      smtpView,
+      graphView,
+      analyticsView,
+      stripeView,
+      ssoSummary,
+      fileSyncSummary,
+      paymentsHealth,
+      paymentsCfg,
+      stripePresetEnabled,
+      graphPresetEnabled,
+      graphUploadPresetEnabled,
+      sharepointCheck,
+    ] = await Promise.all([
       smtp.getConfig(),
       graphRuntime.admin.getConfig(),
       analytics.getAdminConfig(),
       stripe.getConfig(),
-      scaffolds.getSamlScaffold(),
-      scaffolds.getSharePointScaffold(),
+      ssoStatusSummaryFn ? ssoStatusSummaryFn() : Promise.resolve(null),
+      fileSyncStatusSummaryFn ? fileSyncStatusSummaryFn() : Promise.resolve(null),
+      paymentsHealthCountsFn ? paymentsHealthCountsFn() : Promise.resolve(null),
+      deps.settings.get<PaymentsConfigSnapshot | null>(
+        "payments.config",
+        (raw) => (raw && typeof raw === "object" ? (raw as PaymentsConfigSnapshot) : null),
+        null,
+      ),
+      egress.isPresetEnabled("stripe"),
+      egress.isPresetEnabled("microsoft_graph"),
+      egress.isPresetEnabled("microsoft_graph_upload"),
+      checks.get("sharepoint"),
     ]);
 
     const clarityState: ProviderState = !analyticsView.clarity.configured
@@ -373,6 +822,15 @@ export function createIntegrationsModule(
       : !analyticsView.posthog.enabled
         ? "PostHog project token saved, but event capture is disabled."
         : "Configured for /privacy and /terms after visitor consent (live vendor delivery not verified by server).";
+
+    const stripeCard = deriveStripeCardStatus(paymentsHealth, paymentsCfg, stripePresetEnabled, stripeView);
+    const samlCard = deriveSamlCardStatus(ssoSummary, now);
+    const sharepointCard = deriveSharePointCardStatus(
+      fileSyncSummary,
+      graphPresetEnabled,
+      graphUploadPresetEnabled,
+      sharepointCheck,
+    );
 
     return [
       {
@@ -413,30 +871,30 @@ export function createIntegrationsModule(
       },
       {
         key: "stripe",
-        name: "Stripe Payment Webhooks",
-        state: stripeView.state,
-        verified: stripeView.verified,
-        scaffoldOnly: true,
-        lastCheckedAt: stripeView.lastCheckedAt,
-        summary: stripeView.summary,
+        name: "Stripe Payments",
+        state: stripeCard.state,
+        verified: stripeCard.verified,
+        scaffoldOnly: false,
+        lastCheckedAt: stripeCard.lastCheckedAt,
+        summary: stripeCard.summary,
       },
       {
         key: "saml",
         name: "Enterprise SAML 2.0 SSO",
-        state: samlView.state,
-        verified: false,
-        scaffoldOnly: true,
-        lastCheckedAt: null,
-        summary: samlView.releaseBanner,
+        state: samlCard.state,
+        verified: samlCard.verified,
+        scaffoldOnly: false,
+        lastCheckedAt: samlCard.lastCheckedAt,
+        summary: samlCard.summary,
       },
       {
         key: "sharepoint",
         name: "Microsoft 365 / SharePoint Sync",
-        state: sharepointView.state,
-        verified: false,
-        scaffoldOnly: true,
-        lastCheckedAt: null,
-        summary: sharepointView.summary,
+        state: sharepointCard.state,
+        verified: sharepointCard.verified,
+        scaffoldOnly: false,
+        lastCheckedAt: sharepointCard.lastCheckedAt,
+        summary: sharepointCard.summary,
       },
     ];
   }
@@ -471,14 +929,15 @@ export function createIntegrationsModule(
     createScopedGraphClient: graphRuntime.createScopedClient,
     analytics,
     stripe,
-    scaffolds,
     production,
     webhooks,
+    workflowWebhooks,
     analyticsCsp: (pathname) => analytics.analyticsCsp(pathname),
 
     init(): void {
       deps.services.jobAdmin?.registerMailTransport?.(graphRuntime.mailTransport);
       webhooks.init();
+      workflowWebhooks.init();
     },
 
     stop(): void {

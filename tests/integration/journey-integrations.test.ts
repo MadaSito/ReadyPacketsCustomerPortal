@@ -143,10 +143,59 @@ describe("integrations journey (assembled system)", () => {
     expect(Browser.ok(await admin.browser.query<{ passwordConfigured: boolean }>("integrations.admin.smtp.get")).passwordConfigured).toBe(false);
   });
 
-  it("reports scaffolds as not available and refuses to enable Stripe", async () => {
-    const providers = Browser.ok(await admin.browser.query<{ key: string; scaffoldOnly: boolean; state: string }[]>("integrations.admin.providers"));
-    for (const key of ["stripe", "saml", "sharepoint"]) expect(providers.find((p) => p.key === key)).toMatchObject({ scaffoldOnly: true });
-    const enable = await admin.browser.mutate("integrations.admin.stripe.update", { enabled: true, publishableKey: "" });
-    expect(enable.error?.safe?.reasonCode).toBe("STRIPE_NOT_AVAILABLE_IN_RELEASE");
+  it("reports truthful live states for Stripe, SAML SSO, and SharePoint file sync and directs Stripe activation to Payment Setup", async () => {
+    const providers = Browser.ok(
+      await admin.browser.query<{ key: string; scaffoldOnly: boolean; state: string; verified: boolean; summary: string }[]>(
+        "integrations.admin.providers",
+      ),
+    );
+    expect(providers.find((p) => p.key === "stripe")).toMatchObject({
+      scaffoldOnly: false,
+      state: "not_configured",
+      verified: false,
+    });
+    const saml = providers.find((p) => p.key === "saml");
+    expect(saml).toMatchObject({
+      scaffoldOnly: false,
+      state: "not_configured",
+      verified: false,
+    });
+    expect(saml?.summary).toContain("OpenID Connect (Entra ID) · MFA claim required");
+
+    expect(providers.find((p) => p.key === "sharepoint")).toMatchObject({
+      scaffoldOnly: false,
+      state: "not_configured",
+      verified: false,
+    });
+
+    const legacyDiagnosticEnable = await admin.browser.mutate("integrations.admin.stripe.update", {
+      enabled: true,
+      publishableKey: "",
+    });
+    expect(legacyDiagnosticEnable.error?.safe?.reasonCode).toBe("STRIPE_MANAGED_IN_PAYMENTS");
+
+    const readiness = Browser.ok(
+      await admin.browser.query<{
+        provider: string;
+        onlineEnabled: boolean;
+        checklist: { key: string; ready: boolean }[];
+      }>("payments.admin.readiness"),
+    );
+    expect(readiness.provider).toBe("none");
+    expect(readiness.onlineEnabled).toBe(false);
+    expect(readiness.checklist.find((item) => item.key === "stripe_secret_key")?.ready).toBe(false);
+    expect(readiness.checklist.find((item) => item.key === "stripe_webhook_secret")?.ready).toBe(false);
+
+    Browser.ok(await stepUp(sys, admin.browser, admin.password, admin.secret));
+    const enableWithoutSetup = await admin.browser.mutate("payments.admin.updateSettings", {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+      successPath: "/checkout/return",
+      cancelPath: "/checkout/cancel",
+      webhookToleranceSeconds: 300,
+      squareLocationId: null,
+    });
+    expect(enableWithoutSetup.error?.safe?.reasonCode).toBe("FRESH_CREDENTIALS_REQUIRED");
   });
 });

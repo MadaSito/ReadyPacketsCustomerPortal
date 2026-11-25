@@ -8,3 +8,9 @@ allowBuilds:
 # devDependency instead, where jsdom uses it so axe can evaluate text-in-name rules in tests.
 ignoredOptionalDependencies:
   - "@napi-rs/canvas"
+
+# The SAML service provider verifies XML signatures. These two parsers are pinned exactly so that no other
+# package can bring an older line into the tree; raise them together with @node-saml/node-saml.
+overrides:
+  "@xmldom/xmldom": "0.8.15"
+  "xml-crypto": "6.4.0"

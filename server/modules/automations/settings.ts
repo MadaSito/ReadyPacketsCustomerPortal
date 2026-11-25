@@ -4,6 +4,7 @@ import type { AutomationSettingsView } from "./contracts.js";
 
 export const automationsConfigSchema = z.strictObject({
   enabled: z.boolean(),
+  stageBundlesEnabled: z.boolean().default(true),
   globalRunsPerMinute: z.number().int().min(5).max(2_000),
   defaultPerAutomationRunsPerHour: z.number().int().min(1).max(600),
   maxPerAutomationRunsPerHour: z.number().int().min(5).max(1_200),
@@ -12,6 +13,7 @@ export const automationsConfigSchema = z.strictObject({
 
 export const DEFAULT_AUTOMATIONS_SETTINGS: AutomationSettingsView = Object.freeze({
   enabled: false,
+  stageBundlesEnabled: true,
   globalRunsPerMinute: 120,
   defaultPerAutomationRunsPerHour: 60,
   maxPerAutomationRunsPerHour: 600,
@@ -24,7 +26,7 @@ export const AUTOMATIONS_CONFIG = defineSetting({
   group: "engagement",
   label: "Event automations engine",
   description:
-    "Controls whether event-triggered and scheduled automations execute, along with global and per-automation rate limits.",
+    "Controls whether event-triggered and scheduled automations execute, whether staff/admin phase action bundles may run, and global and per-automation rate limits.",
   schema: automationsConfigSchema,
   default: DEFAULT_AUTOMATIONS_SETTINGS,
   sensitivity: "internal",
@@ -37,7 +39,11 @@ export const AUTOMATIONS_CONFIG = defineSetting({
   fields: {
     enabled: {
       label: "Enable automations engine",
-      help: "Ships off by default. When disabled, no event or schedule triggers execute.",
+      help: "Ships off by default. When disabled, no unattended event or schedule triggers execute.",
+    },
+    stageBundlesEnabled: {
+      label: "Enable workflow phase action bundles",
+      help: "Defaults on. Allows administrators and staff with orders.stage.run and fresh step-up verification to run pinned phase action bundles even while unattended rules remain off.",
     },
     globalRunsPerMinute: {
       label: "Global run limit (per minute)",

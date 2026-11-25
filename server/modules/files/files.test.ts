@@ -1,5 +1,7 @@
 import express from "express";
 import request from "supertest";
+import { eq } from "drizzle-orm";
+import { int, mysqlTable } from "drizzle-orm/mysql-core";
 import { Readable } from "node:stream";
 import { buffer } from "node:stream/consumers";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -12,17 +14,19 @@ import { DomainError, notFound } from "../../core/errors.js";
 import { sanitiseAttribute } from "../audit/envelope.js";
 import { newRequestContext } from "../../core/requestContext.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
+import type { StageGovernance, StageUploadIntent } from "../../../shared/workflowStages.js";
 import { setHttpState } from "../../http/requestState.js";
 import { registerFilesHttpRoutes } from "./http.js";
 import { createFilesModule, type FilesModule, type FileUploadSlot, type UploadOptions } from "./index.js";
 import type { ApiCaller, PublicApiProviders } from "../publicApi/ports.js";
 import { createObjectStorage } from "./storage.js";
-import { fileAccessLog, fileDownloadTickets, orderFiles } from "./schema.js";
+import { fileAccessLog, fileDownloadTickets, filePlaybackGrants, orderFiles } from "./schema.js";
 import { exampleDocx, exampleMp4, examplePdf, exampleWav, exampleWebm } from "./fixtures.test-support.js";
 
 const orderPublicId = `01JTEST${"0".repeat(19)}`;
 const userPublicId = `01JTEST${"0".repeat(18)}1`;
 const orderId = 201;
+const lockRows = mysqlTable("test_file_order_locks", { id: int("id").primaryKey() });
 const upload: UploadOptions = { category: "supporting", visibility: "customer_visible" };
 const voiceSlot: FileUploadSlot = {
   key: "voice_evidence", label: "Voice evidence", kind: "audio", maxCount: 1, allowedTypes: ["wav", "webm"],
@@ -48,14 +52,15 @@ let phaseLocked: boolean;
 let acceptanceRequired: boolean;
 let agreementRequired: boolean;
 let extraSlots: FileUploadSlot[];
-let gateActions: { action: string; statusKey: string | null }[];
+  let gateActions: { action: string; statusKey: string | null }[];
 
 beforeAll(async () => {
-  t = await createTestDb({ schema: { orderFiles, fileDownloadTickets, fileAccessLog } });
+  t = await createTestDb({ schema: { orderFiles, fileDownloadTickets, filePlaybackGrants, fileAccessLog, lockRows } });
+  await t.db.insert(lockRows).values({ id: orderId });
 });
 afterAll(() => t?.cleanup());
 beforeEach(async () => {
-  for (const table of [fileDownloadTickets, fileAccessLog, orderFiles]) await t.db.delete(table);
+  for (const table of [fileDownloadTickets, filePlaybackGrants, fileAccessLog, orderFiles]) await t.db.delete(table);
   h = createTestDeps({ db: t.db });
   files = createFilesModule(h.deps);
   h.services.files = files;
@@ -89,7 +94,8 @@ beforeEach(async () => {
       readOnlyImported: locked === "imported_read_only",
     };
   };
-  const write = async (principal: SessionPrincipal, id: number | string) => {
+  const write = async (principal: SessionPrincipal, id: number | string, options?: { tx?: Tx; forUpdate?: boolean }) => {
+    if (options?.forUpdate && options.tx) await options.tx.select().from(lockRows).where(eq(lockRows.id, orderId)).for("update");
     const view = await read(principal, id);
     if (locked !== "none") throw new DomainError("LOCKED", "ORDER_LOCKED", "This order is locked.");
     if (view.accessRole === "viewer") throw new DomainError("FORBIDDEN", "GRANT_READ_ONLY", "This grant is read-only.");
@@ -371,6 +377,9 @@ describe("private file admission and authorization", () => {
       const found = await files.list(owner, orderPublicId, {});
       const derived = found.items.find((item) => item.derivedFromPublicId === id)!;
       expect(derived).toMatchObject({ contentType: "audio/webm", extension: "webm", slotKey: "voice_evidence" });
+      await expect(files.listDeliverableFiles(owner, { orderPublicId })).resolves.toMatchObject({
+        items: [expect.objectContaining({ publicId: derived.publicId })],
+      });
       expect(stageOrderFile.mock.calls.map(([publicId]) => publicId).filter((publicId) => publicId === derived.publicId)).toHaveLength(1);
       expect(stageOrderFile.mock.calls.map(([publicId]) => publicId)).not.toContain(id);
       expect(found.items.find((item) => item.publicId === id)).toMatchObject({ extension: "wav", conversionState: "converted" });
@@ -481,7 +490,7 @@ describe("private file admission and authorization", () => {
     orderStage = "production";
     await t.db.transaction(async (tx) => {
       await expect(files.listOrderFileCopyMetadata(orderPublicId, [accepted.publicId], tx)).resolves.toEqual([{
-        filePublicId: accepted.publicId, displayName: "clean.pdf", statusKey: "intake", slotKey: null, sourceAvailable: true,
+        filePublicId: accepted.publicId, displayName: "clean.pdf", statusKey: "intake", slotKey: null, stageKey: null, sourceAvailable: true,
       }]);
       await expect(files.listOrderFileCopyMetadata(userPublicId, [accepted.publicId], tx)).resolves.toEqual([]);
     });
@@ -744,6 +753,198 @@ describe("download ticket custody", () => {
     expect(h.audit.named("file.download").map((event) => event.outcome)).toEqual(["attempted"]);
     // The result is recorded after flushing the response. Wait for the asynchronous result record.
     await vi.waitFor(() => expect(h.audit.named("file.download.result").map((event) => event.outcome)).toEqual(["completed"]));
+  });
+});
+
+describe("phase files", () => {
+  const stageKey = "intake_phase";
+  const documentUpload = { ...upload, stageKey, intent: "document" } as const;
+  function setPhase(governance: StageGovernance, { visible = true, teamReview = true, implicit = false }:
+    { visible?: boolean; teamReview?: boolean; implicit?: boolean } = {}) {
+    h.services.orders.stages = {
+      async resolveStageForUpload(input: { stageKey?: string; intent: StageUploadIntent; actor: SessionPrincipal }) {
+        if (!input.stageKey && !implicit) throw new DomainError("CONFLICT", "STAGE_REQUIRED", "Select a phase.");
+        if (input.stageKey && input.stageKey !== stageKey) throw notFound("STAGE_NOT_FOUND");
+        if (phaseLocked && input.actor.role === "customer") throw new DomainError("FORBIDDEN", "STAGE_LOCKED", "Phase locked.");
+        return { stageKey, statusKey: "intake", governance };
+      },
+      async listForOrder() {
+        return { format: 3, stages: [{ key: stageKey, customerLabel: "Intake", staffLabel: "Intake", viewable: visible, governance }], statusToStage: { intake: stageKey } };
+      },
+      async assertStageAccess() { return { stage: { actions: { teamFileReview: teamReview }, governance } }; },
+    } as unknown as TestHarness["services"]["orders"]["stages"];
+  }
+  async function prepare(principal = owner, options: UploadOptions = documentUpload, name = "item.pdf", input = examplePdf()) {
+    const plan = await files.beginUpload(principal, orderPublicId, options);
+    const staged = await files.stageUpload(name, Readable.from([input]), plan.rules);
+    return () => files.commitUpload(principal, plan, staged).finally(() => files.cleanUpload(staged));
+  }
+
+  it("pages customer-visible phase uploads newest first, excluding team deliverables and previous versions", async () => {
+    setPhase({});
+    const oldest = await (await prepare(owner, documentUpload, "oldest.pdf"))();
+    h.clock.advance(1000);
+    const retired = await (await prepare(owner, documentUpload, "retired.pdf"))();
+    h.clock.advance(1000);
+    const current = await (await prepare(owner, { ...documentUpload, versionOf: retired.publicId }, "current.pdf"))();
+    await (await prepare(staff, { ...documentUpload, visibility: "staff_only" }, "private.pdf"))();
+    await (await prepare(staff, { ...documentUpload, category: "deliverable" }, "deliverable.pdf"))();
+    // Publication IDs and display dates can differ for restored history.
+    await t.db.update(orderFiles).set({ createdAt: new Date(current.createdAt.getTime() + 1000) }).where(eq(orderFiles.publicId, oldest.publicId));
+    const options = { stageKey, phaseUploadKind: "document", limit: 1 } as const;
+    const first = await files.list(staff, orderPublicId, options);
+    expect(first.items.map(({ publicId }) => publicId)).toEqual([oldest.publicId]);
+    expect(first.nextCursor).not.toBeNull();
+    const next = await files.list(staff, orderPublicId, { ...options, cursor: first.nextCursor! });
+    expect(next.items.map(({ publicId }) => publicId)).toEqual([current.publicId]);
+    expect(next.nextCursor).toBeNull();
+    await expect(files.list(owner, orderPublicId, { stageKey, phaseUploadKind: "audio" })).resolves.toMatchObject({ items: [] });
+  });
+
+  it("binds stable phases and serializes concurrent quota checks before publication", async () => {
+    setPhase({ documentCount: 1 });
+    await expect(files.beginUpload(owner, orderPublicId, upload)).rejects.toMatchObject({ reasonCode: "STAGE_REQUIRED" });
+    await expect(prepare(owner, documentUpload, "voice.wav", exampleWav())).rejects.toMatchObject({ reasonCode: "FILE_TYPE_DISABLED" });
+    const [first, second] = await Promise.all([prepare(), prepare()]);
+    const results = await Promise.allSettled([first(), second()]);
+    expect(results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: "fulfilled", value: expect.objectContaining({ stageKey }) }),
+      expect.objectContaining({ status: "rejected", reason: expect.objectContaining({ reasonCode: "PHASE_FILE_COUNT_LIMIT" }) }),
+    ]));
+    expect((await files.list(owner, orderPublicId, { stageKey })).items).toHaveLength(1);
+    const [only] = await t.db.select().from(orderFiles);
+    expect(only?.stageKey).toBe(stageKey);
+    const replace = await prepare(owner, { ...documentUpload, versionOf: only!.publicId });
+    await expect(replace()).resolves.toMatchObject({ stageKey, version: 2 });
+    const selected = await files.listDeliverableFiles(owner, { orderPublicId, stageKey });
+    expect(selected.items.map(({ version }) => version)).toEqual([2]);
+    await expect(files.openDeliverableFile(owner, { orderPublicId, stageKey, filePublicId: only!.publicId }))
+      .rejects.toMatchObject({ code: "NOT_FOUND" });
+    const current = selected.items[0]!;
+    await files.remove(staff, current.publicId);
+    const standIn = await (await prepare())();
+    await expect(files.restore(staff, current.publicId)).rejects.toMatchObject({ reasonCode: "PHASE_FILE_COUNT_LIMIT" });
+    await files.remove(staff, standIn.publicId);
+    await expect(files.restore(staff, current.publicId)).resolves.toMatchObject({ stageKey, deletedAt: null });
+  });
+
+  it("verifies audio from staged bytes and enforces individual and combined phase limits", async () => {
+    const root = await mkdtemp(join(tmpdir(), "rp-phase-audio-"));
+    try {
+      h.deps.storage = createObjectStorage({ config: { storageDir: root }, logger: h.deps.logger });
+      files = createFilesModule(h.deps);
+      setPhase({ audioCount: 4, recordingMaxSeconds: 1, totalAudioMaxSeconds: 2 });
+      const recording = { ...upload, stageKey, intent: "recording" } as const;
+      const prerecorded = { ...upload, stageKey, intent: "prerecorded_audio" } as const;
+      await expect((await prepare(owner, recording, "too-long.wav", exampleWav(8001)))())
+        .rejects.toMatchObject({ reasonCode: "AUDIO_DURATION_EXCEEDED" });
+      await expect((await prepare(owner, recording, "recorded.wav", exampleWav(8000)))())
+        .resolves.toMatchObject({ durationSeconds: 1, stageKey });
+      await expect((await prepare(owner, prerecorded, "over-total.wav", exampleWav(8001)))())
+        .rejects.toMatchObject({ reasonCode: "PHASE_AUDIO_DURATION_LIMIT" });
+      await expect((await prepare(owner, prerecorded, "at-total.wav", exampleWav(8000)))())
+        .resolves.toMatchObject({ durationSeconds: 1, stageKey });
+      await expect(files.recordingPreflight(owner, orderPublicId, undefined, stageKey))
+        .resolves.toMatchObject({ enabled: false, maxSeconds: 0 });
+    } finally { await rm(root, { force: true, recursive: true }); }
+  });
+
+  it("accepts explicit phase document intent over multipart and refuses incomplete bindings", async () => {
+    setPhase({}, { implicit: true });
+    await expect(files.beginUpload(owner, orderPublicId, { ...upload, statusKey: "intake", slotKey: "legacy_slot" }))
+      .rejects.toMatchObject({ reasonCode: "STAGE_REQUIRED" });
+    await expect(files.list(owner, orderPublicId, {})).resolves.toMatchObject({ currentStageKey: stageKey, stageUploadsRequired: true });
+    const url = `/api/files/upload/${orderPublicId}`;
+    await request(appFor(owner)).post(`${url}?stageKey=${stageKey}`)
+      .attach("files", examplePdf(), "phase.pdf").expect(400);
+    await request(appFor(owner)).post(`${url}?stageKey=${stageKey}&intent=document&source=recording`)
+      .attach("files", examplePdf(), "phase.pdf").expect(400);
+    const response = await request(appFor(owner)).post(`${url}?stageKey=${stageKey}&intent=document`)
+      .attach("files", examplePdf(), "phase.pdf").expect(200);
+    expect(response.body.results).toMatchObject([{ outcome: "completed", file: { stageKey } }]);
+    const pending = await prepare();
+    phaseLocked = true;
+    await expect(pending()).rejects.toMatchObject({ reasonCode: "STAGE_LOCKED" });
+    expect(h.audit.named("file.uploaded")).toHaveLength(1);
+    expect(h.audit.named("file.uploaded")[0]?.attributes).toMatchObject({ stage_key: stageKey, file_source: "document" });
+  });
+
+  it("selects only active, authorized bytes and gates team review separately", async () => {
+    setPhase({});
+    const publicFile = await (await prepare(staff, { ...documentUpload, category: "deliverable" }))();
+    const privateFile = await (await prepare(staff, { ...documentUpload, category: "deliverable", visibility: "staff_only" }))();
+    const supportFile = await (await prepare())();
+    const ids = (list: { items: Array<{ publicId: string }> }) => list.items.map(({ publicId }) => publicId);
+    expect(ids(await files.teamFiles(owner, orderPublicId, stageKey))).toEqual([publicFile.publicId]);
+    expect(ids(await files.listDeliverableFiles(owner, { orderPublicId, stageKey }))).toEqual([publicFile.publicId, supportFile.publicId].sort());
+    await expect(files.openDeliverableFile(owner, { orderPublicId, filePublicId: privateFile.publicId }))
+      .rejects.toMatchObject({ code: "NOT_FOUND" });
+    const opened = await files.openDeliverableFile(owner, { orderPublicId, stageKey, filePublicId: publicFile.publicId });
+    expect(await buffer(opened.stream)).toEqual(examplePdf());
+    expect(h.audit.named("file.deliverable.open")).toHaveLength(1);
+    setPhase({}, { teamReview: false });
+    await expect(files.teamFiles(owner, orderPublicId, stageKey)).rejects.toMatchObject({ code: "NOT_FOUND" });
+    setPhase({}, { visible: false });
+    await expect(files.listDeliverableFiles(owner, { orderPublicId, stageKey })).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(files.issueDownloadTicket(owner, publicFile.publicId)).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+});
+
+describe("playback grant custody and HTTP", () => {
+  async function token(filePublicId: string) {
+    return files.issuePlaybackTicket(owner, orderPublicId, filePublicId);
+  }
+  it("rekeys a single-use ticket to a path-scoped cookie and handles only GET ranges", async () => {
+    const file = await add();
+    const { ticket } = await token(file.publicId);
+    expect((await t.db.select().from(filePlaybackGrants))[0]?.tokenHash).toBe(h.deps.crypto.hashToken(ticket));
+    await request(appFor({ ...owner, sessionId: grantee.sessionId })).post("/api/files/playback").send({ ticket }).expect(404);
+    const app = appFor(owner);
+    const opened = await request(app).post("/api/files/playback").send({ ticket }).expect(200);
+    const path = `/api/files/playback/${opened.body.grantPublicId as string}`;
+    const cookieHeader = (opened.headers["set-cookie"] as unknown as string[])[0]!;
+    expect(cookieHeader).toContain(`Path=${path}`);
+    expect(cookieHeader).toContain("HttpOnly");
+    expect(cookieHeader).toContain("SameSite=Strict");
+    expect(cookieHeader).not.toContain(ticket);
+    const cookie = cookieHeader.split(";")[0]!;
+    await request(app).post("/api/files/playback").send({ ticket }).expect(404);
+    await request(app).get(path).set("Range", "bytes=0-3").expect(404);
+    await request(appFor(grantee)).get(path).set("Cookie", cookie).expect(404);
+    const partial = await request(app).get(path).set("Cookie", cookie).set("Range", "bytes=0-3")
+      .buffer(true)
+      .expect(206).expect("Content-Range", `bytes 0-3/${file.size}`).expect("Cache-Control", "private, no-store");
+    expect(partial.body).toEqual(exampleWav().subarray(0, 4));
+    await vi.waitFor(() => expect(h.audit.named("file.playback.result")).toContainEqual(expect.objectContaining({
+      orderPublicId, outcome: "completed", attributes: { bytes_sent: 4 },
+    })));
+    await request(app).get(path).set("Cookie", cookie).set("Range", "bytes=0-2,4-").expect(416).expect("Content-Range", `bytes */${file.size}`);
+    await request(app).head(path).set("Cookie", cookie).set("Range", "bytes=0-3").expect(200).expect("Content-Length", String(file.size));
+    await request(app).get(path).set("Cookie", cookie).set("Range", "bytes=0-3").set("If-Range", "\"stale\"")
+      .expect(200).expect("Content-Length", String(file.size));
+    expect((await t.db.select().from(fileAccessLog)).some((event) =>
+      event.action === "playback" && event.orderPublicId === orderPublicId && event.reasonCode === "PLAYBACK_RANGE_INVALID")).toBe(true);
+  });
+
+  it("rechecks session and expires or revokes grants on visibility, replacement and removal", async () => {
+    const file = await add();
+    async function grantFor(fileId: string) { return files.redeemPlaybackTicket(owner, (await token(fileId)).ticket); }
+    const first = await grantFor(file.publicId);
+    revokedSession = owner.sessionId;
+    await expect(files.openPlayback(owner, first.grantPublicId, first.secret, undefined, false)).rejects.toMatchObject({ code: "NOT_FOUND" });
+    revokedSession = null;
+    h.clock.advance(10 * 60_000);
+    await expect(files.openPlayback(owner, first.grantPublicId, first.secret, undefined, false)).rejects.toMatchObject({ code: "NOT_FOUND" });
+    const hidden = await grantFor(file.publicId);
+    await files.setVisibility(staff, file.publicId, "staff_only");
+    await expect(files.openPlayback(owner, hidden.grantPublicId, hidden.secret, undefined, false)).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await files.setVisibility(staff, file.publicId, "customer_visible");
+    const replaced = await grantFor(file.publicId);
+    const next = await add(owner, { ...upload, versionOf: file.publicId });
+    await expect(files.openPlayback(owner, replaced.grantPublicId, replaced.secret, undefined, false)).rejects.toMatchObject({ code: "NOT_FOUND" });
+    const removed = await grantFor(next.publicId);
+    await files.remove(staff, next.publicId);
+    await expect(files.openPlayback(owner, removed.grantPublicId, removed.secret, undefined, false)).rejects.toMatchObject({ code: "NOT_FOUND" });
   });
 });
 

@@ -202,6 +202,54 @@ const ENTRIES: TriggerCatalogueEntry[] = [
       ...orderContext, f("invoice_number", "Invoice number", "string", "context"), recipientName],
     recipients: [ORDER_OWNER, ADMINS],
   },
+  /* Increment 07 (D5): payment, intake and phase triggers. Event fields are the owners' safe attributes only;
+     intake answers are never fields. Context fields come from the owners' resolvers (empty until registered). */
+  {
+    key: "payment.succeeded", label: "Payment succeeded", group: "Billing", owner: "compliance",
+    description: "A verified payment was booked against an invoice (online, bank debit after confirmation, or manual).",
+    eventName: "invoice.payment.recorded", outcomes: ["completed"], resourceType: "invoice_payment",
+    fields: [f("invoice_public_id", "Invoice id", "public_id"), f("method", "Payment method", "enum", "event", { enumValues: PAYMENT_METHODS }),
+      f("amount_minor", "Amount paid", "money_minor"), f("currency", "Currency", "string"), ...orderContext, recipientName],
+    recipients: [ORDER_OWNER, ADMINS],
+  },
+  {
+    key: "payment.failed", label: "Payment failed", group: "Billing", owner: "payments", staffOnly: true,
+    description: "An online payment attempt failed. Only the invoice and the provider are known, never card details.",
+    eventName: "payments.attempt.failed", outcomes: ["failed"], resourceType: "payment_attempt",
+    fields: [f("invoice_public_id", "Invoice id", "public_id"), f("order_public_id", "Order id", "public_id"), f("provider", "Payment provider", "string"), f("reason_code", "Reason", "string")],
+    recipients: [ADMINS, STAFF],
+  },
+  {
+    key: "payment.refunded", label: "Payment refunded", group: "Billing", owner: "payments",
+    description: "A refund was confirmed by the payment provider or recorded manually.",
+    // Provider and manual invoice refunds both emit this event (compliance), so the resource type is not fixed.
+    eventName: "payment.refund.succeeded", outcomes: ["completed"], resourceType: null,
+    fields: [f("invoice_public_id", "Invoice id", "public_id"), f("provider", "Payment provider", "string"), ...orderContext, recipientName],
+    recipients: [ORDER_OWNER, ADMINS],
+  },
+  {
+    key: "intake.submitted", label: "Intake submitted", group: "Orders", owner: "compliance",
+    description: "A customer submitted an intake questionnaire. Answers are never available to automations.",
+    eventName: "intake.submission.submitted", outcomes: ["completed"], resourceType: "intake_submission",
+    fields: [f("questionnaire_public_id", "Questionnaire id", "public_id"), f("revision_number", "Revision", "number"), actorRole, ...orderContext, recipientName],
+    recipients: [ORDER_OWNER, ORDER_ASSIGNEE, ADMINS, STAFF],
+  },
+  {
+    key: "intake.reviewed", label: "Intake reviewed", group: "Orders", owner: "compliance",
+    description: "Staff accepted an intake or returned it for changes.",
+    eventName: "intake.submission.reviewed", outcomes: ["completed"], resourceType: "intake_submission",
+    fields: [f("decision", "Decision", "enum", "event", { enumValues: ["accepted", "returned_for_changes"] }), f("revision_number", "Revision", "number"),
+      ...orderContext, recipientName],
+    recipients: [ORDER_OWNER, ORDER_ASSIGNEE, ACTOR, ADMINS],
+  },
+  {
+    key: "order.stage_submitted", label: "Phase submitted", group: "Orders", owner: "orders",
+    description: "A customer submitted and locked a phase of an order.",
+    eventName: "order.stage.submitted", outcomes: ["completed"], resourceType: "order",
+    fields: [f("stage_key", "Phase", "string"), f("stage_index", "Phase number", "number"), f("progress_percent", "Progress (percent)", "number"),
+      actorRole, ...orderContext.slice(1), recipientName],
+    recipients: [ORDER_OWNER, ORDER_ASSIGNEE, ACTOR, ADMINS],
+  },
   /* Increment 05 (D3). Attributes from server/modules/promotions/API.md (camelCase → snake_case by the envelope).
      Staff-only: the code itself is never an attribute, and customers are told about discounts on their order. */
   {

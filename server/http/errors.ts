@@ -13,6 +13,8 @@ const STATUS: Record<DomainErrorCode, number> = {
 
 const PARSER_FAILURES = {
   "entity.too.large": [413, "BODY_TOO_LARGE", "The request body exceeds the permitted size."],
+  "parameters.too.many": [413, "TOO_MANY_FORM_FIELDS", "The request has too many form fields."],
+  "media.unsupported": [415, "UNSUPPORTED_CONTENT_TYPE", "The request content type is not supported."],
   "entity.parse.failed": [400, "INVALID_JSON", "The request body is not valid JSON."],
   "encoding.unsupported": [415, "UNSUPPORTED_ENCODING", "The request content encoding is not supported."],
   "charset.unsupported": [415, "UNSUPPORTED_CHARSET", "The request character encoding is not supported."],

@@ -138,6 +138,44 @@ Migration `0005_increment_05` is additive. It adds eight tables: one workflow im
 - **PDF previews**: `pdfjs-dist` runs in the browser and requires Node.js 22.13.0 or later to install. `@napi-rs/canvas` is a development-only dependency for test rendering. `pnpm-workspace.yaml` ignores PDF.js's optional native canvas dependency, and native and Docker release packaging prune development dependencies, so the production runtime does not ship the native canvas binary.
 - **Emergency access**: Keep the [break-glass runbook](BREAK_GLASS.md) available off-host and verify operator access before enabling ban or policy enforcement. These are narrow overrides for different controls, not alternatives to local administrator MFA.
 
+## Increment 07 and migration `0007`
+
+<!-- platform_engineer with http_security_engineer. Counts from /root at f4fa798; lead QA 2026-11-25. A reverse proxy with TLS on a VPS and the Docker image build were not verifiable in the QA environment. -->
+
+`0007_increment_07` is additive: new tables, nullable columns or columns with defaults, new indexes and enum widening. It drops and renames nothing. Seeding and backfill run in code at start-up and are idempotent; the migration contains no data SQL. It has 16 new tables, 40 new columns on 11 existing tables and one widened enum (`payment_webhook_events.status`) in 96 statements, with no `DROP`. Reported by /root at `f4fa798`: it applied cleanly on a copy of an increment 06 database (189 → 205 tables, 8 migrations), and existing orders got `payment_state = not_required` and `attention = none`. The schema is frozen for increment 07; any further change would need `0008`.
+
+- **New tables:** `order_stage_progress`, `order_status_catalog`, `order_questions`, `order_question_answers`, `order_admin_tasks`, `order_stage_runs`, `order_completion_jobs`, `operational_alerts`, `file_playback_grants`, `file_archives`, `file_archive_tickets`, `storage_managed_order_roots`, `storage_managed_file_copies`, `payment_webhook_rejections`, `sso_saml_certificates` and `sso_role_mappings`.
+- **New columns:** `orders` (7: progress, completion, attention and payment state), `sso_configuration` (8, SAML), `integration_webhook_deliveries` (7), `integration_production_dispatches` (6), `sso_auth_requests` (3), `file_access_log` (2), `storage_connections` (2), `payment_webhook_events` (2), and one each on `order_files` (`stage_key`), `integration_webhook_subscriptions` (`signing_enabled`) and `automations` (`sort_order`).
+
+Existing orders keep their pinned workflow version. The start-up job `orders.increment07.startup` runs once at every boot and then every 10 minutes. When no published version or draft has phases, it gives the default workflow one draft with phases derived from its statuses, for you to review and publish. It publishes nothing and re-pins no order. It also recalculates the stored progress of orders on phases (format 3) versions. In the lead's QA, the boot run finished about 200 ms after the server started listening.
+
+- **Native upgrade.** Follow sections 2–5 without `--yes`, with the same backup, fence and `BACKUP-VERIFIED` steps as for increment 06.
+  - Release validation requires the SQL file and journal entry `0007_increment_07`.
+  - Install and upgrade compare its SHA-256 with exactly one migration journal row. Never run the SQL by hand or mark it applied.
+  - The seeded native baseline used in CI (`f251a10`) checks that an existing order keeps its workflow pin after the upgrade.
+  - If the migration is interrupted, follow [section 6](#6-recovery-if-an-upgrade-stops-mid-way).
+- **Docker Compose.** The image build requires the same SQL and journal entry, and the Compose smoke test checks the hash against exactly one journal row. Follow the [Compose backup and upgrade instructions](../../deploy/docker/README.md); the wrapper does not take the native verified backup.
+- **Refresh the proxy while ingress is still fenced.** The bundled Nginx and Caddy configurations contain the rules below. If you manage your own proxy, install the equivalent rules, validate them and reload before reopening.
+  - **SAML** (only the canonical host over HTTPS; requests over HTTP or on alias hosts are rejected, not redirected):
+    - `GET /api/identity/saml/metadata`
+    - `GET /api/identity/saml/start`
+    - `POST /api/identity/saml/acs`. The match is exact and POST only. The body is a flat URL-encoded form of at most 256 KiB, with no decompression and no caching.
+    - Sensitive request data never goes into proxy or application request logs. This covers the assertion and form body, request headers including cookies, and callback query material such as the start ticket or completion attempt. Application logs record only a fixed route label, the method, the status and the correlation id.
+  - **Audio playback** (`GET` / `HEAD /api/files/playback/:grantPublicId`):
+    - `Range` and `If-Range` are forwarded to the portal unchanged;
+    - the proxy must not buffer or build its own 206 answer.
+    - The POST that creates playback grants keeps the existing Origin and CSRF checks.
+    - **ZIP download** (`POST /api/files/archives/download`) is a native form POST. Because the portal sends `Referrer-Policy: no-referrer`, browsers send `Origin: null` on it. The portal accepts that value only for this exact form, and only with `Sec-Fetch-Site: same-origin`, `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest` of `document` or `empty`. The session, the form CSRF token and a single-use, account-bound ticket are still required. Do not strip or rewrite the `Origin` or `Sec-Fetch-*` headers.
+  - **Stripe webhook** (`POST /api/payments/webhooks/stripe`, canonical host):
+    - it skips only the built-in country allow-list;
+    - the IP deny list, rate limits, the 256 KiB cap and signature (HMAC) verification all stay.
+- **After the upgrade:**
+  - confirm readiness, local administrator MFA, and that a pre-existing order still shows its status and now shows a progress bar;
+  - **Stripe:** check `/admin/payments/setup` (webhook URL, events, egress switch, self-test) before relying on Stripe completion;
+  - **SAML:** keep at least one local administrator with MFA before switching it on. An upgraded existing SSO configuration starts in `portal` MFA mode; `claim` is recommended for new setups, and `entra` needs the typed words `ENTRA MANAGES MFA`. Switching protocol disables SSO until you enable it again;
+  - **Off until configured:** SAML, file sync targets, receipts to Microsoft 365, the P101 / P201 auto-queue (per workflow), production pipeline payload signing (generate a secret first) and attention reminders. Phase actions are empty until you configure them. New webhook subscriptions are signed by default and start paused. Test each with synthetic data before using it with customers.
+  - **Not tested against real services** in the lead's QA: a real Stripe account, an Entra tenant, a SharePoint site, the production P101 / P201 receiver, SMTP, the Docker image build, and a reverse proxy with TLS on a VPS.
+
 ---
 
 ## 6. Recovery if an upgrade stops mid-way

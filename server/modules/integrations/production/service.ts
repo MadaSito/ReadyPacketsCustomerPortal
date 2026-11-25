@@ -21,12 +21,13 @@
  *  - Controlled server-classified `resendReason` codes and never-secret, never-PII durable audit attributes
  */
 import { createHash } from "node:crypto";
-import { and, asc, desc, eq, gt, gte, like, lte, or, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, like, lte, or, sql, type SQL } from "drizzle-orm";
 import type { ModuleDeps } from "../../../container.js";
 import { DomainError, conflict, forbidden, notFound, validation } from "../../../core/errors.js";
 import { ulid } from "../../../core/ids.js";
 import { getRequestContext } from "../../../core/requestContext.js";
 import type { ClaimedJob, JobResult, SafeAttributeValue, SessionPrincipal, Tx } from "../../../core/types.js";
+import { jobRuns } from "../../jobs/schema.js";
 import type { OrderLockState } from "../../orders/types.js";
 import { isSecretConfigured, readSecret, readSetting, writeSetting } from "../../platform/index.js";
 import { flagKey } from "../../platform/settingsRegistry.js";
@@ -52,11 +53,16 @@ import {
   INTEGRATIONS_PRODUCTION_P201_URL,
   INTEGRATIONS_PRODUCTION_P301_URL,
   INTEGRATIONS_PRODUCTION_P401_URL,
+  INTEGRATIONS_PRODUCTION_SIGNING_PREV_SECRET,
+  INTEGRATIONS_PRODUCTION_SIGNING_SECRET,
+  INTEGRATIONS_PRODUCTION_WORKFLOW_AUTO_QUEUE,
   isValidProductionAuthHeaderName,
   isValidProductionWebhookUrl,
   readIntegrationFlag,
 } from "../settings.js";
 import type { ProviderState } from "../smtp.js";
+import { generateWebhookSigningSecret, signWebhookPayload } from "../webhooks/crypto.js";
+import type { StageWebhookTriggerSource } from "../workflowWebhooks/types.js";
 import {
   buildLaterPhaseFromDeliveredP101,
   buildP101Payload,
@@ -88,12 +94,20 @@ const MAX_RECONCILE_BATCHES = 10;
 export const PRODUCTION_SETTINGS_HREF = "/admin/integrations/production" as const;
 export const PRODUCTION_PHASES = ["P101", "P201", "P301", "P401"] as const;
 export type ProductionPhase = (typeof PRODUCTION_PHASES)[number];
-export type ProductionDispatchState = "queued" | "sending" | "delivered" | "failed" | "dead" | "unknown";
+export type ProductionDispatchState =
+  | "queued"
+  | "sending"
+  | "delivered"
+  | "failed"
+  | "dead"
+  | "unknown"
+  | "stopped";
 export type ProductionValidationIssue = PayloadValidationIssue;
 export type ControlledResendReason =
   | "OPERATOR_RETRY_AFTER_INTERRUPTION"
   | "OPERATOR_RETRY_AFTER_DEAD_LETTER"
   | "OPERATOR_RETRY_AFTER_FAILURE"
+  | "OPERATOR_RETRY_AFTER_STOP"
   | "OPERATOR_REPLAY_DELIVERED";
 
 export type ProductionDisabledReasonCategory =
@@ -145,9 +159,23 @@ export interface ProductionSettingsView {
   p401UrlMask: MaskedWebhookUrlView | null;
   authHeaderName: string;
   authHeaderValueConfigured: boolean;
+  signingEnabled: boolean;
+  signingSecretConfigured: boolean;
+  signingSecretLast4: string | null;
+  previousSigningSecretActive: boolean;
   canonVersion: string;
   runMode: string;
   timeoutMs: number;
+}
+
+export interface WorkflowAutoQueueItemView {
+  workflowPublicId: string;
+  workflowKey: string;
+  workflowName: string;
+  isDefault: boolean;
+  p101OnPaymentConfirmed: boolean;
+  p201OnPhase1Locked: boolean;
+  updatedAt: Date | null;
 }
 
 export interface UpdateProductionSettingsInput {
@@ -232,16 +260,23 @@ export interface ProductionDispatchItem {
   lastReasonCode: string | null;
   /** Controlled server-classified code ONLY — never reflects raw operator prose. */
   resendReason: string | null;
-  /** Public ULID of the failed/dead dispatch this attempt retried, or `null`. */
+  /** Public ULID of the failed/dead/stopped dispatch this attempt retried, or `null`. */
   retryOf: string | null;
   /** Public ULID of the already-delivered dispatch this attempt re-delivered, or `null`. */
   redeliveryOf: string | null;
+  triggerSource: string;
+  stageKey: string | null;
+  stoppedAt: Date | null;
+  stoppedByPublicId: string | null;
+  stopReason: string | null;
   requestedByPublicId: string | null;
   correlationId: string;
   createdAt: Date;
   updatedAt: Date;
   deliveredAt: Date | null;
   finalizedAt: Date | null;
+  /** Scheduled next attempt timestamp when a retryable failure is queued in `job_runs`, otherwise `null`. */
+  nextAttemptAt: Date | null;
 }
 
 export interface RequestP101Input {
@@ -263,6 +298,31 @@ export interface RetryProductionDispatchInput {
   dispatchPublicId: string;
 }
 
+export interface StopProductionDispatchInput {
+  orderPublicId: string;
+  dispatchPublicId: string;
+  reason?: string | null;
+}
+
+export interface EnqueueWorkflowProductionDispatchInput {
+  phase: ProductionPhase;
+  orderPublicId: string;
+  stageKey: string | null;
+  triggerSource: StageWebhookTriggerSource;
+  idempotencyKey: string;
+  correlationId?: string;
+  actor: SessionPrincipal | null;
+  releaseStatus?: string | null;
+  bypassPaymentStageCheck?: boolean;
+}
+
+export interface EnqueueWorkflowProductionDispatchResult {
+  outcome: "queued" | "already_queued_or_delivered" | "refused_precondition" | "disabled";
+  dispatchPublicId: string | null;
+  reasonCode: string | null;
+  message: string | null;
+}
+
 export interface RedeliverProductionDispatchInput {
   orderPublicId: string;
   dispatchPublicId: string;
@@ -279,9 +339,11 @@ export interface ResendProductionInput {
   phase1ArtifactsConfirmed?: boolean;
 }
 
+export type ProductionDispatchFilterState = ProductionDispatchState | "retrying";
+
 export interface ListProductionDispatchesInput {
   phase?: ProductionPhase;
-  state?: ProductionDispatchState;
+  state?: ProductionDispatchFilterState;
   orderReference?: string;
   fromDate?: Date;
   toDate?: Date;
@@ -291,6 +353,38 @@ export interface ListProductionDispatchesInput {
 export interface ProductionWebhookService {
   getSettings(): Promise<ProductionSettingsView>;
   updateSettings(principal: SessionPrincipal, input: UpdateProductionSettingsInput): Promise<ProductionSettingsView>;
+  rotateSigningSecret(
+    principal: SessionPrincipal,
+    input?: { overlapMinutes?: number },
+  ): Promise<{ settings: ProductionSettingsView; signingSecretOnce: string }>;
+  setSigningEnabled(principal: SessionPrincipal, input: { enabled: boolean }): Promise<ProductionSettingsView>;
+  listWorkflowAutoQueue(principal: SessionPrincipal): Promise<{ items: WorkflowAutoQueueItemView[] }>;
+  setWorkflowAutoQueue(
+    principal: SessionPrincipal,
+    input: {
+      workflowPublicId?: string;
+      workflowKey?: string;
+      p101OnPaymentConfirmed: boolean;
+      p201OnPhase1Locked: boolean;
+    },
+  ): Promise<{ items: WorkflowAutoQueueItemView[] }>;
+  getWorkflowAutoQueueForOrderInTx(
+    orderPublicId: string,
+    tx: Tx,
+  ): Promise<{
+    workflowPublicId: string | null;
+    p101OnPaymentConfirmed: boolean;
+    p201OnPhase1Locked: boolean;
+    intakeStageKey: string | null;
+  }>;
+  enqueueWorkflowDispatch(
+    input: EnqueueWorkflowProductionDispatchInput,
+    tx: Tx,
+  ): Promise<EnqueueWorkflowProductionDispatchResult>;
+  getTargetStatus(
+    phase: ProductionPhase,
+    tx?: Tx,
+  ): Promise<{ enabled: boolean; configured: boolean; endpointConfigured: boolean }>;
   testDestination(principal: SessionPrincipal, input: { phase: ProductionPhase }): Promise<ProductionDryRunResult>;
   previewOrder(
     principal: SessionPrincipal,
@@ -300,6 +394,7 @@ export interface ProductionWebhookService {
   requestP201(principal: SessionPrincipal, input: RequestP201Input): Promise<ProductionDispatchItem>;
   requestP301(principal: SessionPrincipal, input: RequestLaterPhaseInput): Promise<ProductionDispatchItem>;
   requestP401(principal: SessionPrincipal, input: RequestLaterPhaseInput): Promise<ProductionDispatchItem>;
+  stop(principal: SessionPrincipal, input: StopProductionDispatchInput): Promise<ProductionDispatchItem>;
   retry(principal: SessionPrincipal, input: RetryProductionDispatchInput): Promise<ProductionDispatchItem>;
   redeliver(principal: SessionPrincipal, input: RedeliverProductionDispatchInput): Promise<ProductionDispatchItem>;
   resend(principal: SessionPrincipal, input: ResendProductionInput): Promise<ProductionDispatchItem>;
@@ -381,6 +476,12 @@ export function fixedDispatchSummary(
       return "Canceled before delivery because the order no longer exists.";
     case "ORDER_SCOPE_CHANGED":
       return "Canceled before delivery because the order packet scope changed.";
+    case "PAYMENT_NOT_CONFIRMED":
+      return "Canceled before delivery because order payment is not confirmed.";
+    case "PHASE1_INTAKE_NOT_LOCKED":
+      return "Canceled before delivery because the intake phase is not submitted and locked.";
+    case "STOPPED_BY_OPERATOR":
+      return "Stopped before delivery by an operator; payload cleared.";
     case "PRODUCTION_NOT_CONFIGURED":
       return "Canceled before delivery because production webhooks are disabled or incomplete.";
     case "PRODUCTION_PAYLOAD_MISSING":
@@ -419,6 +520,9 @@ function classifyResendReasonCode(
   }
   if (latestPhaseRow.state === "dead") {
     return "OPERATOR_RETRY_AFTER_DEAD_LETTER";
+  }
+  if (latestPhaseRow.state === "stopped") {
+    return "OPERATOR_RETRY_AFTER_STOP";
   }
   if (latestPhaseRow.state === "delivered") {
     return "OPERATOR_REPLAY_DELIVERED";
@@ -463,7 +567,7 @@ function resolveRetryRootWireKey(targetRow: DispatchRow, existingRows: readonly 
   return toWireIdempotencyKey(resolveRetryRootRow(targetRow, existingRows).idempotencyKey);
 }
 
-function toDispatchItem(row: DispatchRow): ProductionDispatchItem {
+function toDispatchItem(row: DispatchRow, nextAttemptAt: Date | null = null): ProductionDispatchItem {
   return {
     publicId: row.publicId,
     orderPublicId: row.orderPublicId,
@@ -489,13 +593,48 @@ function toDispatchItem(row: DispatchRow): ProductionDispatchItem {
     resendReason: row.resendReason ?? null,
     retryOf: row.retryOfPublicId ?? null,
     redeliveryOf: row.redeliveryOfPublicId ?? null,
+    triggerSource: row.triggerSource ?? "operator",
+    stageKey: row.stageKey ?? null,
+    stoppedAt: row.stoppedAt ?? null,
+    stoppedByPublicId: row.stoppedByPublicId ?? null,
+    stopReason: row.stopReason ?? null,
     requestedByPublicId: row.requestedByPublicId ?? null,
     correlationId: row.correlationId,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     deliveredAt: row.deliveredAt ?? null,
     finalizedAt: row.finalizedAt ?? null,
+    nextAttemptAt,
   };
+}
+
+async function mapDispatchItemsWithScheduledRetries(
+  tx: Tx,
+  rows: readonly DispatchRow[],
+): Promise<ProductionDispatchItem[]> {
+  const retryingJobIds = [
+    ...new Set(
+      rows
+        .filter((row) => row.state === "queued" && row.attemptCount > 0)
+        .map((row) => row.jobPublicId),
+    ),
+  ];
+  const nextAttemptByJobId = new Map<string, Date>();
+  if (retryingJobIds.length > 0) {
+    const queuedJobs = await tx
+      .select({ publicId: jobRuns.publicId, runAt: jobRuns.runAt })
+      .from(jobRuns)
+      .where(and(inArray(jobRuns.publicId, retryingJobIds), eq(jobRuns.state, "queued")));
+    for (const jobRow of queuedJobs) {
+      nextAttemptByJobId.set(jobRow.publicId, jobRow.runAt);
+    }
+  }
+  return rows.map((row) =>
+    toDispatchItem(
+      row,
+      row.state === "queued" && row.attemptCount > 0 ? (nextAttemptByJobId.get(row.jobPublicId) ?? null) : null,
+    ),
+  );
 }
 
 function buildSafeDispatchAuditAttributes(
@@ -585,11 +724,13 @@ export function createProductionWebhookService(
       authHeaderValue: string | null;
       canonVersion: string;
       runMode: string;
+      signingEnabled?: boolean;
+      signingSecret?: string | null;
     },
   ): string {
     const normalizedHeaderName = params.authHeaderName.trim().toLowerCase();
     const effectiveHeaderValue = normalizedHeaderName !== "" ? (params.authHeaderValue ?? "") : "";
-    const tuple =
+    const baseTuple =
       phase === "P101"
         ? [
             phase,
@@ -600,11 +741,126 @@ export function createProductionWebhookService(
             params.runMode.trim(),
           ]
         : [phase, params.targetUrl.trim(), normalizedHeaderName, effectiveHeaderValue];
+    const tuple =
+      params.signingEnabled === true
+        ? [...baseTuple, "sig:v1", params.signingSecret ?? ""]
+        : baseTuple;
     return deps.crypto.blindIndex(JSON.stringify(tuple), destinationFingerprintPurpose(phase));
   }
 
+  async function emitProdOpsAlert(input: {
+    orderPublicId: string;
+    phase: ProductionPhase;
+    severity: "warning" | "error" | "critical";
+    code: string;
+    title: string;
+    text?: string;
+    correlationId?: string;
+  }) {
+    try {
+      await deps.services.opsAlerts?.emit({
+        source: "webhook",
+        severity: input.severity,
+        dedupKey: `prod:${input.orderPublicId}:${input.phase}`,
+        code: input.code,
+        title: input.title,
+        text: input.text,
+        orderPublicId: input.orderPublicId,
+        correlationId: input.correlationId,
+      });
+    } catch {
+      // Never fail production dispatch handling on best-effort ops alert persistence.
+    }
+  }
+
+  async function resolveProdOpsAlert(orderPublicId: string, phase: ProductionPhase, correlationId?: string) {
+    try {
+      await deps.services.opsAlerts?.resolve({
+        source: "webhook",
+        dedupKey: `prod:${orderPublicId}:${phase}`,
+        correlationId,
+      });
+    } catch {
+      // Never fail production dispatch handling on best-effort ops alert resolution.
+    }
+  }
+
+  async function evaluateFormat3StagePreconditionsInTx(
+    tx: Tx,
+    orderPublicId: string,
+    options?: { bypassPaymentStageCheck?: boolean },
+  ): Promise<{
+    isFormat3: boolean;
+    paymentConfirmed: boolean;
+    intakeLocked: boolean;
+    intakeStageKey: string | null;
+    workflowVersionId: number | null;
+  }> {
+    const orders = requireOrders();
+    if (!orders.stages?.contextForRun) {
+      return {
+        isFormat3: false,
+        paymentConfirmed: true,
+        intakeLocked: true,
+        intakeStageKey: null,
+        workflowVersionId: null,
+      };
+    }
+    const ctx = await orders.stages.contextForRun(orderPublicId, tx);
+    if (!ctx.stages || ctx.stages.length === 0) {
+      return {
+        isFormat3: false,
+        paymentConfirmed: true,
+        intakeLocked: true,
+        intakeStageKey: null,
+        workflowVersionId: ctx.workflowVersionId,
+      };
+    }
+
+    const payIdx = ctx.stages.findIndex((s) => s.completesOn === "payment");
+    const currentIdx = ctx.currentStageKey
+      ? ctx.stages.findIndex((s) => s.key === ctx.currentStageKey)
+      : -1;
+    const paymentConfirmed =
+      options?.bypassPaymentStageCheck === true ||
+      payIdx < 0 ||
+      (currentIdx >= 0 && currentIdx > payIdx);
+
+    const intakeStage =
+      ctx.stages.find((s) => s.key === "phase_1_intake") ??
+      ctx.stages.find((s) => s.progression === "submit_lock") ??
+      null;
+    let intakeLocked = true;
+    if (intakeStage && intakeStage.statusKeys[0] && orders.isStatusPhaseLocked) {
+      intakeLocked = await orders.isStatusPhaseLocked(
+        ctx.orderId,
+        ctx.workflowVersionId,
+        intakeStage.statusKeys[0],
+        tx,
+      );
+    }
+
+    return {
+      isFormat3: true,
+      paymentConfirmed,
+      intakeLocked,
+      intakeStageKey: intakeStage?.key ?? null,
+      workflowVersionId: ctx.workflowVersionId,
+    };
+  }
+
   async function readProductionState(tx?: Tx) {
-    const [enabled, cfg, p101Secret, p201Secret, p301Secret, p401Secret, authValueConfigured] = await Promise.all([
+    const [
+      enabled,
+      cfg,
+      p101Secret,
+      p201Secret,
+      p301Secret,
+      p401Secret,
+      authValueConfigured,
+      signingSecret,
+      signingPrevSecret,
+    ] = await Promise.all([
       readIntegrationFlag(deps.settings, INTEGRATIONS_PRODUCTION_FLAG, tx),
       readSetting(deps.settings, INTEGRATIONS_PRODUCTION_CONFIG, tx),
       readSecret(deps.settings, INTEGRATIONS_PRODUCTION_P101_URL, tx),
@@ -612,6 +868,8 @@ export function createProductionWebhookService(
       readSecret(deps.settings, INTEGRATIONS_PRODUCTION_P301_URL, tx),
       readSecret(deps.settings, INTEGRATIONS_PRODUCTION_P401_URL, tx),
       isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_AUTH_VALUE, tx),
+      readSecret(deps.settings, INTEGRATIONS_PRODUCTION_SIGNING_SECRET, tx),
+      readSecret(deps.settings, INTEGRATIONS_PRODUCTION_SIGNING_PREV_SECRET, tx),
     ]);
 
     const p101UrlConfigured = Boolean(p101Secret && isValidProductionWebhookUrl(p101Secret));
@@ -620,11 +878,25 @@ export function createProductionWebhookService(
     const p401UrlConfigured = Boolean(p401Secret && isValidProductionWebhookUrl(p401Secret));
     const authHeaderValid = isValidProductionAuthHeaderName(cfg.authHeaderName);
     const authConsistent = authHeaderValid && (cfg.authHeaderName === "" || authValueConfigured);
+    const signingSecretConfigured = Boolean(signingSecret && signingSecret.length >= 16);
+    const signingConsistent = !cfg.signingEnabled || signingSecretConfigured;
+    const nowMs = deps.clock.now().getTime();
+    const prevExpiryMs = cfg.previousSigningSecretExpiresAt
+      ? Date.parse(cfg.previousSigningSecretExpiresAt)
+      : Number.NaN;
+    const previousSigningSecretActive =
+      Boolean(signingPrevSecret) && Number.isFinite(prevExpiryMs) && nowMs < prevExpiryMs;
     const canonTrimmed = cfg.canonVersion.trim();
     const canonValid =
       canonTrimmed.length > 0 && CANON_VERSION_PATTERN.test(canonTrimmed) && hasNoHeaderInjection(canonTrimmed);
     const runModeValid = RUN_MODE_PATTERN.test(cfg.runMode.trim());
-    const configured = p101UrlConfigured && p201UrlConfigured && canonValid && runModeValid && authConsistent;
+    const configured =
+      p101UrlConfigured &&
+      p201UrlConfigured &&
+      canonValid &&
+      runModeValid &&
+      authConsistent &&
+      signingConsistent;
 
     return {
       enabled,
@@ -633,12 +905,17 @@ export function createProductionWebhookService(
       p201Secret,
       p301Secret,
       p401Secret,
+      signingSecret,
+      overlapSigningSecret: previousSigningSecretActive ? signingPrevSecret : null,
+      signingSecretConfigured,
+      previousSigningSecretActive,
       p101UrlConfigured,
       p201UrlConfigured,
       p301UrlConfigured,
       p401UrlConfigured,
       authHeaderValid,
       authConsistent,
+      signingConsistent,
       canonValid,
       runModeValid,
       authValueConfigured,
@@ -703,7 +980,7 @@ export function createProductionWebhookService(
   ): Promise<boolean> {
     const jobAdmin = requireJobAdmin();
     try {
-      return await deps.db.transaction(async (tx) => {
+      const reconciledAlert = await deps.db.transaction(async (tx) => {
         const txNow = deps.clock.now();
         const shouldCancelQueued =
           candidate.state === "queued" && candidate.expiresAt.getTime() <= txNow.getTime();
@@ -713,7 +990,7 @@ export function createProductionWebhookService(
           cancelQueued: shouldCancelQueued,
         });
         if (disposition.state === "running_live" || disposition.state === "queued_live") {
-          return false;
+          return null;
         }
 
         const [locked] = await tx
@@ -790,8 +1067,35 @@ export function createProductionWebhookService(
           tx,
         );
 
-        return true;
+        return {
+          orderPublicId: locked.orderPublicId,
+          orderReference: locked.orderReference,
+          phase: locked.phase as ProductionPhase,
+          uncertain,
+          reasonCode,
+          summary,
+          correlationId: correlationIdOverride ?? locked.correlationId,
+        };
       });
+      if (!reconciledAlert) {
+        return false;
+      }
+      await emitProdOpsAlert({
+        orderPublicId: reconciledAlert.orderPublicId,
+        phase: reconciledAlert.phase,
+        severity: reconciledAlert.uncertain
+          ? reconciledAlert.phase === "P101" || reconciledAlert.phase === "P201"
+            ? "critical"
+            : "error"
+          : "warning",
+        code: reconciledAlert.reasonCode,
+        title: reconciledAlert.uncertain
+          ? `${reconciledAlert.phase} production webhook outcome uncertain for order ${reconciledAlert.orderReference}`
+          : `${reconciledAlert.phase} production webhook stalled for order ${reconciledAlert.orderReference}`,
+        text: reconciledAlert.summary,
+        correlationId: reconciledAlert.correlationId,
+      });
+      return true;
     } catch (err) {
       if (err instanceof CandidateMovedRollback) {
         if (!allowRetryOnMove) {
@@ -1067,6 +1371,10 @@ export function createProductionWebhookService(
       p401UrlMask: maskSecretWebhookUrl(p401Secret),
       authHeaderName: cfg.authHeaderName,
       authHeaderValueConfigured: authValueConfigured,
+      signingEnabled: cfg.signingEnabled,
+      signingSecretConfigured: stateSnapshot.signingSecretConfigured,
+      signingSecretLast4: cfg.signingSecretLast4,
+      previousSigningSecretActive: stateSnapshot.previousSigningSecretActive,
       canonVersion: cfg.canonVersion,
       runMode: cfg.runMode,
       timeoutMs: cfg.timeoutMs,
@@ -1077,6 +1385,7 @@ export function createProductionWebhookService(
     tx: Tx,
     orderId: number,
     releaseStatusOverride?: string,
+    options?: { bypassPaymentStageCheck?: boolean },
   ): Promise<{
     scope: NonNullable<Awaited<ReturnType<ReturnType<typeof requireOrders>["getProductionScope"]>>>;
     prodState: Awaited<ReturnType<typeof readProductionState>>;
@@ -1114,6 +1423,14 @@ export function createProductionWebhookService(
       errors.push({
         code: "ORDER_OWNER_INACTIVE",
         message: "The order owner account must be active to dispatch production webhooks.",
+      });
+    }
+
+    const stagePreconditions = await evaluateFormat3StagePreconditionsInTx(tx, scope.orderPublicId, options);
+    if (stagePreconditions.isFormat3 && !stagePreconditions.paymentConfirmed) {
+      errors.push({
+        code: "PAYMENT_NOT_CONFIRMED",
+        message: "Order payment must be confirmed before Phase I (P101) can run.",
       });
     }
 
@@ -1191,7 +1508,7 @@ export function createProductionWebhookService(
   async function enqueueDispatchInTx(
     tx: Tx,
     params: {
-      principal: SessionPrincipal;
+      principal: SessionPrincipal | null;
       orderId: number;
       orderPublicId: string;
       orderReference: string;
@@ -1216,6 +1533,9 @@ export function createProductionWebhookService(
       dispatchKind?: DispatchActionKind;
       reasonLength?: number;
       phase1ArtifactsConfirmed: boolean;
+      triggerSource?: StageWebhookTriggerSource | "manual";
+      stageKey?: string | null;
+      correlationIdOverride?: string;
     },
   ): Promise<ProductionDispatchItem> {
     const now = deps.clock.now();
@@ -1230,11 +1550,13 @@ export function createProductionWebhookService(
     const payloadJson = JSON.stringify(params.payloadObject);
     const payloadSha256 = sha256Hex(payloadJson);
     const payloadEnc = deps.crypto.encrypt(payloadJson, dispatchPayloadAad(publicId));
-    const correlationId = getRequestContext()?.correlationId ?? ulid();
+    const correlationId = params.correlationIdOverride ?? getRequestContext()?.correlationId ?? ulid();
     const expiresAt = new Date(now.getTime() + PRODUCTION_DISPATCH_MAX_TTL_MS);
     const retryOfPublicId = params.retryOfPublicId ?? null;
     const redeliveryOfPublicId = params.redeliveryOfPublicId ?? null;
     const dispatchKind: DispatchActionKind = params.dispatchKind ?? (params.isResend ? "resend" : "request");
+    const triggerSource: StageWebhookTriggerSource | "manual" = params.triggerSource ?? "manual";
+    const stageKey = params.stageKey ? params.stageKey.slice(0, 64) : null;
 
     const { jobId } = await deps.jobs.enqueue(
       PRODUCTION_DELIVERY_JOB,
@@ -1278,8 +1600,10 @@ export function createProductionWebhookService(
       retryOfPublicId,
       redeliveryOfPublicId,
       phase1ArtifactsConfirmed: params.phase1ArtifactsConfirmed,
-      requestedByUserId: params.principal.userId,
-      requestedByPublicId: params.principal.userPublicId,
+      triggerSource,
+      stageKey,
+      requestedByUserId: params.principal?.userId ?? null,
+      requestedByPublicId: params.principal?.userPublicId ?? null,
       correlationId,
       deliveredAt: null,
       finalizedAt: null,
@@ -1298,6 +1622,8 @@ export function createProductionWebhookService(
       idempotency_key: wireIdempotencyKey,
       retry_of_public_id: retryOfPublicId,
       redelivery_of_public_id: redeliveryOfPublicId,
+      trigger_source: triggerSource,
+      stage_key: stageKey,
     };
     if (params.isResend && params.resendReasonCode) {
       reqAttrs.resend_reason_code = params.resendReasonCode;
@@ -1401,10 +1727,37 @@ export function createProductionWebhookService(
   function terminalDecision(
     nextState: "failed" | "unknown",
     reasonCode: string,
-  ): { kind: "terminal_failed"; reasonCode: string } | { kind: "terminal_unknown"; reasonCode: string } {
+    row: Pick<DispatchRow, "orderPublicId" | "orderReference" | "phase">,
+  ):
+    | {
+        kind: "terminal_failed";
+        reasonCode: string;
+        orderPublicId: string;
+        orderReference: string;
+        phase: ProductionPhase;
+      }
+    | {
+        kind: "terminal_unknown";
+        reasonCode: string;
+        orderPublicId: string;
+        orderReference: string;
+        phase: ProductionPhase;
+      } {
     return nextState === "unknown"
-      ? { kind: "terminal_unknown", reasonCode }
-      : { kind: "terminal_failed", reasonCode };
+      ? {
+          kind: "terminal_unknown",
+          reasonCode,
+          orderPublicId: row.orderPublicId,
+          orderReference: row.orderReference,
+          phase: row.phase as ProductionPhase,
+        }
+      : {
+          kind: "terminal_failed",
+          reasonCode,
+          orderPublicId: row.orderPublicId,
+          orderReference: row.orderReference,
+          phase: row.phase as ProductionPhase,
+        };
   }
 
   /* ------------------------------------------------- Background Delivery Job Handler */
@@ -1414,9 +1767,21 @@ export function createProductionWebhookService(
     | { kind: "already_completed" }
     | { kind: "already_unknown"; reasonCode: string }
     | { kind: "already_failed"; reasonCode: string }
-    | { kind: "ambiguous_sending" }
-    | { kind: "terminal_unknown"; reasonCode: string }
-    | { kind: "terminal_failed"; reasonCode: string }
+    | { kind: "ambiguous_sending"; orderPublicId: string; orderReference: string; phase: ProductionPhase }
+    | {
+        kind: "terminal_unknown";
+        reasonCode: string;
+        orderPublicId: string;
+        orderReference: string;
+        phase: ProductionPhase;
+      }
+    | {
+        kind: "terminal_failed";
+        reasonCode: string;
+        orderPublicId: string;
+        orderReference: string;
+        phase: ProductionPhase;
+      }
     | {
         kind: "ready";
         row: DispatchRow;
@@ -1426,6 +1791,9 @@ export function createProductionWebhookService(
         targetUrl: string;
         authHeaderName: string;
         authHeaderValue: string | null;
+        signingEnabled: boolean;
+        signingSecret: string | null;
+        overlapSigningSecret: string | null;
         timeoutMs: number;
         payloadJson: string;
       };
@@ -1453,6 +1821,9 @@ export function createProductionWebhookService(
       if (row.jobPublicId !== job.jobId) {
         return { kind: "canceled", reasonCode: "PRODUCTION_JOB_SUPERSEDED" };
       }
+      if (row.state === "stopped") {
+        return { kind: "canceled", reasonCode: "STOPPED_BY_OPERATOR" };
+      }
       if (row.state === "delivered") {
         return { kind: "already_completed" };
       }
@@ -1476,7 +1847,12 @@ export function createProductionWebhookService(
           "WARN",
           { delivery_uncertain: true },
         );
-        return { kind: "ambiguous_sending" };
+        return {
+          kind: "ambiguous_sending",
+          orderPublicId: row.orderPublicId,
+          orderReference: row.orderReference,
+          phase: row.phase as ProductionPhase,
+        };
       }
       if (row.state !== "queued") {
         return { kind: "canceled", reasonCode: "PRODUCTION_UNEXPECTED_STATE" };
@@ -1485,7 +1861,7 @@ export function createProductionWebhookService(
         const expiryReason =
           row.attemptCount > 0 ? "PRODUCTION_PRIOR_ATTEMPT_UNCERTAIN" : "PRODUCTION_DELIVERY_EXPIRED";
         const st = await failTerminalBeforeSendInTx(tx, row, now, expiryReason, job.correlationId);
-        return terminalDecision(st, expiryReason);
+        return terminalDecision(st, expiryReason, row);
       }
 
       if (!row.payloadEnc) {
@@ -1497,7 +1873,7 @@ export function createProductionWebhookService(
           job.correlationId,
           "ERROR",
         );
-        return terminalDecision(st, "PRODUCTION_PAYLOAD_MISSING");
+        return terminalDecision(st, "PRODUCTION_PAYLOAD_MISSING", row);
       }
 
       const prodState = await readProductionState(tx);
@@ -1510,10 +1886,10 @@ export function createProductionWebhookService(
 
       if (!prodState.enabled) {
         const st = await failTerminalBeforeSendInTx(tx, row, now, "PRODUCTION_NOT_CONFIGURED", job.correlationId);
-        return terminalDecision(st, "PRODUCTION_NOT_CONFIGURED");
+        return terminalDecision(st, "PRODUCTION_NOT_CONFIGURED", row);
       }
 
-      // PW-04: Pin dispatch to the exact destination, auth header, and canon/runMode authorized at queue time.
+      // PW-04: Pin dispatch to the exact destination, auth header, signing mode/secret, and canon/runMode authorized at queue time.
       // Any change (including via generic Platform settings) cancels the queued/retried dispatch with DESTINATION_CHANGED.
       if (!targetUrl || !prodState.configured || !isValidProductionWebhookUrl(targetUrl)) {
         const currentFpWhenIncomplete = computeDestinationFingerprint(phase, {
@@ -1522,13 +1898,15 @@ export function createProductionWebhookService(
           authHeaderValue,
           canonVersion: prodState.cfg.canonVersion,
           runMode: prodState.cfg.runMode,
+          signingEnabled: prodState.cfg.signingEnabled,
+          signingSecret: prodState.signingSecret,
         });
         const reasonCode =
           currentFpWhenIncomplete !== row.destinationFingerprint
             ? "DESTINATION_CHANGED"
             : "PRODUCTION_NOT_CONFIGURED";
         const st = await failTerminalBeforeSendInTx(tx, row, now, reasonCode, job.correlationId);
-        return terminalDecision(st, reasonCode);
+        return terminalDecision(st, reasonCode, row);
       }
 
       const currentFingerprint = computeDestinationFingerprint(phase, {
@@ -1537,10 +1915,27 @@ export function createProductionWebhookService(
         authHeaderValue,
         canonVersion: prodState.cfg.canonVersion,
         runMode: prodState.cfg.runMode,
+        signingEnabled: prodState.cfg.signingEnabled,
+        signingSecret: prodState.signingSecret,
       });
-      if (currentFingerprint !== row.destinationFingerprint) {
+      const overlapFingerprint =
+        prodState.cfg.signingEnabled && prodState.overlapSigningSecret
+          ? computeDestinationFingerprint(phase, {
+              targetUrl,
+              authHeaderName: prodState.cfg.authHeaderName,
+              authHeaderValue,
+              canonVersion: prodState.cfg.canonVersion,
+              runMode: prodState.cfg.runMode,
+              signingEnabled: true,
+              signingSecret: prodState.overlapSigningSecret,
+            })
+          : null;
+      if (
+        currentFingerprint !== row.destinationFingerprint &&
+        (overlapFingerprint === null || overlapFingerprint !== row.destinationFingerprint)
+      ) {
         const st = await failTerminalBeforeSendInTx(tx, row, now, "DESTINATION_CHANGED", job.correlationId);
-        return terminalDecision(st, "DESTINATION_CHANGED");
+        return terminalDecision(st, "DESTINATION_CHANGED", row);
       }
 
       // PW-03: Re-validate current order existence, legal-hold/lock state, cancellation, owner binding, and scope BEFORE send.
@@ -1549,24 +1944,24 @@ export function createProductionWebhookService(
       const scope = await orders.getProductionScope(row.orderId, { tx });
       if (!scope) {
         const st = await failTerminalBeforeSendInTx(tx, row, now, "ORDER_NOT_FOUND", job.correlationId);
-        return terminalDecision(st, "ORDER_NOT_FOUND");
+        return terminalDecision(st, "ORDER_NOT_FOUND", row);
       }
       if (isOrderLockedForProduction(scope.lockState)) {
         const st = await failTerminalBeforeSendInTx(tx, row, now, "ORDER_LOCKED", job.correlationId);
-        return terminalDecision(st, "ORDER_LOCKED");
+        return terminalDecision(st, "ORDER_LOCKED", row);
       }
       if (isOrderCanceledStatus(scope.statusKey)) {
         const st = await failTerminalBeforeSendInTx(tx, row, now, "ORDER_CANCELED", job.correlationId);
-        return terminalDecision(st, "ORDER_CANCELED");
+        return terminalDecision(st, "ORDER_CANCELED", row);
       }
       if (scope.ownerUserId !== row.expectedOwnerUserId) {
         const st = await failTerminalBeforeSendInTx(tx, row, now, "ORDER_OWNER_CHANGED", job.correlationId);
-        return terminalDecision(st, "ORDER_OWNER_CHANGED");
+        return terminalDecision(st, "ORDER_OWNER_CHANGED", row);
       }
       const owner = await identity.getUser(scope.ownerUserId, { tx });
       if (!owner || owner.status !== "active") {
         const st = await failTerminalBeforeSendInTx(tx, row, now, "ORDER_OWNER_INACTIVE", job.correlationId);
-        return terminalDecision(st, "ORDER_OWNER_INACTIVE");
+        return terminalDecision(st, "ORDER_OWNER_INACTIVE", row);
       }
       if (phase === "P101") {
         const liveP101 = buildP101Payload({
@@ -1589,7 +1984,7 @@ export function createProductionWebhookService(
           liveP101.payload.bundle_scope_manifest === row.bundleScopeManifest;
         if (!scopeUnchanged) {
           const st = await failTerminalBeforeSendInTx(tx, row, now, "ORDER_SCOPE_CHANGED", job.correlationId);
-          return terminalDecision(st, "ORDER_SCOPE_CHANGED");
+          return terminalDecision(st, "ORDER_SCOPE_CHANGED", row);
         }
       }
 
@@ -1605,7 +2000,7 @@ export function createProductionWebhookService(
           job.correlationId,
           "ERROR",
         );
-        return terminalDecision(st, "PRODUCTION_PAYLOAD_DECRYPT_FAILED");
+        return terminalDecision(st, "PRODUCTION_PAYLOAD_DECRYPT_FAILED", row);
       }
 
       // Defense-in-depth: verify SHA-256 and canonical payload schema before any network socket opens.
@@ -1629,7 +2024,7 @@ export function createProductionWebhookService(
       if (!integrityOk || !schemaOk) {
         const reasonCode = !integrityOk ? "PRODUCTION_PAYLOAD_HASH_MISMATCH" : "PRODUCTION_PAYLOAD_INVALID";
         const st = await failTerminalBeforeSendInTx(tx, row, now, reasonCode, job.correlationId, "ERROR");
-        return terminalDecision(st, reasonCode);
+        return terminalDecision(st, reasonCode, row);
       }
 
       const claimedVersion = row.version + 1;
@@ -1669,6 +2064,9 @@ export function createProductionWebhookService(
         targetUrl,
         authHeaderName: prodState.cfg.authHeaderName,
         authHeaderValue,
+        signingEnabled: prodState.cfg.signingEnabled,
+        signingSecret: prodState.signingSecret,
+        overlapSigningSecret: prodState.overlapSigningSecret,
         timeoutMs: prodState.cfg.timeoutMs,
         payloadJson,
       };
@@ -1685,16 +2083,43 @@ export function createProductionWebhookService(
     }
     if (decision.kind === "terminal_unknown") {
       await checks.recordOutcome("production", "failed", decision.reasonCode);
+      await emitProdOpsAlert({
+        orderPublicId: decision.orderPublicId,
+        phase: decision.phase,
+        severity: decision.phase === "P101" || decision.phase === "P201" ? "critical" : "error",
+        code: decision.reasonCode,
+        title: `${decision.phase} production webhook outcome uncertain for order ${decision.orderReference}`,
+        text: fixedDispatchSummary(decision.reasonCode, null, "unknown"),
+        correlationId: job.correlationId,
+      });
       return { outcome: "unknown", reasonCode: decision.reasonCode };
     }
     if (decision.kind === "already_failed" || decision.kind === "terminal_failed") {
       if (decision.kind === "terminal_failed") {
         await checks.recordOutcome("production", "failed", decision.reasonCode);
+        await emitProdOpsAlert({
+          orderPublicId: decision.orderPublicId,
+          phase: decision.phase,
+          severity: "error",
+          code: decision.reasonCode,
+          title: `${decision.phase} production webhook failed for order ${decision.orderReference}`,
+          text: fixedDispatchSummary(decision.reasonCode, null, "failed"),
+          correlationId: job.correlationId,
+        });
       }
       return { outcome: "failed", reasonCode: decision.reasonCode, retryable: false };
     }
     if (decision.kind === "ambiguous_sending") {
       await checks.recordOutcome("production", "failed", "PRODUCTION_AMBIGUOUS_IN_FLIGHT");
+      await emitProdOpsAlert({
+        orderPublicId: decision.orderPublicId,
+        phase: decision.phase,
+        severity: decision.phase === "P101" || decision.phase === "P201" ? "critical" : "error",
+        code: "PRODUCTION_AMBIGUOUS_IN_FLIGHT",
+        title: `${decision.phase} production webhook interrupted in flight for order ${decision.orderReference}`,
+        text: fixedDispatchSummary("PRODUCTION_AMBIGUOUS_IN_FLIGHT", null, "unknown"),
+        correlationId: job.correlationId,
+      });
       return { outcome: "unknown", reasonCode: "PRODUCTION_AMBIGUOUS_IN_FLIGHT" };
     }
 
@@ -1712,6 +2137,16 @@ export function createProductionWebhookService(
     }
     if (decision.authHeaderName && decision.authHeaderValue) {
       headers[decision.authHeaderName] = decision.authHeaderValue;
+    }
+    if (decision.signingEnabled && decision.signingSecret) {
+      const timestampSec = Math.floor(deps.clock.now().getTime() / 1000);
+      headers["X-ReadyPackets-Timestamp"] = String(timestampSec);
+      headers["X-ReadyPackets-Signature"] = signWebhookPayload(
+        Buffer.from(decision.payloadJson, "utf8"),
+        timestampSec,
+        decision.signingSecret,
+        decision.overlapSigningSecret,
+      );
     }
 
     type AttemptOutcome =
@@ -2044,10 +2479,67 @@ export function createProductionWebhookService(
       return { outcome: "failed", reasonCode: attemptOutcome.reasonCode, retryable: false };
     });
 
+    const phase = decision.row.phase as ProductionPhase;
     if (result.outcome === "completed") {
       await checks.recordOutcome("production", "succeeded", "PRODUCTION_DELIVERED");
-    } else if (result.outcome === "failed" || result.outcome === "unknown") {
+      await resolveProdOpsAlert(decision.row.orderPublicId, phase, job.correlationId);
+    } else if (result.outcome === "unknown") {
       await checks.recordOutcome("production", "failed", result.reasonCode);
+      await emitProdOpsAlert({
+        orderPublicId: decision.row.orderPublicId,
+        phase,
+        severity: phase === "P101" || phase === "P201" ? "critical" : "error",
+        code: result.reasonCode,
+        title: `${phase} production webhook outcome uncertain for order ${decision.row.orderReference}`,
+        text: fixedDispatchSummary(result.reasonCode, null, "unknown"),
+        correlationId: job.correlationId,
+      });
+    } else if (result.outcome === "failed") {
+      await checks.recordOutcome("production", "failed", result.reasonCode);
+      const isExhausted = attemptOutcome.kind === "failed" && attemptOutcome.retryable && job.attempt >= PRODUCTION_MAX_ATTEMPTS;
+      if (isExhausted) {
+        await emitProdOpsAlert({
+          orderPublicId: decision.row.orderPublicId,
+          phase,
+          severity: phase === "P101" || phase === "P201" ? "critical" : "error",
+          code: result.reasonCode,
+          title: `${phase} production webhook dead-lettered for order ${decision.row.orderReference}`,
+          text: fixedDispatchSummary(
+            result.reasonCode,
+            attemptOutcome.kind === "failed" ? attemptOutcome.httpStatus : null,
+            "dead",
+          ),
+          correlationId: job.correlationId,
+        });
+      } else if (!result.retryable) {
+        await emitProdOpsAlert({
+          orderPublicId: decision.row.orderPublicId,
+          phase,
+          severity: "error",
+          code: result.reasonCode,
+          title: `${phase} production webhook failed for order ${decision.row.orderReference}`,
+          text: fixedDispatchSummary(
+            result.reasonCode,
+            attemptOutcome.kind === "failed" ? attemptOutcome.httpStatus : null,
+            "failed",
+          ),
+          correlationId: job.correlationId,
+        });
+      } else if (job.attempt >= 2) {
+        await emitProdOpsAlert({
+          orderPublicId: decision.row.orderPublicId,
+          phase,
+          severity: "warning",
+          code: result.reasonCode,
+          title: `${phase} production webhook retrying for order ${decision.row.orderReference}`,
+          text: fixedDispatchSummary(
+            result.reasonCode,
+            attemptOutcome.kind === "failed" ? attemptOutcome.httpStatus : null,
+            "queued",
+          ),
+          correlationId: job.correlationId,
+        });
+      }
     }
 
     return result;
@@ -2165,6 +2657,14 @@ export function createProductionWebhookService(
         settingsActionable: true,
       });
     }
+    if (!prodState.signingConsistent) {
+      reasons.push({
+        code: "SIGNING_SECRET_MISSING",
+        category: "config_incomplete",
+        message: "HMAC payload signing is enabled without a rotated signing secret.",
+        settingsActionable: true,
+      });
+    }
 
     const inProgress = phaseRows.some((r) => r.state === "queued" || r.state === "sending");
     const delivered = phaseRows.some((r) => r.state === "delivered");
@@ -2248,6 +2748,7 @@ export function createProductionWebhookService(
       releaseStatusOverride?: string;
       requireExplicitP201Confirm: boolean;
       phase1ArtifactsConfirmed: boolean;
+      bypassPaymentStageCheck?: boolean;
       action: DispatchActionKind;
     },
   ): Promise<{ ok: true; prepared: PreparedPhaseDispatch } | { ok: false; error: DomainError }> {
@@ -2256,7 +2757,9 @@ export function createProductionWebhookService(
     const { orderId, orderPublicId, phase, existingRows, action } = params;
 
     if (phase === "P101") {
-      const candidate = await evaluateP101CandidateInTx(tx, orderId, params.releaseStatusOverride);
+      const candidate = await evaluateP101CandidateInTx(tx, orderId, params.releaseStatusOverride, {
+        bypassPaymentStageCheck: params.bypassPaymentStageCheck,
+      });
       if (!candidate.featureEnabled || !candidate.featureConfigured || !candidate.prodState.p101Secret) {
         await recordRefusedAuditInTx(tx, {
           phase: "P101",
@@ -2293,7 +2796,9 @@ export function createProductionWebhookService(
         return {
           ok: false,
           error:
-            first.code === "ORDER_LOCKED" || first.code === "ORDER_CANCELED"
+            first.code === "ORDER_LOCKED" ||
+            first.code === "ORDER_CANCELED" ||
+            first.code === "PAYMENT_NOT_CONFIRMED"
               ? conflict(first.code, first.message)
               : validation(first.code, first.message, {
                   error_codes: candidate.validationErrors.map((e) => e.code),
@@ -2311,6 +2816,8 @@ export function createProductionWebhookService(
         authHeaderValue,
         canonVersion: candidate.prodState.cfg.canonVersion,
         runMode: candidate.prodState.cfg.runMode,
+        signingEnabled: candidate.prodState.cfg.signingEnabled,
+        signingSecret: candidate.prodState.signingSecret,
       });
 
       const p = candidate.payload;
@@ -2402,6 +2909,25 @@ export function createProductionWebhookService(
           "The order owner account must be active to dispatch production webhooks.",
         ),
       };
+    }
+
+    if (phase === "P201") {
+      const stagePre = await evaluateFormat3StagePreconditionsInTx(tx, orderPublicId);
+      if (stagePre.isFormat3 && !stagePre.intakeLocked) {
+        await recordRefusedAuditInTx(tx, {
+          phase: "P201",
+          orderPublicId,
+          reasonCode: "PHASE1_INTAKE_NOT_LOCKED",
+          action,
+        });
+        return {
+          ok: false,
+          error: conflict(
+            "PHASE1_INTAKE_NOT_LOCKED",
+            "Phase 1 (Intake) must be submitted and locked before Phase II (P201) can start.",
+          ),
+        };
+      }
     }
 
     if (params.requireExplicitP201Confirm && phase === "P201" && params.phase1ArtifactsConfirmed !== true) {
@@ -2522,6 +3048,8 @@ export function createProductionWebhookService(
       authHeaderValue,
       canonVersion: prodState.cfg.canonVersion,
       runMode: prodState.cfg.runMode,
+      signingEnabled: prodState.cfg.signingEnabled,
+      signingSecret: prodState.signingSecret,
     });
 
     return {
@@ -2737,6 +3265,8 @@ export function createProductionWebhookService(
       authHeaderValue,
       canonVersion: prodState.cfg.canonVersion,
       runMode: prodState.cfg.runMode,
+      signingEnabled: prodState.cfg.signingEnabled,
+      signingSecret: prodState.signingSecret,
     });
 
     if (phase === "P101") {
@@ -3082,13 +3612,15 @@ export function createProductionWebhookService(
       await deps.db.transaction(async (tx) => {
         await assertIntegrationsManageInTx(deps, principal, tx);
 
-        const [existingP101, existingP201, existingP301, existingP401, existingAuthVal] = await Promise.all([
-          isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_P101_URL, tx),
-          isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_P201_URL, tx),
-          isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_P301_URL, tx),
-          isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_P401_URL, tx),
-          isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_AUTH_VALUE, tx),
-        ]);
+        const [currentCfg, existingP101, existingP201, existingP301, existingP401, existingAuthVal] =
+          await Promise.all([
+            readSetting(deps.settings, INTEGRATIONS_PRODUCTION_CONFIG, tx),
+            isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_P101_URL, tx),
+            isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_P201_URL, tx),
+            isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_P301_URL, tx),
+            isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_P401_URL, tx),
+            isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_AUTH_VALUE, tx),
+          ]);
 
         const nextP101Configured = input.p101Url === undefined ? existingP101 : input.p101Url !== null;
         const nextP201Configured = input.p201Url === undefined ? existingP201 : input.p201Url !== null;
@@ -3151,7 +3683,15 @@ export function createProductionWebhookService(
         await writeSetting(
           deps.settings,
           INTEGRATIONS_PRODUCTION_CONFIG,
-          { canonVersion, runMode, timeoutMs, authHeaderName },
+          {
+            canonVersion,
+            runMode,
+            timeoutMs,
+            authHeaderName,
+            signingEnabled: currentCfg.signingEnabled,
+            signingSecretLast4: currentCfg.signingSecretLast4,
+            previousSigningSecretExpiresAt: currentCfg.previousSigningSecretExpiresAt,
+          },
           tx,
         );
         await deps.settings.set(flagKey(INTEGRATIONS_PRODUCTION_FLAG.flag), input.enabled, tx);
@@ -3193,6 +3733,383 @@ export function createProductionWebhookService(
       });
 
       return loadSettingsView();
+    },
+
+    async rotateSigningSecret(
+      principal,
+      input = {},
+    ): Promise<{ settings: ProductionSettingsView; signingSecretOnce: string }> {
+      const checkedAt = deps.clock.now();
+      assertIntegrationsManagePreflight(principal, checkedAt);
+      const overlapMinutes = Math.min(Math.max(Math.trunc(input.overlapMinutes ?? 1440), 0), 10_080);
+      const { secret: nextSecret, last4: nextLast4 } = generateWebhookSigningSecret();
+
+      await deps.db.transaction(async (tx) => {
+        await assertIntegrationsManageInTx(deps, principal, tx);
+        const [currentCfg, existingSecret] = await Promise.all([
+          readSetting(deps.settings, INTEGRATIONS_PRODUCTION_CONFIG, tx),
+          readSecret(deps.settings, INTEGRATIONS_PRODUCTION_SIGNING_SECRET, tx),
+        ]);
+        const txNow = deps.clock.now();
+        let previousSigningSecretExpiresAt: string | null = null;
+        if (existingSecret && overlapMinutes > 0) {
+          await deps.settings.setSecret(INTEGRATIONS_PRODUCTION_SIGNING_PREV_SECRET.key, existingSecret, tx);
+          previousSigningSecretExpiresAt = new Date(
+            txNow.getTime() + overlapMinutes * 60_000,
+          ).toISOString();
+        } else {
+          await deps.settings.setSecret(INTEGRATIONS_PRODUCTION_SIGNING_PREV_SECRET.key, null, tx);
+        }
+
+        await deps.settings.setSecret(INTEGRATIONS_PRODUCTION_SIGNING_SECRET.key, nextSecret, tx);
+        await writeSetting(
+          deps.settings,
+          INTEGRATIONS_PRODUCTION_CONFIG,
+          {
+            ...currentCfg,
+            signingSecretLast4: nextLast4,
+            previousSigningSecretExpiresAt,
+          },
+          tx,
+        );
+
+        await deps.audit.record(
+          {
+            category: "integration",
+            eventName: "integration.production.signing_secret_rotated",
+            action: "rotate_secret",
+            outcome: "completed",
+            severity: "WARN",
+            provider: "production_webhook",
+            resource: { type: "integration_provider", publicId: "production" },
+            attributes: {
+              signing_enabled: currentCfg.signingEnabled,
+              overlap_minutes: overlapMinutes,
+              previous_retained: Boolean(existingSecret && overlapMinutes > 0),
+            },
+          },
+          tx,
+        );
+      });
+
+      const settings = await loadSettingsView();
+      return { settings, signingSecretOnce: nextSecret };
+    },
+
+    async setSigningEnabled(principal, input): Promise<ProductionSettingsView> {
+      const checkedAt = deps.clock.now();
+      assertIntegrationsManagePreflight(principal, checkedAt);
+
+      await deps.db.transaction(async (tx) => {
+        await assertIntegrationsManageInTx(deps, principal, tx);
+        const [currentCfg, secretConfigured] = await Promise.all([
+          readSetting(deps.settings, INTEGRATIONS_PRODUCTION_CONFIG, tx),
+          isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_SIGNING_SECRET, tx),
+        ]);
+        if (input.enabled && !secretConfigured) {
+          throw validation(
+            "PRODUCTION_SIGNING_SECRET_REQUIRED",
+            "Generate a production webhook signing secret before enabling HMAC payload signing.",
+          );
+        }
+
+        await writeSetting(
+          deps.settings,
+          INTEGRATIONS_PRODUCTION_CONFIG,
+          {
+            ...currentCfg,
+            signingEnabled: input.enabled,
+          },
+          tx,
+        );
+
+        await deps.audit.record(
+          {
+            category: "integration",
+            eventName: "integration.production.signing_updated",
+            action: "update",
+            outcome: "completed",
+            severity: "INFO",
+            provider: "production_webhook",
+            resource: { type: "integration_provider", publicId: "production" },
+            attributes: {
+              signing_enabled: input.enabled,
+              signing_secret_configured: secretConfigured,
+            },
+          },
+          tx,
+        );
+      });
+
+      return loadSettingsView();
+    },
+
+    async listWorkflowAutoQueue(principal): Promise<{ items: WorkflowAutoQueueItemView[] }> {
+      if (principal.state !== "full" || principal.pendingSteps.length > 0) {
+        throw new DomainError(
+          "REMEDIATION_REQUIRED",
+          "ACCOUNT_STEP_PENDING",
+          "Please finish securing your account to continue.",
+        );
+      }
+      if (principal.role !== "admin") {
+        throw forbidden("ADMIN_REQUIRED");
+      }
+      const orders = requireOrders();
+      const [workflows, map] = await Promise.all([
+        orders.workflows?.list ? orders.workflows.list() : Promise.resolve([]),
+        readSetting(deps.settings, INTEGRATIONS_PRODUCTION_WORKFLOW_AUTO_QUEUE),
+      ]);
+      const items: WorkflowAutoQueueItemView[] = workflows.map((wf) => {
+        const entry =
+          map[wf.publicId] ??
+          map[wf.workflowKey] ??
+          Object.values(map).find((v) => v.workflowKey === wf.workflowKey);
+        return {
+          workflowPublicId: wf.publicId,
+          workflowKey: wf.workflowKey,
+          workflowName: wf.name,
+          isDefault: wf.isDefault,
+          p101OnPaymentConfirmed: entry?.p101OnPaymentConfirmed ?? false,
+          p201OnPhase1Locked: entry?.p201OnPhase1Locked ?? false,
+          updatedAt: entry?.updatedAt ? new Date(entry.updatedAt) : null,
+        };
+      });
+      return { items };
+    },
+
+    async setWorkflowAutoQueue(principal, input): Promise<{ items: WorkflowAutoQueueItemView[] }> {
+      const checkedAt = deps.clock.now();
+      assertIntegrationsManagePreflight(principal, checkedAt);
+      const orders = requireOrders();
+      const workflows = orders.workflows?.list ? await orders.workflows.list() : [];
+      const targetWf = workflows.find(
+        (wf) =>
+          (input.workflowPublicId && wf.publicId === input.workflowPublicId) ||
+          (input.workflowKey && wf.workflowKey === input.workflowKey),
+      );
+      if (!targetWf) {
+        throw notFound("WORKFLOW_NOT_FOUND");
+      }
+
+      await deps.db.transaction(async (tx) => {
+        await assertIntegrationsManageInTx(deps, principal, tx);
+        const currentMap = await readSetting(deps.settings, INTEGRATIONS_PRODUCTION_WORKFLOW_AUTO_QUEUE, tx);
+        const txNowIso = deps.clock.now().toISOString();
+        const nextMap = {
+          ...currentMap,
+          [targetWf.publicId]: {
+            workflowKey: targetWf.workflowKey,
+            p101OnPaymentConfirmed: input.p101OnPaymentConfirmed,
+            p201OnPhase1Locked: input.p201OnPhase1Locked,
+            updatedAt: txNowIso,
+          },
+        };
+        await writeSetting(deps.settings, INTEGRATIONS_PRODUCTION_WORKFLOW_AUTO_QUEUE, nextMap, tx);
+
+        await deps.audit.record(
+          {
+            category: "integration",
+            eventName: "integration.production.workflow_auto_queue_updated",
+            action: "update",
+            outcome: "completed",
+            severity: "INFO",
+            provider: "production_webhook",
+            resource: { type: "order_workflow", publicId: targetWf.publicId },
+            attributes: {
+              workflow_public_id: targetWf.publicId,
+              workflow_key: targetWf.workflowKey,
+              p101_on_payment_confirmed: input.p101OnPaymentConfirmed,
+              p201_on_phase1_locked: input.p201OnPhase1Locked,
+            },
+          },
+          tx,
+        );
+      });
+
+      const updatedMap = await readSetting(deps.settings, INTEGRATIONS_PRODUCTION_WORKFLOW_AUTO_QUEUE);
+      return {
+        items: workflows.map((wf) => {
+          const entry = updatedMap[wf.publicId];
+          return {
+            workflowPublicId: wf.publicId,
+            workflowKey: wf.workflowKey,
+            workflowName: wf.name,
+            isDefault: wf.isDefault,
+            p101OnPaymentConfirmed: entry?.p101OnPaymentConfirmed ?? false,
+            p201OnPhase1Locked: entry?.p201OnPhase1Locked ?? false,
+            updatedAt: entry?.updatedAt ? new Date(entry.updatedAt) : null,
+          };
+        }),
+      };
+    },
+
+    async getWorkflowAutoQueueForOrderInTx(orderPublicId, tx) {
+      const orders = requireOrders();
+      if (!orders.stages?.contextForRun || !orders.workflows?.byVersionId) {
+        return {
+          workflowPublicId: null,
+          p101OnPaymentConfirmed: false,
+          p201OnPhase1Locked: false,
+          intakeStageKey: null,
+        };
+      }
+      const ctx = await orders.stages.contextForRun(orderPublicId, tx);
+      const [bound, map] = await Promise.all([
+        orders.workflows.byVersionId(tx, ctx.workflowVersionId),
+        readSetting(deps.settings, INTEGRATIONS_PRODUCTION_WORKFLOW_AUTO_QUEUE, tx),
+      ]);
+      const intakeStage =
+        ctx.stages.find((s) => s.key === "phase_1_intake") ??
+        ctx.stages.find((s) => s.progression === "submit_lock") ??
+        null;
+
+      let matchedPublicId: string | null = null;
+      let matchedEntry = Object.entries(map).find(([, v]) => v.workflowKey === bound.workflowKey);
+      if (matchedEntry) {
+        matchedPublicId = matchedEntry[0];
+      } else if (orders.workflows.list) {
+        const workflows = await orders.workflows.list();
+        const wf = workflows.find((w) => w.workflowKey === bound.workflowKey);
+        if (wf) {
+          matchedPublicId = wf.publicId;
+          const byId = map[wf.publicId];
+          if (byId) {
+            matchedEntry = [wf.publicId, byId];
+          }
+        }
+      }
+
+      return {
+        workflowPublicId: matchedPublicId,
+        p101OnPaymentConfirmed: matchedEntry?.[1].p101OnPaymentConfirmed ?? false,
+        p201OnPhase1Locked: matchedEntry?.[1].p201OnPhase1Locked ?? false,
+        intakeStageKey: intakeStage?.key ?? null,
+      };
+    },
+
+    async enqueueWorkflowDispatch(input, tx): Promise<EnqueueWorkflowProductionDispatchResult> {
+      const orders = requireOrders();
+      const orderRef = await orders.getOrderRefByPublicId(input.orderPublicId, tx, { forUpdate: true });
+      if (!orderRef) {
+        return {
+          outcome: "refused_precondition",
+          dispatchPublicId: null,
+          reasonCode: "ORDER_NOT_FOUND",
+          message: "Order was not found.",
+        };
+      }
+
+      const prodState = await readProductionState(tx);
+      const endpointConfigured = phaseUrlConfigured(prodState, input.phase);
+      if (!prodState.enabled || !prodState.configured || !endpointConfigured) {
+        await recordRefusedAuditInTx(tx, {
+          phase: input.phase,
+          orderPublicId: orderRef.publicId,
+          reasonCode: "PRODUCTION_WEBHOOKS_NOT_ENABLED",
+          extraAttrs: {
+            trigger_source: input.triggerSource,
+            stage_key: input.stageKey,
+          },
+        });
+        return {
+          outcome: "disabled",
+          dispatchPublicId: null,
+          reasonCode: "PRODUCTION_WEBHOOKS_NOT_ENABLED",
+          message: `Production webhook ${input.phase} is disabled or not configured.`,
+        };
+      }
+
+      const existingRows = await tx
+        .select()
+        .from(integrationProductionDispatches)
+        .where(eq(integrationProductionDispatches.orderId, orderRef.id))
+        .for("update")
+        .orderBy(desc(integrationProductionDispatches.id));
+
+      const phaseRows = existingRows.filter((r) => r.phase === input.phase);
+      const existingActiveOrDelivered = phaseRows.find(
+        (r) => r.state === "queued" || r.state === "sending" || r.state === "delivered",
+      );
+      if (existingActiveOrDelivered) {
+        return {
+          outcome: "already_queued_or_delivered",
+          dispatchPublicId: existingActiveOrDelivered.publicId,
+          reasonCode:
+            existingActiveOrDelivered.state === "delivered"
+              ? `PRODUCTION_${input.phase}_ALREADY_DELIVERED`
+              : "PRODUCTION_DISPATCH_IN_PROGRESS",
+          message: `${input.phase} is already ${existingActiveOrDelivered.state} for this order.`,
+        };
+      }
+      if (phaseRows.length > 0) {
+        return {
+          outcome: "refused_precondition",
+          dispatchPublicId: phaseRows[0]!.publicId,
+          reasonCode: "PRODUCTION_PRIOR_ATTEMPT_EXISTS",
+          message: `A prior ${input.phase} attempt ended in ${phaseRows[0]!.state}; operator retry or re-send is required.`,
+        };
+      }
+
+      const prep = await preparePhasePayloadInTx(tx, {
+        orderId: orderRef.id,
+        orderPublicId: orderRef.publicId,
+        phase: input.phase,
+        existingRows,
+        releaseStatusOverride: input.releaseStatus ?? undefined,
+        requireExplicitP201Confirm: false,
+        phase1ArtifactsConfirmed: true,
+        bypassPaymentStageCheck: input.bypassPaymentStageCheck,
+        action: "request",
+      });
+      if (!prep.ok) {
+        return {
+          outcome: "refused_precondition",
+          dispatchPublicId: null,
+          reasonCode: prep.error.reasonCode,
+          message: prep.error.message,
+        };
+      }
+
+      const item = await enqueueDispatchInTx(tx, {
+        principal: input.actor,
+        orderId: orderRef.id,
+        orderPublicId: orderRef.publicId,
+        orderReference: prep.prepared.orderReference,
+        expectedOwnerUserId: prep.prepared.expectedOwnerUserId,
+        destinationFingerprint: prep.prepared.destinationFingerprint,
+        phase: input.phase,
+        payloadObject: prep.prepared.payloadObject,
+        sentCustomerId: prep.prepared.sentCustomerId,
+        sentOrderId: prep.prepared.sentOrderId,
+        sentRunMode: prep.prepared.sentRunMode,
+        packet: prep.prepared.packet,
+        tier: prep.prepared.tier,
+        bundleScopeManifest: prep.prepared.bundleScopeManifest,
+        releaseStatus: prep.prepared.releaseStatus,
+        isResend: false,
+        resendReasonCode: null,
+        phase1ArtifactsConfirmed: prep.prepared.phase1ArtifactsConfirmed,
+        triggerSource: input.triggerSource,
+        stageKey: input.stageKey,
+        correlationIdOverride: input.correlationId,
+      });
+
+      return {
+        outcome: "queued",
+        dispatchPublicId: item.publicId,
+        reasonCode: null,
+        message: null,
+      };
+    },
+
+    async getTargetStatus(phase, tx) {
+      const prodState = await readProductionState(tx);
+      return {
+        enabled: prodState.enabled,
+        configured: prodState.configured,
+        endpointConfigured: phaseUrlConfigured(prodState, phase),
+      };
     },
 
     async testDestination(principal, input): Promise<ProductionDryRunResult> {
@@ -3348,6 +4265,13 @@ export function createProductionWebhookService(
         }
 
         const p201Errors: ProductionValidationIssue[] = [...baseOrderErrors];
+        const stagePre = await evaluateFormat3StagePreconditionsInTx(tx, access.publicId);
+        if (stagePre.isFormat3 && !stagePre.intakeLocked) {
+          p201Errors.push({
+            code: "PHASE1_INTAKE_NOT_LOCKED",
+            message: "Phase 1 (Intake) must be submitted and locked before Phase II (P201) can start.",
+          });
+        }
         let previewP201Payload: P201Payload | null = null;
         if (!deliveredP101) {
           p201Errors.push({
@@ -3579,7 +4503,9 @@ export function createProductionWebhookService(
             return {
               ok: false,
               error:
-                first.code === "ORDER_LOCKED" || first.code === "ORDER_CANCELED"
+                first.code === "ORDER_LOCKED" ||
+                first.code === "ORDER_CANCELED" ||
+                first.code === "PAYMENT_NOT_CONFIRMED"
                   ? conflict(first.code, first.message)
                   : validation(first.code, first.message, {
                       error_codes: candidate.validationErrors.map((e) => e.code),
@@ -3628,6 +4554,8 @@ export function createProductionWebhookService(
             authHeaderValue,
             canonVersion: candidate.prodState.cfg.canonVersion,
             runMode: candidate.prodState.cfg.runMode,
+            signingEnabled: candidate.prodState.cfg.signingEnabled,
+            signingSecret: candidate.prodState.signingSecret,
           });
 
           const p = candidate.payload;
@@ -3723,6 +4651,22 @@ export function createProductionWebhookService(
               error: validation(
                 "ORDER_OWNER_INACTIVE",
                 "The order owner account must be active to dispatch production webhooks.",
+              ),
+            };
+          }
+
+          const stagePre = await evaluateFormat3StagePreconditionsInTx(tx, access.publicId);
+          if (stagePre.isFormat3 && !stagePre.intakeLocked) {
+            await recordRefusedAuditInTx(tx, {
+              phase: "P201",
+              orderPublicId: access.publicId,
+              reasonCode: "PHASE1_INTAKE_NOT_LOCKED",
+            });
+            return {
+              ok: false,
+              error: conflict(
+                "PHASE1_INTAKE_NOT_LOCKED",
+                "Phase 1 (Intake) must be submitted and locked before Phase II (P201) can start.",
               ),
             };
           }
@@ -3832,6 +4776,8 @@ export function createProductionWebhookService(
             authHeaderValue,
             canonVersion: prodState.cfg.canonVersion,
             runMode: prodState.cfg.runMode,
+            signingEnabled: prodState.cfg.signingEnabled,
+            signingSecret: prodState.signingSecret,
           });
 
           const item = await enqueueDispatchInTx(tx, {
@@ -3870,6 +4816,134 @@ export function createProductionWebhookService(
 
     async requestP401(principal, input): Promise<ProductionDispatchItem> {
       return requestOptionalLaterPhase(principal, input.orderPublicId, "P401");
+    },
+
+    async stop(principal, input): Promise<ProductionDispatchItem> {
+      assertProductionTriggerPreflight(principal);
+      const cleanReason = input.reason ? input.reason.trim() : null;
+      if (cleanReason !== null && (cleanReason.length > 280 || !hasNoHeaderInjection(cleanReason))) {
+        throw validation("INVALID_STOP_REASON", "Stop reason must be at most 280 printable characters.");
+      }
+
+      const orders = requireOrders();
+      const jobAdmin = requireJobAdmin();
+
+      const item = await deps.db.transaction(async (tx) => {
+        // PW-05 + PW-02 strict total lock order: `orders` -> `identity` -> `job_runs` -> `integration_production_dispatches`.
+        const access = await orders.assertCanReadOrder(principal, input.orderPublicId, {
+          tx,
+          forUpdate: true,
+        });
+        await assertProductionTriggerInTx(deps, principal, tx);
+
+        const [snapshot] = await tx
+          .select({
+            id: integrationProductionDispatches.id,
+            jobPublicId: integrationProductionDispatches.jobPublicId,
+            state: integrationProductionDispatches.state,
+            phase: integrationProductionDispatches.phase,
+          })
+          .from(integrationProductionDispatches)
+          .where(
+            and(
+              eq(integrationProductionDispatches.orderId, access.id),
+              eq(integrationProductionDispatches.publicId, input.dispatchPublicId),
+            ),
+          )
+          .limit(1);
+        if (!snapshot) {
+          throw notFound("PRODUCTION_DISPATCH_NOT_FOUND");
+        }
+        if (snapshot.state !== "queued") {
+          throw conflict(
+            "PRODUCTION_DISPATCH_NOT_STOPPABLE",
+            `Cannot stop a production dispatch in state ${snapshot.state}; only queued dispatches can be stopped.`,
+          );
+        }
+
+        const disposition = await jobAdmin.reconcileOutboxJob(snapshot.jobPublicId, tx, {
+          cancelQueued: true,
+        });
+        if (disposition.state === "running_live") {
+          throw conflict(
+            "PRODUCTION_DISPATCH_NOT_STOPPABLE",
+            "This production dispatch has already been claimed by a worker and cannot be stopped in flight.",
+          );
+        }
+
+        const [locked] = await tx
+          .select()
+          .from(integrationProductionDispatches)
+          .where(eq(integrationProductionDispatches.id, snapshot.id))
+          .for("update")
+          .limit(1);
+        if (!locked) {
+          throw notFound("PRODUCTION_DISPATCH_NOT_FOUND");
+        }
+        if (locked.state !== "queued") {
+          throw conflict(
+            "PRODUCTION_DISPATCH_NOT_STOPPABLE",
+            `Cannot stop a production dispatch in state ${locked.state}; only queued dispatches can be stopped.`,
+          );
+        }
+
+        const now = deps.clock.now();
+        const summary = fixedDispatchSummary("OPERATOR_STOPPED", null, "stopped");
+        await tx
+          .update(integrationProductionDispatches)
+          .set({
+            state: "stopped",
+            payloadEnc: null,
+            activeFencingToken: 0,
+            lastReasonCode: "OPERATOR_STOPPED",
+            responseSummary: summary,
+            stoppedAt: now,
+            stoppedByPublicId: principal.userPublicId,
+            stopReason: cleanReason && cleanReason.length > 0 ? cleanReason : null,
+            finalizedAt: now,
+            updatedAt: now,
+            version: locked.version + 1,
+          })
+          .where(
+            and(
+              eq(integrationProductionDispatches.id, locked.id),
+              eq(integrationProductionDispatches.version, locked.version),
+            ),
+          );
+
+        await deps.audit.record(
+          {
+            category: "integration",
+            eventName: "integration.production.dispatch.stopped",
+            action: "stop",
+            outcome: "completed",
+            severity: "WARN",
+            provider: "production_webhook",
+            reasonCode: "OPERATOR_STOPPED",
+            orderPublicId: access.publicId,
+            resource: { type: "integration_production_dispatch", publicId: locked.publicId },
+            attributes: buildSafeDispatchAuditAttributes(locked, {
+              stopped_by_public_id: principal.userPublicId,
+              has_stop_reason: Boolean(cleanReason && cleanReason.length > 0),
+            }),
+            ...(cleanReason ? { safeCounts: { reason_length: cleanReason.length } } : {}),
+          },
+          tx,
+        );
+
+        const [updated] = await tx
+          .select()
+          .from(integrationProductionDispatches)
+          .where(eq(integrationProductionDispatches.id, locked.id))
+          .limit(1);
+        if (!updated) {
+          throw notFound("PRODUCTION_DISPATCH_NOT_FOUND");
+        }
+        return toDispatchItem(updated);
+      });
+
+      await resolveProdOpsAlert(item.orderPublicId, item.phase);
+      return item;
     },
 
     async retry(principal, input): Promise<ProductionDispatchItem> {
@@ -3944,10 +5018,14 @@ export function createProductionWebhookService(
               `A ${phase} attempt ended with an uncertain outcome; verify downstream state before re-sending.`,
             );
           }
-          if (targetRow.state !== "failed" && targetRow.state !== "dead") {
+          if (
+            targetRow.state !== "failed" &&
+            targetRow.state !== "dead" &&
+            targetRow.state !== "stopped"
+          ) {
             throw conflict(
               "PRODUCTION_DISPATCH_NOT_FAILED",
-              "Only failed or dead-lettered dispatches can be retried.",
+              "Only failed, dead-lettered, or stopped dispatches can be retried.",
             );
           }
           if (phaseRows[0]?.publicId !== targetRow.publicId) {
@@ -3968,9 +5046,39 @@ export function createProductionWebhookService(
             return prep;
           }
 
+          let overlapRetryMatch = false;
           if (
             prep.prepared.destinationFingerprint !== rootRow.destinationFingerprint ||
             prep.prepared.destinationFingerprint !== targetRow.destinationFingerprint
+          ) {
+            const prodState = await readProductionState(tx);
+            const targetSecret = targetSecretForPhase(prodState, phase);
+            if (prodState.cfg.signingEnabled && prodState.overlapSigningSecret && targetSecret) {
+              const authHeaderValue =
+                prodState.cfg.authHeaderName !== ""
+                  ? await readSecret(deps.settings, INTEGRATIONS_PRODUCTION_AUTH_VALUE, tx)
+                  : null;
+              const overlapFp = computeDestinationFingerprint(phase, {
+                targetUrl: targetSecret,
+                authHeaderName: prodState.cfg.authHeaderName,
+                authHeaderValue,
+                canonVersion: prodState.cfg.canonVersion,
+                runMode: prodState.cfg.runMode,
+                signingEnabled: true,
+                signingSecret: prodState.overlapSigningSecret,
+              });
+              overlapRetryMatch =
+                (prep.prepared.destinationFingerprint === rootRow.destinationFingerprint ||
+                  overlapFp === rootRow.destinationFingerprint) &&
+                (prep.prepared.destinationFingerprint === targetRow.destinationFingerprint ||
+                  overlapFp === targetRow.destinationFingerprint);
+            }
+          }
+
+          if (
+            !overlapRetryMatch &&
+            (prep.prepared.destinationFingerprint !== rootRow.destinationFingerprint ||
+              prep.prepared.destinationFingerprint !== targetRow.destinationFingerprint)
           ) {
             await recordRefusedAuditInTx(tx, {
               phase,
@@ -3995,7 +5103,11 @@ export function createProductionWebhookService(
           }
 
           const resendReasonCode: ControlledResendReason =
-            targetRow.state === "dead" ? "OPERATOR_RETRY_AFTER_DEAD_LETTER" : "OPERATOR_RETRY_AFTER_FAILURE";
+            targetRow.state === "dead"
+              ? "OPERATOR_RETRY_AFTER_DEAD_LETTER"
+              : targetRow.state === "stopped"
+                ? "OPERATOR_RETRY_AFTER_STOP"
+                : "OPERATOR_RETRY_AFTER_FAILURE";
           const retryRootWireKey = resolveRetryRootWireKey(targetRow, phaseRows);
 
           const item = await enqueueDispatchInTx(tx, {
@@ -4381,7 +5493,7 @@ export function createProductionWebhookService(
           .where(eq(integrationProductionDispatches.orderId, access.id))
           .orderBy(desc(integrationProductionDispatches.id))
           .limit(200);
-        return { items: rows.map(toDispatchItem) };
+        return { items: await mapDispatchItemsWithScheduledRetries(tx, rows) };
       });
     },
 
@@ -4407,7 +5519,21 @@ export function createProductionWebhookService(
         if (input.phase) {
           conditions.push(eq(integrationProductionDispatches.phase, input.phase));
         }
-        if (input.state) {
+        if (input.state === "retrying") {
+          conditions.push(eq(integrationProductionDispatches.state, "queued"));
+          conditions.push(gt(integrationProductionDispatches.attemptCount, 0));
+          conditions.push(
+            sql`exists (select 1 from ${jobRuns} where ${jobRuns.publicId} = ${integrationProductionDispatches.jobPublicId} and ${jobRuns.state} = 'queued')`,
+          );
+        } else if (input.state === "queued") {
+          conditions.push(eq(integrationProductionDispatches.state, "queued"));
+          conditions.push(
+            or(
+              eq(integrationProductionDispatches.attemptCount, 0),
+              sql`not exists (select 1 from ${jobRuns} where ${jobRuns.publicId} = ${integrationProductionDispatches.jobPublicId} and ${jobRuns.state} = 'queued')`,
+            )!,
+          );
+        } else if (input.state) {
           conditions.push(eq(integrationProductionDispatches.state, input.state));
         }
         if (input.orderReference && input.orderReference.trim() !== "") {
@@ -4429,7 +5555,7 @@ export function createProductionWebhookService(
           .orderBy(desc(integrationProductionDispatches.id))
           .limit(limit);
 
-        return { items: rows.map(toDispatchItem) };
+        return { items: await mapDispatchItemsWithScheduledRetries(tx, rows) };
       });
     },
   };

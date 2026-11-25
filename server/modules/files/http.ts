@@ -1,14 +1,18 @@
 import busboy from "busboy";
 import type { Request, Router } from "express";
 import { Readable, Transform } from "node:stream";
-import { finished } from "node:stream/promises";
+import { finished, pipeline } from "node:stream/promises";
 import { z } from "zod";
+import { stageKeySchema } from "../../../shared/workflowStages.js";
 import type { Services } from "../../container.js";
-import { DomainError, validation } from "../../core/errors.js";
+import { DomainError, notFound, validation } from "../../core/errors.js";
 import { ULID_PATTERN } from "../../core/ids.js";
 import { sendPrivateDownload } from "../../http/downloads.js";
 import { getHttpState, requireFullSession } from "../../http/requestState.js";
-import type { StagedUpload, UploadAuthorization } from "./index.js";
+import { readCookie } from "../../http/sessionTransport.js";
+import { registerFileArchiveHttpRoutes } from "./archivesHttp.js";
+import { playbackLifetimeMs, type StagedUpload, type UploadAuthorization } from "./index.js";
+import { uploadIntents } from "./governance.js";
 import { fileCategories, fileVisibilities } from "./schema.js";
 import { slotKeySchema, transcriptSchema } from "./settings.js";
 
@@ -19,11 +23,14 @@ const options = z.strictObject({
   slotKey: slotKeySchema.optional(),
   statusKey: slotKeySchema.optional(),
   source: z.literal("recording").optional(),
+  stageKey: stageKeySchema.optional(),
+  intent: z.enum(uploadIntents).optional(),
 });
 const downloadBody = z.strictObject({ ticket: z.string().length(43).regex(/^[a-zA-Z0-9_-]{43}$/) });
 const publicId = z.string().length(26).regex(ULID_PATTERN);
 const documentParams = z.strictObject({ orderPublicId: publicId, filePublicId: publicId });
 const documentQuery = z.strictObject({ taskKey: slotKeySchema.optional() });
+const playbackCookie = "rp_audio_grant";
 const multipartInvalid = () => validation("INVALID_MULTIPART", "Send one or more files using the multipart file fields.");
 const requestTooLarge = () => validation("UPLOAD_REQUEST_TOO_LARGE", "The upload request exceeds the allowed size.");
 const countExceeded = () => validation("TOO_MANY_FILES", "This upload contains too many files.");
@@ -149,6 +156,13 @@ async function readMultipart(req: Request, services: Services, plan: UploadAutho
 }
 
 export function registerFilesHttpRoutes(router: Router, services: Services): void {
+  async function requirePlaybackSession(req: Request) {
+    try { return requireFullSession(req); }
+    catch (error) {
+      if (error instanceof DomainError) await services.files.recordPlaybackAccess(getHttpState(req).session, "denied", undefined, error.reasonCode);
+      throw error;
+    }
+  }
   router.post("/upload/:orderId", async (req, res) => {
     const principal = requireFullSession(req);
     const orderId = req.params.orderId;
@@ -238,6 +252,70 @@ export function registerFilesHttpRoutes(router: Router, services: Services): voi
     }
   });
 
+  router.post("/playback", async (req, res) => {
+    const principal = await requirePlaybackSession(req);
+    const body = downloadBody.safeParse(req.body);
+    if (!body.success) {
+      await services.files.recordPlaybackAccess(principal, "denied", undefined, "PLAYBACK_NOT_AVAILABLE");
+      throw notFound("PLAYBACK_NOT_AVAILABLE");
+    }
+    const { grantPublicId, secret } = await services.files.redeemPlaybackTicket(principal, body.data.ticket);
+    res.cookie(playbackCookie, secret, {
+      path: `/api/files/playback/${grantPublicId}`, httpOnly: true, sameSite: "strict",
+      secure: services.config.cookieSecure, maxAge: playbackLifetimeMs,
+    });
+    res.set("Cache-Control", "private, no-store").json({ grantPublicId });
+  });
+
+  router.get("/playback/:publicId", async (req, res) => {
+    const principal = await requirePlaybackSession(req);
+    const id = publicId.safeParse(req.params.publicId);
+    if (!id.success || req.get("sec-fetch-site") === "cross-site") {
+      await services.files.recordPlaybackAccess(principal, "denied", undefined, "PLAYBACK_NOT_AVAILABLE");
+      throw notFound("PLAYBACK_NOT_AVAILABLE");
+    }
+    const secret = readCookie(req, playbackCookie) ?? "";
+    const head = req.method === "HEAD";
+    // Without a strong validator no If-Range request can match.
+    const rangeHeader = head || req.get("if-range") !== undefined ? undefined : req.get("range");
+    const { file, range, stream } = await services.files.openPlayback(principal, id.data, secret, rangeHeader, head);
+    res.set({
+      "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+      "Cross-Origin-Resource-Policy": "same-origin", "Accept-Ranges": "bytes", "X-Accel-Buffering": "no",
+    });
+    if (range === "unsatisfiable") {
+      res.status(416).set("Content-Range", `bytes */${file.size}`).end();
+      return;
+    }
+    const size = range ? range.end - range.start + 1 : file.size;
+    res.status(range ? 206 : 200).set({ "Content-Type": file.contentType, "Content-Length": String(size) });
+    if (range) res.set("Content-Range", `bytes ${range.start}-${range.end}/${file.size}`);
+    let outcome: "completed" | "failed" | "unknown" = "unknown";
+    try {
+      if (!stream) {
+        res.end();
+      } else {
+        let bytes = 0;
+        await pipeline(stream, new Transform({
+          transform(chunk: Buffer, _encoding, done) {
+            bytes += chunk.length;
+            if (bytes > size) done(new Error("PLAYBACK_LENGTH_MISMATCH"));
+            else done(null, chunk);
+          },
+          flush(done) { done(bytes === size ? undefined : new Error("PLAYBACK_LENGTH_MISMATCH")); },
+        }), res);
+      }
+      if (res.writableFinished) outcome = "completed";
+    } catch {
+      if (!req.destroyed || res.headersSent) outcome = "failed";
+      res.destroy();
+    } finally {
+      stream?.destroy();
+      await services.files.recordPlaybackAccess(principal, outcome, file, undefined, outcome === "completed" ? (stream ? size : 0) : undefined)
+        .catch(() => services.logger.error("Audio playback outcome could not be recorded"));
+    }
+  });
+
   router.post("/download", async (req, res) => {
     let principal;
     try {
@@ -270,4 +348,5 @@ export function registerFilesHttpRoutes(router: Router, services: Services): voi
         .catch(() => services.logger.error("Private download outcome could not be recorded"));
     }
   });
+  registerFileArchiveHttpRoutes(router, services);
 }

@@ -42,10 +42,13 @@ describe("workflow import edge configuration", () => {
   it("matches the original path in Caddy, rejects batch queries, and inherits upstream handling", () => {
     const config = load("deploy/docker/Caddyfile");
     expect(config).toMatch(/\bmax_size 256KiB\b/u);
-    expect(config).toMatch(/@workflow_import \{\s+method POST\b/u);
-    expect(config).toMatch(/\bnot query batch=\*/u);
-    expect(config).toMatch(/handle @workflow_import \{\s+request_body \{\s+max_size 4352KiB\s+\}\s+import rp_upstream\s+\}/u);
-    const pattern = /expression \{orig_uri\}\.matches\('([^']+)'\)/u.exec(config)?.[1];
+    const matcher = /^[ \t]*@workflow_import \{\s+method POST\b([\s\S]*?)^[ \t]*\}/mu.exec(config)?.[1] ?? "";
+    expect(matcher).toMatch(/\bnot query batch=\*/u);
+    expect(config).toMatch(/handle @workflow_import \{\s+request_body \{\s+max_size 4352KiB\s+\}\s+import rp_upstream 0s\s+\}/u);
+    const upstream = /^\(rp_upstream\) \{([\s\S]*?)^\}/mu.exec(config)?.[1] ?? "";
+    expect(upstream).toMatch(/^\s*flush_interval \{args\[0\]\}\s*$/mu);
+    expect(upstream).toMatch(/^\s*response_header_timeout 120s\s*$/mu);
+    const pattern = /expression \{orig_uri\}\.matches\('([^']+)'\)/u.exec(matcher)?.[1];
     expect(pattern).toBeTruthy();
     const exact = new RegExp(pattern!, "u");
     expect(procedures.map((name) => exact.test(`${base}.${name}`))).toEqual([true, true]);

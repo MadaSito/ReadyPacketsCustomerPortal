@@ -52,6 +52,8 @@ import { createReportsModule, type ReportsModule } from "./modules/reports/index
 import { createCartModule, type CartModule } from "./modules/cart/index.js";
 import { createKnowledgeModule, type KnowledgeModule } from "./modules/knowledge/index.js";
 import { createPaymentsModule, type PaymentsModule } from "./modules/payments/index.js";
+import { createOpsAlertsModule, type OpsAlertsModule } from "./modules/opsAlerts/index.js";
+import { createFileArchivesModule, type FileArchivesModule } from "./modules/files/archives.js";
 
 export interface ModuleRegistry {
   identity: IdentityModule;
@@ -82,6 +84,8 @@ export interface ModuleRegistry {
   cart: CartModule;
   knowledge: KnowledgeModule;
   payments: PaymentsModule;
+  opsAlerts: OpsAlertsModule;
+  fileArchives: FileArchivesModule;
 }
 
 /** Everything a request handler can reach: infrastructure + every module. */
@@ -160,6 +164,8 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
   services.cart = createCartModule(deps);
   services.knowledge = createKnowledgeModule(deps);
   services.payments = createPaymentsModule(deps);
+  services.opsAlerts = createOpsAlertsModule(deps);
+  services.fileArchives = createFileArchivesModule(deps);
   services.sessionResolver = {
     // Late-bound so the identity module owns session truth without the container knowing its shape.
     resolve: (credentials) => services.identity.sessionResolver.resolve(credentials),
@@ -193,6 +199,8 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
     services.cart,
     services.knowledge,
     services.payments,
+    services.opsAlerts,
+    services.fileArchives,
   ];
   services.allModules = modules;
   for (const module of modules) module.init?.();

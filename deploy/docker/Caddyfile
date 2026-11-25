@@ -38,6 +38,8 @@
 
 (rp_upstream) {
 	reverse_proxy web:5000 {
+		# Playback stays streaming; a positive interval preserves upstream cancellation on disconnect.
+		flush_interval {args[0]}
 		header_up Host {$RP_DOMAIN}
 		header_up X-Forwarded-For {remote_host}
 		header_up X-Forwarded-Proto https
@@ -49,6 +51,7 @@
 		header_up -traceparent
 		header_up -tracestate
 		transport http {
+			compression off
 			dial_timeout 5s
 			# Starts once the request has been sent in full. Per-read upstream timers are not used:
 			# they also count the time a client spends uploading and would cut long uploads short.
@@ -75,13 +78,40 @@
 		respond 421
 	}
 
+	@saml_get {
+		method GET
+		expression {orig_uri}.matches('^/api/identity/saml/(metadata|start)([?]|$)')
+	}
+	handle @saml_get {
+		import rp_upstream 0s
+	}
+
+	@saml_acs {
+		method POST
+		expression {orig_uri} == '/api/identity/saml/acs'
+	}
+	handle @saml_acs {
+		request_body {
+			max_size 256KiB
+		}
+		import rp_upstream 0s
+	}
+
+	@playback {
+		method GET HEAD
+		expression {orig_uri}.matches('^/api/files/playback/[0-9A-HJKMNP-TV-Z]{26}([?]|$)')
+	}
+	handle @playback {
+		import rp_upstream 10ms
+	}
+
 	# Case-sensitive, anchored matches: only the exact upload routes get a larger body allowance.
 	@portable_import path_regexp ^/api/portable/imports$
 	handle @portable_import {
 		request_body {
 			max_size 192MiB
 		}
-		import rp_upstream
+		import rp_upstream 0s
 	}
 
 	@file_upload {
@@ -92,7 +122,7 @@
 		request_body {
 			max_size 256MiB
 		}
-		import rp_upstream
+		import rp_upstream 0s
 	}
 
 	@document_save {
@@ -103,7 +133,7 @@
 		request_body {
 			max_size 10256KiB
 		}
-		import rp_upstream
+		import rp_upstream 0s
 	}
 
 	@presentation_image path_regexp ^/api/platform/presentation/images$
@@ -111,7 +141,7 @@
 		request_body {
 			max_size 2MiB
 		}
-		import rp_upstream
+		import rp_upstream 0s
 	}
 
 	# Compare the escaped path literally; encoded spellings stay under the default limit.
@@ -124,14 +154,14 @@
 		request_body {
 			max_size 4352KiB
 		}
-		import rp_upstream
+		import rp_upstream 0s
 	}
 
 	handle {
 		request_body {
 			max_size 256KiB
 		}
-		import rp_upstream
+		import rp_upstream 0s
 	}
 }
 
@@ -152,7 +182,7 @@ http://{$RP_DOMAIN} {
 		respond 421
 	}
 
-	@canonical_callback path_regexp (?i)^/(?:api/identity/sso/callback/?$|api/storage/oauth/callback(?:/|$)|api/(?:webhooks/inbound|payments/(?:webhooks|return))(?:/|$))
+	@canonical_callback path_regexp (?i)^/(?:api/identity/(?:sso/callback/?$|saml(?:/|$))|api/storage/oauth/callback(?:/|$)|api/(?:webhooks/inbound|payments/(?:webhooks|return))(?:/|$))
 	handle @canonical_callback {
 		respond 404
 	}

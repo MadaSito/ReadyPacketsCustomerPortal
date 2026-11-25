@@ -9,9 +9,9 @@
  *  3. SMTP TLS enforcement, plaintext refusal, CRLF header injection defense, secret write-only encryption,
  *     and outbox `send()` outcome taxonomy (`not_configured`, `accepted`, `rejected`, `unknown`).
  *  4. Analytics (Clarity + PostHog) strict identifier/origin validation, public safe config, and route-exact CSP.
- *  5. Stripe signature-verified raw-body webhook, replay window, idempotency, payload-mismatch detection,
- *     Express IPv6 /64 rate-limit key normalization, and transactional `recordProviderPayment` delegation.
- *  6. Disabled SAML 2.0 SSO & SharePoint scaffolds.
+ *  5. Stripe signature-verified raw-body diagnostic webhook, replay window, idempotency, payload-mismatch detection,
+ *     and Express IPv6 /64 rate-limit key normalization.
+ *  6. Live SAML 2.0 / Entra SSO, SharePoint / Microsoft 365 file-sync, and Stripe hub status derivation.
  *  7. Zero-trust authorization & cross-model review regression tests:
  *     - Customer, staff, step-up-missing admin, and remediation-pending admin rejected.
  *     - In-transaction `identity.sessions.assertCurrent(principal, tx)` actor revocation rejection + rollback.
@@ -35,9 +35,8 @@ import { registerSignedIntegrationWebhooks } from "./http.js";
 import {
   createIntegrationsModule,
   createPinnedLookup,
-  SAML_RELEASE_BANNER,
   STRIPE_LEDGER_MUTATION_ENABLED,
-  STRIPE_RELEASE_BANNER,
+  STRIPE_PAYMENTS_SETUP_NOTICE,
   type IntegrationsModule,
 } from "./index.js";
 import { parseIpAddress, precheckHost, type IpAddressClass } from "./ipPolicy.js";
@@ -411,8 +410,8 @@ describe("integrations module — DB-backed integration suite", () => {
       ["mail.graph", "not_configured"],
       ["integrations.clarity", "not_configured"],
       ["integrations.posthog", "not_configured"],
-      ["integrations.stripe", "disabled"],
-      ["integrations.saml", "disabled"],
+      ["integrations.stripe", "not_configured"],
+      ["integrations.saml", "not_configured"],
       ["integrations.sharepoint", "disabled"],
       ["integrations.production", "disabled"],
       ["integrations.webhooks", "disabled"],
@@ -772,7 +771,7 @@ describe("integrations module — DB-backed integration suite", () => {
     }
   });
 
-  it("keeps Stripe hard-disabled as a scaffold, verifies webhook signatures idempotently, and leaves the compliance ledger unchanged", async () => {
+  it("keeps the legacy integrations Stripe diagnostic receiver inert, verifies webhook signatures idempotently, and leaves the compliance ledger unchanged", async () => {
     const admin = makeStepUpAdmin(h);
     const webhookSecret = "whsec_TestSigningSecretKey1234567890";
     const secretKey = "sk_test_SecretApiKeyValue1234567890";
@@ -781,8 +780,8 @@ describe("integrations module — DB-backed integration suite", () => {
     const initialCfg = await mod.stripe.getConfig();
     expect(initialCfg).toMatchObject({
       enabled: false,
-      availableInRelease: false,
-      releaseBanner: STRIPE_RELEASE_BANNER,
+      summary: STRIPE_PAYMENTS_SETUP_NOTICE,
+      paymentsSetupPath: "/admin/payments/setup",
       state: "disabled",
       verified: false,
     });
@@ -794,7 +793,7 @@ describe("integrations module — DB-backed integration suite", () => {
     });
     expect(inertRes).toMatchObject({ httpStatus: 503, accepted: false, reasonCode: "STRIPE_NOT_CONFIGURED" });
 
-    // 2. Attempting to enable Stripe in this release is strictly rejected (`STRIPE_NOT_AVAILABLE_IN_RELEASE`)
+    // 2. Attempting to enable Stripe via the legacy diagnostic endpoint directs callers to Payment Setup (`STRIPE_MANAGED_IN_PAYMENTS`)
     await expect(
       withTestRequest(
         () =>
@@ -807,10 +806,10 @@ describe("integrations module — DB-backed integration suite", () => {
           }),
         admin,
       ),
-    ).rejects.toMatchObject({ reasonCode: "STRIPE_NOT_AVAILABLE_IN_RELEASE" });
+    ).rejects.toMatchObject({ reasonCode: "STRIPE_MANAGED_IN_PAYMENTS" });
     expect(await mod.stripe.isOnlinePaymentConfigured()).toBe(false);
 
-    // 3. Save non-active scaffold metadata + webhook signing secret (`enabled: false`) & attach compliance spy
+    // 3. Save non-active diagnostic metadata + webhook signing secret (`enabled: false`) & attach compliance spy
     const savedCfg = await withTestRequest(
       () =>
         mod.stripe.updateConfig(admin, {
@@ -823,7 +822,6 @@ describe("integrations module — DB-backed integration suite", () => {
       admin,
     );
     expect(savedCfg.enabled).toBe(false);
-    expect(savedCfg.availableInRelease).toBe(false);
     expect(savedCfg.webhookSecretConfigured).toBe(true);
     expect(await mod.stripe.isOnlinePaymentConfigured()).toBe(false);
 
@@ -881,7 +879,7 @@ describe("integrations module — DB-backed integration suite", () => {
       accepted: true,
       duplicate: false,
       ledgerMutated: false,
-      reasonCode: "STRIPE_DISABLED_IN_RELEASE",
+      reasonCode: "STRIPE_INERT_DIAGNOSTIC_RECEIVER",
     });
 
     for (const [evtId, evtType] of [
@@ -906,7 +904,7 @@ describe("integrations module — DB-backed integration suite", () => {
         accepted: true,
         duplicate: false,
         ledgerMutated: false,
-        reasonCode: "STRIPE_DISABLED_IN_RELEASE",
+        reasonCode: "STRIPE_INERT_DIAGNOSTIC_RECEIVER",
       });
     }
 
@@ -915,7 +913,7 @@ describe("integrations module — DB-backed integration suite", () => {
     expect(recordedRows).toHaveLength(3);
     expect(recordedRows.every((r) => r.status === "ignored")).toBe(true);
 
-    // Health stays `disabled` (scaffold never reports active `ok`)
+    // Health stays `disabled` when Stripe online checkout is not configured in Payment Setup
     const stripeHealth = (await mod.health()).find((c) => c.component === "integrations.stripe");
     expect(stripeHealth?.state).toBe("disabled");
 
@@ -977,48 +975,217 @@ describe("integrations module — DB-backed integration suite", () => {
     }
   });
 
-  it("keeps SAML SSO & SharePoint strictly disabled scaffolds with mandatory security requirements", async () => {
+  it("derives live SAML SSO, SharePoint/Microsoft 365 file-sync, and Stripe hub states from real service ports", async () => {
     const admin = makeStepUpAdmin(h);
+    const now = h.clock.now();
+    const dayMs = 24 * 60 * 60 * 1000;
 
-    const samlInitial = await mod.scaffolds.getSamlScaffold();
-    expect(samlInitial.availableInRelease).toBe(false);
-    expect(samlInitial.state).toBe("disabled");
-    expect(samlInitial.releaseBanner).toBe(SAML_RELEASE_BANNER);
-    expect(samlInitial.securityRequirements.length).toBeGreaterThanOrEqual(6);
+    // 1. SAML card state machine + protocol & MFA mode wording
+    let ssoState = {
+      configured: false,
+      enabled: false,
+      complete: false,
+      availableInThisDeployment: true,
+      protocol: "saml" as "saml" | "oidc",
+      entraMfaMode: "portal" as "portal" | "claim" | "entra",
+      trustedCertificates: 0,
+      nearestCertificateExpiry: null as Date | null,
+      metadataStatus: null as string | null,
+      metadataCheckedAt: null as Date | null,
+      lastSignInAt: null as Date | null,
+      settingsPath: "/admin/sso" as const,
+    };
+    (h.services.identity as unknown as { sso: { statusSummary: () => Promise<typeof ssoState> } }).sso = {
+      statusSummary: async () => ({ ...ssoState }),
+    };
 
-    // Attempting to enable SAML in this release is strictly rejected
-    await expect(
-      withTestRequest(
-        () =>
-          mod.scaffolds.updateSamlMetadata(admin, {
-            idpEntityId: "https://idp.corp.example/metadata",
-            idpSsoUrl: "https://idp.corp.example/sso/saml",
-            spEntityId: "https://portal.readypackets.example/saml/sp",
-            nameIdFormat: "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
-            enabled: true,
-          }),
-        admin,
-      ),
-    ).rejects.toMatchObject({ reasonCode: "SAML_NOT_AVAILABLE_IN_RELEASE" });
+    // 1a. No tenant / certificate -> not_configured, summary names protocol + "Portal MFA always"
+    let samlCard = await mod.providers.getStatus("saml");
+    expect(samlCard).toMatchObject({ state: "not_configured", verified: false, scaffoldOnly: false, lastCheckedAt: null });
+    expect(samlCard.summary).toContain("SAML 2.0 · Portal MFA always");
+    expect((await mod.health()).find((c) => c.component === "integrations.saml")?.state).toBe("not_configured");
 
-    // Saving planning metadata keeps SAML disabled
-    const samlSaved = await withTestRequest(
-      () =>
-        mod.scaffolds.updateSamlMetadata(admin, {
-          idpEntityId: "https://idp.corp.example/metadata",
-          idpSsoUrl: "https://idp.corp.example/sso/saml",
-          spEntityId: "https://portal.readypackets.example/saml/sp",
-          nameIdFormat: "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
-        }),
+    // 1b. Configured + valid certificate, switched off -> disabled, summary names "MFA claim required"
+    ssoState = {
+      ...ssoState,
+      configured: true,
+      enabled: false,
+      complete: true,
+      entraMfaMode: "claim",
+      trustedCertificates: 1,
+      nearestCertificateExpiry: new Date(now.getTime() + 120 * dayMs),
+    };
+    samlCard = await mod.providers.getStatus("saml");
+    expect(samlCard).toMatchObject({ state: "disabled", verified: false });
+    expect(samlCard.summary).toContain("SAML 2.0 · MFA claim required");
+    expect((await mod.health()).find((c) => c.component === "integrations.saml")?.state).toBe("disabled");
+
+    // 1c. Enabled, valid certificate, never verified -> degraded
+    ssoState = {
+      ...ssoState,
+      enabled: true,
+      entraMfaMode: "entra",
+    };
+    samlCard = await mod.providers.getStatus("saml");
+    expect(samlCard).toMatchObject({ state: "degraded", verified: false });
+    expect(samlCard.summary).toContain("SAML 2.0 · Entra manages MFA");
+    expect((await mod.health()).find((c) => c.component === "integrations.saml")?.state).toBe("degraded");
+
+    // 1d. Enabled + verified sign-in + cert valid > 30 days -> configured + verified=true (health = "ok")
+    const signInAt = new Date(now.getTime() - 60_000);
+    ssoState = {
+      ...ssoState,
+      lastSignInAt: signInAt,
+    };
+    samlCard = await mod.providers.getStatus("saml");
+    expect(samlCard).toMatchObject({ state: "configured", verified: true, lastCheckedAt: signInAt });
+    expect(samlCard.summary).toContain("SAML 2.0 · Entra manages MFA");
+    expect((await mod.health()).find((c) => c.component === "integrations.saml")?.state).toBe("ok");
+
+    // 1e. Enabled + verified, certificate expires within 30 days -> degraded
+    ssoState = {
+      ...ssoState,
+      nearestCertificateExpiry: new Date(now.getTime() + 14 * dayMs),
+    };
+    samlCard = await mod.providers.getStatus("saml");
+    expect(samlCard).toMatchObject({ state: "degraded", verified: false });
+    expect(samlCard.summary).toContain("expires within 30 days");
+    expect((await mod.health()).find((c) => c.component === "integrations.saml")?.state).toBe("degraded");
+
+    // 1f. No valid certificate -> failing
+    ssoState = {
+      ...ssoState,
+      complete: false,
+      trustedCertificates: 0,
+      nearestCertificateExpiry: null,
+    };
+    samlCard = await mod.providers.getStatus("saml");
+    expect(samlCard).toMatchObject({ state: "failing", verified: false });
+    expect(samlCard.summary).toContain("no valid active signing certificate");
+    expect((await mod.health()).find((c) => c.component === "integrations.saml")?.state).toBe("failing");
+
+    // 2. SharePoint / Microsoft 365 file-sync card state machine
+    let fileSyncState = {
+      totalConnections: 0,
+      enabledConnections: 0,
+      approvedConnections: 0,
+      writeTestedConnections: 0,
+      readyConnections: 0,
+      failingConnections: 0,
+      blockedTransfers: 0,
+      lastCheckedAt: null as Date | null,
+      lastSuccessAt: null as Date | null,
+    };
+    (h.services as unknown as { storageConnections: unknown }).storageConnections = {
+      fileSync: { statusSummary: async () => ({ ...fileSyncState }) },
+    };
+
+    // 2a. No connections -> not_configured
+    expect(await mod.providers.getStatus("sharepoint")).toMatchObject({
+      state: "not_configured",
+      verified: false,
+      scaffoldOnly: false,
+    });
+
+    // 2b. Connection configured, switched off -> disabled
+    fileSyncState = { ...fileSyncState, totalConnections: 1 };
+    expect(await mod.providers.getStatus("sharepoint")).toMatchObject({ state: "disabled", verified: false });
+
+    // 2c. Enabled + ready connection, egress presets still off -> degraded until both Graph presets enabled
+    const writeTestedAt = new Date(now.getTime() - 30_000);
+    fileSyncState = {
+      ...fileSyncState,
+      enabledConnections: 1,
+      approvedConnections: 1,
+      writeTestedConnections: 1,
+      readyConnections: 1,
+      lastCheckedAt: writeTestedAt,
+    };
+    expect(await mod.providers.getStatus("sharepoint")).toMatchObject({ state: "degraded", verified: false });
+
+    await withTestRequest(
+      () => mod.egress.setPresetEnabled(admin, { presetKey: "microsoft_graph", enabled: true }),
       admin,
     );
-    expect(samlSaved.availableInRelease).toBe(false);
-    expect(samlSaved.state).toBe("disabled");
-    expect(samlSaved.metadata.idpEntityId).toBe("https://idp.corp.example/metadata");
+    await withTestRequest(
+      () => mod.egress.setPresetEnabled(admin, { presetKey: "microsoft_graph_upload", enabled: true }),
+      admin,
+    );
 
-    const sp = await mod.scaffolds.getSharePointScaffold();
-    expect(sp).toMatchObject({ availableInRelease: false, state: "disabled" });
-    expect(sp.targetRequirements.length).toBeGreaterThanOrEqual(3);
+    // 2d. Ready connection + both Graph presets enabled -> configured + verified=true (health = "ok")
+    const spReady = await mod.providers.getStatus("sharepoint");
+    expect(spReady).toMatchObject({ state: "configured", verified: true, lastCheckedAt: writeTestedAt });
+    expect((await mod.health()).find((c) => c.component === "integrations.sharepoint")?.state).toBe("ok");
+
+    // 2e. Failing enabled connection -> failing
+    fileSyncState = { ...fileSyncState, readyConnections: 0, failingConnections: 1, blockedTransfers: 2 };
+    expect(await mod.providers.getStatus("sharepoint")).toMatchObject({ state: "failing", verified: false });
+    expect((await mod.health()).find((c) => c.component === "integrations.sharepoint")?.state).toBe("failing");
+
+    // 3. Stripe card distinguishes unstaged (`not_configured`), staged-while-off (`disabled`), and active (`configured`)
+    expect(await mod.providers.getStatus("stripe")).toMatchObject({
+      state: "not_configured",
+      verified: false,
+      scaffoldOnly: false,
+    });
+
+    const verifiedIso = new Date(now.getTime() - 15_000).toISOString();
+    let paymentsConfigOverride: Record<string, unknown> = {
+      provider: "none",
+      mode: "test",
+      stripeSecretKeyLast4: "4242",
+      stripeWebhookSecretLast4: "9999",
+      stripeLastApiVerifiedAt: null,
+      stripeLastSelfTestAt: null,
+    };
+    const origGet = h.deps.settings.get.bind(h.deps.settings);
+    h.deps.settings.get = (async (key: string, parse: (raw: unknown) => unknown, fallback: unknown, tx?: Tx) => {
+      if (key === "payments.config") {
+        return parse(paymentsConfigOverride);
+      }
+      return origGet(key, parse, fallback, tx);
+    }) as typeof h.deps.settings.get;
+    (h.services as unknown as { payments: unknown }).payments = {
+      healthCounts: async () => ({
+        provider: "none",
+        onlineEnabled: false,
+        redirectedAttempts: 0,
+        retryPendingWebhooks: 0,
+      }),
+    };
+    const stripeStaged = await mod.providers.getStatus("stripe");
+    expect(stripeStaged).toMatchObject({
+      state: "disabled",
+      verified: false,
+      scaffoldOnly: false,
+      summary: "Stripe credentials are staged in Payment Setup, with Stripe online checkout switched off.",
+    });
+    expect((await mod.health()).find((c) => c.component === "integrations.stripe")?.state).toBe("disabled");
+
+    paymentsConfigOverride = {
+      provider: "stripe",
+      mode: "test",
+      stripeSecretKeyLast4: "4242",
+      stripeWebhookSecretLast4: "9999",
+      stripeLastApiVerifiedAt: verifiedIso,
+      stripeLastSelfTestAt: verifiedIso,
+    };
+    (h.services as unknown as { payments: unknown }).payments = {
+      healthCounts: async () => ({
+        provider: "stripe",
+        onlineEnabled: true,
+        redirectedAttempts: 0,
+        retryPendingWebhooks: 0,
+      }),
+    };
+    const stripeActive = await mod.providers.getStatus("stripe");
+    expect(stripeActive).toMatchObject({
+      state: "configured",
+      verified: true,
+      scaffoldOnly: false,
+      lastCheckedAt: new Date(verifiedIso),
+    });
+    expect((await mod.health()).find((c) => c.component === "integrations.stripe")?.state).toBe("ok");
   });
 
   it("enforces negative authorization, in-tx actor revocation re-validation, audit-before-delete, fail-closed audit, and single-connection pool safety", async () => {

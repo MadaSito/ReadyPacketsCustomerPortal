@@ -14,7 +14,7 @@
  *    hardcoded reviewed same-origin paths.
  */
 import { createHash } from "node:crypto";
-import { and, asc, count, desc, eq, inArray, lt, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, inArray, lt, ne, or } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
@@ -32,7 +32,12 @@ import {
 import { isSecretConfigured, readSecret, readSetting, writeSetting } from "../platform/index.js";
 import { createSquareProviderAdapter } from "./providers/square.js";
 import { createSquareRefundAdapter } from "./providers/square-refund.js";
-import { createStripeProviderAdapter, createStripeRefundAdapter } from "./providers/stripe.js";
+import {
+  buildSignedStripeSelfTestWebhook,
+  createStripeProviderAdapter,
+  createStripeRefundAdapter,
+  STRIPE_REQUIRED_WEBHOOK_EVENTS,
+} from "./providers/stripe.js";
 import type {
   PaymentProviderAdapter,
   PaymentRefundAdapter,
@@ -50,8 +55,11 @@ import {
   paymentRefunds,
   type PaymentRefundRow,
   type PaymentRefundStatus,
+  type PaymentWebhookEnvHint,
   paymentWebhookEvents,
   type PaymentWebhookEventRow,
+  paymentWebhookRejections,
+  type PaymentWebhookRejectionRow,
   type PaymentWebhookStatus,
 } from "./schema.js";
 import {
@@ -72,6 +80,7 @@ import {
   PAYMENTS_SQUARE_WEBHOOK_SIGNATURE_KEY,
   PAYMENTS_STRIPE_SECRET_KEY,
   PAYMENTS_STRIPE_WEBHOOK_SECRET,
+  PAYMENTS_STRIPE_WEBHOOK_SECRET_SECONDARY,
   resolveProviderMinimumMinor,
   sanitizeCardBrand,
   sanitizeCardLast4,
@@ -185,6 +194,17 @@ export interface PaymentsAdminSettingsView
     secretKeyLast4: string | null;
     webhookSecretConfigured: boolean;
     webhookSecretLast4: string | null;
+    webhookSecretSecondaryConfigured: boolean;
+    webhookSecretSecondaryLast4: string | null;
+    lastApiVerifiedAt: string | null;
+    lastSelfTestAt: string | null;
+    lastSelfTestWebhookAt: string | null;
+    lastVerifiedWebhookAt: string | null;
+    lastVerifiedWebhookEventType: string | null;
+    lastVerifiedWebhookStatus: PaymentWebhookStatus | null;
+    inboundCountryAllowlistExempt: true;
+    requiredEvents: readonly string[];
+    ready: boolean;
     webhookUrl: string;
     returnUrlPattern: string;
     egressHost: "api.stripe.com";
@@ -217,6 +237,8 @@ export interface UpdatePaymentsSettingsInput {
   clearStripeSecretKey?: boolean | undefined;
   stripeWebhookSecret?: string | undefined;
   clearStripeWebhookSecret?: boolean | undefined;
+  stripeWebhookSecretSecondary?: string | undefined;
+  clearStripeWebhookSecretSecondary?: boolean | undefined;
   squareLocationId?: string | null | undefined;
   squareAccessToken?: string | undefined;
   clearSquareAccessToken?: boolean | undefined;
@@ -224,6 +246,99 @@ export interface UpdatePaymentsSettingsInput {
   clearSquareWebhookSignatureKey?: boolean | undefined;
   smallTotals?: PaymentsSmallTotalsValue | undefined;
   receipts?: PaymentsReceiptsValue | undefined;
+}
+
+export interface PaymentsReadinessChecklistItem {
+  key:
+    | "egress_allowlist"
+    | "webhook_route_protection"
+    | "stripe_secret_key"
+    | "stripe_webhook_secret"
+    | "api_connection_verified"
+    | "self_test_webhook_verified"
+    | "provider_activated";
+  label: string;
+  ready: boolean;
+  detail: string;
+}
+
+export interface PaymentsReadinessView {
+  provider: PaymentProviderChoice;
+  mode: PaymentEnvironmentMode;
+  currency: string;
+  onlineEnabled: boolean;
+  webhookUrl: string;
+  requiredWebhookEvents: string[];
+  egress: {
+    presetKey: "stripe";
+    host: "api.stripe.com";
+    allowlisted: boolean;
+  };
+  routeProtection: {
+    webhookPath: "/api/payments/webhooks/stripe";
+    countryAllowlistExempt: true;
+    ipRulesEnforced: true;
+    rateLimitEnforced: true;
+    bodyCapBytes: 262144;
+  };
+  secrets: {
+    secretKeyConfigured: boolean;
+    secretKeyLast4: string | null;
+    secretKeyModeMatches: boolean;
+    webhookSecretConfigured: boolean;
+    webhookSecretLast4: string | null;
+    webhookSecretSecondaryConfigured: boolean;
+    webhookSecretSecondaryLast4: string | null;
+  };
+  verification: {
+    lastApiVerifiedAt: string | null;
+    lastSelfTestAt: string | null;
+    lastVerifiedWebhookAt: string | null;
+    lastVerifiedWebhookEventType: string | null;
+    attentionRequiredWebhookCount: number;
+    recentRejectionCount24h: number;
+  };
+  checklist: PaymentsReadinessChecklistItem[];
+}
+
+export interface TestStripeConnectionResult {
+  ok: boolean;
+  provider: "stripe";
+  mode: PaymentEnvironmentMode;
+  livemode: boolean | null;
+  accountRef: string | null;
+  verifiedAt: string | null;
+  failureReasonCode: string | null;
+  detail: string;
+  message: string;
+}
+
+export interface SendStripeSelfTestWebhookResult {
+  ok: boolean;
+  externalEventId: string;
+  httpStatus: number;
+  reasonCode: string;
+  verifiedAt: string | null;
+}
+
+export interface PaymentWebhookRejectionSummary {
+  publicId: string;
+  rejectionPublicId: string;
+  provider: ActivePaymentProvider;
+  environmentHint: PaymentWebhookEnvHint;
+  reasonCode: string;
+  reasonLabel: string;
+  httpStatus: number;
+  skewSeconds: number | null;
+  detail: string;
+  receivedAt: Date;
+}
+
+export interface ListWebhookRejectionsInput {
+  provider?: ActivePaymentProvider | undefined;
+  reasonCode?: string | undefined;
+  cursor?: string | undefined;
+  limit?: number | undefined;
 }
 
 export interface AdminPaymentAttemptSummary {
@@ -264,8 +379,11 @@ export interface AdminPaymentWebhookSummary {
   providerRef: string | null;
   providerOrderRef: string | null;
   providerPaymentRef: string | null;
+  providerRefundRef: string | null;
   status: PaymentWebhookStatus;
   reasonCode: string | null;
+  attemptCount: number;
+  lastErrorCode: string | null;
   occurredAt: Date;
   receivedAt: Date;
   processedAt: Date | null;
@@ -448,12 +566,146 @@ function toAdminWebhookSummary(row: PaymentWebhookEventRow): AdminPaymentWebhook
     providerRef: row.providerRef,
     providerOrderRef: row.providerOrderRef,
     providerPaymentRef: row.providerPaymentRef,
+    providerRefundRef: row.providerRefundRef,
     status: row.status,
     reasonCode: row.reasonCode,
+    attemptCount: row.attemptCount,
+    lastErrorCode: row.lastErrorCode,
     occurredAt: row.occurredAt,
     receivedAt: row.receivedAt,
     processedAt: row.processedAt,
   };
+}
+
+function labelWebhookRejectionReason(reasonCode: string): string {
+  switch (reasonCode) {
+    case "INVALID_SIGNATURE":
+    case "SQUARE_SIGNATURE_INVALID":
+    case "WEBHOOK_SIGNATURE_INVALID":
+      return "Invalid signature";
+    case "MISSING_SIGNATURE":
+    case "MALFORMED_SIGNATURE":
+    case "WEBHOOK_SIGNATURE_MISSING":
+      return "Missing signature";
+    case "TIMESTAMP_OUT_OF_RANGE":
+    case "SQUARE_EVENT_STALE":
+    case "WEBHOOK_TIMESTAMP_EXPIRED":
+      return "Stale timestamp";
+    case "INVALID_JSON":
+    case "INVALID_EVENT_PAYLOAD":
+    case "INVALID_EVENT_ENVELOPE":
+    case "SQUARE_EVENT_INVALID":
+    case "WEBHOOK_PAYLOAD_INVALID":
+      return "Malformed JSON";
+    case "WEBHOOK_MODE_MISMATCH":
+      return "Environment mismatch";
+    case "WEBHOOK_NOT_CONFIGURED":
+    case "WEBHOOK_SECRET_MISSING":
+    case "WEBHOOK_PROVIDER_OFF":
+      return "Provider not configured";
+    case "PAYLOAD_TAMPER_CONFLICT":
+      return "Conflicting duplicate payload";
+    case "WEBHOOK_EMPTY_BODY":
+      return "Empty request body";
+    default:
+      return "Rejected delivery";
+  }
+}
+
+function expandWebhookRejectionReasonFilter(reasonCode: string): string[] {
+  switch (reasonCode) {
+    case "INVALID_SIGNATURE":
+    case "WEBHOOK_SIGNATURE_INVALID":
+      return ["INVALID_SIGNATURE", "SQUARE_SIGNATURE_INVALID", "WEBHOOK_SIGNATURE_INVALID"];
+    case "MISSING_SIGNATURE":
+    case "WEBHOOK_SIGNATURE_MISSING":
+      return ["MISSING_SIGNATURE", "MALFORMED_SIGNATURE", "WEBHOOK_SIGNATURE_MISSING"];
+    case "TIMESTAMP_OUT_OF_RANGE":
+    case "WEBHOOK_TIMESTAMP_EXPIRED":
+      return ["TIMESTAMP_OUT_OF_RANGE", "SQUARE_EVENT_STALE", "WEBHOOK_TIMESTAMP_EXPIRED"];
+    case "INVALID_JSON":
+    case "WEBHOOK_PAYLOAD_INVALID":
+      return [
+        "INVALID_JSON",
+        "INVALID_EVENT_PAYLOAD",
+        "INVALID_EVENT_ENVELOPE",
+        "SQUARE_EVENT_INVALID",
+        "WEBHOOK_PAYLOAD_INVALID",
+      ];
+    case "WEBHOOK_NOT_CONFIGURED":
+    case "WEBHOOK_SECRET_MISSING":
+    case "WEBHOOK_PROVIDER_OFF":
+      return ["WEBHOOK_NOT_CONFIGURED", "WEBHOOK_SECRET_MISSING", "WEBHOOK_PROVIDER_OFF"];
+    default:
+      return [reasonCode];
+  }
+}
+
+function describeWebhookRejection(row: PaymentWebhookRejectionRow): string {
+  switch (row.reasonCode) {
+    case "INVALID_SIGNATURE":
+    case "SQUARE_SIGNATURE_INVALID":
+    case "WEBHOOK_SIGNATURE_INVALID":
+      return "HMAC signature did not match the configured signing secret(s).";
+    case "MISSING_SIGNATURE":
+    case "WEBHOOK_SIGNATURE_MISSING":
+      return row.provider === "stripe"
+        ? "Stripe-Signature header was missing."
+        : "Webhook signature header was missing.";
+    case "MALFORMED_SIGNATURE":
+      return row.provider === "stripe"
+        ? "Stripe-Signature header was malformed."
+        : "Webhook signature header was malformed.";
+    case "TIMESTAMP_OUT_OF_RANGE":
+    case "SQUARE_EVENT_STALE":
+    case "WEBHOOK_TIMESTAMP_EXPIRED":
+      return row.skewSeconds !== null
+        ? `Timestamp outside the allowed freshness window (skew ${row.skewSeconds}s).`
+        : "Timestamp outside the allowed freshness window.";
+    case "WEBHOOK_MODE_MISMATCH":
+      return `Event livemode (${row.environmentHint}) did not match configured portal mode.`;
+    case "WEBHOOK_NOT_CONFIGURED":
+    case "WEBHOOK_SECRET_MISSING":
+    case "WEBHOOK_PROVIDER_OFF":
+      return "Provider signing credentials were not configured when this delivery arrived.";
+    case "INVALID_JSON":
+    case "WEBHOOK_PAYLOAD_INVALID":
+      return "Request body was not valid JSON.";
+    case "INVALID_EVENT_PAYLOAD":
+    case "INVALID_EVENT_ENVELOPE":
+    case "SQUARE_EVENT_INVALID":
+      return "JSON payload missed required webhook event envelope fields.";
+    case "PAYLOAD_TAMPER_CONFLICT":
+      return "Duplicate event ID arrived with a different payload digest.";
+    case "WEBHOOK_EMPTY_BODY":
+      return "Webhook request body was empty.";
+    default:
+      return row.skewSeconds !== null
+        ? `Rejected before verification (skew ${row.skewSeconds}s).`
+        : "Rejected before webhook signature and envelope verification.";
+  }
+}
+
+function toWebhookRejectionSummary(row: PaymentWebhookRejectionRow): PaymentWebhookRejectionSummary {
+  return {
+    publicId: row.publicId,
+    rejectionPublicId: row.publicId,
+    provider: row.provider,
+    environmentHint: row.environmentHint,
+    reasonCode: row.reasonCode,
+    reasonLabel: labelWebhookRejectionReason(row.reasonCode),
+    httpStatus: row.httpStatus,
+    skewSeconds: row.skewSeconds,
+    detail: describeWebhookRejection(row),
+    receivedAt: row.receivedAt,
+  };
+}
+
+const WEBHOOK_REJECTION_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+
+function sanitizeOpsAlertCode(raw: string, fallback = "PAYMENT_VERIFICATION_FAILED"): string {
+  const upper = raw.trim().toUpperCase().replace(/[^A-Z0-9_]/gu, "_").slice(0, 64);
+  return /^[A-Z][A-Z0-9_]{1,63}$/u.test(upper) ? upper : fallback;
 }
 
 export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServiceOptions) {
@@ -604,23 +856,269 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     };
   }
 
+  function computeStripeApiFingerprint(
+    mode: PaymentEnvironmentMode,
+    stripeSecretKey: string,
+    stripeEgressStamp: string,
+  ): string {
+    return createHash("sha256")
+      .update(`stripe-api-v1|${mode}|${stripeSecretKey}|${stripeEgressStamp}`)
+      .digest("hex");
+  }
+
+  function computeStripeSelfTestFingerprint(
+    mode: PaymentEnvironmentMode,
+    stripeWebhookSecret: string,
+  ): string {
+    return createHash("sha256")
+      .update(`stripe-wh-v1|${mode}|${stripeWebhookSecret}`)
+      .digest("hex");
+  }
+
+  async function checkEgressPresets(mode: PaymentEnvironmentMode): Promise<{
+    wired: boolean;
+    stripeAllowlisted: boolean;
+    squareAllowlisted: boolean;
+    stripeEgressStamp: string;
+  }> {
+    const egressSvc = (deps.services as Partial<typeof deps.services>).integrations?.egress as
+      | {
+          isPresetEnabled?: (key: string) => Promise<boolean>;
+          listPresets?: () => Promise<Array<{ key: string; enabled: boolean }>>;
+          listAllowlist?: () => Promise<
+            Array<{
+              publicId: string;
+              purpose: string;
+              pattern: string;
+              enabled: boolean;
+              version: number;
+            }>
+          >;
+        }
+      | undefined;
+    if (
+      !egressSvc ||
+      (typeof egressSvc.isPresetEnabled !== "function" && typeof egressSvc.listPresets !== "function")
+    ) {
+      return { wired: false, stripeAllowlisted: false, squareAllowlisted: false, stripeEgressStamp: "unwired" };
+    }
+    try {
+      const sqPresetKey = mode === "live" ? "square" : "square_sandbox";
+      const allowlistPromise =
+        typeof egressSvc.listAllowlist === "function" ? egressSvc.listAllowlist() : Promise.resolve(null);
+      let stripeAllowlisted = false;
+      let squareAllowlisted = false;
+      if (typeof egressSvc.isPresetEnabled === "function") {
+        [stripeAllowlisted, squareAllowlisted] = await Promise.all([
+          egressSvc.isPresetEnabled("stripe"),
+          egressSvc.isPresetEnabled(sqPresetKey),
+        ]);
+      } else {
+        const presets = await egressSvc.listPresets!();
+        stripeAllowlisted = presets.some((p) => p.key === "stripe" && p.enabled);
+        squareAllowlisted = presets.some((p) => p.key === sqPresetKey && p.enabled);
+      }
+      const rules = await allowlistPromise;
+      const stripeRules = rules
+        ? rules
+            .filter((r) => r.purpose === "stripe")
+            .map((r) => `${r.publicId}:${r.version}:${r.enabled ? 1 : 0}`)
+            .sort()
+        : null;
+      const stripeEgressStamp = stripeRules
+        ? stripeRules.length > 0
+          ? stripeRules.join(",")
+          : "none"
+        : stripeAllowlisted
+          ? "preset:1"
+          : "preset:0";
+      return { wired: true, stripeAllowlisted, squareAllowlisted, stripeEgressStamp };
+    } catch {
+      return { wired: true, stripeAllowlisted: false, squareAllowlisted: false, stripeEgressStamp: "error" };
+    }
+  }
+
+  async function notifyOrderPaymentEventInTx(
+    tx: Tx,
+    input: {
+      orderPublicId: string;
+      kind: "pending_async" | "failed";
+      eventRef: string;
+    },
+  ): Promise<void> {
+    const ordersPayments = (deps.services as Partial<typeof deps.services>).orders?.payments;
+    if (ordersPayments && typeof ordersPayments.onPaymentEventInTx === "function") {
+      await ordersPayments.onPaymentEventInTx(input, tx);
+    }
+  }
+
+  async function emitPaymentOpsAlert(
+    input: {
+      dedupKey: string;
+      severity: "warning" | "error" | "critical";
+      code: string;
+      title: string;
+      text?: string;
+      orderPublicId?: string;
+    },
+    tx?: Tx,
+  ): Promise<void> {
+    const opsAlerts = (deps.services as Partial<typeof deps.services>).opsAlerts;
+    if (!opsAlerts || typeof opsAlerts.emit !== "function") return;
+    try {
+      const ctx = getRequestContext();
+      const correlationId = ctx?.correlationId ?? ctx?.requestId;
+      await opsAlerts.emit(
+        {
+          source: "payment",
+          dedupKey: input.dedupKey.slice(0, 200),
+          severity: input.severity,
+          code: sanitizeOpsAlertCode(input.code),
+          title: input.title.slice(0, 120),
+          ...(input.text ? { text: input.text.slice(0, 500) } : {}),
+          ...(input.orderPublicId && ULID_PATTERN.test(input.orderPublicId)
+            ? { orderPublicId: input.orderPublicId }
+            : {}),
+          ...(correlationId ? { correlationId } : {}),
+        },
+        tx,
+      );
+    } catch {
+      // Never allow operational alert persistence failure to abort webhook or ledger work.
+    }
+  }
+
+  async function resolvePaymentOpsAlert(dedupKey: string, tx?: Tx): Promise<void> {
+    const opsAlerts = (deps.services as Partial<typeof deps.services>).opsAlerts;
+    if (!opsAlerts || typeof opsAlerts.resolve !== "function") return;
+    try {
+      await opsAlerts.resolve({ source: "payment", dedupKey: dedupKey.slice(0, 200) }, tx);
+    } catch {
+      // Non-fatal.
+    }
+  }
+
+  async function recordWebhookRejection(input: {
+    provider: ActivePaymentProvider;
+    environmentHint: PaymentWebhookEnvHint;
+    reasonCode: string;
+    httpStatus: number;
+    skewSeconds?: number | null;
+    receivedAt?: Date;
+  }): Promise<void> {
+    const receivedAt = input.receivedAt ?? deps.clock.now();
+    try {
+      await deps.db.insert(paymentWebhookRejections).values({
+        publicId: ulid(receivedAt.getTime()),
+        provider: input.provider,
+        environmentHint: input.environmentHint,
+        reasonCode: input.reasonCode.slice(0, 64),
+        httpStatus: input.httpStatus,
+        skewSeconds:
+          typeof input.skewSeconds === "number" && Number.isFinite(input.skewSeconds)
+            ? Math.trunc(input.skewSeconds)
+            : null,
+        receivedAt,
+      });
+    } catch {
+      // Never allow diagnostic rejection telemetry to mask the webhook HTTP response.
+    }
+  }
+
+  async function recordHttpRejection(input: {
+    provider: ActivePaymentProvider;
+    reasonCode: string;
+    httpStatus: number;
+  }): Promise<void> {
+    await recordWebhookRejection({
+      provider: input.provider,
+      environmentHint: "unknown",
+      reasonCode: input.reasonCode,
+      httpStatus: input.httpStatus,
+    });
+  }
+
+  async function pruneExpiredWebhookRejections(now: Date): Promise<void> {
+    try {
+      const cutoff = new Date(now.getTime() - WEBHOOK_REJECTION_RETENTION_MS);
+      await deps.db
+        .delete(paymentWebhookRejections)
+        .where(lt(paymentWebhookRejections.receivedAt, cutoff));
+    } catch {
+      // Best-effort diagnostic table pruning.
+    }
+  }
+
+  function resolveStripeVerificationState(
+    config: PaymentsConfigValue,
+    stripeKey: string | null,
+    stripeWh: string | null,
+    egress: { wired: boolean; stripeAllowlisted: boolean; stripeEgressStamp: string },
+  ): {
+    egressOk: boolean;
+    secretKeyModeMatches: boolean;
+    apiVerified: boolean;
+    selfTestVerified: boolean;
+    effectiveLastApiVerifiedAt: string | null;
+    effectiveLastSelfTestAt: string | null;
+    ready: boolean;
+  } {
+    const egressOk = !egress.wired || egress.stripeAllowlisted;
+    const expectedPrefix = config.mode === "live" ? /^(?:sk|rk)_live_/u : /^(?:sk|rk)_test_/u;
+    const secretKeyModeMatches = Boolean(stripeKey && expectedPrefix.test(stripeKey));
+    const apiVerified = Boolean(
+      stripeKey &&
+        secretKeyModeMatches &&
+        egressOk &&
+        config.stripeLastApiVerifiedAt &&
+        config.stripeApiVerifiedFingerprint ===
+          computeStripeApiFingerprint(config.mode, stripeKey, egress.stripeEgressStamp),
+    );
+    const selfTestVerified = Boolean(
+      stripeWh &&
+        config.stripeLastSelfTestAt &&
+        config.stripeSelfTestedFingerprint === computeStripeSelfTestFingerprint(config.mode, stripeWh),
+    );
+    const ready = Boolean(
+      stripeKey && secretKeyModeMatches && stripeWh && egressOk && apiVerified && selfTestVerified,
+    );
+    return {
+      egressOk,
+      secretKeyModeMatches,
+      apiVerified,
+      selfTestVerified,
+      effectiveLastApiVerifiedAt: apiVerified ? config.stripeLastApiVerifiedAt : null,
+      effectiveLastSelfTestAt: selfTestVerified ? config.stripeLastSelfTestAt : null,
+      ready,
+    };
+  }
+
   async function isProviderCredentialsReady(
     config: PaymentsConfigValue,
     tx?: Tx,
   ): Promise<boolean> {
     if (config.provider === "none") return false;
+    const egress = tx
+      ? { wired: false, stripeAllowlisted: true, squareAllowlisted: true, stripeEgressStamp: "unwired" }
+      : await checkEgressPresets(config.mode);
     if (config.provider === "stripe") {
-      const [hasKey, hasWh] = await Promise.all([
-        isSecretConfigured(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx),
-        isSecretConfigured(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx),
+      const [stripeKey, stripeWh] = await Promise.all([
+        readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx),
+        readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx),
       ]);
-      return hasKey && hasWh;
+      const state = resolveStripeVerificationState(config, stripeKey, stripeWh, egress);
+      if (!egress.wired && config.stripeApiVerifiedFingerprint === null && config.stripeSelfTestedFingerprint === null) {
+        // Legacy pre-Increment-07 raw settings seeded in isolated unit harnesses without wired egress.
+        return Boolean(stripeKey && state.secretKeyModeMatches && stripeWh);
+      }
+      return state.ready;
     }
     const [hasToken, hasSig] = await Promise.all([
       isSecretConfigured(deps.settings, PAYMENTS_SQUARE_ACCESS_TOKEN, tx),
       isSecretConfigured(deps.settings, PAYMENTS_SQUARE_WEBHOOK_SIGNATURE_KEY, tx),
     ]);
-    return Boolean(config.squareLocationId && hasToken && hasSig);
+    const egressOk = !egress.wired || egress.squareAllowlisted;
+    return Boolean(config.squareLocationId && hasToken && hasSig && egressOk);
   }
 
   async function isOnlineCheckoutEnabled(tx?: DbOrTx): Promise<boolean> {
@@ -1165,6 +1663,12 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           })
           .where(and(eq(paymentAttempts.id, preAttempt.attemptId), eq(paymentAttempts.status, "created")));
 
+        await notifyOrderPaymentEventInTx(tx, {
+          orderPublicId: invoice.orderPublicId,
+          kind: "failed",
+          eventRef: preAttempt.attemptPublicId,
+        });
+
         await deps.audit.record(
           {
             category: "integration",
@@ -1175,10 +1679,14 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             reasonCode,
             actor: { role: "system" },
             resource: { type: "payment_attempt", publicId: preAttempt.attemptPublicId },
+            orderPublicId: invoice.orderPublicId,
             attributes: {
+              order_public_id: invoice.orderPublicId,
               invoice_public_id: invoice.invoicePublicId,
               provider: activeProvider,
               environment: config.mode,
+              reason_code: reasonCode.slice(0, 64),
+              payment_state: "failed",
             },
           },
           tx,
@@ -1532,6 +2040,12 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         })
         .where(eq(paymentWebhookEvents.id, whRow.id));
 
+      await notifyOrderPaymentEventInTx(tx, {
+        orderPublicId: locked.orderPublicId,
+        kind: "failed",
+        eventRef: locked.publicId,
+      });
+
       await deps.audit.record(
         {
           category: "security",
@@ -1542,7 +2056,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           reasonCode: matchCheck.reasonCode,
           actor: { role: "system" },
           resource: { type: "payment_attempt", publicId: locked.publicId },
+          orderPublicId: locked.orderPublicId,
           attributes: {
+            order_public_id: locked.orderPublicId,
             invoice_public_id: locked.invoicePublicId,
             provider: locked.provider,
             expected_amount_minor: locked.amountMinor,
@@ -1550,6 +2066,40 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             expected_currency: locked.currency,
             fetched_currency: input.fetched.currency,
           },
+        },
+        tx,
+      );
+
+      await deps.audit.record(
+        {
+          category: "business",
+          eventName: "payments.attempt.failed",
+          action: "verify",
+          outcome: "failed",
+          severity: "WARN",
+          reasonCode: matchCheck.reasonCode,
+          actor: { role: "system" },
+          resource: { type: "payment_attempt", publicId: locked.publicId },
+          orderPublicId: locked.orderPublicId,
+          attributes: {
+            order_public_id: locked.orderPublicId,
+            invoice_public_id: locked.invoicePublicId,
+            provider: locked.provider,
+            reason_code: matchCheck.reasonCode,
+            payment_state: "failed",
+          },
+        },
+        tx,
+      );
+
+      await emitPaymentOpsAlert(
+        {
+          dedupKey: `verification-mismatch:${locked.publicId}`,
+          severity: "error",
+          code: matchCheck.reasonCode,
+          title: "Payment verification mismatch held booking",
+          text: "Upstream payment details did not match the expected invoice amount, currency, or metadata.",
+          orderPublicId: locked.orderPublicId,
         },
         tx,
       );
@@ -1606,6 +2156,8 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       })
       .where(eq(paymentWebhookEvents.id, whRow.id));
 
+    await resolvePaymentOpsAlert(`webhook-verify:${locked.publicId}`, tx);
+
     await deps.audit.record(
       {
         category: "business",
@@ -1614,6 +2166,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         outcome: "completed",
         actor: { role: "system" },
         resource: { type: "payment_attempt", publicId: locked.publicId },
+        orderPublicId: locked.orderPublicId,
         attributes: {
           invoice_public_id: locked.invoicePublicId,
           order_public_id: locked.orderPublicId,
@@ -1623,6 +2176,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           amount_minor: locked.amountMinor,
           currency: locked.currency,
           verified_webhook_event_id: locked.verifiedWebhookEventId,
+          payment_state: "paid",
         },
       },
       tx,
@@ -1639,6 +2193,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       attemptPublicId: string | null;
       providerRef: string | null;
       providerOrderRef: string | null;
+      providerPaymentRef?: string | null;
     },
   ): Promise<PaymentAttemptRow | null> {
     if (refs.attemptPublicId) {
@@ -1686,6 +2241,21 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         .limit(1);
       if (byOrder) return byOrder;
     }
+    if (refs.providerPaymentRef) {
+      const [byPayment] = await tx
+        .select()
+        .from(paymentAttempts)
+        .where(
+          and(
+            eq(paymentAttempts.provider, provider),
+            eq(paymentAttempts.environment, environment),
+            eq(paymentAttempts.providerPaymentRef, refs.providerPaymentRef),
+          ),
+        )
+        .for("update")
+        .limit(1);
+      if (byPayment) return byPayment;
+    }
     return null;
   }
 
@@ -1705,6 +2275,13 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       credentials = loaded.credentials;
       webhookSecret = loaded.webhookSecret;
     } catch {
+      await recordWebhookRejection({
+        provider: input.provider,
+        environmentHint: config.mode,
+        reasonCode: "WEBHOOK_NOT_CONFIGURED",
+        httpStatus: 503,
+        receivedAt: now,
+      });
       await deps.audit.record({
         category: "integration",
         eventName: "payments.webhook.rejected",
@@ -1724,17 +2301,31 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       };
     }
 
+    const secondaryWebhookSecret =
+      input.provider === "stripe"
+        ? await readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET_SECONDARY)
+        : null;
+
     const adapter = adapters[input.provider];
     const verified = adapter.verifyWebhook({
       rawBody: input.rawBody,
       headers: input.headers,
       webhookSecret,
+      secondaryWebhookSecret,
       notificationUrl: input.notificationUrl,
       now,
       toleranceSeconds: config.webhookToleranceSeconds,
     });
 
     if (!verified.ok) {
+      await recordWebhookRejection({
+        provider: input.provider,
+        environmentHint: verified.environmentHint ?? "unknown",
+        reasonCode: verified.reasonCode,
+        httpStatus: 400,
+        skewSeconds: verified.skewSeconds ?? null,
+        receivedAt: now,
+      });
       await deps.audit.record({
         category: "security",
         eventName: "payments.webhook.rejected",
@@ -1756,6 +2347,14 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
     const eventEnv: PaymentEnvironmentMode = verified.livemode ? "live" : "test";
     if (eventEnv !== config.mode) {
+      await recordWebhookRejection({
+        provider: input.provider,
+        environmentHint: eventEnv,
+        reasonCode: "WEBHOOK_MODE_MISMATCH",
+        httpStatus: 400,
+        skewSeconds: Math.round(Math.abs(now.getTime() - verified.occurredAt.getTime()) / 1000),
+        receivedAt: now,
+      });
       await deps.audit.record({
         category: "security",
         eventName: "payments.webhook.rejected",
@@ -1810,9 +2409,182 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
       const webhookPublicId = existing?.publicId ?? ulid(now.getTime());
 
+      if (verified.outcomeHint === "self_test") {
+        if (existing) {
+          await tx
+            .update(paymentWebhookEvents)
+            .set({
+              status: "processed",
+              reasonCode: "SELF_TEST_OK",
+              processedAt: now,
+            })
+            .where(eq(paymentWebhookEvents.id, existing.id));
+        } else {
+          await tx.insert(paymentWebhookEvents).values({
+            publicId: webhookPublicId,
+            provider: input.provider,
+            environment: eventEnv,
+            externalEventId: verified.externalEventId,
+            eventType: verified.eventType,
+            payloadSha256,
+            status: "processed",
+            reasonCode: "SELF_TEST_OK",
+            occurredAt: verified.occurredAt,
+            receivedAt: now,
+            processedAt: now,
+          });
+        }
+        return { kind: "self_test_ok" as const, duplicate: Boolean(existing) };
+      }
+
       if (verified.outcomeHint === "refund_updated") {
         const refundRow = await findRefundForWebhookInTx(tx, input.provider, eventEnv, verified);
         if (!refundRow) {
+          const portalRefundRows = verified.providerPaymentRef
+            ? await tx
+                .select()
+                .from(paymentRefunds)
+                .where(
+                  and(
+                    eq(paymentRefunds.provider, input.provider),
+                    eq(paymentRefunds.environment, eventEnv),
+                    eq(paymentRefunds.providerPaymentRef, verified.providerPaymentRef),
+                  ),
+                )
+            : [];
+          const matchedAttempt = await findAttemptForWebhookInTx(tx, input.provider, eventEnv, {
+            attemptPublicId: verified.attemptPublicId,
+            providerRef: verified.providerRef,
+            providerOrderRef: verified.providerOrderRef,
+            providerPaymentRef: verified.providerPaymentRef,
+          });
+
+          if (
+            !verified.providerRefundRef &&
+            verified.providerPaymentRef &&
+            (portalRefundRows.length > 0 || matchedAttempt) &&
+            typeof refundAdapters[input.provider].listPaymentRefunds === "function"
+          ) {
+            let webhookRowId: number;
+            if (existing) {
+              webhookRowId = existing.id;
+            } else {
+              const [ins] = await tx.insert(paymentWebhookEvents).values({
+                publicId: webhookPublicId,
+                provider: input.provider,
+                environment: eventEnv,
+                externalEventId: verified.externalEventId,
+                eventType: verified.eventType,
+                payloadSha256,
+                attemptId: matchedAttempt?.id ?? portalRefundRows[0]?.attemptId ?? null,
+                attemptPublicId: matchedAttempt?.publicId ?? null,
+                refundId: null,
+                refundPublicId: verified.refundPublicIdHint ?? null,
+                providerRef: verified.providerRef,
+                providerOrderRef: verified.providerOrderRef,
+                providerPaymentRef: verified.providerPaymentRef,
+                providerRefundRef: verified.providerRefundRef ?? null,
+                status: "retry_pending",
+                reasonCode: "AWAITING_REFUND_LIST_VERIFICATION",
+                occurredAt: verified.occurredAt,
+                receivedAt: now,
+              });
+              webhookRowId = ins.insertId;
+            }
+            return {
+              kind: "verify_refund_list" as const,
+              webhookRowId,
+              providerPaymentRef: verified.providerPaymentRef,
+              matchedAttempt,
+              fallbackOrderPublicId:
+                matchedAttempt?.orderPublicId ?? portalRefundRows[0]?.orderPublicId ?? null,
+              fallbackInvoicePublicId:
+                matchedAttempt?.invoicePublicId ?? portalRefundRows[0]?.invoicePublicId ?? null,
+              attemptCount: existing?.attemptCount ?? 0,
+              duplicate: Boolean(existing),
+            };
+          }
+
+          if (matchedAttempt && !verified.refundPublicIdHint) {
+            const unlinkedRef = verified.providerRefundRef ?? verified.externalEventId;
+            if (existing) {
+              await tx
+                .update(paymentWebhookEvents)
+                .set({
+                  status: "attention_required",
+                  reasonCode: "UNLINKED_PROVIDER_REFUND",
+                  lastErrorCode: "UNLINKED_PROVIDER_REFUND",
+                  attemptId: matchedAttempt.id,
+                  attemptPublicId: matchedAttempt.publicId,
+                  providerRefundRef: verified.providerRefundRef ?? existing.providerRefundRef,
+                  processedAt: now,
+                })
+                .where(eq(paymentWebhookEvents.id, existing.id));
+            } else {
+              await tx.insert(paymentWebhookEvents).values({
+                publicId: webhookPublicId,
+                provider: input.provider,
+                environment: eventEnv,
+                externalEventId: verified.externalEventId,
+                eventType: verified.eventType,
+                payloadSha256,
+                attemptId: matchedAttempt.id,
+                attemptPublicId: matchedAttempt.publicId,
+                refundId: null,
+                refundPublicId: null,
+                providerRef: verified.providerRef,
+                providerOrderRef: verified.providerOrderRef,
+                providerPaymentRef: verified.providerPaymentRef,
+                providerRefundRef: verified.providerRefundRef ?? null,
+                status: "attention_required",
+                reasonCode: "UNLINKED_PROVIDER_REFUND",
+                lastErrorCode: "UNLINKED_PROVIDER_REFUND",
+                occurredAt: verified.occurredAt,
+                receivedAt: now,
+                processedAt: now,
+              });
+            }
+
+            await deps.audit.record(
+              {
+                category: "security",
+                eventName: "payment.refund.flagged",
+                action: "verify",
+                outcome: "denied",
+                severity: "WARN",
+                reasonCode: "UNLINKED_PROVIDER_REFUND",
+                actor: { role: "system" },
+                resource: { type: "payment_attempt", publicId: matchedAttempt.publicId },
+                orderPublicId: matchedAttempt.orderPublicId,
+                attributes: {
+                  order_public_id: matchedAttempt.orderPublicId,
+                  invoice_public_id: matchedAttempt.invoicePublicId,
+                  provider: input.provider,
+                  external_event_id: verified.externalEventId,
+                  reason_code: "UNLINKED_PROVIDER_REFUND",
+                },
+              },
+              tx,
+            );
+
+            const refundHash = createHash("sha256")
+              .update(`${input.provider}:${unlinkedRef}`)
+              .digest("hex")
+              .slice(0, 24);
+            await emitPaymentOpsAlert(
+              {
+                dedupKey: `unlinked-refund:${input.provider}:${refundHash}`,
+                severity: "warning",
+                code: "UNLINKED_PROVIDER_REFUND",
+                title: "Refund made outside portal requires review",
+                text: "A provider refund without portal metadata was detected on a paid order and held from automatic ledger booking.",
+                orderPublicId: matchedAttempt.orderPublicId,
+              },
+              tx,
+            );
+            return { kind: "unlinked_refund" as const, duplicate: Boolean(existing) };
+          }
+
           if (existing) {
             await tx
               .update(paymentWebhookEvents)
@@ -1888,9 +2660,93 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         attemptPublicId: verified.attemptPublicId,
         providerRef: verified.providerRef,
         providerOrderRef: verified.providerOrderRef,
+        providerPaymentRef: verified.providerPaymentRef,
       });
 
       if (!attempt || verified.outcomeHint === "ignored") {
+        if (!attempt && verified.outcomeHint !== "ignored" && verified.hasPortalMetadata) {
+          if (existing) {
+            await tx
+              .update(paymentWebhookEvents)
+              .set({
+                status: "attention_required",
+                reasonCode: "UNMATCHED_PORTAL_PAYMENT",
+                lastErrorCode: "UNMATCHED_PORTAL_PAYMENT",
+                attemptPublicId: verified.attemptPublicId ?? existing.attemptPublicId,
+                providerRef: verified.providerRef ?? existing.providerRef,
+                providerOrderRef: verified.providerOrderRef ?? existing.providerOrderRef,
+                providerPaymentRef: verified.providerPaymentRef ?? existing.providerPaymentRef,
+                processedAt: now,
+              })
+              .where(eq(paymentWebhookEvents.id, existing.id));
+          } else {
+            await tx.insert(paymentWebhookEvents).values({
+              publicId: webhookPublicId,
+              provider: input.provider,
+              environment: eventEnv,
+              externalEventId: verified.externalEventId,
+              eventType: verified.eventType,
+              payloadSha256,
+              attemptId: null,
+              attemptPublicId: verified.attemptPublicId,
+              providerRef: verified.providerRef,
+              providerOrderRef: verified.providerOrderRef,
+              providerPaymentRef: verified.providerPaymentRef,
+              status: "attention_required",
+              reasonCode: "UNMATCHED_PORTAL_PAYMENT",
+              lastErrorCode: "UNMATCHED_PORTAL_PAYMENT",
+              occurredAt: verified.occurredAt,
+              receivedAt: now,
+              processedAt: now,
+            });
+          }
+
+          await deps.audit.record(
+            {
+              category: "security",
+              eventName: "payments.webhook.unmatched_portal_session",
+              action: "verify",
+              outcome: "denied",
+              severity: "WARN",
+              reasonCode: "UNMATCHED_PORTAL_PAYMENT",
+              actor: { role: "system" },
+              resource: {
+                type: "payment_webhook",
+                publicId: webhookPublicId,
+              },
+              ...(verified.orderPublicId ? { orderPublicId: verified.orderPublicId } : {}),
+              attributes: {
+                provider: input.provider,
+                external_event_id: verified.externalEventId,
+                event_type: verified.eventType,
+                attempt_public_id: verified.attemptPublicId,
+                invoice_public_id: verified.invoicePublicId,
+                order_public_id: verified.orderPublicId ?? null,
+                reason_code: "UNMATCHED_PORTAL_PAYMENT",
+              },
+            },
+            tx,
+          );
+
+          const sessionRef = verified.providerRef ?? verified.externalEventId;
+          const sessionHash = createHash("sha256")
+            .update(`${input.provider}:${sessionRef}`)
+            .digest("hex")
+            .slice(0, 24);
+          await emitPaymentOpsAlert(
+            {
+              dedupKey: `unmatched-portal-payment:${input.provider}:${sessionHash}`,
+              severity: "warning",
+              code: "UNMATCHED_PORTAL_PAYMENT",
+              title: "Signed payment event with portal metadata could not be matched",
+              text: "A verified payment webhook carried ReadyPackets metadata (attempt, invoice, or order ID) that did not match any portal payment attempt or invoice. Review before settling manually.",
+              ...(verified.orderPublicId ? { orderPublicId: verified.orderPublicId } : {}),
+            },
+            tx,
+          );
+          return { kind: "unmatched_portal_payment" as const, duplicate: Boolean(existing) };
+        }
+
         if (existing) {
           await tx
             .update(paymentWebhookEvents)
@@ -1935,6 +2791,14 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
               updatedAt: now,
             })
             .where(and(eq(paymentAttempts.id, attempt.id), eq(paymentAttempts.version, attempt.version)));
+
+          if (nextStatus === "failed") {
+            await notifyOrderPaymentEventInTx(tx, {
+              orderPublicId: attempt.orderPublicId,
+              kind: "failed",
+              eventRef: verified.externalEventId,
+            });
+          }
         }
 
         if (existing) {
@@ -1968,13 +2832,20 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             category: "business",
             eventName: `payments.attempt.${nextStatus}`,
             action: "transition",
-            outcome: "completed",
+            outcome: nextStatus === "failed" ? "failed" : "completed",
+            ...(nextStatus === "failed"
+              ? { severity: "WARN" as const, reasonCode: verified.eventType.slice(0, 64) }
+              : {}),
             actor: { role: "system" },
             resource: { type: "payment_attempt", publicId: attempt.publicId },
+            orderPublicId: attempt.orderPublicId,
             attributes: {
+              order_public_id: attempt.orderPublicId,
               invoice_public_id: attempt.invoicePublicId,
               provider: input.provider,
               external_event_id: verified.externalEventId,
+              reason_code: verified.eventType.slice(0, 64),
+              payment_state: nextStatus === "failed" ? "failed" : "unpaid",
             },
           },
           tx,
@@ -2020,11 +2891,19 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         kind: "verify_paid" as const,
         webhookRowId,
         attempt,
+        attemptCount: existing?.attemptCount ?? 0,
         duplicate: Boolean(existing),
       };
     });
 
     if (staged.kind === "tamper_conflict") {
+      await recordWebhookRejection({
+        provider: input.provider,
+        environmentHint: eventEnv,
+        reasonCode: "PAYLOAD_TAMPER_CONFLICT",
+        httpStatus: 409,
+        receivedAt: now,
+      });
       await deps.audit.record({
         category: "security",
         eventName: "payments.webhook.rejected",
@@ -2054,6 +2933,36 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         duplicate: true,
         booked: staged.booked,
         reasonCode: "DUPLICATE_EVENT",
+      };
+    }
+
+    if (staged.kind === "self_test_ok") {
+      return {
+        httpStatus: 200,
+        accepted: true,
+        duplicate: staged.duplicate,
+        booked: false,
+        reasonCode: "SELF_TEST_OK",
+      };
+    }
+
+    if (staged.kind === "unlinked_refund") {
+      return {
+        httpStatus: 200,
+        accepted: true,
+        duplicate: staged.duplicate,
+        booked: false,
+        reasonCode: "UNLINKED_PROVIDER_REFUND",
+      };
+    }
+
+    if (staged.kind === "unmatched_portal_payment") {
+      return {
+        httpStatus: 200,
+        accepted: true,
+        duplicate: staged.duplicate,
+        booked: false,
+        reasonCode: "UNMATCHED_PORTAL_PAYMENT",
       };
     }
 
@@ -2090,6 +2999,163 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       });
     }
 
+    if (staged.kind === "verify_refund_list") {
+      const listFn = refundAdapters[input.provider].listPaymentRefunds!;
+      const listed = await listFn({
+        credentials,
+        providerPaymentRef: staged.providerPaymentRef,
+      });
+
+      if (!listed.ok) {
+        const nextCount = staged.attemptCount + 1;
+        const errCode = (listed.failureReasonCode ?? "STRIPE_REFUND_LIST_FAILED").slice(0, 64);
+        await deps.db
+          .update(paymentWebhookEvents)
+          .set({
+            status: "retry_pending",
+            reasonCode: errCode,
+            attemptCount: nextCount,
+            lastErrorCode: errCode,
+          })
+          .where(eq(paymentWebhookEvents.id, staged.webhookRowId));
+        return {
+          httpStatus: 503,
+          accepted: false,
+          duplicate: staged.duplicate,
+          booked: false,
+          reasonCode: errCode,
+        };
+      }
+
+      const portalRefundRows = await deps.db
+        .select()
+        .from(paymentRefunds)
+        .where(
+          and(
+            eq(paymentRefunds.provider, input.provider),
+            eq(paymentRefunds.environment, eventEnv),
+            eq(paymentRefunds.providerPaymentRef, staged.providerPaymentRef),
+          ),
+        );
+
+      let anyBooked = false;
+      let lastSettledResult: PaymentWebhookResult | null = null;
+      const unlinkedItems: Array<(typeof listed.items)[number]> = [];
+
+      for (const item of listed.items) {
+        const match = portalRefundRows.find(
+          (r) =>
+            (item.refundPublicIdHint && r.publicId === item.refundPublicIdHint) ||
+            r.providerRefundRef === item.providerRefundRef,
+        );
+        if (match) {
+          if (match.status !== "succeeded" && (item.status === "succeeded" || item.status === "failed")) {
+            const res = await verifyAndApplyRefundWebhook({
+              provider: input.provider,
+              credentials,
+              refundRow: match,
+              webhookRowId: staged.webhookRowId,
+              externalEventId: verified.externalEventId,
+              providerRefundRefHint: item.providerRefundRef,
+              duplicate: staged.duplicate,
+              now,
+            });
+            lastSettledResult = res;
+            if (res.booked) anyBooked = true;
+          }
+        } else if (item.status === "succeeded" || item.status === "pending") {
+          unlinkedItems.push(item);
+        }
+      }
+
+      if (unlinkedItems.length > 0) {
+        const firstUnlinked = unlinkedItems[0]!;
+        const orderPubId = staged.fallbackOrderPublicId;
+        const invoicePubId = staged.fallbackInvoicePublicId;
+        await deps.db.transaction(async (tx) => {
+          await tx
+            .update(paymentWebhookEvents)
+            .set({
+              status: "attention_required",
+              reasonCode: "UNLINKED_PROVIDER_REFUND",
+              lastErrorCode: "UNLINKED_PROVIDER_REFUND",
+              providerRefundRef: firstUnlinked.providerRefundRef,
+              processedAt: now,
+            })
+            .where(eq(paymentWebhookEvents.id, staged.webhookRowId));
+
+          await deps.audit.record(
+            {
+              category: "security",
+              eventName: "payment.refund.flagged",
+              action: "verify",
+              outcome: "denied",
+              severity: "WARN",
+              reasonCode: "UNLINKED_PROVIDER_REFUND",
+              actor: { role: "system" },
+              resource: staged.matchedAttempt
+                ? { type: "payment_attempt", publicId: staged.matchedAttempt.publicId }
+                : { type: "payment_webhook", publicId: verified.externalEventId },
+              ...(orderPubId ? { orderPublicId: orderPubId } : {}),
+              attributes: {
+                ...(orderPubId ? { order_public_id: orderPubId } : {}),
+                ...(invoicePubId ? { invoice_public_id: invoicePubId } : {}),
+                provider: input.provider,
+                external_event_id: verified.externalEventId,
+                reason_code: "UNLINKED_PROVIDER_REFUND",
+                unlinked_refund_count: unlinkedItems.length,
+              },
+            },
+            tx,
+          );
+
+          const refundHash = createHash("sha256")
+            .update(`${input.provider}:${firstUnlinked.providerRefundRef}`)
+            .digest("hex")
+            .slice(0, 24);
+          await emitPaymentOpsAlert(
+            {
+              dedupKey: `unlinked-refund:${input.provider}:${refundHash}`,
+              severity: "warning",
+              code: "UNLINKED_PROVIDER_REFUND",
+              title: "Refund made outside portal requires review",
+              text: "A provider refund without portal metadata was detected on a paid order and held from automatic ledger booking.",
+              ...(orderPubId ? { orderPublicId: orderPubId } : {}),
+            },
+            tx,
+          );
+        });
+
+        return {
+          httpStatus: 200,
+          accepted: true,
+          duplicate: staged.duplicate,
+          booked: anyBooked,
+          reasonCode: "UNLINKED_PROVIDER_REFUND",
+        };
+      }
+
+      if (lastSettledResult) {
+        return lastSettledResult;
+      }
+
+      await deps.db
+        .update(paymentWebhookEvents)
+        .set({
+          status: "processed",
+          reasonCode: portalRefundRows.length > 0 ? "REFUND_ALREADY_PROCESSED" : "REFUND_LIST_EMPTY",
+          processedAt: now,
+        })
+        .where(eq(paymentWebhookEvents.id, staged.webhookRowId));
+      return {
+        httpStatus: 200,
+        accepted: true,
+        duplicate: staged.duplicate,
+        booked: false,
+        reasonCode: portalRefundRows.length > 0 ? "REFUND_ALREADY_PROCESSED" : "REFUND_LIST_EMPTY",
+      };
+    }
+
     const { attempt, webhookRowId } = staged;
     if (!attempt.providerRef) {
       return {
@@ -2111,6 +3177,26 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       });
     } catch (err) {
       const reasonCode = err instanceof DomainError ? err.reasonCode : "PROVIDER_FETCH_FAILED";
+      const nextAttemptCount = staged.attemptCount + 1;
+      await deps.db
+        .update(paymentWebhookEvents)
+        .set({
+          attemptCount: nextAttemptCount,
+          lastErrorCode: reasonCode.slice(0, 64),
+        })
+        .where(eq(paymentWebhookEvents.id, webhookRowId));
+
+      if (nextAttemptCount >= 3) {
+        await emitPaymentOpsAlert({
+          dedupKey: `webhook-verify:${attempt.publicId}`,
+          severity: "warning",
+          code: reasonCode,
+          title: "Payment verification retrying",
+          text: "Provider payment lookup failed repeatedly while verifying a signed webhook; scheduled reconciliation will continue retrying.",
+          orderPublicId: attempt.orderPublicId,
+        });
+      }
+
       await deps.audit.record({
         category: "integration",
         eventName: "payments.verification.retry_scheduled",
@@ -2120,9 +3206,12 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         reasonCode,
         actor: { role: "system" },
         resource: { type: "payment_attempt", publicId: attempt.publicId },
+        orderPublicId: attempt.orderPublicId,
         attributes: {
+          order_public_id: attempt.orderPublicId,
           provider: input.provider,
           external_event_id: verified.externalEventId,
+          attempt_count: nextAttemptCount,
         },
       });
       return {
@@ -2135,24 +3224,70 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     }
 
     if (fetched.status === "open") {
+      const settledWaitAt = deps.clock.now();
+      await deps.db.transaction(async (tx) => {
+        await tx
+          .update(paymentAttempts)
+          .set({
+            reconciliationNote: "awaiting_async_settlement",
+            updatedAt: settledWaitAt,
+          })
+          .where(eq(paymentAttempts.id, attempt.id));
+
+        await tx
+          .update(paymentWebhookEvents)
+          .set({
+            status: "awaiting_settlement",
+            reasonCode: "AWAITING_ASYNC_SETTLEMENT",
+            processedAt: settledWaitAt,
+          })
+          .where(eq(paymentWebhookEvents.id, webhookRowId));
+
+        await notifyOrderPaymentEventInTx(tx, {
+          orderPublicId: attempt.orderPublicId,
+          kind: "pending_async",
+          eventRef: verified.externalEventId,
+        });
+
+        await deps.audit.record(
+          {
+            category: "business",
+            eventName: "payments.attempt.pending_async",
+            action: "transition",
+            outcome: "completed",
+            actor: { role: "system" },
+            resource: { type: "payment_attempt", publicId: attempt.publicId },
+            orderPublicId: attempt.orderPublicId,
+            attributes: {
+              order_public_id: attempt.orderPublicId,
+              invoice_public_id: attempt.invoicePublicId,
+              provider: input.provider,
+              external_event_id: verified.externalEventId,
+              payment_state: "pending_async",
+            },
+          },
+          tx,
+        );
+      });
       return {
-        httpStatus: 503,
+        httpStatus: 200,
         accepted: true,
         duplicate: staged.duplicate,
         booked: false,
-        reasonCode: "PAYMENT_NOT_SETTLED_YET",
+        reasonCode: "AWAITING_ASYNC_SETTLEMENT",
       };
     }
 
     if (fetched.status === "failed" || fetched.status === "expired") {
       const termStatus: PaymentAttemptStatus = fetched.status === "expired" ? "expired" : "failed";
+      const termReason = `FETCH_${termStatus.toUpperCase()}`;
       const termAt = deps.clock.now();
       await deps.db.transaction(async (tx) => {
         await tx
           .update(paymentAttempts)
           .set({
             status: termStatus,
-            failureReasonCode: `FETCH_${termStatus.toUpperCase()}`,
+            failureReasonCode: termReason,
             lastReconciledAt: termAt,
             version: attempt.version + 1,
             updatedAt: termAt,
@@ -2163,17 +3298,47 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           .update(paymentWebhookEvents)
           .set({
             status: "processed",
-            reasonCode: `FETCH_${termStatus.toUpperCase()}`,
+            reasonCode: termReason,
             processedAt: termAt,
           })
           .where(eq(paymentWebhookEvents.id, webhookRowId));
+
+        if (termStatus === "failed") {
+          await notifyOrderPaymentEventInTx(tx, {
+            orderPublicId: attempt.orderPublicId,
+            kind: "failed",
+            eventRef: verified.externalEventId,
+          });
+          await deps.audit.record(
+            {
+              category: "business",
+              eventName: "payments.attempt.failed",
+              action: "transition",
+              outcome: "failed",
+              severity: "WARN",
+              reasonCode: termReason,
+              actor: { role: "system" },
+              resource: { type: "payment_attempt", publicId: attempt.publicId },
+              orderPublicId: attempt.orderPublicId,
+              attributes: {
+                order_public_id: attempt.orderPublicId,
+                invoice_public_id: attempt.invoicePublicId,
+                provider: input.provider,
+                external_event_id: verified.externalEventId,
+                reason_code: termReason,
+                payment_state: "failed",
+              },
+            },
+            tx,
+          );
+        }
       });
       return {
         httpStatus: 200,
         accepted: true,
         duplicate: staged.duplicate,
         booked: false,
-        reasonCode: `FETCH_${termStatus.toUpperCase()}`,
+        reasonCode: termReason,
       };
     }
 
@@ -2199,6 +3364,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     signal?: AbortSignal | undefined;
     beforeSend?: (() => Promise<void>) | undefined;
   }): Promise<ReconcilePaymentsResult> {
+    await pruneExpiredWebhookRejections(deps.clock.now());
     const limit = Math.min(Math.max(opts?.limit ?? 25, 1), 100);
     const config = await loadConfig();
     // Enforce zero outbound network activity when payments are off (`provider === "none"`).
@@ -2327,16 +3493,46 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       }
 
       if (fetched.status === "failed") {
-        await deps.db
-          .update(paymentAttempts)
-          .set({
-            status: "failed",
-            failureReasonCode: "RECONCILE_PROVIDER_FAILED",
-            lastReconciledAt: now,
-            version: attempt.version + 1,
-            updatedAt: now,
-          })
-          .where(and(eq(paymentAttempts.id, attempt.id), eq(paymentAttempts.version, attempt.version)));
+        await deps.db.transaction(async (tx) => {
+          await tx
+            .update(paymentAttempts)
+            .set({
+              status: "failed",
+              failureReasonCode: "RECONCILE_PROVIDER_FAILED",
+              lastReconciledAt: now,
+              version: attempt.version + 1,
+              updatedAt: now,
+            })
+            .where(and(eq(paymentAttempts.id, attempt.id), eq(paymentAttempts.version, attempt.version)));
+
+          await notifyOrderPaymentEventInTx(tx, {
+            orderPublicId: attempt.orderPublicId,
+            kind: "failed",
+            eventRef: attempt.publicId,
+          });
+
+          await deps.audit.record(
+            {
+              category: "business",
+              eventName: "payments.attempt.failed",
+              action: "transition",
+              outcome: "failed",
+              severity: "WARN",
+              reasonCode: "RECONCILE_PROVIDER_FAILED",
+              actor: { role: "system" },
+              resource: { type: "payment_attempt", publicId: attempt.publicId },
+              orderPublicId: attempt.orderPublicId,
+              attributes: {
+                order_public_id: attempt.orderPublicId,
+                invoice_public_id: attempt.invoicePublicId,
+                provider: attempt.provider,
+                reason_code: "RECONCILE_PROVIDER_FAILED",
+                payment_state: "failed",
+              },
+            },
+            tx,
+          );
+        });
         failed += 1;
         continue;
       }
@@ -2359,37 +3555,51 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       loadSmallTotals(tx),
       loadReceiptsSetting(tx),
     ]);
-    const [stripeKeySet, stripeWhSet, squareTokenSet, squareSigSet] = await Promise.all([
-      isSecretConfigured(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx),
-      isSecretConfigured(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx),
+    const [stripeKey, stripeWh, stripeWhSecSet, squareTokenSet, squareSigSet] = await Promise.all([
+      readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx),
+      readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx),
+      isSecretConfigured(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET_SECONDARY, tx),
       isSecretConfigured(deps.settings, PAYMENTS_SQUARE_ACCESS_TOKEN, tx),
       isSecretConfigured(deps.settings, PAYMENTS_SQUARE_WEBHOOK_SIGNATURE_KEY, tx),
     ]);
+    const stripeKeySet = Boolean(stripeKey);
+    const stripeWhSet = Boolean(stripeWh);
 
     const squareHost =
       config.mode === "live" ? ("connect.squareup.com" as const) : ("connect.squareupsandbox.com" as const);
 
-    let stripeAllowlisted = false;
-    let squareAllowlisted = false;
-    const egressSvc = (deps.services as Partial<typeof deps.services>).integrations?.egress;
-    if (!tx && egressSvc && typeof egressSvc.listPresets === "function") {
-      try {
-        const presets = await egressSvc.listPresets();
-        stripeAllowlisted = presets.some((p) => p.key === "stripe" && p.enabled);
-        const sqPresetKey = config.mode === "live" ? "square" : "square_sandbox";
-        squareAllowlisted = presets.some((p) => p.key === sqPresetKey && p.enabled);
-      } catch {
-        stripeAllowlisted = false;
-        squareAllowlisted = false;
-      }
-    }
+    const egress = await checkEgressPresets(config.mode);
+    const stripeState = resolveStripeVerificationState(config, stripeKey, stripeWh, egress);
 
+    const stripeReady = stripeState.ready;
     const onlineEnabled =
       config.provider === "stripe"
-        ? stripeKeySet && stripeWhSet
+        ? stripeReady
         : config.provider === "square"
-          ? Boolean(config.squareLocationId && squareTokenSet && squareSigSet)
+          ? Boolean(
+              config.squareLocationId &&
+                squareTokenSet &&
+                squareSigSet &&
+                (!egress.wired || egress.squareAllowlisted),
+            )
           : false;
+
+    const dbOrTx = tx ?? deps.db;
+    const [latestStripeWebhook] = await dbOrTx
+      .select({
+        receivedAt: paymentWebhookEvents.receivedAt,
+        eventType: paymentWebhookEvents.eventType,
+        status: paymentWebhookEvents.status,
+      })
+      .from(paymentWebhookEvents)
+      .where(
+        and(
+          eq(paymentWebhookEvents.provider, "stripe"),
+          ne(paymentWebhookEvents.eventType, "readypackets.self_test"),
+        ),
+      )
+      .orderBy(desc(paymentWebhookEvents.id))
+      .limit(1);
 
     const stripeWebhookUrl = new URL("/api/payments/webhooks/stripe", deps.config.canonicalOrigin).href;
     const squareWebhookUrl = new URL("/api/payments/webhooks/square", deps.config.canonicalOrigin).href;
@@ -2409,10 +3619,21 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         secretKeyLast4: stripeKeySet ? config.stripeSecretKeyLast4 : null,
         webhookSecretConfigured: stripeWhSet,
         webhookSecretLast4: stripeWhSet ? config.stripeWebhookSecretLast4 : null,
+        webhookSecretSecondaryConfigured: stripeWhSecSet,
+        webhookSecretSecondaryLast4: stripeWhSecSet ? config.stripeWebhookSecretSecondaryLast4 : null,
+        lastApiVerifiedAt: stripeState.effectiveLastApiVerifiedAt,
+        lastSelfTestAt: stripeState.effectiveLastSelfTestAt,
+        lastSelfTestWebhookAt: stripeState.effectiveLastSelfTestAt,
+        lastVerifiedWebhookAt: latestStripeWebhook ? latestStripeWebhook.receivedAt.toISOString() : null,
+        lastVerifiedWebhookEventType: latestStripeWebhook?.eventType ?? null,
+        lastVerifiedWebhookStatus: latestStripeWebhook?.status ?? null,
+        inboundCountryAllowlistExempt: true,
+        requiredEvents: STRIPE_REQUIRED_WEBHOOK_EVENTS,
+        ready: stripeReady,
         webhookUrl: stripeWebhookUrl,
         returnUrlPattern: stripeReturnPattern,
         egressHost: "api.stripe.com",
-        egressAllowlisted: stripeAllowlisted,
+        egressAllowlisted: egress.stripeAllowlisted,
       },
       square: {
         locationId: config.squareLocationId,
@@ -2423,7 +3644,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         webhookUrl: squareWebhookUrl,
         returnUrlPattern: squareReturnPattern,
         egressHost: squareHost,
-        egressAllowlisted: squareAllowlisted,
+        egressAllowlisted: egress.squareAllowlisted,
       },
       smallTotals,
       defaultProviderMinimumsMinor: DEFAULT_PROVIDER_MINIMUMS_MINOR,
@@ -2445,10 +3666,13 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       throw validation("INVALID_CURRENCY", "Currency must be a 3-letter uppercase ISO 4217 code.");
     }
 
+    const egress = await checkEgressPresets(input.mode);
+
     await runComplianceTx(deps, principal, { type: "payments_settings" }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "payments.manage");
       const prev = await loadConfig(tx);
 
+      const modeChanged = prev.mode !== input.mode;
       const nextConfig: PaymentsConfigValue = {
         provider: input.provider,
         mode: input.mode,
@@ -2458,6 +3682,11 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         webhookToleranceSeconds: input.webhookToleranceSeconds ?? prev.webhookToleranceSeconds,
         stripeSecretKeyLast4: prev.stripeSecretKeyLast4,
         stripeWebhookSecretLast4: prev.stripeWebhookSecretLast4,
+        stripeWebhookSecretSecondaryLast4: prev.stripeWebhookSecretSecondaryLast4,
+        stripeLastApiVerifiedAt: modeChanged ? null : prev.stripeLastApiVerifiedAt,
+        stripeApiVerifiedFingerprint: modeChanged ? null : prev.stripeApiVerifiedFingerprint,
+        stripeLastSelfTestAt: modeChanged ? null : prev.stripeLastSelfTestAt,
+        stripeSelfTestedFingerprint: modeChanged ? null : prev.stripeSelfTestedFingerprint,
         squareLocationId:
           input.squareLocationId !== undefined
             ? input.squareLocationId && input.squareLocationId.trim() !== ""
@@ -2468,7 +3697,11 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         squareWebhookSignatureKeyLast4: prev.squareWebhookSignatureKeyLast4,
       };
 
-      const rotatedSecrets: string[] = [];
+      const rotatedSecrets: Array<{
+        provider: "stripe" | "square";
+        slot: string;
+        operation: "rotated" | "cleared";
+      }> = [];
 
       function parseCredential(schema: { safeParse: (v: unknown) => { success: true; data: string } | { success: false } }, raw: string, label: string): string {
         const res = schema.safeParse(raw);
@@ -2481,40 +3714,73 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       if (input.clearStripeSecretKey) {
         await deps.settings.setSecret(PAYMENTS_STRIPE_SECRET_KEY.key, null, tx);
         nextConfig.stripeSecretKeyLast4 = null;
-        rotatedSecrets.push("stripe_secret_key_cleared");
+        nextConfig.stripeLastApiVerifiedAt = null;
+        nextConfig.stripeApiVerifiedFingerprint = null;
+        rotatedSecrets.push({ provider: "stripe", slot: "api_key", operation: "cleared" });
       } else if (input.stripeSecretKey !== undefined && input.stripeSecretKey.trim() !== "") {
         const parsed = parseCredential(PAYMENTS_STRIPE_SECRET_KEY.schema, input.stripeSecretKey.trim(), "Stripe secret key");
+        const expectedPrefix = nextConfig.mode === "live" ? /^(?:sk|rk)_live_/u : /^(?:sk|rk)_test_/u;
+        if (!expectedPrefix.test(parsed)) {
+          throw validation(
+            "STRIPE_KEY_MODE_MISMATCH",
+            `Stripe secret key must match ${nextConfig.mode} mode.`,
+          );
+        }
         await deps.settings.setSecret(PAYMENTS_STRIPE_SECRET_KEY.key, parsed, tx);
         nextConfig.stripeSecretKeyLast4 = maskLast4(parsed);
-        rotatedSecrets.push("stripe_secret_key");
+        nextConfig.stripeLastApiVerifiedAt = null;
+        nextConfig.stripeApiVerifiedFingerprint = null;
+        rotatedSecrets.push({ provider: "stripe", slot: "api_key", operation: "rotated" });
       }
 
       if (input.clearStripeWebhookSecret) {
         await deps.settings.setSecret(PAYMENTS_STRIPE_WEBHOOK_SECRET.key, null, tx);
         nextConfig.stripeWebhookSecretLast4 = null;
-        rotatedSecrets.push("stripe_webhook_secret_cleared");
+        nextConfig.stripeLastSelfTestAt = null;
+        nextConfig.stripeSelfTestedFingerprint = null;
+        rotatedSecrets.push({ provider: "stripe", slot: "webhook_primary", operation: "cleared" });
       } else if (input.stripeWebhookSecret !== undefined && input.stripeWebhookSecret.trim() !== "") {
         const parsed = parseCredential(PAYMENTS_STRIPE_WEBHOOK_SECRET.schema, input.stripeWebhookSecret.trim(), "Stripe webhook signing secret");
         await deps.settings.setSecret(PAYMENTS_STRIPE_WEBHOOK_SECRET.key, parsed, tx);
         nextConfig.stripeWebhookSecretLast4 = maskLast4(parsed);
-        rotatedSecrets.push("stripe_webhook_secret");
+        nextConfig.stripeLastSelfTestAt = null;
+        nextConfig.stripeSelfTestedFingerprint = null;
+        rotatedSecrets.push({ provider: "stripe", slot: "webhook_primary", operation: "rotated" });
+      }
+
+      if (input.clearStripeWebhookSecretSecondary) {
+        await deps.settings.setSecret(PAYMENTS_STRIPE_WEBHOOK_SECRET_SECONDARY.key, null, tx);
+        nextConfig.stripeWebhookSecretSecondaryLast4 = null;
+        rotatedSecrets.push({ provider: "stripe", slot: "webhook_secondary", operation: "cleared" });
+      } else if (
+        input.stripeWebhookSecretSecondary !== undefined &&
+        input.stripeWebhookSecretSecondary.trim() !== ""
+      ) {
+        const parsed = parseCredential(
+          PAYMENTS_STRIPE_WEBHOOK_SECRET_SECONDARY.schema,
+          input.stripeWebhookSecretSecondary.trim(),
+          "Stripe secondary webhook signing secret",
+        );
+        await deps.settings.setSecret(PAYMENTS_STRIPE_WEBHOOK_SECRET_SECONDARY.key, parsed, tx);
+        nextConfig.stripeWebhookSecretSecondaryLast4 = maskLast4(parsed);
+        rotatedSecrets.push({ provider: "stripe", slot: "webhook_secondary", operation: "rotated" });
       }
 
       if (input.clearSquareAccessToken) {
         await deps.settings.setSecret(PAYMENTS_SQUARE_ACCESS_TOKEN.key, null, tx);
         nextConfig.squareAccessTokenLast4 = null;
-        rotatedSecrets.push("square_access_token_cleared");
+        rotatedSecrets.push({ provider: "square", slot: "access_token", operation: "cleared" });
       } else if (input.squareAccessToken !== undefined && input.squareAccessToken.trim() !== "") {
         const parsed = parseCredential(PAYMENTS_SQUARE_ACCESS_TOKEN.schema, input.squareAccessToken.trim(), "Square access token");
         await deps.settings.setSecret(PAYMENTS_SQUARE_ACCESS_TOKEN.key, parsed, tx);
         nextConfig.squareAccessTokenLast4 = maskLast4(parsed);
-        rotatedSecrets.push("square_access_token");
+        rotatedSecrets.push({ provider: "square", slot: "access_token", operation: "rotated" });
       }
 
       if (input.clearSquareWebhookSignatureKey) {
         await deps.settings.setSecret(PAYMENTS_SQUARE_WEBHOOK_SIGNATURE_KEY.key, null, tx);
         nextConfig.squareWebhookSignatureKeyLast4 = null;
-        rotatedSecrets.push("square_webhook_signature_key_cleared");
+        rotatedSecrets.push({ provider: "square", slot: "webhook_signature_key", operation: "cleared" });
       } else if (
         input.squareWebhookSignatureKey !== undefined &&
         input.squareWebhookSignatureKey.trim() !== ""
@@ -2526,16 +3792,17 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         );
         await deps.settings.setSecret(PAYMENTS_SQUARE_WEBHOOK_SIGNATURE_KEY.key, parsed, tx);
         nextConfig.squareWebhookSignatureKeyLast4 = maskLast4(parsed);
-        rotatedSecrets.push("square_webhook_signature_key");
+        rotatedSecrets.push({ provider: "square", slot: "webhook_signature_key", operation: "rotated" });
       }
 
-      const requiresFreshPair =
+      const requiresFreshPairStrict =
         nextConfig.provider !== "none" &&
-        (prev.provider !== nextConfig.provider || prev.mode !== nextConfig.mode);
+        (prev.mode !== nextConfig.mode ||
+          (prev.provider !== "none" && prev.provider !== nextConfig.provider));
 
       if (nextConfig.provider === "stripe") {
         if (
-          requiresFreshPair &&
+          requiresFreshPairStrict &&
           (!input.stripeSecretKey?.trim() || !input.stripeWebhookSecret?.trim())
         ) {
           throw validation(
@@ -2548,6 +3815,12 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx),
         ]);
         if (!stripeKey || !stripeWh) {
+          if (prev.provider !== "stripe") {
+            throw validation(
+              "FRESH_CREDENTIALS_REQUIRED",
+              "Configure both the Stripe secret key and webhook signing secret before enabling Stripe.",
+            );
+          }
           throw validation(
             "STRIPE_CREDENTIALS_REQUIRED",
             "Configure both the Stripe secret key and webhook signing secret before enabling Stripe.",
@@ -2560,9 +3833,41 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             `Stripe secret key must match ${nextConfig.mode} mode.`,
           );
         }
-      } else if (nextConfig.provider === "square") {
+        if (egress.wired && !egress.stripeAllowlisted) {
+          throw validation(
+            "STRIPE_EGRESS_NOT_ALLOWLISTED",
+            "Enable the Stripe outbound HTTPS allowlist preset (api.stripe.com:443) before activating Stripe Checkout.",
+          );
+        }
+        const expectedApiFp = computeStripeApiFingerprint(
+          nextConfig.mode,
+          stripeKey,
+          egress.stripeEgressStamp,
+        );
         if (
-          requiresFreshPair &&
+          !nextConfig.stripeLastApiVerifiedAt ||
+          nextConfig.stripeApiVerifiedFingerprint !== expectedApiFp
+        ) {
+          throw validation(
+            "STRIPE_API_NOT_VERIFIED",
+            "Verify outbound Stripe API connectivity for the current staged secret key, mode, and outbound allowlist before activating Stripe Checkout.",
+          );
+        }
+        const expectedWhFp = computeStripeSelfTestFingerprint(nextConfig.mode, stripeWh);
+        if (
+          !nextConfig.stripeLastSelfTestAt ||
+          nextConfig.stripeSelfTestedFingerprint !== expectedWhFp
+        ) {
+          throw validation(
+            "STRIPE_WEBHOOK_NOT_VERIFIED",
+            "Run a passing signed webhook self-test for the current staged signing secret and mode before activating Stripe Checkout.",
+          );
+        }
+      } else if (nextConfig.provider === "square") {
+        const requiresSquareFresh =
+          prev.provider !== nextConfig.provider || prev.mode !== nextConfig.mode;
+        if (
+          requiresSquareFresh &&
           (!input.squareAccessToken?.trim() || !input.squareWebhookSignatureKey?.trim())
         ) {
           throw validation(
@@ -2592,6 +3897,26 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         await writeSetting(deps.settings, PAYMENTS_RECEIPTS_SETTING, cleanedReceipts, tx);
       }
 
+      for (const secretOp of rotatedSecrets) {
+        await deps.audit.record(
+          {
+            category: "security",
+            eventName: "payments.secret.rotated",
+            action: "update",
+            outcome: "completed",
+            actor: { userId: liveActor.userId, role: liveActor.role },
+            resource: { type: "payments_settings" },
+            attributes: {
+              provider: secretOp.provider,
+              slot: secretOp.slot,
+              operation: secretOp.operation,
+              mode: nextConfig.mode,
+            },
+          },
+          tx,
+        );
+      }
+
       await deps.audit.record(
         {
           category: "admin",
@@ -2615,6 +3940,414 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     });
 
     return buildAdminSettingsView();
+  }
+
+  async function adminReadiness(principal: SessionPrincipal): Promise<PaymentsReadinessView> {
+    await assertAdminPaymentsRead(principal);
+    const now = deps.clock.now();
+    await pruneExpiredWebhookRejections(now);
+
+    const config = await loadConfig();
+    const [stripeKey, stripeWh, stripeWhSecSet, egress] = await Promise.all([
+      readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY),
+      readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET),
+      isSecretConfigured(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET_SECONDARY),
+      checkEgressPresets(config.mode),
+    ]);
+
+    const stripeKeySet = Boolean(stripeKey);
+    const stripeWhSet = Boolean(stripeWh);
+    const stripeState = resolveStripeVerificationState(config, stripeKey, stripeWh, egress);
+    const secretKeyModeMatches = stripeState.secretKeyModeMatches;
+
+    const cutoff24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const [[lastRealWebhook], [attentionRow], [rejRow]] = await Promise.all([
+      deps.db
+        .select({
+          receivedAt: paymentWebhookEvents.receivedAt,
+          eventType: paymentWebhookEvents.eventType,
+        })
+        .from(paymentWebhookEvents)
+        .where(
+          and(
+            eq(paymentWebhookEvents.provider, "stripe"),
+            ne(paymentWebhookEvents.eventType, "readypackets.self_test"),
+          ),
+        )
+        .orderBy(desc(paymentWebhookEvents.id))
+        .limit(1),
+      deps.db
+        .select({ total: count() })
+        .from(paymentWebhookEvents)
+        .where(
+          and(
+            eq(paymentWebhookEvents.provider, "stripe"),
+            eq(paymentWebhookEvents.status, "attention_required"),
+          ),
+        ),
+      deps.db
+        .select({ total: count() })
+        .from(paymentWebhookRejections)
+        .where(
+          and(
+            eq(paymentWebhookRejections.provider, "stripe"),
+            gte(paymentWebhookRejections.receivedAt, cutoff24h),
+          ),
+        ),
+    ]);
+
+    const egressReady = stripeState.egressOk;
+    const onlineEnabled = config.provider === "stripe" && stripeState.ready;
+
+    const webhookUrl = new URL("/api/payments/webhooks/stripe", deps.config.canonicalOrigin).href;
+
+    const checklist: PaymentsReadinessChecklistItem[] = [
+      {
+        key: "egress_allowlist",
+        label: "Outbound allowlist for api.stripe.com",
+        ready: egressReady,
+        detail: egress.stripeAllowlisted
+          ? "Outbound HTTPS to api.stripe.com:443 is enabled."
+          : egress.wired
+            ? "Enable the Stripe outbound allowlist preset before calling the Stripe API."
+            : "Outbound allowlist service not attached in this environment.",
+      },
+      {
+        key: "webhook_route_protection",
+        label: "Inbound webhook route country-allowlist exemption",
+        ready: true,
+        detail:
+          "POST /api/payments/webhooks/stripe bypasses country geo-blocking while preserving IP block rules, rate limiting, and the 256 KiB raw-body cap.",
+      },
+      {
+        key: "stripe_secret_key",
+        label: `Stripe ${config.mode} API secret key staged`,
+        ready: stripeKeySet && secretKeyModeMatches,
+        detail: !stripeKeySet
+          ? `Stage a Stripe ${config.mode} secret key (${config.mode === "live" ? "sk_live_ / rk_live_" : "sk_test_ / rk_test_"}).`
+          : secretKeyModeMatches
+            ? `Secret key ending in ${config.stripeSecretKeyLast4 ?? "••••"} matches ${config.mode} mode.`
+            : `Staged secret key does not match ${config.mode} mode.`,
+      },
+      {
+        key: "stripe_webhook_secret",
+        label: "Primary Stripe webhook signing secret staged",
+        ready: stripeWhSet,
+        detail: stripeWhSet
+          ? `Primary signing secret ending in ${config.stripeWebhookSecretLast4 ?? "••••"} is configured.`
+          : "Stage the whsec_ signing secret from your Stripe webhook endpoint.",
+      },
+      {
+        key: "api_connection_verified",
+        label: "Pinned Stripe API connection verified",
+        ready: stripeState.apiVerified,
+        detail: stripeState.effectiveLastApiVerifiedAt
+          ? `Verified at ${stripeState.effectiveLastApiVerifiedAt} for the current staged key, mode, and outbound allowlist.`
+          : "Run Test Stripe API to verify egress and key livemode for the current staged key.",
+      },
+      {
+        key: "self_test_webhook_verified",
+        label: "Signed webhook receiver self-test passed",
+        ready: stripeState.selfTestVerified,
+        detail: stripeState.effectiveLastSelfTestAt
+          ? `Verified at ${stripeState.effectiveLastSelfTestAt} for the current staged signing secret and mode.`
+          : "Run Send self-test webhook to verify HMAC signature and timestamp handling.",
+      },
+      {
+        key: "provider_activated",
+        label: "Stripe online checkout activated",
+        ready: onlineEnabled,
+        detail: onlineEnabled
+          ? `Online Stripe checkout is active in ${config.mode} mode.`
+          : config.provider === "stripe"
+            ? "Stripe is selected, but one or more prerequisites above are incomplete or unverified; checkout remains on invoice fallback until resolved."
+            : "Provider is currently set to off (invoice-only). Activate Stripe when ready.",
+      },
+    ];
+
+    return {
+      provider: config.provider,
+      mode: config.mode,
+      currency: config.currency,
+      onlineEnabled,
+      webhookUrl,
+      requiredWebhookEvents: [...STRIPE_REQUIRED_WEBHOOK_EVENTS],
+      egress: {
+        presetKey: "stripe",
+        host: "api.stripe.com",
+        allowlisted: egressReady,
+      },
+      routeProtection: {
+        webhookPath: "/api/payments/webhooks/stripe",
+        countryAllowlistExempt: true,
+        ipRulesEnforced: true,
+        rateLimitEnforced: true,
+        bodyCapBytes: 262144,
+      },
+      secrets: {
+        secretKeyConfigured: stripeKeySet,
+        secretKeyLast4: stripeKeySet ? config.stripeSecretKeyLast4 : null,
+        secretKeyModeMatches,
+        webhookSecretConfigured: stripeWhSet,
+        webhookSecretLast4: stripeWhSet ? config.stripeWebhookSecretLast4 : null,
+        webhookSecretSecondaryConfigured: stripeWhSecSet,
+        webhookSecretSecondaryLast4: stripeWhSecSet ? config.stripeWebhookSecretSecondaryLast4 : null,
+      },
+      verification: {
+        lastApiVerifiedAt: stripeState.effectiveLastApiVerifiedAt,
+        lastSelfTestAt: stripeState.effectiveLastSelfTestAt,
+        lastVerifiedWebhookAt: lastRealWebhook?.receivedAt
+          ? lastRealWebhook.receivedAt.toISOString()
+          : null,
+        lastVerifiedWebhookEventType: lastRealWebhook?.eventType ?? null,
+        attentionRequiredWebhookCount: attentionRow?.total ?? 0,
+        recentRejectionCount24h: rejRow?.total ?? 0,
+      },
+      checklist,
+    };
+  }
+
+  async function adminTestConnection(principal: SessionPrincipal): Promise<TestStripeConnectionResult> {
+    const stagedCheck = await runComplianceTx(
+      deps,
+      principal,
+      { type: "payments_settings" },
+      async (tx) => {
+        const liveActor = await assertLiveActorInTx(deps, principal, tx, "payments.manage");
+        const config = await loadConfig(tx);
+        const stripeKey = await readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx);
+        if (!stripeKey) {
+          throw validation(
+            "STRIPE_CREDENTIALS_REQUIRED",
+            "Stage a Stripe secret key before testing the Stripe API connection.",
+          );
+        }
+        const expectedPrefix = config.mode === "live" ? /^(?:sk|rk)_live_/u : /^(?:sk|rk)_test_/u;
+        if (!expectedPrefix.test(stripeKey)) {
+          throw validation(
+            "STRIPE_KEY_MODE_MISMATCH",
+            `Stripe secret key must match ${config.mode} mode.`,
+          );
+        }
+        return { liveActor, config, stripeKey };
+      },
+    );
+
+    if (typeof adapters.stripe.testConnection !== "function") {
+      throw new DomainError(
+        "UNAVAILABLE",
+        "STRIPE_CONNECTION_TEST_UNAVAILABLE",
+        "Stripe connection testing is not supported by the active adapter.",
+      );
+    }
+
+    const now = deps.clock.now();
+    const res = await adapters.stripe.testConnection({
+      credentials: { mode: stagedCheck.config.mode, secretKey: stagedCheck.stripeKey },
+      now,
+    });
+
+    const failureReasonCode = res.ok ? null : (res.reasonCode ?? "STRIPE_CONNECTION_FAILED");
+    const livemode = res.ok ? stagedCheck.config.mode === "live" : null;
+    const detail = res.ok
+      ? `Connected to api.stripe.com in ${stagedCheck.config.mode} mode (${res.latencyMs}ms).`
+      : failureReasonCode === "STRIPE_AUTH_INVALID_KEY"
+        ? "Stripe rejected the staged secret key (HTTP 401)."
+        : failureReasonCode === "STRIPE_KEY_MISSING_PERMISSION"
+          ? "Staged restricted key lacks Checkout Sessions read permission (HTTP 403)."
+          : failureReasonCode === "STRIPE_KEY_MODE_MISMATCH"
+            ? `Staged secret key does not match ${stagedCheck.config.mode} mode.`
+            : `Outbound connection to api.stripe.com failed (${failureReasonCode}). Enable the Stripe outbound allowlist preset and try again.`;
+
+    const verifiedAt = res.ok ? (res.verifiedAt ?? now).toISOString() : null;
+    const egress = await checkEgressPresets(stagedCheck.config.mode);
+    await deps.db.transaction(async (tx) => {
+      const latest = await loadConfig(tx);
+      const currentKey = await readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx);
+      const sameKeyAndMode =
+        latest.mode === stagedCheck.config.mode && currentKey === stagedCheck.stripeKey;
+      if (!sameKeyAndMode) return;
+      await writeSetting(
+        deps.settings,
+        PAYMENTS_CONFIG_SETTING,
+        res.ok && verifiedAt
+          ? {
+              ...latest,
+              stripeLastApiVerifiedAt: verifiedAt,
+              stripeApiVerifiedFingerprint: computeStripeApiFingerprint(
+                latest.mode,
+                stagedCheck.stripeKey,
+                egress.stripeEgressStamp,
+              ),
+            }
+          : {
+              ...latest,
+              stripeLastApiVerifiedAt: null,
+              stripeApiVerifiedFingerprint: null,
+            },
+        tx,
+      );
+    });
+
+    await deps.audit.record({
+      category: "integration",
+      eventName: "payments.connection.tested",
+      action: "verify",
+      outcome: res.ok ? "completed" : "failed",
+      ...(res.ok
+        ? {}
+        : {
+            severity: "WARN" as const,
+            reasonCode: failureReasonCode ?? "STRIPE_CONNECTION_FAILED",
+          }),
+      actor: { userId: stagedCheck.liveActor.userId, role: stagedCheck.liveActor.role },
+      resource: { type: "payments_settings" },
+      attributes: {
+        provider: "stripe",
+        mode: stagedCheck.config.mode,
+        livemode,
+        ...(failureReasonCode ? { failure_reason_code: failureReasonCode } : {}),
+      },
+    });
+
+    return {
+      ok: res.ok,
+      provider: "stripe",
+      mode: stagedCheck.config.mode,
+      livemode,
+      accountRef: null,
+      verifiedAt,
+      failureReasonCode,
+      detail,
+      message: detail,
+    };
+  }
+
+  async function adminSendSelfTestWebhook(
+    principal: SessionPrincipal,
+  ): Promise<SendStripeSelfTestWebhookResult> {
+    const stagedCheck = await runComplianceTx(
+      deps,
+      principal,
+      { type: "payments_settings" },
+      async (tx) => {
+        const liveActor = await assertLiveActorInTx(deps, principal, tx, "payments.manage");
+        const config = await loadConfig(tx);
+        const stripeWh = await readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx);
+        if (!stripeWh) {
+          throw validation(
+            "STRIPE_CREDENTIALS_REQUIRED",
+            "Stage the primary Stripe webhook signing secret before running a self-test webhook.",
+          );
+        }
+        return { liveActor, config, stripeWh };
+      },
+    );
+
+    const now = deps.clock.now();
+    const built = buildSignedStripeSelfTestWebhook({
+      webhookSecret: stagedCheck.stripeWh,
+      mode: stagedCheck.config.mode,
+      now,
+    });
+    const notificationUrl = new URL("/api/payments/webhooks/stripe", deps.config.canonicalOrigin).href;
+    const dispatched = await handleSignedWebhook({
+      provider: "stripe",
+      rawBody: built.rawBody,
+      headers: built.headers,
+      notificationUrl,
+    });
+
+    const ok = dispatched.accepted && dispatched.reasonCode === "SELF_TEST_OK";
+    const verifiedAt = ok ? deps.clock.now().toISOString() : null;
+
+    await deps.db.transaction(async (tx) => {
+      const latest = await loadConfig(tx);
+      const currentWh = await readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx);
+      const sameWhAndMode =
+        latest.mode === stagedCheck.config.mode && currentWh === stagedCheck.stripeWh;
+      if (!sameWhAndMode) return;
+      await writeSetting(
+        deps.settings,
+        PAYMENTS_CONFIG_SETTING,
+        ok && verifiedAt
+          ? {
+              ...latest,
+              stripeLastSelfTestAt: verifiedAt,
+              stripeSelfTestedFingerprint: computeStripeSelfTestFingerprint(
+                latest.mode,
+                stagedCheck.stripeWh,
+              ),
+            }
+          : {
+              ...latest,
+              stripeLastSelfTestAt: null,
+              stripeSelfTestedFingerprint: null,
+            },
+        tx,
+      );
+    });
+
+    await deps.audit.record({
+      category: "integration",
+      eventName: "payments.webhook.self_tested",
+      action: "verify",
+      outcome: ok ? "completed" : "failed",
+      ...(ok ? {} : { severity: "WARN" as const, reasonCode: dispatched.reasonCode }),
+      actor: { userId: stagedCheck.liveActor.userId, role: stagedCheck.liveActor.role },
+      resource: { type: "payments_settings" },
+      attributes: {
+        provider: "stripe",
+        mode: stagedCheck.config.mode,
+        external_event_id: built.eventId,
+        http_status: dispatched.httpStatus,
+        reason_code: dispatched.reasonCode,
+      },
+    });
+
+    return {
+      ok,
+      externalEventId: built.eventId,
+      httpStatus: dispatched.httpStatus,
+      reasonCode: dispatched.reasonCode,
+      verifiedAt,
+    };
+  }
+
+  async function adminListWebhookRejections(
+    principal: SessionPrincipal,
+    input: ListWebhookRejectionsInput = {},
+  ): Promise<{ items: PaymentWebhookRejectionSummary[]; nextCursor: string | null }> {
+    await assertAdminPaymentsRead(principal);
+    const now = deps.clock.now();
+    await pruneExpiredWebhookRejections(now);
+
+    const limit = Math.min(Math.max(input.limit ?? 50, 1), 100);
+    const afterId = decodeIdCursor(input.cursor);
+    const cutoff = new Date(now.getTime() - WEBHOOK_REJECTION_RETENTION_MS);
+
+    const conds = [gte(paymentWebhookRejections.receivedAt, cutoff)];
+    if (afterId !== null) conds.push(lt(paymentWebhookRejections.id, afterId));
+    if (input.provider) conds.push(eq(paymentWebhookRejections.provider, input.provider));
+    if (input.reasonCode) {
+      conds.push(
+        inArray(paymentWebhookRejections.reasonCode, expandWebhookRejectionReasonFilter(input.reasonCode)),
+      );
+    }
+
+    const rows = await deps.db
+      .select()
+      .from(paymentWebhookRejections)
+      .where(and(...conds))
+      .orderBy(desc(paymentWebhookRejections.id))
+      .limit(limit + 1);
+
+    const hasMore = rows.length > limit;
+    const slice = hasMore ? rows.slice(0, limit) : rows;
+    return {
+      items: slice.map(toWebhookRejectionSummary),
+      nextCursor: hasMore && slice.length > 0 ? encodeIdCursor(slice[slice.length - 1]!.id) : null,
+    };
   }
 
   async function adminListAttempts(
@@ -4203,6 +5936,8 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     getCheckoutStatus,
     cancelAttemptIfUnpaid,
     handleSignedWebhook,
+    recordHttpRejection,
+    pruneExpiredWebhookRejections,
     reconcilePendingAttempts,
     reconcileProviderRefund,
     getAttemptExposureForOrderInTx,
@@ -4213,6 +5948,10 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     admin: {
       getSettings: adminGetSettings,
       updateSettings: adminUpdateSettings,
+      readiness: adminReadiness,
+      testConnection: adminTestConnection,
+      sendSelfTestWebhook: adminSendSelfTestWebhook,
+      listWebhookRejections: adminListWebhookRejections,
       listAttempts: adminListAttempts,
       getAttempt: adminGetAttempt,
       listWebhooks: adminListWebhooks,

@@ -642,9 +642,11 @@ export function createIntakeService(deps: ModuleDeps) {
         outcome: "completed",
         actor: { userId: liveActor.userId, role: liveActor.role },
         resource: { type: "intake_submission", publicId: submissionPublicId },
+        orderPublicId: orderView.publicId,
         attributes: {
           order_public_id: orderView.publicId,
           questionnaire_public_id: q.publicId,
+          questionnaire_slug: q.slug,
           questionnaire_version_public_id: ver.publicId,
           revision_number: nextRevision,
           status: nextStatus,
@@ -772,8 +774,10 @@ export function createIntakeService(deps: ModuleDeps) {
           outcome: "completed",
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "intake_submission", publicId: sub.publicId },
+          orderPublicId: orderView.publicId,
           attributes: {
             order_public_id: orderView.publicId,
+            ...(q ? { questionnaire_public_id: q.publicId, questionnaire_slug: q.slug } : {}),
             decision: input.decision,
             revision_number: nextRevision,
             has_review_note: trimmedNote.length > 0,

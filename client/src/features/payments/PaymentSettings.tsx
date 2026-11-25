@@ -16,18 +16,57 @@ const smallTotalOptions = [
   { value: "waive", label: "Waive remaining small balance (default)" },
   { value: "block", label: "Block checkout when total is below provider minimum" },
 ];
-type SecretKey = "stripeSecretKey" | "stripeWebhookSecret" | "squareAccessToken" | "squareWebhookSignatureKey";
-const emptySecrets: Record<SecretKey, string> = { stripeSecretKey: "", stripeWebhookSecret: "", squareAccessToken: "", squareWebhookSignatureKey: "" };
+type SecretKey =
+  | "stripeSecretKey"
+  | "stripeWebhookSecret"
+  | "stripeWebhookSecretSecondary"
+  | "squareAccessToken"
+  | "squareWebhookSignatureKey";
+const emptySecrets: Record<SecretKey, string> = {
+  stripeSecretKey: "",
+  stripeWebhookSecret: "",
+  stripeWebhookSecretSecondary: "",
+  squareAccessToken: "",
+  squareWebhookSignatureKey: "",
+};
 type PaymentConfig = Pick<PaymentsConfigValue, "provider" | "mode" | "currency" | "successPath" | "cancelPath" | "webhookToleranceSeconds" | "squareLocationId">;
 export type PaymentSettingsInput = PaymentConfig &
   Partial<Record<SecretKey, string>> & {
+    clearStripeWebhookSecretSecondary?: boolean;
     smallTotals?: PaymentsSmallTotalsValue;
     receipts?: PaymentsReceiptsValue;
   };
 export type PaymentSettingsView = Pick<
   PaymentsAdminSettingsView,
-  "provider" | "mode" | "currency" | "successPath" | "cancelPath" | "webhookToleranceSeconds" | "onlineEnabled" | "stripe" | "square"
+  "provider" | "mode" | "currency" | "successPath" | "cancelPath" | "webhookToleranceSeconds" | "onlineEnabled"
 > & {
+  stripe: Pick<
+    PaymentsAdminSettingsView["stripe"],
+    | "secretKeyConfigured"
+    | "secretKeyLast4"
+    | "webhookSecretConfigured"
+    | "webhookSecretLast4"
+    | "webhookUrl"
+    | "returnUrlPattern"
+    | "egressHost"
+    | "egressAllowlisted"
+  > &
+    Partial<
+      Pick<
+        PaymentsAdminSettingsView["stripe"],
+        | "webhookSecretSecondaryConfigured"
+        | "webhookSecretSecondaryLast4"
+        | "inboundCountryAllowlistExempt"
+        | "requiredEvents"
+        | "ready"
+        | "lastApiVerifiedAt"
+        | "lastVerifiedWebhookAt"
+        | "lastVerifiedWebhookEventType"
+        | "lastVerifiedWebhookStatus"
+        | "lastSelfTestWebhookAt"
+      >
+    >;
+  square: PaymentsAdminSettingsView["square"];
   smallTotals?: PaymentsSmallTotalsValue;
   defaultProviderMinimumsMinor?: PaymentsAdminSettingsView["defaultProviderMinimumsMinor"];
   receipts?: PaymentsReceiptsValue;
@@ -51,6 +90,7 @@ export function PaymentSettings({ settings, saving, onSave }: {
   const [tolerance, setTolerance] = useState(String(settings.webhookToleranceSeconds));
   const [locationId, setLocationId] = useState(settings.square.locationId ?? "");
   const [secrets, setSecrets] = useState(emptySecrets);
+  const [clearSecondary, setClearSecondary] = useState(false);
   const [belowMinimum, setBelowMinimum] = useState<"waive" | "block">(
     settings.smallTotals?.belowProviderMinimum ?? "waive",
   );
@@ -71,13 +111,23 @@ export function PaymentSettings({ settings, saving, onSave }: {
     (mode === "live" ? "connect.squareup.com" : "connect.squareupsandbox.com") : activeSettings?.egressHost;
   const egressConfirmed = provider !== "square" || mode === settings.mode;
   const changingLive = mode === "live" && provider !== "none" && (settings.mode !== "live" || settings.provider !== provider);
-  const newCredentialsRequired = provider !== "none" && (settings.mode !== mode || settings.provider !== provider);
+  const activatingTest = mode === "test" && provider !== "none" && settings.provider !== provider;
+  const deactivatingToInvoice = provider === "none" && settings.provider !== "none";
+  const needsConfirmation = changingLive || activatingTest || deactivatingToInvoice;
+  const sameMode = settings.mode === mode;
+  const newCredentialsRequired =
+    provider === "stripe"
+      ? !sameMode || !settings.stripe.secretKeyConfigured || !settings.stripe.webhookSecretConfigured
+      : provider === "square"
+        ? !sameMode || !settings.square.accessTokenConfigured || !settings.square.webhookSignatureKeyConfigured
+        : false;
 
   async function save(input: PaymentSettingsInput) {
     setNotice(null);
     try {
       await onSave(input);
       setSecrets(emptySecrets);
+      setClearSecondary(false);
     } catch (error) {
       setNotice(errorMessage(error, "Payment settings could not be saved."));
       throw error;
@@ -94,8 +144,9 @@ export function PaymentSettings({ settings, saving, onSave }: {
       setNotice("Enter a three-letter currency, valid internal return paths, a 30–300 second webhook window, and a Square location ID if using Square.");
       return;
     }
-    const activeSecrets: readonly SecretKey[] = provider === "stripe" ? ["stripeSecretKey", "stripeWebhookSecret"] :
+    const requiredSecrets: readonly SecretKey[] = provider === "stripe" ? ["stripeSecretKey", "stripeWebhookSecret"] :
       provider === "square" ? ["squareAccessToken", "squareWebhookSignatureKey"] : [];
+    const optionalSecrets: readonly SecretKey[] = provider === "stripe" ? ["stripeWebhookSecretSecondary"] : [];
     const input: PaymentSettingsInput = {
       provider, mode, currency: normalizedCurrency, successPath, cancelPath, webhookToleranceSeconds: seconds,
       squareLocationId: provider === "square" ? locationId.trim() : settings.square.locationId,
@@ -109,21 +160,36 @@ export function PaymentSettings({ settings, saving, onSave }: {
         footerText: receiptsFooter.trim(),
       },
     };
-    for (const name of activeSecrets) {
+    for (const name of [...requiredSecrets, ...optionalSecrets]) {
       const value = secrets[name].trim();
       if (value) input[name] = value;
     }
-    if (newCredentialsRequired && activeSecrets.some((name) => !input[name])) {
+    if (provider === "stripe" && clearSecondary && !input.stripeWebhookSecretSecondary) {
+      input.clearStripeWebhookSecretSecondary = true;
+    }
+    const missingRequired =
+      provider === "stripe"
+        ? (!sameMode && (!input.stripeSecretKey || !input.stripeWebhookSecret)) ||
+          (sameMode &&
+            ((!settings.stripe.secretKeyConfigured && !input.stripeSecretKey) ||
+              (!settings.stripe.webhookSecretConfigured && !input.stripeWebhookSecret)))
+        : provider === "square"
+          ? (!sameMode && (!input.squareAccessToken || !input.squareWebhookSignatureKey)) ||
+            (sameMode &&
+              ((!settings.square.accessTokenConfigured && !input.squareAccessToken) ||
+                (!settings.square.webhookSignatureKeyConfigured && !input.squareWebhookSignatureKey)))
+          : false;
+    if (missingRequired) {
       setNotice("Enter both credentials for the selected provider and environment before activating it.");
       return;
     }
-    if (changingLive) setConfirm(input);
+    if (needsConfirmation) setConfirm(input);
     else void save(input).catch(() => {});
   }
 
-  function keyInput(name: SecretKey, label: string, suffix: string | null) {
-    return <Field label={label} required={newCredentialsRequired}
-      hint={newCredentialsRequired ? "Enter a key issued for the selected environment." : keyHint(suffix)}>
+  function keyInput(name: SecretKey, label: string, suffix: string | null, required = newCredentialsRequired) {
+    return <Field label={label} required={required}
+      hint={required && !sameMode ? "Enter a key issued for the selected environment." : keyHint(suffix)}>
       <Input type="password" value={secrets[name]} autoComplete="new-password" spellCheck={false} maxLength={256} disabled={saving}
         onChange={(event) => setSecrets((previous) => ({ ...previous, [name]: event.target.value }))} />
     </Field>;
@@ -135,9 +201,9 @@ export function PaymentSettings({ settings, saving, onSave }: {
       <form className="grid min-w-0 gap-5" onSubmit={submit}>
         <div className="grid min-w-0 gap-4 sm:grid-cols-3">
           <Field label="Payment provider" required><Select value={provider} options={providerOptions} disabled={saving}
-            onChange={(event) => { setProvider(event.target.value as PaymentConfig["provider"]); setSecrets(emptySecrets); }} /></Field>
+            onChange={(event) => { setProvider(event.target.value as PaymentConfig["provider"]); setSecrets(emptySecrets); setClearSecondary(false); }} /></Field>
           <Field label="Environment" required><Select value={mode} options={modeOptions} disabled={saving}
-            onChange={(event) => { setMode(event.target.value as PaymentConfig["mode"]); setSecrets(emptySecrets); }} /></Field>
+            onChange={(event) => { setMode(event.target.value as PaymentConfig["mode"]); setSecrets(emptySecrets); setClearSecondary(false); }} /></Field>
           <Field label="Invoice currency" hint="Three-letter ISO currency code." required><Input value={currency} disabled={saving}
             maxLength={3} autoCapitalize="characters" onChange={(event) => setCurrency(event.target.value)} /></Field>
         </div>
@@ -166,6 +232,21 @@ export function PaymentSettings({ settings, saving, onSave }: {
           {provider === "stripe" ? <>
             {keyInput("stripeSecretKey", "Stripe API secret key", settings.stripe.secretKeyLast4)}
             {keyInput("stripeWebhookSecret", "Stripe webhook signing secret", settings.stripe.webhookSecretLast4)}
+            {keyInput(
+              "stripeWebhookSecretSecondary",
+              "Secondary Stripe webhook signing secret",
+              settings.stripe.webhookSecretSecondaryLast4 ?? null,
+              false,
+            )}
+            {sameMode && settings.stripe.webhookSecretSecondaryConfigured ? (
+              <Checkbox
+                label="Remove secondary signing secret after rotation"
+                description="Retire the rollover webhook signing secret once Stripe sends events exclusively with the primary secret."
+                checked={clearSecondary}
+                disabled={saving || Boolean(secrets.stripeWebhookSecretSecondary.trim())}
+                onCheckedChange={setClearSecondary}
+              />
+            ) : null}
           </> : <>
             {keyInput("squareAccessToken", "Square access token", settings.square.accessTokenLast4)}
             {keyInput("squareWebhookSignatureKey", "Square webhook signature key", settings.square.webhookSignatureKeyLast4)}
@@ -239,8 +320,40 @@ export function PaymentSettings({ settings, saving, onSave }: {
         </Callout>
       </div>
     </Card> : null}
-    <ConfirmDialog title="Enable live payments?" open={confirm !== null} onOpenChange={(open) => { if (!open) setConfirm(null); }}
-      description="Customers will use the live provider to make real payments. Verify the provider account and live webhook before enabling it."
-      confirmLabel="Enable live payments" onConfirm={async () => { if (confirm) await save(confirm); }} />
+    <ConfirmDialog
+      title={
+        confirm?.provider === "none"
+          ? "Switch back to Pay by invoice?"
+          : confirm?.mode === "live"
+            ? "Enable live payments?"
+            : `Activate ${confirm ? providerLabels[confirm.provider] : "hosted checkout"} (test mode)?`
+      }
+      open={confirm !== null}
+      onOpenChange={(open) => {
+        if (!open) setConfirm(null);
+      }}
+      description={
+        confirm?.provider === "none"
+          ? "Hosted online checkout buttons will be turned off for new customer cart checkouts and unpaid invoices. Customers will place invoice-only orders while saved provider credentials remain stored."
+          : confirm?.mode === "live"
+            ? "Customer cart checkouts and unpaid issued invoices will redirect buyers to the live payment provider and charge real funds. Verify outbound API connectivity and live webhooks before enabling it."
+            : "Customer cart checkouts and unpaid issued invoices will offer hosted sandbox checkout instead of invoice-only settlement. Test payment methods will be accepted and no real funds will move."
+      }
+      confirmText={
+        confirm && confirm.provider !== "none" && confirm.mode === "live"
+          ? "ACTIVATE LIVE PAYMENTS"
+          : undefined
+      }
+      confirmLabel={
+        confirm?.provider === "none"
+          ? "Switch to Pay by invoice"
+          : confirm?.mode === "live"
+            ? "Enable live payments"
+            : "Activate hosted checkout"
+      }
+      onConfirm={async () => {
+        if (confirm) await save(confirm);
+      }}
+    />
   </div>;
 }

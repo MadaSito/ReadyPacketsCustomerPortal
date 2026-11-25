@@ -17,7 +17,9 @@ import {
 } from "../../trpc/trpc.js";
 import { customerRefSchema, emailSchema, nameSchema } from "./normalize.js";
 import { AUTH_METHODS } from "../../../shared/domain.js";
-import { COUNTRY_RULE_MODES, RESTRICTION_SCOPES, SIGN_IN_EVENT_KINDS, SSO_JIT_MODES, USER_STATUSES } from "./schema.js";
+import {
+  COUNTRY_RULE_MODES, ENTRA_MFA_MODES, RESTRICTION_SCOPES, SIGN_IN_EVENT_KINDS, SSO_JIT_MODES, SSO_MAPPED_ROLES, SSO_PROTOCOLS, USER_STATUSES,
+} from "./schema.js";
 import type { SignInMethods } from "./sso/service.js";
 import type { Services } from "../../container.js";
 
@@ -43,11 +45,18 @@ const ssoConfigInput = z.strictObject({
   clientSecret: z.string().min(1).max(512).nullable().optional(),
   buttonLabel: z.string().trim().max(60).nullable(),
   allowedDomains: z.array(z.string().trim().min(1).max(253)).max(50),
-  trustEntraMfa: z.boolean(),
   jitMode: z.enum(SSO_JIT_MODES),
   jitStaffAppRole: z.string().trim().max(120).nullable(),
   jitDailyLimit: z.number().int().min(1).max(500),
+  protocol: z.enum(SSO_PROTOCOLS),
+  samlEntityId: z.string().trim().min(1).max(255).nullable(),
+  entraMfaMode: z.enum(ENTRA_MFA_MODES),
+  entraModeConfirmation: z.string().max(40).optional(),
+  acceptedAuthnContexts: z.array(z.string().trim().min(1).max(255)).max(10),
+  allowedRoles: z.array(z.enum(USER_ROLES)).min(1).max(USER_ROLES.length),
 });
+const ssoManage = adminProcedure.use(requireCapability("identity.sso.manage"));
+const expectedVersion = z.number().int().min(1);
 
 /** Adds the sign-in method column (password / Microsoft) to list pages. */
 async function withSignInMethods<T extends { publicId: string }>(services: Services, page: { items: T[]; nextCursor: string | null }) {
@@ -270,6 +279,41 @@ export const identityRouter = router({
           await ctx.services.identity.sso.unbindUser(ctx.session, input.userId);
           return { ok: true as const };
         }),
+      /* increment 07 — SAML 2.0 (D10). Each mutation returns the refreshed admin view. */
+      saml: router({
+        importMetadata: ssoManage
+          .input(z.union([
+            z.strictObject({ expectedVersion, url: z.string().trim().min(10).max(2048) }),
+            z.strictObject({ expectedVersion, xml: z.string().min(100).max(512 * 1024) }),
+          ]))
+          .mutation(async ({ ctx, input }) => {
+            const result = await ctx.services.identity.sso.saml.importMetadata(ctx.session, input);
+            return { result, view: await ctx.services.identity.sso.adminView() };
+          }),
+        addCertificate: ssoManage
+          .input(z.strictObject({ expectedVersion, pem: z.string().min(100).max(16 * 1024) }))
+          .mutation(async ({ ctx, input }) => {
+            await ctx.services.identity.sso.saml.addCertificate(ctx.session, input);
+            return ctx.services.identity.sso.adminView();
+          }),
+        retireCertificate: ssoManage
+          .input(z.strictObject({ expectedVersion, certificateId: publicId }))
+          .mutation(async ({ ctx, input }) => {
+            await ctx.services.identity.sso.saml.retireCertificate(ctx.session, input);
+            return ctx.services.identity.sso.adminView();
+          }),
+      }),
+      roleMappings: router({
+        set: ssoManage
+          .input(z.strictObject({
+            expectedVersion,
+            mappings: z.array(z.strictObject({ appRoleValue: z.string().trim().min(1).max(120), role: z.enum(SSO_MAPPED_ROLES) })).max(20),
+          }))
+          .mutation(async ({ ctx, input }) => {
+            await ctx.services.identity.sso.saml.setRoleMappings(ctx.session, input);
+            return ctx.services.identity.sso.adminView();
+          }),
+      }),
     }),
     customers: router({
       list: staffProcedure

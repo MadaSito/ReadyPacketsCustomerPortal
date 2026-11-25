@@ -41,6 +41,8 @@ export const mailTemplatesRouter = router({
   listForAutomations: automationsRead.query(({ ctx }) =>
     ctx.services.mailTemplates.listForAutomations(ctx.session),
   ),
+  listForPhaseActions: adminProcedure.use(requireCapability("workflows.manage"))
+    .query(({ ctx }) => ctx.services.mailTemplates.listForPhaseActions(ctx.session)),
 
   get: mailManage
     .input(z.strictObject({ templateKey: templateKeySchema }))

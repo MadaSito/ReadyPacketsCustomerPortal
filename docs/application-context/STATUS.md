@@ -1,6 +1,6 @@
 # ReadyPackets Portal — Status
 
-Last updated: 2026-11-22 (increment 05 released; authenticator setup fix and the P101 test of prompt 22 recorded). Keep this file current; it is the honest state of the build,
+Last updated: 2026-11-25 (increment 07 lead QA and final gates recorded; PR #16). Keep this file current; it is the honest state of the build,
 not a certification. "Verified" below means the integrator ran the check and saw the result. Anything not
 listed under "Verified" has not been proven and must not be described as working in production.
 
@@ -70,7 +70,17 @@ listed under "Verified" has not been proven and must not be described as working
 | Word editing (increment 06) | browser-only conversion; save as new version, original kept; stated limits; ADR 0052 | `client/src/lib/docconvert`, `client/src/features/docedit`, `server/modules/files` |
 | Policies and MNDA (increment 06) | import from Word/Markdown/PDF, timed notices, enforcement with session end and `/accept-policy`, typed-name check, order agreement gate (off by default); ADR 0053 | `server/modules/{compliance,identity,orders,jobs}`, `client/src/features/compliance`, `client/src/lib/agreementGate` |
 | Receipts and discount limits (increment 06) | one receipt per confirmed payment with PDF, e-mail and portal tab; small-total waive/block; discount limits up to 100 % and `set_total`; ADR 0054 | `server/modules/{compliance,payments,promotions,cart}`, `client/src/features/{compliance,payments,promotions,cart}` |
-| Documentation | 54 ADRs, threat model, security reviews, guides for customers / staff / admins, runbooks, requirements register | `docs/` |
+| Phases-first workflows (increment 07) | definition format 3 with up to 20 named phases; customer phase wizard (Next, Submit and lock with acknowledgement); staff review and administrator reopen with a reason; questions with versioned answers; administrator checklist; standard workflow starting with "Payment"; ADR 0055 | `server/modules/orders`, `server/modules/orders/questions`, `shared/workflowStages.ts`, `client/src/features/orders/stages` |
+| Progress (increment 07) | weighted derived progress capped at 99 until a `done` status, shown as the higher of derived and explicit; `OrderProgress` progressbar on orders, lists, dashboard and console; recalculated by `orders.increment07.startup` at every boot and every 10 minutes; ADR 0055 | `shared/workflowStages.ts`, `server/modules/orders`, `client/src/ui` |
+| Status catalogue and attention (increment 07) | `/admin/workflows/statuses`; "Awaiting staff review" and "Awaiting customer response" filters and counts; optional reminder alerts (off); ADR 0056 | `server/modules/orders/statusCatalog*`, `client/src/features/orders` |
+| Phase actions and rules (increment 07) | human-confirmed bundle (status, completion fixed or a range drawn once, e-mail, webhook, alert), delays up to 30 days, rule ordering and new triggers; unattended rules never change status; ADR 0057 | `server/modules/automations` |
+| Operational alerts and phase webhooks (increment 07) | `/admin/alerts`; P101 / P201 auto-queue (off per workflow; P101 on a real payment record); pipeline signing (off); stop, retry, redeliver; live integrations hub cards; ADR 0058 | `server/modules/{opsAlerts,integrations}` |
+| Phase files (increment 07) | phase-bound uploads (`STAGE_REQUIRED` on phases orders), governance, playback grants with range requests, phase and whole-order ZIP; ADR 0059 | `server/modules/files`, `client/src/features/files` |
+| Stripe completion (increment 07) | order payment state, Pay online, async payments, `/admin/payments/setup` with gated activation, rejections log; ADR 0060 | `server/modules/{payments,compliance}`, `client/src/features/payments` |
+| Microsoft 365 file sync (increment 07) | one-way per phase to SharePoint, write check, bounded resync, health and alerts (off until configured); ADR 0061 | `server/modules/{storage,sharepoint}` |
+| SAML with Entra ID (increment 07) | SP-initiated SAML 2.0 with a hardened wrapper, pinned certificates, MFA modes `claim` / `entra` / `portal`, allowed roles, daily metadata check (off until configured); ADR 0062 | `server/modules/identity/sso`, `client/src/features/identity/sso` |
+| Migration (increment 07) | `migrations/0007_increment_07.sql`, additive: 16 tables, 40 columns on 11 tables, one widened enum, 96 statements, no `DROP` | `migrations/` |
+| Documentation | 62 ADRs, threat model, security reviews, guides for customers / staff / admins, runbooks, requirements register | `docs/` |
 
 ## Verified in session 01 (integrator's own runs)
 
@@ -370,6 +380,68 @@ Details are in `docs/session-logs/2026-11-22-session-03.md`.
   not started; the pipeline switch was turned off afterwards. webhook.site is a request inspector, so this
   proves delivery and format, not the production receiver.
 
+## Verification for increment 07
+
+The lead's QA of 2026-11-25 (QA 5044), on a production build against MySQL in a real Chromium browser, with synthetic data. The three groups below are kept apart on purpose.
+
+### Verified by the lead in a browser
+
+- **SAML:** round trips against a local fake IdP in all three MFA modes (`claim`, `entra`, `portal`).
+- **Phase lifecycle**, as administrator and customer:
+  - Next, and Submit and lock with acknowledgement;
+  - review accept and changes requested;
+  - reopen with a reason;
+  - the guards answering 409.
+- **Progress bar:** values including weights, and the recalculation at boot. The boot run finished about 200 ms after the server started listening.
+- **Phase action bundles:**
+  - preview and confirm;
+  - a fixed completion, and a delayed range completion that survived a restart;
+  - the e-mail queued and the alert created;
+  - the P201 skip reason, the run summary toast and the counts.
+- **Alerts:** acknowledge and resolve on `/admin/alerts`.
+- **Status catalogue:** add and retire.
+- **Stripe:**
+  - the setup page gates;
+  - a fake-key API test failing gracefully with 401;
+  - a signed webhook end to end, with a locally signed event;
+  - the rejection log.
+- **Customer uploads in a phase:**
+  - a PDF accepted and a disguised file refused;
+  - WAV to a WebM copy;
+  - the allowance countdown.
+- **Downloads:** a single download, audio playback with a 206 range answer, phase ZIP as customer and as staff, and a whole-order ZIP behind step-up.
+- **Webhooks:** a subscription test delivery, the delivery detail, and Retry (attempt count 2).
+- **Lifecycle auto-queue:** P101 queued after a recorded manual payment. The dispatch reached `https://example.com` and got 405, which proves the transport, not the receiver.
+- **Integrations hub:** every link answered 200.
+
+### Peer-reported (automated tests, not driven by the lead in a browser)
+
+- SharePoint / OneDrive managed file sync against mocked Graph;
+- the Graph `Sites.Selected` write check;
+- redelivery records;
+- stop controls;
+- inbound endpoints;
+- delayed completion of up to 30 days;
+- rule ordering, enabling and deleting;
+- clarification question versioning;
+- receipts to Microsoft 365.
+
+### Not verifiable in this environment
+
+- a real Stripe account (live or test-mode keys);
+- a real Microsoft Entra tenant;
+- a real SharePoint site;
+- the owner's production P101 / P201 receiver;
+- the Docker image build;
+- a reverse proxy with TLS on the VPS;
+- real SMTP.
+
+### Gates
+
+- **Full vitest at `7c6bb71`:** 229 files, with 2,894 tests passed, 1 flaky client test (being fixed) and 4 todo.
+- **Final gates** on `fa9780a` (`54c6f26` plus a gitleaks baseline commit): full vitest 229 files, 2,896 passed, 4 todo, 0 failed; type check clean; `eslint . --max-warnings 0` clean; `pnpm audit --prod` reported no known vulnerabilities; gitleaks found no leaks (five reviewed synthetic fixtures were added to `.gitleaksignore` in `fa9780a`). The branch is on [PR #16](https://github.com/MadaSito/ReadyPacketsCustomerPortal/pull/16), to be merged with a merge commit once the four workflows (ci, security, container, native-install) pass; CI results live on the PR.
+- **Since the QA pass:** `54c6f26` shows production dispatches as "Failed" or "Failed (retrying)" with the next attempt time, uses readable trigger labels and adds a "Switched off" badge on the integrations hub; `fd20503` makes the pending-upload guard use layout effects. ui_foundation's sweep on `7c6bb71` found no axe violations and no overflow at 320, 768 and 1280 px in both themes on all changed pages, with reduced motion honoured and one polite announcement per progress change; the Stripe activation confirm dialog and the run-summary callout were not swept. No screen-reader or physical-phone pass was done.
+
 ## Verified for increment 06 (integrator's own runs)
 
 The lead checked these live in a real Chromium browser, against a QA build with strict CSP and synthetic data, on 2026-11-23.
@@ -414,6 +486,13 @@ Defects found in lead QA and fixed before merge:
 
 ## Not verified
 
+- increment 07:
+  - a real Stripe account, so Stripe completion was tested only with a locally signed event and a fake key;
+  - a real Microsoft Entra tenant, so SAML was tested only against a local fake IdP;
+  - a real SharePoint site, so file sync was tested only against mocked Graph;
+  - the owner's production P101 / P201 receiver;
+  - the Docker image build, a reverse proxy with TLS on the VPS, and real SMTP;
+  - physical phones and a screen-reader pass over the phase wizard.
 - increment 06:
   - no real Stripe or Square account, so the waive path for totals below the provider minimum is covered by tests only;
   - receipt e-mail delivery end to end (mail is not configured in QA);
@@ -456,6 +535,13 @@ Defects found in lead QA and fixed before merge:
 
 ## Outstanding and known limits
 
+- Increment 07 decisions the owner should confirm (ADRs 0055–0062):
+  - the progress formula: weighted, capped at 99 until a `done` status, and the higher of derived and explicit;
+  - publishing the prepared phases draft of the default workflow; running orders keep their version;
+  - the 250-file, 500 MiB and 30-minute ZIP limits;
+  - the nine Stripe events, and staff review of refunds made in the Stripe dashboard;
+  - the MFA mode for SSO: upgraded configurations start in `portal`, and `entra` makes MFA depend entirely on the Entra tenant's policies.
+  - **Not built:** document conversion profiles, two-way SharePoint sync, unattended status changes, IdP-initiated SAML, single logout, encrypted assertions, and Stripe Elements.
 - Increment 02 decisions the owner should confirm: Packet 8 is not loaded or offered; the 15% bundle
   discount applies only when all six packets are in one order; `order_scope_mode` is never sent (per the
   corrected P101 document); P101 / P201 are started by staff by hand and there is no callback from the

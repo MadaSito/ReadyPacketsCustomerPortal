@@ -570,8 +570,9 @@ describe("Package I — integrations.webhooks (outbound, inbound HTTP, I-01, rep
     expect(rotated.subscription.hasOverlapSecret).toBe(true);
 
     // Trigger via AuditTap (`invoice.payment.recorded` -> `invoice.paid`) and verify `automation:` correlationId is suppressed
-    expect(registeredTaps).toHaveLength(1);
-    const tap = registeredTaps[0]!;
+    expect(registeredTaps).toHaveLength(2);
+    const tap = registeredTaps.find((t) => t.listens("invoice.payment.recorded"))!;
+    expect(tap).toBeDefined();
     const tapEvent: AuditTapEvent = {
       eventId: "01JAUDITEVT000000000000001",
       occurredAt: h.clock.now().toISOString(),

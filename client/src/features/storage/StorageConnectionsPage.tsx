@@ -557,6 +557,9 @@ export function StorageConnectionsPage() {
         actions={
           <div className="flex flex-wrap gap-2">
             <Button asChild variant="secondary" size="sm">
+              <Link href="/admin/storage/file-sync">Microsoft 365 file sync</Link>
+            </Button>
+            <Button asChild variant="secondary" size="sm">
               <Link href="/admin/sharepoint-sync">SharePoint order sync</Link>
             </Button>
             <Button asChild size="sm">

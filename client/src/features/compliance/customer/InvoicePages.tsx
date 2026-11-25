@@ -1,13 +1,21 @@
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
-import { Download, Plus, ReceiptText } from "lucide-react";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { CreditCard, Download, Plus, ReceiptText } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { Link, useLocation, useParams, useSearch } from "wouter";
 import type { InvoiceDetailView, InvoicePaymentView, InvoiceSummaryView } from "@server/modules/compliance/invoicesService";
-import { useTRPC } from "@/lib/trpc";
+import { errorMessage, useTRPC } from "@/lib/trpc";
 import { Breadcrumbs, Button, Callout, Card, DateTime, EmptyState, ErrorState, KeyValueList, LoadMore, Money, PageHeader, Section, Skeleton, Tabs } from "@/ui";
 import { useCan } from "../admin/common";
 import { ConsoleOrderReceiptsSection, CustomerOrderReceiptsSection, CustomerReceiptsPanel } from "../receipts/ReceiptViews";
 import { downloadInvoicePdf, InvoiceStatusBadge } from "../shared";
+
+const PUBLIC_ID_PATTERN = /^[0-9A-HJKMNP-TV-Z]{26}$/u;
+
+export const invoiceCheckoutNavigation = {
+  redirectToHostedCheckout(url: string): void {
+    window.location.assign(url);
+  },
+};
 
 function Amount({ minor, currency }: { minor: number; currency: string }) {
   return <Money value={{ amountMinor: minor, currency }} />;
@@ -15,6 +23,185 @@ function Amount({ minor, currency }: { minor: number; currency: string }) {
 
 function DueDate({ date }: { date: Date | null }) {
   return date ? <DateTime value={date} format="date" /> : <>No due date set</>;
+}
+
+function InvoicePaymentReturnBannerLoader({
+  attemptPublicId,
+  resultHint,
+  currentInvoiceId,
+}: {
+  attemptPublicId: string;
+  resultHint: string | null;
+  currentInvoiceId?: string;
+}) {
+  const trpc = useTRPC();
+  const statusQuery = useQuery({
+    ...trpc.payments.checkoutStatus.queryOptions({ attemptPublicId }),
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      if (!data) return false;
+      if (data.invoiceStatus === "paid" || data.invoiceStatus === "void") return false;
+      return data.attempt?.status === "redirected" ? 3000 : false;
+    },
+  });
+
+  if (statusQuery.isPending) {
+    return (
+      <Callout tone="info" title="Checking payment status" live="polite">
+        Verifying your invoice payment status with the payment provider.
+      </Callout>
+    );
+  }
+
+  if (statusQuery.isError || !statusQuery.data) {
+    return null;
+  }
+
+  const data = statusQuery.data;
+  const showInvoiceLink = Boolean(data.invoicePublicId && data.invoicePublicId !== currentInvoiceId);
+
+  if (data.invoiceStatus === "paid") {
+    return (
+      <Callout tone="success" title="Payment confirmed" live="polite">
+        <p>Your payment has been verified and recorded on this invoice.</p>
+        <div className="mt-2 flex flex-wrap gap-3">
+          {showInvoiceLink ? (
+            <Link
+              href={`/invoices/${encodeURIComponent(data.invoicePublicId)}`}
+              className="font-semibold text-action underline underline-offset-2"
+            >
+              View paid invoice
+            </Link>
+          ) : null}
+          {data.receiptPublicId ? (
+            <Link
+              href={`/receipts/${encodeURIComponent(data.receiptPublicId)}`}
+              className="font-semibold text-action underline underline-offset-2"
+            >
+              View payment receipt
+            </Link>
+          ) : null}
+        </div>
+      </Callout>
+    );
+  }
+
+  if (resultHint === "cancelled" || data.attempt?.status === "cancelled") {
+    return (
+      <Callout tone="info" title="Checkout was cancelled" live="polite">
+        <p>No payment was completed. You can pay this invoice online whenever you are ready.</p>
+        {showInvoiceLink ? (
+          <p className="mt-2">
+            <Link
+              href={`/invoices/${encodeURIComponent(data.invoicePublicId)}`}
+              className="font-semibold text-action underline underline-offset-2"
+            >
+              Return to invoice
+            </Link>
+          </p>
+        ) : null}
+      </Callout>
+    );
+  }
+
+  if (data.attempt?.status === "failed" || data.attempt?.status === "expired") {
+    return (
+      <Callout tone="warning" title="Payment was not completed" live="polite">
+        <p>The checkout session ended without a confirmed payment. Open the invoice to start a new payment attempt.</p>
+        {showInvoiceLink ? (
+          <p className="mt-2">
+            <Link
+              href={`/invoices/${encodeURIComponent(data.invoicePublicId)}`}
+              className="font-semibold text-action underline underline-offset-2"
+            >
+              Open invoice
+            </Link>
+          </p>
+        ) : null}
+      </Callout>
+    );
+  }
+
+  return (
+    <Callout tone="info" title="Confirming your payment" live="polite">
+      <p>
+        We received your return from hosted checkout and are waiting for the signed confirmation from the payment provider. Bank-debit methods can take 1 to 5 business days to settle; this page updates automatically once confirmed.
+      </p>
+      {showInvoiceLink ? (
+        <p className="mt-2">
+          <Link
+            href={`/invoices/${encodeURIComponent(data.invoicePublicId)}`}
+            className="font-semibold text-action underline underline-offset-2"
+          >
+            View invoice details
+          </Link>
+        </p>
+      ) : null}
+    </Callout>
+  );
+}
+
+function InvoicePaymentReturnBanner({ currentInvoiceId }: { currentInvoiceId?: string }) {
+  const search = useSearch();
+  const params = new URLSearchParams(search);
+  const attempt = params.get("attempt")?.trim() ?? "";
+  if (!PUBLIC_ID_PATTERN.test(attempt)) return null;
+  return (
+    <InvoicePaymentReturnBannerLoader
+      attemptPublicId={attempt}
+      resultHint={params.get("result")}
+      currentInvoiceId={currentInvoiceId}
+    />
+  );
+}
+
+function InvoiceOnlinePayAction({
+  invoice,
+  variant = "primary",
+  onCheckoutError,
+}: {
+  invoice: InvoiceDetailView;
+  variant?: "primary" | "secondary";
+  onCheckoutError: (message: string | null) => void;
+}) {
+  const trpc = useTRPC();
+  const queryClient = useQueryClient();
+  const startCheckout = useMutation(trpc.payments.startInvoiceCheckout.mutationOptions());
+
+  async function payOnline() {
+    onCheckoutError(null);
+    try {
+      const invoicePath = `/invoices/${invoice.invoicePublicId}`;
+      const res = await startCheckout.mutateAsync({
+        invoicePublicId: invoice.invoicePublicId,
+        successPath: invoicePath,
+        cancelPath: invoicePath,
+      });
+      if (res.mode === "redirect") {
+        invoiceCheckoutNavigation.redirectToHostedCheckout(res.redirectUrl);
+        return;
+      }
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: trpc.compliance.invoices.pathKey() }),
+        queryClient.invalidateQueries({ queryKey: trpc.compliance.receipts.pathKey() }),
+      ]);
+    } catch (error) {
+      onCheckoutError(errorMessage(error, "Online checkout could not be started for this invoice."));
+    }
+  }
+
+  return (
+    <Button
+      variant={variant}
+      leadingIcon={<CreditCard aria-hidden="true" />}
+      loading={startCheckout.isPending}
+      onClick={() => {
+        void payOnline();
+      }}
+    >
+      Pay online
+    </Button>
+  );
 }
 
 function InvoiceList({
@@ -91,6 +278,9 @@ export function InvoicesPage() {
   return (
     <>
       <PageHeader title="Invoices" description="See issued invoices, confirmed payment receipts, and their payment status." />
+      <div className="mb-4">
+        <InvoicePaymentReturnBanner />
+      </div>
       <Tabs
         label="Billing documents"
         value={activeTab}
@@ -165,6 +355,7 @@ const paymentLabels: Record<InvoicePaymentView["method"], string> = {
 function InvoiceDetail({ invoice }: { invoice: InvoiceDetailView }) {
   const [downloading, setDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState(false);
+  const [checkoutError, setCheckoutError] = useState<string | null>(null);
   async function download() {
     if (downloading) return;
     setDownloading(true);
@@ -174,13 +365,23 @@ function InvoiceDetail({ invoice }: { invoice: InvoiceDetailView }) {
     finally { setDownloading(false); }
   }
   const amount = (minor: number) => <Amount minor={minor} currency={invoice.currency} />;
+  const canPayOnline = invoice.onlinePaymentConfigured && invoice.status === "issued" && invoice.balanceDueMinor > 0;
   return (
     <div className="space-y-6">
       <PageHeader breadcrumbs={<Breadcrumbs items={[{ href: "/invoices", label: "Invoices" }, { label: invoice.invoiceNumber ?? "Invoice details" }]} />}
         title={invoice.invoiceNumber ?? "Invoice details"} description={`Order ${invoice.orderReference}`}
         meta={<InvoiceStatusBadge status={invoice.status} />}
-        actions={<Button leadingIcon={<Download aria-hidden="true" />} variant="secondary" loading={downloading} onClick={() => void download()}>Download PDF</Button>} />
+        actions={
+          <div className="flex flex-wrap items-center gap-2">
+            {canPayOnline ? <InvoiceOnlinePayAction invoice={invoice} onCheckoutError={setCheckoutError} /> : null}
+            <Button leadingIcon={<Download aria-hidden="true" />} variant="secondary" loading={downloading} onClick={() => void download()}>
+              Download PDF
+            </Button>
+          </div>
+        } />
+      <InvoicePaymentReturnBanner currentInvoiceId={invoice.invoicePublicId} />
       {downloadError ? <Callout tone="danger" live="assertive">We couldn’t download this PDF. Try again or contact us if the problem continues.</Callout> : null}
+      {checkoutError ? <Callout tone="danger" title="Could not start online payment" live="assertive">{checkoutError}</Callout> : null}
       <Card title="Invoice summary">
         <KeyValueList columns={3} items={[
           { label: "Issued by", value: invoice.issuerName },
@@ -211,9 +412,21 @@ function InvoiceDetail({ invoice }: { invoice: InvoiceDetailView }) {
           ...(invoice.memo ? [{ label: "Invoice note", value: <p className="whitespace-pre-wrap">{invoice.memo}</p>, wide: true }] : []),
         ]} />
       </Card>
-      <Callout tone="info" title="Online payment is not available.">
-        <Link href="/support" className="font-semibold text-action underline underline-offset-2">Contact us</Link> for payment instructions or questions about this invoice.
-      </Callout>
+      {canPayOnline ? (
+        <Callout tone="info" title="Online checkout available">
+          <p>
+            Pay the outstanding balance of {amount(invoice.balanceDueMinor)} securely through hosted checkout, or{" "}
+            <Link href="/support" className="font-semibold text-action underline underline-offset-2">
+              contact us
+            </Link>{" "}
+            if you have billing questions.
+          </p>
+        </Callout>
+      ) : invoice.status !== "paid" && invoice.status !== "void" ? (
+        <Callout tone="info" title="Online payment is not available.">
+          <Link href="/support" className="font-semibold text-action underline underline-offset-2">Contact us</Link> for payment instructions or questions about this invoice.
+        </Callout>
+      ) : null}
       <Section title="Line items">
         {invoice.lines.length ? <ul className="grid gap-3">
           {invoice.lines.map((line) => <li key={line.linePublicId}>
@@ -271,6 +484,6 @@ function InvoiceUnavailable() {
 
 export function InvoiceDetailPage() {
   const { invoiceId } = useParams<{ invoiceId: string }>();
-  return invoiceId && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(invoiceId)
+  return invoiceId && PUBLIC_ID_PATTERN.test(invoiceId)
     ? <InvoiceDetailQuery key={invoiceId} invoiceId={invoiceId} /> : <InvoiceUnavailable />;
 }

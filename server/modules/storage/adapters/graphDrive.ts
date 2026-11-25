@@ -3,7 +3,8 @@
  * Business (`onedrive`). Destination for COPIES only; local storage stays authoritative (ADR / decision 5).
  *
  * Permissions (least privilege, documented in API.md): application permission `Sites.Selected` with a
- * `write` grant on the one site (SharePoint), or `Files.ReadWrite.All` restricted by policy (OneDrive).
+ * `write` grant on the one site (SharePoint). OneDrive application access can require tenant-wide
+ * `Files.ReadWrite.All`; a configured root path does not narrow the application's provider permissions.
  *
  * put():
  *  - Names are mapped to SharePoint/OneDrive-safe names (graphDriveNames.ts) and the full decoded path,
@@ -88,7 +89,7 @@ const asRecord = (v: unknown): Record<string, unknown> => (v && typeof v === "ob
 const str = (v: unknown): string | null => (typeof v === "string" && v.length > 0 && v.length <= 2048 ? v : null);
 
 function expectOk(res: GraphResponse, ...ok: number[]): Record<string, unknown> {
-  if (!ok.includes(res.status)) throw fromStatus(res.status);
+  if (!ok.includes(res.status)) throw fromStatus(res.status, res.headers["retry-after"]);
   return asRecord(res.body);
 }
 
@@ -156,7 +157,8 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
   };
 
   /** Returns the folder item id at root + segments (creating missing folders) and the REAL segment names. */
-  const ensureFolderId = async (segments: readonly string[], signal?: AbortSignal, beforeWrite?: () => Promise<void>): Promise<{ id: string; names: string[] }> => {
+  const ensureFolderId = async (segments: readonly string[], signal?: AbortSignal, beforeWrite?: () => Promise<void>,
+    requireExistingRoot = false): Promise<{ id: string; names: string[] }> => {
     const full = [...root, ...segments];
     const rootItem = await itemByPath([], signal);
     let parentId = str(rootItem?.id);
@@ -172,6 +174,7 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
         if (!existing.folder) throw new StorageAdapterError("DESTINATION_CONFLICT", false);
         folder = existing;
       } else {
+        if (requireExistingRoot && i < root.length) throw new StorageAdapterError("DESTINATION_NOT_FOUND");
         await beforeWrite?.();
         const res = await call({
           method: "POST",
@@ -282,6 +285,7 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
     let offset = 0;
     let finalItem: Record<string, unknown> | null = null;
     let identical: { item: Record<string, unknown>; quickXor: string } | null = null;
+    let finalSent = false;
     const stopIdentical = new Error("identical");
     // A lost fence must reach the job layer unchanged (never re-labelled as a retryable provider error).
     let fenceError: { error: unknown } | null = null;
@@ -312,8 +316,10 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
             let r: GraphResponse | null = null;
             await fence();
             try {
-              r = await graph.uploadSessionPut({ url, body: chunk, contentRange: `bytes ${offset}-${end}/${input.size}`, signal: input.signal, beforeSend: fence });
+              r = await graph.uploadSessionPut({ url, body: chunk, contentRange: `bytes ${offset}-${end}/${input.size}`, signal: input.signal,
+                beforeSend: async () => { await fence(); if (end === input.size - 1) finalSent = true; } });
             } catch (error) {
+              if (input.exactCreate && finalSent && !fenceError) throw new StorageAdapterError("OUTCOME_UNKNOWN");
               if (fenceError || attempt >= CHUNK_ATTEMPTS) throw error instanceof StorageAdapterError || fenceError ? error : toAdapterError(error);
             }
             if (r && (r.status === 200 || r.status === 201)) {
@@ -321,6 +327,10 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
               break;
             }
             if (r && r.status === 202) break;
+            if (input.exactCreate && r) {
+              if (finalSent && r.status >= 500) throw new StorageAdapterError("OUTCOME_UNKNOWN");
+              throw fromStatus(r.status, r.headers["retry-after"]);
+            }
             // Name taken at commit by a concurrent writer: nothing of ours was committed; a retry picks the next name.
             if (r && r.status === 409) throw new StorageAdapterError("DESTINATION_CONFLICT", true);
             if (r && !(r.status >= 500 || r.status === 429)) throw fromStatus(r.status);
@@ -344,13 +354,41 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
       if (error === stopIdentical && identical) return { kind: "identical", ...(identical as { item: Record<string, unknown>; quickXor: string }) };
       throw toAdapterError(error);
     }
-    if (!finalItem) throw new StorageAdapterError("PROVIDER_UNAVAILABLE", true);
+    if (!finalItem) throw input.exactCreate && finalSent ? new StorageAdapterError("OUTCOME_UNKNOWN") : new StorageAdapterError("PROVIDER_UNAVAILABLE", true);
     return { kind: "uploaded", item: finalItem, quickXor: hash.digestBase64() };
   };
 
   return {
     // put() validates names and the full path first, then creates its folders behind beforeWrite.
     putCreatesFolders: true,
+
+    async testWrite(beforeWrite, signal): Promise<StorageTestResult> {
+      try {
+        const folder = await itemByPath(root, signal);
+        const parentId = folder?.folder ? str(folder.id) : null;
+        const { tenant } = await describeDrive(signal);
+        if (!parentId || !tenant) return { ok: false, code: "DESTINATION_NOT_FOUND" };
+        const name = `readypackets-write-check-${crypto.randomUUID()}.tmp`;
+        const res = await call({
+          method: "POST", path: `${drive}/items/${encodeURIComponent(parentId)}:/${name}:/createUploadSession`,
+          body: { item: { "@microsoft.graph.conflictBehavior": "fail" } }, signal, beforeSend: beforeWrite,
+        });
+        const url = checkUploadUrl(expectOk(res, 200).uploadUrl, tenant);
+        if (!url) return { ok: false, code: "DESTINATION_DENIED" };
+        // Cancellation proves the chunk-session egress path without writing a file or deleting an item.
+        expectOk(await graph.uploadSessionControl({ url, method: "DELETE", signal, beforeSend: beforeWrite }), 204, 200);
+        return { ok: true, code: "OK" };
+      } catch (error) {
+        const { code } = toAdapterError(error);
+        return { ok: false, code: code === "AUTH_FAILED" || code === "DESTINATION_DENIED" || code === "DESTINATION_NOT_FOUND" ||
+          code === "EGRESS_DENIED" || code === "RATE_LIMITED" || code === "NOT_CONFIGURED" ? code : "PROVIDER_UNAVAILABLE" };
+      }
+    },
+    async inspectExact(path, name, signal) {
+      const prepared = await prepare(path, name, signal);
+      if (!prepared.name) throw new StorageAdapterError("INVALID_INPUT");
+      return await itemByPath([...root, ...prepared.folders, prepared.name], signal) ? "present" : "missing";
+    },
 
     async test(signal?: AbortSignal): Promise<StorageTestResult> {
       try {
@@ -382,8 +420,9 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
       if (!name) throw new StorageAdapterError("INVALID_INPUT", false);
       // Simple PUT needs a raw-bytes request; transports without it use a (single-chunk) upload session.
       if (input.size === 0 && graph.supportsRawBody === false) throw new StorageAdapterError("INVALID_INPUT", false);
-      const simple = input.size <= SIMPLE_UPLOAD_MAX && graph.supportsRawBody !== false;
-      const parent = await ensureFolderId(folders, input.signal, input.beforeWrite);
+      if (input.exactCreate && input.size === 0) throw new StorageAdapterError("INVALID_INPUT");
+      const simple = !input.exactCreate && input.size <= SIMPLE_UPLOAD_MAX && graph.supportsRawBody !== false;
+      const parent = await ensureFolderId(folders, input.signal, input.beforeWrite, input.exactCreate === true);
       const folderPath = [...root, ...parent.names];
 
       let bytes: Buffer | null = null;
@@ -401,14 +440,18 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
       const sameSize: Record<string, unknown>[] = [];
       const identicalTo = (hash: string) => sameSize.find((item) => hashOf(item) === hash) ?? null;
       const done = async (item: Record<string, unknown>, hash: string, candidate: string) => {
-        const result = await verify(item, input.size, hash, input.signal);
+        const result = await verify(item, input.size, hash, input.signal).catch((error: unknown) => {
+          if (input.exactCreate) throw new StorageAdapterError("OUTCOME_UNKNOWN");
+          throw error;
+        });
         // The real final path below the configured root: drive casing for folders, the committed file name.
         return { ...result, targetPath: [...parent.names, str(item.name) ?? candidate] };
       };
-      for (let n = 0; n <= MAX_SUFFIX; n++) {
+      for (let n = 0; n <= (input.exactCreate ? 0 : MAX_SUFFIX); n++) {
         const candidate = conflictVariant(name, n);
         const existing = await itemByPath([...folderPath, candidate], input.signal);
         if (existing) {
+          if (input.exactCreate) throw new StorageAdapterError("DESTINATION_CONFLICT");
           if (existing.file && existing.size === input.size) sameSize.push(existing);
           continue;
         }

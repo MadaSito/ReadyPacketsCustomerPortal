@@ -29,6 +29,8 @@ export {
   JOB_PURGE_RUNS,
   JOB_SCHEDULE_TICK,
 } from "./service.js";
+export { JOB_APPLY_COMPLETION } from "./completionJobs.js";
+export { STAGE_BUNDLES_DISABLED_MESSAGE } from "./stageBundles.js";
 
 export function createAutomationsModule(deps: ModuleDeps): AutomationsModule {
   return createAutomationsService(deps);

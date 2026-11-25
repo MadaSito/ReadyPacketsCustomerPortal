@@ -654,4 +654,25 @@ export interface AcceptanceLogExportResult {
 - Strict receipt & refund-note ACL (`assertCustomerReceiptAccess`): only the order buyer (`order.customerId === userId`), an active explicit billing grant (`billing` / `billing_viewer` / `payer` / `finance`), or staff with `invoices.read_all` may list, view, or download receipts and refund notes (`/api/compliance/receipts/:receiptPublicId/pdf`, `/api/compliance/refund-notes/:notePublicId/pdf`). Generic order collaborators receive a detail-free `404 NOT_FOUND` on direct ID/PDF routes and `FORBIDDEN` on `listForOrder` (gracefully hidden in `CustomerOrderReceiptsSection`).
 - Routes & UI: customer `/invoices` (`"Invoices"` | `"Receipts"` tabs), `/receipts/:receiptId`, Console `/admin/receipts/:receiptId`, Console order billing `"Payment receipts"` section, customer profile `"Receipts"` tab (`CustomerReceiptsTab`), and `CompanyProfileDialog` on `/admin/invoices`.
 
+---
+
+## 11. Increment 07 — Package M (D9 Order/Cart Payment Booking, Customer Pay Online & D12 Receipt Sync Port)
+
+- **Atomic booking side-effects inside `tx` (`server/modules/compliance/invoicesService.ts`)**:
+  - Whenever an invoice becomes settled (`bookVerifiedProviderPayment`, `recordManualPayment`, or `settleCheckoutInvoiceInTx` for `zero_total` / `waived_small_total`), `compliance` runs inside the same database transaction:
+    1. `services.cart.onInvoicePaidInTx({ invoicePublicId, orderPublicId, paidAt }, tx)` — transitions any `awaiting_payment` cart to `checked_out`.
+    2. `services.orders.payments.onInvoicePaidInTx({ orderPublicId, invoicePublicId, paidAt, method: provider ? "stripe" : "manual", amountMinor, currency }, tx)` — sets `orders.payment_state = "paid"` + `paid_at`, completes any stage with `completesOn: "payment"`, and advances the order with history reason `INVOICE_PAID`.
+    3. Issues the immutable payment receipt (`RPR-...`) and stages optional Microsoft 365 receipt sync (`services.storageConnections?.stageReceiptPdf({ receiptPublicId, orderPublicId }, tx)`).
+    4. Records durable `invoice.payment.recorded` (`outcome: "completed"`, attributes include `order_public_id`, `invoice_public_id`, `method`, `amount_minor`, `currency`, `payment_state: "paid"`), firing the `payment.succeeded` (`D5`) and `invoice.paid` automation triggers.
+  - Whenever a refund settles (`bookSettledRefundInTx` or `invoices.admin.recordRefund`), `compliance` updates receipt refund state / issues `RPRN-...`, calls `services.orders.payments.onPaymentEventInTx({ orderPublicId, kind: resultingState, eventRef }, tx)` (`"partially_refunded" | "refunded"`), and ensures durable `payment.refund.succeeded` (`outcome: "completed"`) is recorded for the `payment.refunded` (`D5`) trigger.
+- **Customer Invoice `"Pay online"` & Return Banner (`invoicesService.ts`, `client/src/features/compliance/customer/InvoicePages.tsx`)**:
+  - `compliance.invoices.get` and `compliance.invoices.listForOrder` populate `onlinePaymentConfigured` from live `services.payments.isOnlineCheckoutEnabled(tx)`.
+  - Customer `/invoices` and `/invoices/:invoiceId` render a `"Pay online"` action on issued unpaid invoices (`balanceDueMinor > 0`) when `onlinePaymentConfigured === true`, invoking `trpc.payments.startInvoiceCheckout` with return paths `/invoices/:invoiceId`, and render a read-only return status banner when `?attempt=<ulid>&result=return|cancelled` is present (polling `trpc.payments.checkoutStatus` and linking to `/receipts/:receiptPublicId` once webhook-confirmed).
+- **D12 Microsoft 365 Receipt PDF Source Port (`services.compliance.receipts.getFileSyncPdf`)**:
+  - `getFileSyncPdf(input: { receiptPublicId: string; orderPublicId: string }, tx: Tx): Promise<Buffer | null>`
+  - Verifies the `compliance_payment_receipts` row exists, matches `orderPublicId`, and has `origin === "portal"`, decrypts `pdf_enc` with AAD `compliance_payment_receipts.pdf:<receiptPublicId>`, and returns the immutable PDF `Buffer` (or `null` when missing, mismatched, or imported).
+- **D5 Trigger Context Resolvers (`server/modules/compliance/automationTriggers.ts`)**:
+  - Registers context resolvers (`order_owner`, `order_assignee`, `order_reference`, `order_status`, `recipient_name`, plus safe scalar fields) for `payment.succeeded`, `payment.failed`, `payment.refunded`, `intake.submitted`, and `intake.reviewed`.
+
+
 

@@ -97,6 +97,7 @@ interface GraphApiErrorLike {
   name?: unknown;
   reasonCode?: unknown;
   status?: unknown;
+  retryAfterSeconds?: unknown;
   retryable?: unknown;
   requestSent?: unknown;
   reason?: unknown;
@@ -118,7 +119,8 @@ export function mapGraphError(error: unknown): GraphResponse {
   if (tag.includes("TOO_LARGE")) throw new GraphTransportError("RESPONSE_TOO_LARGE", false);
   if (tag.includes("TIMEOUT")) throw new GraphTransportError("TIMEOUT", true);
   if (typeof e.status === "number" && Number.isInteger(e.status) && e.status >= 100 && e.status <= 599) {
-    return { status: e.status, headers: {}, body: null };
+    return { status: e.status, headers: typeof e.retryAfterSeconds === "number" ?
+      { "retry-after": String(e.retryAfterSeconds) } : {}, body: null };
   }
   if (tag.includes("TOKEN") || tag.includes("AUTH")) throw new GraphTransportError("AUTH_FAILED", false);
   throw new GraphTransportError("NETWORK", e.retryable !== false);

@@ -16,10 +16,13 @@ import { createTestDeps, type TestHarness } from "../../../../tests/helpers/fake
 import { createTestDb, type TestDb } from "../../../../tests/helpers/testDb.js";
 import { createEntraAssurance } from "../../assurance/entra.js";
 import { createIdentityModule, type IdentityModule } from "../index.js";
-import { customerRefHistory, customerRefReservations, identityTokens, sessionRestrictions, signInEvents, ssoAuthRequests, ssoConfiguration, ssoIdentities, users, userSessions } from "../schema.js";
+import { customerRefHistory, customerRefReservations, identityTokens, sessionRestrictions, signInEvents, ssoAuthRequests, ssoConfiguration, ssoIdentities, ssoRoleMappings, ssoSamlCertificates, users, userSessions } from "../schema.js";
 import { authorizationUrl, entraEndpoints, OidcValidationError, peekKeyId, verifyIdToken } from "./oidc.js";
 import { createFakeEntra, type FakeEntra, type FakeEntraIdentity } from "./testing.js";
 import type { SsoConfigInput } from "./service.js";
+import { inflateRawSync } from "node:zlib";
+import { spUrls } from "./saml.js";
+import { buildSignedResponse, TEST_IDP } from "./samlTesting.js";
 
 const PW = "copper lantern drifts beyond quiet harbor";
 const TENANT = "11111111-2222-4333-8444-555555555555";
@@ -89,7 +92,8 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
 
   const baseConfig = (patch: Partial<SsoConfigInput> = {}): SsoConfigInput => ({
     expectedVersion: 1, tenantId: TENANT, clientId: CLIENT, clientSecret: SECRET, buttonLabel: null, allowedDomains: [],
-    trustEntraMfa: true, jitMode: "off", jitStaffAppRole: null, jitDailyLimit: 25, ...patch,
+    jitMode: "off", jitStaffAppRole: null, jitDailyLimit: 25,
+    protocol: "oidc", samlEntityId: null, entraMfaMode: "claim", acceptedAuthnContexts: [], allowedRoles: ["admin", "staff", "customer"], ...patch,
   });
 
   async function configure(patch: Partial<SsoConfigInput> = {}, enable = true) {
@@ -130,7 +134,7 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
     db.db.select().from(userSessions).where(and(eq(userSessions.userId, userId), eq(userSessions.authMethod, "entra"), isNull(userSessions.revokedAt)));
 
   beforeAll(async () => {
-    db = await createTestDb({ schema: { users, userSessions, identityTokens, customerRefReservations, customerRefHistory, signInEvents, sessionRestrictions, ssoConfiguration, ssoIdentities, ssoAuthRequests } });
+    db = await createTestDb({ schema: { users, userSessions, identityTokens, customerRefReservations, customerRefHistory, signInEvents, sessionRestrictions, ssoConfiguration, ssoIdentities, ssoAuthRequests, ssoSamlCertificates, ssoRoleMappings } });
   });
   afterAll(async () => db?.cleanup());
   beforeEach(async () => build());
@@ -192,7 +196,7 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
     });
 
     it("without Entra MFA trust, an Entra session still needs local MFA", async () => {
-      await configure({ trustEntraMfa: false });
+      await configure({ entraMfaMode: "portal" });
       const user = await makeUser({ mfa: false });
       const id = oid();
       await bind(user.publicId, id);
@@ -481,7 +485,7 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
       const view = await configure();
       const { user, run } = await prepared();
       const gate = gateAudit("identity.sso.config_updated");
-      const change = sso().updateConfig(admin, { ...baseConfig({ trustEntraMfa: false }), clientSecret: undefined, expectedVersion: view.version });
+      const change = sso().updateConfig(admin, { ...baseConfig({ entraMfaMode: "portal" }), clientSecret: undefined, expectedVersion: view.version });
       await gate.arrived; // updateConfig holds the configuration lock
       const completion = run.finish();
       await new Promise((resolve) => setTimeout(resolve, 150));
@@ -500,7 +504,7 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
       const gate = gateAudit("auth.login.succeeded");
       const completion = run.finish();
       await gate.arrived; // completion holds the configuration lock
-      const change = sso().updateConfig(admin, { ...baseConfig({ trustEntraMfa: false }), clientSecret: undefined, expectedVersion: view.version });
+      const change = sso().updateConfig(admin, { ...baseConfig({ entraMfaMode: "portal" }), clientSecret: undefined, expectedVersion: view.version });
       await new Promise((resolve) => setTimeout(resolve, 150));
       gate.release();
       await completion;
@@ -514,6 +518,257 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
       await sso().updateConfig(admin, { ...baseConfig(), clientSecret: "rotated-client-secret-0002", expectedVersion: view.version });
       await rejects(run.finish(), "SSO_EXPIRED");
       expect(await entraSessions(user.id)).toHaveLength(0);
+    });
+  });
+
+  /* ------------------------------------------------------------------ SAML 2.0 (increment 07, D10) */
+
+  describe("SAML 2.0", () => {
+    const sp = spUrls("https://portal.example.test", null);
+    const requestIdOf = (url: string) => {
+      const xml = inflateRawSync(Buffer.from(new URL(url).searchParams.get("SAMLRequest")!, "base64")).toString("utf8");
+      return /ID="([^"]+)"/.exec(xml)![1]!;
+    };
+
+    async function configureSaml(patch: Partial<SsoConfigInput> = {}, opts: { cert?: boolean; enable?: boolean } = {}) {
+      let view = await configure({ protocol: "saml", clientId: null, clientSecret: null, ...patch }, false);
+      if (opts.cert !== false && !view.saml.certificates.some((c) => c.state === "trusted")) {
+        await sso().saml.addCertificate(admin, { expectedVersion: view.version, pem: TEST_IDP.certificatePem });
+        view = await sso().adminView();
+      }
+      if (opts.enable !== false) view = await sso().setEnabled(admin, true, view.version);
+      return view;
+    }
+
+    async function samlSignIn(objectId: string, extra: Partial<Parameters<typeof buildSignedResponse>[0]> = {}) {
+      const browser = `b-${randomUUID()}`;
+      const url = await sso().startSignIn({ next: "/orders", browser });
+      const inResponseTo = requestIdOf(url);
+      const response = buildSignedResponse({ sp, inResponseTo, nowMs: h.clock.now().getTime(), tenantId: TENANT, objectId, ...extra });
+      const location = await sso().acs({ samlResponse: response });
+      return { location, response, inResponseTo, browser, finish: () => sso().complete({ attempt: attemptOf(location), browser, session: null, userAgent: "vitest" }) };
+    }
+
+    it("needs a trusted certificate before it can be enabled, then signs in a bound identity", async () => {
+      const view = await configureSaml({}, { cert: false, enable: false });
+      expect(view.protocol).toBe("saml");
+      expect(view.complete).toBe(false);
+      await rejects(sso().setEnabled(admin, true, view.version), "SSO_SAML_CERTIFICATE_REQUIRED");
+      await sso().saml.addCertificate(admin, { expectedVersion: view.version, pem: TEST_IDP.certificatePem });
+      const enabled = await sso().setEnabled(admin, true, (await sso().adminView()).version);
+      expect(enabled.enabled).toBe(true);
+      expect(enabled.saml.certificates[0]?.state).toBe("trusted");
+      expect(await sso().samlMetadata()).toContain(sp.acsUrl);
+
+      const user = await makeUser({ mfa: false });
+      const id = oid();
+      await bind(user.publicId, id);
+      const run = await samlSignIn(id);
+      expect(run.location).toMatch(/^\/sso\/complete\?attempt=[0-9A-Z]{26}$/);
+      const done = await run.finish();
+      if (done.purpose !== "sign_in") throw new Error("unreachable");
+      const principal = await identity.sessionResolver.resolve({ token: done.issued.token, transport: "cookie" });
+      expect(principal?.authMethod).toBe("entra");
+      expect(principal?.state).toBe("full"); // claim mode + multipleauthn
+      const login = h.audit.named("auth.login.succeeded").at(-1)!;
+      expect(login.attributes).toMatchObject({ protocol: "saml", mfa_mode: "claim", mfa_basis: "saml_claim" });
+      expect(JSON.stringify([...h.audit.events, ...h.audit.notes])).not.toContain(run.response.slice(0, 40));
+    });
+
+    it("refuses a replayed response (InResponseTo is single use) and a response for no request", async () => {
+      await configureSaml();
+      const user = await makeUser();
+      const id = oid();
+      await bind(user.publicId, id);
+      const run = await samlSignIn(id);
+      expect(reasonOf(await sso().acs({ samlResponse: run.response }))).toBe("SSO_EXPIRED");
+      const stray = buildSignedResponse({ sp, inResponseTo: `_${"x".repeat(30)}`, nowMs: h.clock.now().getTime(), tenantId: TENANT, objectId: id });
+      expect(reasonOf(await sso().acs({ samlResponse: stray }))).toBe("SSO_EXPIRED");
+      expect(h.audit.named("identity.sso.callback_refused").length).toBeGreaterThanOrEqual(2);
+      await run.finish();
+    });
+
+    it("refuses forged responses and maps an IdP error to cancelled", async () => {
+      await configureSaml();
+      const run = await samlSignIn(oid(), { unsigned: true });
+      expect(reasonOf(run.location)).toBe("SSO_FAILED");
+      const cancelled = await samlSignIn(oid(), { statusCode: "urn:oasis:names:tc:SAML:2.0:status:Responder" });
+      expect(reasonOf(cancelled.location)).toBe("SSO_CANCELLED");
+      expect(reasonOf(await sso().acs({ samlResponse: undefined }))).toBe("SSO_FAILED");
+    });
+
+    it("MFA modes: portal always asks, entra never asks, claim follows multipleauthn", async () => {
+      const user = await makeUser({ mfa: false });
+      const id = oid();
+      await configureSaml({ entraMfaMode: "portal" });
+      await bind(user.publicId, id);
+      const portal = await (await samlSignIn(id)).finish();
+      if (portal.purpose !== "sign_in") throw new Error("unreachable");
+      expect(portal.nextStep).not.toBeNull();
+
+      let view = await sso().adminView();
+      await rejects(sso().updateConfig(admin, { ...baseConfig({ protocol: "saml", clientId: null, clientSecret: undefined, entraMfaMode: "entra" }), expectedVersion: view.version }), "SSO_ENTRA_MODE_CONFIRMATION");
+      view = await sso().updateConfig(admin, { ...baseConfig({ protocol: "saml", clientId: null, clientSecret: undefined, entraMfaMode: "entra", entraModeConfirmation: "ENTRA MANAGES MFA" }), expectedVersion: view.version });
+      expect(view.entraMfaMode).toBe("entra");
+      const changed = h.audit.named("identity.sso.mfa_mode_changed").at(-1)!;
+      expect(changed.severity).toBe("WARN");
+      const entra = await (await samlSignIn(id, { methods: ["http://schemas.microsoft.com/ws/2008/06/identity/authenticationmethod/password"] })).finish();
+      if (entra.purpose !== "sign_in") throw new Error("unreachable");
+      expect(entra.nextStep).toBeNull();
+
+      // Back to claim (stricter): Entra sessions are revoked; a password-only Entra sign-in needs the portal factor.
+      await sso().updateConfig(admin, { ...baseConfig({ protocol: "saml", clientId: null, clientSecret: undefined, entraMfaMode: "claim" }), expectedVersion: view.version });
+      expect(await entraSessions(user.id)).toHaveLength(0);
+      const weak = await (await samlSignIn(id, { methods: ["http://schemas.microsoft.com/ws/2008/06/identity/authenticationmethod/password"] })).finish();
+      if (weak.purpose !== "sign_in") throw new Error("unreachable");
+      expect(weak.nextStep).not.toBeNull();
+    });
+
+    it("refuses roles that may not use SSO, and revokes their sessions when a role is removed", async () => {
+      await configureSaml({ allowedRoles: ["admin", "staff"] });
+      const customer = await makeUser({ role: "customer" });
+      const id = oid();
+      await bind(customer.publicId, id);
+      await rejects((await samlSignIn(id)).finish(), "SSO_ROLE_NOT_ALLOWED");
+
+      const staff = await makeUser({ role: "staff" });
+      const sid = oid();
+      await bind(staff.publicId, sid);
+      await (await samlSignIn(sid)).finish();
+      expect(await entraSessions(staff.id)).toHaveLength(1);
+      const view = await sso().adminView();
+      await sso().updateConfig(admin, { ...baseConfig({ protocol: "saml", clientId: null, clientSecret: undefined, allowedRoles: ["admin"] }), expectedVersion: view.version });
+      expect(await entraSessions(staff.id)).toHaveLength(0);
+    });
+
+    it("provisions by app-role mapping, never as administrator", async () => {
+      const view = await configureSaml({ jitMode: "staff", jitStaffAppRole: "Portal.LegacyStaff", allowedRoles: ["admin", "staff", "customer"] });
+      await sso().saml.setRoleMappings(admin, { expectedVersion: view.version, mappings: [{ appRoleValue: "Portal.Staff", role: "staff" }, { appRoleValue: "Portal.Customer", role: "customer" }] });
+      const email = `jit.${randomUUID().slice(0, 6)}@contoso.test`;
+      const staff = await (await samlSignIn(oid(), { email, roles: ["Portal.Staff"] })).finish();
+      if (staff.purpose !== "sign_in") throw new Error("unreachable");
+      expect(staff.provisioned).toBe(true);
+      const principal = await identity.sessionResolver.resolve({ token: staff.issued.token, transport: "cookie" });
+      expect(principal?.role).toBe("staff");
+      await rejects((await samlSignIn(oid(), { email: `none.${randomUUID().slice(0, 6)}@contoso.test`, roles: ["Unmapped"] })).finish(), "SSO_ROLE_NOT_ASSIGNED");
+    });
+
+    it("an older row (no MFA mode, no allowed roles) keeps its previous behaviour", async () => {
+      await configureSaml();
+      await db.db.update(ssoConfiguration).set({ entraMfaMode: null, allowedRoles: null, trustEntraMfa: false });
+      const view = await sso().adminView();
+      expect(view.entraMfaMode).toBe("portal");
+      expect(view.allowedRoles).toEqual(["admin", "staff", "customer"]);
+      const user = await makeUser({ role: "customer", mfa: false });
+      const id = oid();
+      await bind(user.publicId, id);
+      const done = await (await samlSignIn(id)).finish();
+      if (done.purpose !== "sign_in") throw new Error("unreachable");
+      expect(done.nextStep).not.toBeNull();
+    });
+
+    /** Session-bound SAML round trip (link / step-up): prepare → ticket → AuthnRequest → signed response → ACS. */
+    async function samlSessionBound(principal: SessionPrincipal, purpose: "step_up" | "link", objectId: string, extra: Partial<Parameters<typeof buildSignedResponse>[0]> = {}) {
+      const browser = `b-${randomUUID()}`;
+      const { startUrl } = await sso().prepare(principal, purpose, "/account");
+      const ticket = new URL(`https://x.test${startUrl}`).searchParams.get("ticket")!;
+      const url = await sso().startWithTicket({ ticket, session: principal, browser });
+      const request = inflateRawSync(Buffer.from(new URL(url).searchParams.get("SAMLRequest")!, "base64")).toString("utf8");
+      const response = buildSignedResponse({ sp, inResponseTo: requestIdOf(url), nowMs: h.clock.now().getTime(), tenantId: TENANT, objectId, ...extra });
+      const location = await sso().acs({ samlResponse: response });
+      return { request, location, finish: (session: SessionPrincipal | null = principal) => sso().complete({ attempt: attemptOf(location), browser, session, userAgent: "vitest" }) };
+    }
+
+    const PASSWORD_ONLY = ["http://schemas.microsoft.com/ws/2008/06/identity/authenticationmethod/password"];
+
+    async function ssoOnlySession(mode: "claim" | "entra" | "portal") {
+      await configureSaml(mode === "entra" ? {} : { entraMfaMode: mode });
+      if (mode === "entra") {
+        const view = await sso().adminView();
+        await sso().updateConfig(admin, { ...baseConfig({ protocol: "saml", clientId: null, clientSecret: undefined, entraMfaMode: "entra", entraModeConfirmation: "ENTRA MANAGES MFA" }), expectedVersion: view.version });
+      }
+      // SSO-only: no local MFA factor enrolled; signs in with Entra (claim mode gets the MFA claim).
+      const user = await makeUser({ role: "staff", mfa: false });
+      const id = oid();
+      await bind(user.publicId, id);
+      const signed = await (await samlSignIn(id)).finish();
+      if (signed.purpose !== "sign_in") throw new Error("unreachable");
+      let principal = (await identity.sessionResolver.resolve({ token: signed.issued.token, transport: "cookie" }))!;
+      // Portal mode: the session waits for the portal factor; complete it as the MFA step would.
+      if (mode === "portal") principal = (await identity.sessionResolver.resolve({ token: (await identity.sessions.markMfaVerified(principal.sessionId)).token, transport: "cookie" }))!;
+      expect(principal.state).toBe("full");
+      return { user, id, principal };
+    }
+
+    it("step-up for an SSO-only user: ForceAuthn round trip in claim mode needs the MFA claim and a fresh sign-in", async () => {
+      const { id, principal } = await ssoOnlySession("claim");
+      const run = await samlSessionBound(principal, "step_up", id);
+      expect(run.request).toMatch(/ForceAuthn="true"/);
+      const done = await run.finish();
+      expect(done.purpose).toBe("step_up");
+      expect(h.audit.named("auth.step_up.verified")).toHaveLength(1);
+      const fresh = (await identity.sessionResolver.resolve({ token: (done as { issued: { token: string } }).issued.token, transport: "cookie" }))!;
+      // Password only: refused in claim mode.
+      await rejects((await samlSessionBound(fresh, "step_up", id, { methods: PASSWORD_ONLY })).finish(fresh), "SSO_MFA_REQUIRED");
+      // Entra reused an old sign-in despite ForceAuthn: refused at the ACS.
+      const stale = await samlSessionBound(fresh, "step_up", id, { authnInstantMs: h.clock.now().getTime() - 10 * 60_000 });
+      expect(reasonOf(stale.location)).toBe("SSO_FAILED");
+      // Another Entra identity cannot step up this session.
+      await rejects((await samlSessionBound(fresh, "step_up", oid())).finish(fresh), "SSO_WRONG_ACCOUNT");
+    });
+
+    it("step-up in entra mode accepts a fresh Entra sign-in without the MFA claim", async () => {
+      const { id, principal } = await ssoOnlySession("entra");
+      const run = await samlSessionBound(principal, "step_up", id, { methods: PASSWORD_ONLY });
+      expect(run.request).toMatch(/ForceAuthn="true"/);
+      expect((await run.finish()).purpose).toBe("step_up");
+      expect(h.audit.named("auth.step_up.verified")).toHaveLength(1);
+    });
+
+    it("step-up in portal mode never accepts Entra as the second factor", async () => {
+      const { id, principal } = await ssoOnlySession("portal");
+      await rejects((await samlSessionBound(principal, "step_up", id)).finish(), "SSO_MFA_REQUIRED");
+      expect(h.audit.named("auth.step_up.verified")).toHaveLength(0);
+    });
+
+    it("local break-glass sign-in still demands portal MFA in every mode", async () => {
+      for (const mode of ["claim", "entra", "portal"] as const) {
+        const { user } = await ssoOnlySession(mode);
+        const local = await identity.auth.signIn({ email: user.email, password: PW }, { userAgent: "vitest" });
+        expect(local.nextStep, mode).not.toBeNull();
+        const principal = await identity.sessionResolver.resolve({ token: local.issued.token, transport: "cookie" });
+        expect(principal?.authMethod, mode).not.toBe("entra");
+        expect(principal?.state, mode).not.toBe("full");
+      }
+    });
+
+    it("statusSummary: unprivileged read for status cards, no secrets or identifiers", async () => {
+      const before = await sso().statusSummary();
+      expect(before).toMatchObject({ enabled: false, protocol: "oidc", nearestCertificateExpiry: null, settingsPath: "/admin/sso" });
+      await configureSaml({ entraMfaMode: "portal" });
+      const user = await makeUser();
+      const id = oid();
+      await bind(user.publicId, id);
+      await (await samlSignIn(id)).finish();
+      const summary = await sso().statusSummary();
+      expect(summary).toMatchObject({ configured: true, enabled: true, complete: true, protocol: "saml", entraMfaMode: "portal", trustedCertificates: 1 });
+      expect(summary.nearestCertificateExpiry?.getTime()).toBeGreaterThan(h.clock.now().getTime());
+      expect(summary.lastSignInAt?.getTime()).toBe(h.clock.now().getTime());
+      const text = JSON.stringify(summary);
+      for (const secret of [TENANT, CLIENT, SECRET, id, user.publicId, "BEGIN CERTIFICATE"]) expect(text).not.toContain(secret);
+    });
+
+    it("a protocol switch cancels pending attempts but keeps sessions", async () => {
+      await configureSaml({ clientId: CLIENT, clientSecret: SECRET });
+      const user = await makeUser();
+      const id = oid();
+      await bind(user.publicId, id);
+      await (await samlSignIn(id)).finish();
+      const pending = await samlSignIn(id);
+      const view = await sso().adminView();
+      await sso().updateConfig(admin, { ...baseConfig({ protocol: "oidc", clientSecret: undefined }), expectedVersion: view.version });
+      await rejects(pending.finish(), "SSO_EXPIRED");
+      expect(await entraSessions(user.id)).toHaveLength(1);
     });
   });
 

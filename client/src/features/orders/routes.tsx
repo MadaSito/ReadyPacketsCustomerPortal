@@ -20,6 +20,7 @@ export const ordersFeature: FeatureRoutes = {
     { path: "/admin/orders/:orderId/:tab", access: "staff", title: "Order", component: AdminOrderDetailPage, capability: "orders.read_all" },
     { path: "/admin/catalog", access: "admin", title: "Catalog", component: lazy(() => import("./pages/AdminCatalogPage")), capability: "catalog.manage" },
     { path: "/admin/workflows", access: "admin", title: "Workflows", component: lazy(() => import("./pages/AdminWorkflowsPage")), capability: "workflows.manage" },
+    { path: "/admin/workflows/statuses", access: "admin", title: "Order statuses", component: lazy(() => import("./pages/workflows/AdminWorkflowStatusesPage")), capability: "orders.statuses.manage" },
     { path: "/admin/workflows/drafts/:draftId", access: "admin", title: "Workflow draft", component: lazy(() => import("./pages/workflows/WorkflowDesignerPage")), capability: "workflows.manage" },
     { path: "/admin/workflows/versions/:versionId", access: "admin", title: "Workflow version", component: lazy(() => import("./pages/workflows/WorkflowVersionPage")), capability: "workflows.manage" },
     { path: "/admin/workflows/:workflowId/versions", access: "admin", title: "Workflow versions", component: lazy(() => import("./pages/workflows/WorkflowVersionsPage")), capability: "workflows.manage" },

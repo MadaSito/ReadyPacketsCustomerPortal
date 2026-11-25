@@ -12,7 +12,8 @@ scripts/dev/lint.sh server/modules/portable client/src/features/portable
 ```
 
 - **Two isolated MySQL schemas**: The server suite uses distinct source and target installations, field-crypto keys, and real Identity, Orders, Files, and Portable services. It checks package verification outside the portal workflow, absence of the fixture credential marker, all three selection modes, export expiry and audit-gated removal, dry-run conflicts, stale session and audit refusal, tamper refusal, object move recovery, replay without duplication, pending identities, read-only orders, target bytes and source timestamps, and separate approval and acceptance actors.
-- **Controlled faults**: The service suite uses fake session resolution, an in-memory object store, a simulated fence, fake audit and the test job registry. Its interrupted move case writes the private destination object before failing the simulated worker, then verifies that the next run uses receipts and exact bytes instead of making a duplicate. This does not validate actual queue lease loss, production audit durability, physical storage permissions, or proxy/TLS settings.
+- **Controlled faults**: The service suite uses real Identity session persistence and resolution, an assurance-state fixture, an in-memory object store, a simulated fence, fake audit and the test job registry. Its interrupted move case writes the private destination object before failing the simulated worker, then verifies that the next run uses receipts and exact bytes instead of making a duplicate. This does not validate actual queue lease loss, production audit durability, physical storage permissions, or proxy/TLS settings.
+- **Worker session authority**: Import rehydrates the original approving session in each fenced transaction with `identity.sessions.principalForJob` and still requires the original approval to be fresh. The MySQL regression routes imported file adoption through the real `sessions.assertCurrent`, then verifies that a revoked approving session cannot write any order or file rows. The export publication job uses requester session state, not a synthesized principal; retention is system-only.
 - **Admin UI**: jsdom/axe checks representative histories, upload availability, both wizard screens, focus transition, and held-content/reconciliation states. It excludes computed contrast and is not a browser, mobile, screen-reader or ADA compliance certification.
 
 ## Increment 05 (package E)
@@ -26,6 +27,12 @@ scripts/dev/lint.sh server/modules/portable client/src/features/portable
 - **Tested (one file, `portable.test.ts`):** the manifest lists the new exclusions `security-operations`, `policy-notices` and `report-definitions` next to the increment 05 ones.
 - **Reviewed, not tested:** the wording changes to `historical-evidence` (receipts) and `internal-order-notes` (task notes and waivers). No collector reads the new tables.
 - **Not verified here:** that a backup restore covers the new tables (owned by the backup module).
+
+## Increment 07
+
+- **Tested (one file, `portable.test.ts`, real MySQL with migration 0007):** the manifest lists the new exclusions `ephemeral-access`, `phase-workspace`, `operational-diagnostics` and `installation-configuration`. Export and import of a complete order still pass with the new `orders` and `order_files` columns present. An order imported onto a format-3 default workflow (status in the second of three phases) has no `order_stage_progress` rows and `progress_percent` NULL; `orders.stages.workspace` opens it as the customer, reports format 3, current phase `review`, progress above 0 and only the last phase as future (orders' runtime derives state from the status and creates rows lazily).
+- **Reviewed, not tested:** the per-table assignment of the 16 new tables (API.md "Increment 07 coverage"). No collector reads them.
+- **Not verified here:** that a backup restore covers the new tables (owned by the backup module; it enumerates every base table). Phase assignment (`order_files.stage_key`) is not carried in a package by design.
 
 ## Release limits and proposed decisions
 

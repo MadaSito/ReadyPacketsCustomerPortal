@@ -380,6 +380,12 @@ describe("RFC 5424 & RFC 5425 golden vectors", () => {
 
     expect(findSiemCatalogueEntry("policy.notice.scheduled")?.forwardable).toBe(true);
     expect(findSiemCatalogueEntry("report.definition.created")?.forwardable).toBe(true);
+    expect(findSiemCatalogueEntry("file.archive.denied")?.defaultSeverity).toBe("WARN");
+    expect(findSiemCatalogueEntry("file.archive.ticket_issued")?.forwardable).toBe(true);
+    expect(findSiemCatalogueEntry("file.archive.revoked")?.forwardable).toBe(true);
+    expect(findSiemCatalogueEntry("integration.graph.sites_selected_checked")?.forwardable).toBe(true);
+    expect(findSiemCatalogueEntry("integration.egress.preset_updated")?.forwardable).toBe(true);
+    expect(findSiemCatalogueEntry("integration.production.dispatch.stopped")?.forwardable).toBe(true);
     expect(findSiemCatalogueEntry("siem.delivery.failed")?.forwardable).toBe(false);
     expect(isSiemOperationalSelfEvent("siem.delivery.failed")).toBe(true);
   });
@@ -564,5 +570,169 @@ describe("RFC 5424 & RFC 5425 golden vectors", () => {
       max_discount_bps: 4525,
     });
     expect(promoSettings.dropped_attributes).toBe(2);
+  });
+
+  it("projects Increment 07 phase, status catalogue, question, automation, ops alert, webhook, archive, Stripe, SAML, and M365 sync events without leaking local ULIDs, dedupe keys, or bodies", () => {
+    const inc07Events: readonly [string, string][] = [
+      ["order.stage.advanced", "business"],
+      ["order.stage.submitted", "business"],
+      ["order.stage.reviewed", "business"],
+      ["order.stage.reopened", "admin"],
+      ["order.status_catalog.created", "admin"],
+      ["order.question.asked", "business"],
+      ["order.question.answered", "business"],
+      ["order.admin_task.checked", "business"],
+      ["order.stage_run.completed", "business"],
+      ["order.stage_run.partial_failed", "business"],
+      ["order.completion.scheduled", "business"],
+      ["automation.rules.reordered", "admin"],
+      ["ops.alert.opened", "job"],
+      ["ops.alert.escalated", "job"],
+      ["ops.alert.acknowledged", "job"],
+      ["ops.alert.resolved", "job"],
+      ["integration.webhook.lifecycle_queued", "integration"],
+      ["file.playback.access", "file"],
+      ["file.archive.built", "file"],
+      ["payments.attempt.pending_async", "business"],
+      ["payment.refund.flagged", "security"],
+      ["identity.saml.mfa_mode_changed", "security"],
+      ["storage.file_sync.completed", "integration"],
+    ];
+    for (const [name, expectedCat] of inc07Events) {
+      const entry = findSiemCatalogueEntry(name);
+      expect(entry, `missing catalogue entry for ${name}`).not.toBeNull();
+      expect(entry!.category).toBe(expectedCat);
+      expect(entry!.forwardable).toBe(true);
+      expect(entry!.increment).toBe("07");
+    }
+
+    // D6 operational alert: forwards alert_source, alert_severity, reason_code; strips dedupe_key & alert text.
+    const opsAlert = sanitizeProjectedEvent({
+      ...sampleEvent({
+        category: "job",
+        severity_text: "WARN",
+        event_name: "ops.alert.opened",
+        action: "open",
+        outcome: "completed",
+        resource_type: "operational_alert",
+      }),
+      attributes: {
+        alert_source: "jobs.dead_letter",
+        alert_severity: "critical",
+        reason_code: "QUEUE_DEAD_LETTER_THRESHOLD",
+        alert_public_id: "01JEALERT00000000000000001",
+        dedupe_key: "jobs:dead_letter:order:01JESECRET",
+        alert_title: "Customer Alice order sync stuck",
+        alert_text: "SharePoint library /sites/Legal/CustomerA failed",
+      },
+    });
+    expect(opsAlert.attributes).toEqual({
+      alert_source: "jobs.dead_letter",
+      alert_severity: "critical",
+      reason_code: "QUEUE_DEAD_LETTER_THRESHOLD",
+    });
+    expect(opsAlert.dropped_attributes).toBe(4);
+
+    // D2 status catalogue + D4 encrypted phase questions: forwards safe vocab/booleans, strips bodies/labels/ULIDs.
+    const statusCreated = sanitizeProjectedEvent({
+      ...sampleEvent({
+        category: "admin",
+        severity_text: "INFO",
+        event_name: "order.status_catalog.created",
+        outcome: "completed",
+      }),
+      attributes: {
+        status_key: "attorney_review",
+        category: "working",
+        attention: "staff_review",
+        label: "Custom Attorney Review Label",
+      },
+    });
+    expect(statusCreated.attributes).toEqual({
+      status_key: "attorney_review",
+      category: "working",
+      attention: "staff_review",
+    });
+
+    const questionAnswered = sanitizeProjectedEvent({
+      ...sampleEvent({
+        category: "business",
+        severity_text: "INFO",
+        event_name: "order.question.answered",
+        outcome: "completed",
+      }),
+      attributes: {
+        stage_key: "intake_phase",
+        answer_version: 2,
+        order_public_id: "01JEORDER00000000000000001",
+        question_public_id: "01JEQUEST00000000000000001",
+        answer_text: "Sensitive customer medical disclosure",
+      },
+    });
+    expect(questionAnswered.attributes).toEqual({
+      stage_key: "intake_phase",
+      answer_version: 2,
+    });
+
+    // D7 webhook target_key: canonical production:P101..P401 allowed; subscription ULIDs & URLs dropped.
+    const canonicalWebhook = sanitizeProjectedEvent({
+      ...sampleEvent({
+        category: "integration",
+        severity_text: "INFO",
+        event_name: "integration.webhook.lifecycle_queued",
+        outcome: "completed",
+      }),
+      attributes: {
+        target_key: "production:P201",
+        destination_url: "https://hooks.internal.example/secret",
+      },
+    });
+    expect(canonicalWebhook.attributes).toEqual({ target_key: "production:P201" });
+
+    const subscriptionWebhook = sanitizeProjectedEvent({
+      ...sampleEvent({
+        category: "integration",
+        severity_text: "INFO",
+        event_name: "integration.webhook.lifecycle_queued",
+        outcome: "completed",
+      }),
+      attributes: {
+        target_key: "subscription:01JESUB0000000000000000001",
+      },
+    });
+    expect(subscriptionWebhook.attributes).toEqual({});
+
+    // D10 SAML login & MFA mode: forwards protocol/method/mfa_source, strips SAML XML assertion.
+    const samlLogin = sanitizeProjectedEvent({
+      ...sampleEvent({
+        category: "security",
+        severity_text: "INFO",
+        event_name: "auth.login.succeeded",
+        outcome: "completed",
+      }),
+      attributes: {
+        auth_method: "saml",
+        method: "saml",
+        protocol: "saml2",
+        mfa_source: "entra_claim",
+        assertion: "<saml:Assertion>SECRET</saml:Assertion>",
+      },
+    });
+    expect(samlLogin.attributes).toEqual({
+      auth_method: "saml",
+      method: "saml",
+      protocol: "saml2",
+      mfa_source: "entra_claim",
+    });
+
+    const wireText = [
+      formatRfc5424Message(opsAlert).text,
+      formatJsonlRecord(questionAnswered).toString("utf8"),
+      formatCefSyslogFrame(samlLogin).cefText,
+    ].join("\n");
+    expect(wireText).not.toContain("01JESECRET");
+    expect(wireText).not.toContain("Customer Alice");
+    expect(wireText).not.toContain("Sensitive customer medical disclosure");
+    expect(wireText).not.toContain("<saml:Assertion>");
   });
 });

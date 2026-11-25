@@ -1,15 +1,16 @@
-# Cart, Cart Suggestions & Discount Codes — Verification Record (Increments 04–06)
+# Cart, Cart Suggestions & Discount Codes — Verification Record (Increments 04–07)
 
 Owner: `recovery_ops_engineer` (`server/modules/cart/**`, `client/src/features/cart/**`)
 
-## 1. Commands Executed & Verified on `feat/increment-06`
+## 1. Commands Executed & Verified on `feat/increment-07`
 
 - **TypeScript (`scripts/dev/tc.sh`):**
   - Clean (`0` errors) across the entire monorepo (`server`, `client`, `shared`).
 - **Server integration & abuse-case suites (real MySQL + real `OrdersModule` + real `ComplianceModule` + real `PromotionsModule`):**
   - `scripts/dev/test.sh server/modules/cart/cart.test.ts` — **7/7 passing** (Increment 04 baseline invariants, authz matrix, CAS, AES-256-GCM field encryption, atomic checkout, read-only payment return, cancel/restore, abandoned-cart expiry worker).
   - `scripts/dev/test.sh server/modules/cart/cartUpsellPromo.test.ts` — **5/5 passing** (Increment 05 Package B: 5-actor authz matrix, upsell evaluation & lock ordering, `FOR SHARE` single-connection pool regression, AES-256-GCM promo encryption, `PROMO_RECONFIRM_TOTAL`, and zero-total checkout).
-  - `scripts/dev/test.sh server/modules/cart/cartIncrement06.test.ts` — **6/6 passing** (Increment 06 Package D):
+  - `scripts/dev/test.sh server/modules/cart/cartIncrement06.test.ts` — **7/7 passing** (Increment 06 Package D + live D9 ledger-settlement integration).
+  - `scripts/dev/test.sh server/modules/cart/cartIncrement07.test.ts` — **2/2 passing** (Increment 07 Decision D9: `cart.onInvoicePaidInTx` marks `awaiting_payment -> checked_out` inside the payment transaction, emits `cart.checkout_completed`, is idempotent on repeat calls and no-ops for non-cart invoices, blocks `restoreCheckout` with `CHECKOUT_ALREADY_PAID`, and never regresses `checked_out -> awaiting_payment` if a fast webhook settles before Phase 2 finishes).
     1. Legacy/corrupt stored setting resilience for `cart.upsell_seeded_keys` (`parseCartUpsellSeededKeysSetting` handles `undefined`, `null`, primitives, malformed objects, duplicate keys, blank strings, and overlong entries without throwing).
     2. Pre-input router authorization on all new D3 admin procedures (`setFeature`, `setAllActive`, `seedSuggested`, `duplicate` reject anonymous with `401 UNAUTHORIZED` and customer/unprivileged staff with `403 FORBIDDEN` before `.input()` validation).
     3. Decision D3: deterministic starter seeding across all 4 categories (`tier_upgrade`, `bundle_completion`, `next_packet`, `add_on`) with `active = false`, idempotent re-seeding, non-destructive preservation of admin edits and deletions on startup, `seedSuggested` restoring missing starter rows disabled, `setFeature` (`feature.cart.upsell` + optional `feature.cart`), `setAllActive`, `duplicate`, and live `bundle_completion` evaluation.

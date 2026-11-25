@@ -1,19 +1,40 @@
 /**
  * /admin/sso — Microsoft Entra ID single sign-on configuration (capability identity.sso.manage).
  * Secret is write-only (configured + last 4). Saving, enabling, testing and linking need step-up.
+ * Increment 07: OpenID Connect or SAML 2.0, the three-mode MFA setting (typed confirmation for "entra"),
+ * allowed roles, signing certificates and app-role mappings (SamlCards).
  */
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useSearch } from "wouter";
-import { errorMessage, safeError, useTRPC, type useTRPCClient } from "@/lib/trpc";
+import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
 import {
-  Badge, Button, Callout, Card, ConfirmDialog, CopyButton, ErrorState, Field, Input, KeyValueList, PageHeader, RadioGroup, Skeleton,
-  StepUpCancelledError, Switch, Textarea, useStepUp, useToast,
+  Badge, Button, Callout, Card, Checkbox, ConfirmDialog, CopyButton, ErrorState, Field, Input, KeyValueList, PageHeader, RadioGroup, Skeleton,
+  StepUpCancelledError, Switch, TagInput, Textarea, useStepUp, useToast,
 } from "@/ui";
+import { RoleMappingsCard, SamlCertificatesCard, SamlEntraValues, type AdminView } from "./SamlCards";
 import { lastSsoTestResult } from "./SsoCompletePage";
 
-type AdminView = Awaited<ReturnType<ReturnType<typeof useTRPCClient>["identity"]["admin"]["sso"]["get"]["query"]>>;
 type JitMode = AdminView["jitMode"];
+type Protocol = AdminView["protocol"];
+type MfaMode = AdminView["entraMfaMode"];
+type Role = AdminView["allowedRoles"][number];
+
+/** Must match the server's ENTRA_MODE_CONFIRMATION. */
+const ENTRA_MODE_CONFIRMATION = "ENTRA MANAGES MFA";
+
+const PROTOCOL_OPTIONS = [
+  { value: "oidc", label: "OpenID Connect", description: "App registration with a client secret." },
+  { value: "saml", label: "SAML 2.0", description: "Enterprise application with a signing certificate." },
+];
+
+const MFA_OPTIONS = [
+  { value: "claim", label: "Trust Microsoft when it confirms MFA (recommended)", description: "No portal code when Microsoft reports multi-factor sign-in; otherwise the portal asks for its own factor." },
+  { value: "entra", label: "Microsoft Entra ID manages MFA", description: "The portal never asks people who sign in with Microsoft for its own factor. Use only with a Conditional Access policy that requires MFA." },
+  { value: "portal", label: "Always ask for the portal factor", description: "People sign in with Microsoft and then confirm with their portal authenticator." },
+];
+
+const ROLE_LABELS: Record<Role, string> = { admin: "Administrators", staff: "Staff", customer: "Customers" };
 
 const JIT_OPTIONS = [
   { value: "off", label: "Off", description: "Only accounts linked by the person or by an administrator can sign in." },
@@ -44,7 +65,12 @@ function SsoAdmin({ data, refetch }: { data: AdminView; refetch: () => Promise<v
   const [secret, setSecret] = useState("");
   const [buttonLabel, setButtonLabel] = useState(data.buttonLabel ?? "");
   const [domains, setDomains] = useState(data.allowedDomains.join("\n"));
-  const [trust, setTrust] = useState(data.trustEntraMfa);
+  const [protocol, setProtocol] = useState<Protocol>(data.protocol);
+  const [entityId, setEntityId] = useState(data.saml.entityIdIsDefault ? "" : data.saml.entityId);
+  const [mfaMode, setMfaMode] = useState<MfaMode>(data.entraMfaMode);
+  const [contexts, setContexts] = useState<string[]>(data.acceptedAuthnContexts);
+  const [roles, setRoles] = useState<Role[]>(data.allowedRoles);
+  const [confirmEntra, setConfirmEntra] = useState(false);
   const [jitMode, setJitMode] = useState<JitMode>(data.jitMode);
   const [appRole, setAppRole] = useState(data.jitStaffAppRole ?? "");
   const [limit, setLimit] = useState(String(data.jitDailyLimit));
@@ -64,8 +90,14 @@ function SsoAdmin({ data, refetch }: { data: AdminView; refetch: () => Promise<v
     }
   };
 
-  const onSave = async (event: FormEvent) => {
+  const onSave = (event: FormEvent) => {
     event.preventDefault();
+    // Switching to "entra" needs the typed confirmation first.
+    if (mfaMode === "entra" && data.entraMfaMode !== "entra") setConfirmEntra(true);
+    else void save();
+  };
+
+  const save = async (entraModeConfirmation?: string) => {
     setFieldErrors({});
     const days = Number(limit);
     try {
@@ -76,10 +108,15 @@ function SsoAdmin({ data, refetch }: { data: AdminView; refetch: () => Promise<v
         ...(secret ? { clientSecret: secret } : {}),
         buttonLabel: buttonLabel.trim() || null,
         allowedDomains: domains.split(/[\s,]+/).map((d) => d.trim()).filter(Boolean),
-        trustEntraMfa: trust,
         jitMode,
         jitStaffAppRole: appRole.trim() || null,
         jitDailyLimit: Number.isInteger(days) ? days : 0,
+        protocol,
+        samlEntityId: entityId.trim() || null,
+        entraMfaMode: mfaMode,
+        ...(entraModeConfirmation ? { entraModeConfirmation } : {}),
+        acceptedAuthnContexts: contexts,
+        allowedRoles: roles,
       }), "Settings not saved");
       setSecret("");
       toast.show({ tone: "success", title: "Single sign-on settings saved" });
@@ -127,7 +164,9 @@ function SsoAdmin({ data, refetch }: { data: AdminView; refetch: () => Promise<v
         <div className="flex flex-col gap-4">
           <Switch
             label="Show “Sign in with SSO” on the sign-in page"
-            description={data.complete ? "People with a linked Microsoft account can sign in with it." : "Enter the tenant ID, client ID and client secret first."}
+            description={data.complete
+              ? "People with a linked Microsoft account can sign in with it."
+              : data.protocol === "saml" ? "Enter the tenant ID and add a trusted signing certificate first." : "Enter the tenant ID, client ID and client secret first."}
             checked={data.enabled}
             disabled={!data.complete || !data.availableInThisDeployment}
             onCheckedChange={(next) => setConfirmEnable(next)}
@@ -135,10 +174,11 @@ function SsoAdmin({ data, refetch }: { data: AdminView; refetch: () => Promise<v
           <KeyValueList
             columns={1}
             items={[
-              {
+              { label: "Protocol", value: data.protocol === "saml" ? "SAML 2.0" : "OpenID Connect" },
+              ...(data.protocol === "oidc" ? [{
                 label: "Redirect URI (add to the app registration in Entra ID)",
                 value: <span className="flex min-w-0 flex-wrap items-center gap-2"><code className="break-all">{data.redirectUri}</code><CopyButton value={data.redirectUri} label="Copy redirect URI" iconOnly /></span>,
-              },
+              }] : []),
               { label: "Linked accounts", value: String(data.linkedAccounts) },
             ]}
           />
@@ -150,22 +190,34 @@ function SsoAdmin({ data, refetch }: { data: AdminView; refetch: () => Promise<v
         </div>
       </Card>
 
+      {data.protocol === "saml" ? <SamlEntraValues data={data} /> : null}
+
       <Card title="Microsoft Entra ID application">
-        <form className="flex flex-col gap-4" onSubmit={(e) => void onSave(e)} noValidate>
+        <form className="flex flex-col gap-4" onSubmit={onSave} noValidate>
+          <RadioGroup legend="Protocol" variant="cards" orientation="horizontal" options={PROTOCOL_OPTIONS} value={protocol} onValueChange={(v) => setProtocol(v as Protocol)} error={fieldErrors.protocol}
+            hint="Switching cancels sign-ins in progress. Linked accounts and signed-in sessions are kept." />
           <div className="grid min-w-0 gap-4 md:grid-cols-2">
             <Field label="Directory (tenant) ID" hint="GUID from the Entra ID overview page. Multi-tenant values are not allowed." error={fieldErrors.tenantId}>
               <Input value={tenantId} onChange={(e) => setTenantId(e.target.value)} autoComplete="off" spellCheck={false} inputMode="text" />
             </Field>
-            <Field label="Application (client) ID" hint="GUID of the app registration." error={fieldErrors.clientId}>
-              <Input value={clientId} onChange={(e) => setClientId(e.target.value)} autoComplete="off" spellCheck={false} />
-            </Field>
-            <Field
-              label="Client secret"
-              hint={data.clientSecret.configured ? `A secret ending in ${data.clientSecret.last4 ?? "····"} is stored. Leave blank to keep it.` : "Paste the secret's Value (not its ID). It is stored encrypted and never shown again."}
-              error={fieldErrors.clientSecret}
-            >
-              <Input type="password" value={secret} onChange={(e) => setSecret(e.target.value)} autoComplete="new-password" spellCheck={false} />
-            </Field>
+            {protocol === "oidc" ? (
+              <>
+                <Field label="Application (client) ID" hint="GUID of the app registration." error={fieldErrors.clientId}>
+                  <Input value={clientId} onChange={(e) => setClientId(e.target.value)} autoComplete="off" spellCheck={false} />
+                </Field>
+                <Field
+                  label="Client secret"
+                  hint={data.clientSecret.configured ? `A secret ending in ${data.clientSecret.last4 ?? "····"} is stored. Leave blank to keep it.` : "Paste the secret's Value (not its ID). It is stored encrypted and never shown again."}
+                  error={fieldErrors.clientSecret}
+                >
+                  <Input type="password" value={secret} onChange={(e) => setSecret(e.target.value)} autoComplete="new-password" spellCheck={false} />
+                </Field>
+              </>
+            ) : (
+              <Field label="Identifier (Entity ID)" hint="Optional. Leave empty to use the default shown in Values for Microsoft Entra ID." error={fieldErrors.samlEntityId}>
+                <Input value={entityId} onChange={(e) => setEntityId(e.target.value)} autoComplete="off" spellCheck={false} maxLength={255} />
+              </Field>
+            )}
             <Field label="Button label" hint="Optional. Default: Sign in with SSO." error={fieldErrors.buttonLabel}>
               <Input value={buttonLabel} onChange={(e) => setButtonLabel(e.target.value)} maxLength={40} />
             </Field>
@@ -173,12 +225,40 @@ function SsoAdmin({ data, refetch }: { data: AdminView; refetch: () => Promise<v
           <Field label="Allowed e-mail domains" hint="Optional. One per line, e.g. contoso.com. Leave empty to allow any account in the tenant." error={fieldErrors.allowedDomains}>
             <Textarea rows={3} value={domains} onChange={(e) => setDomains(e.target.value)} spellCheck={false} />
           </Field>
-          <Switch
-            label="Trust Microsoft multi-factor authentication"
-            description="When Microsoft confirms MFA, people are not asked for the portal authenticator. Turning this off signs out every Microsoft session."
-            checked={trust}
-            onCheckedChange={setTrust}
-          />
+          <RadioGroup legend="Multi-factor authentication for Microsoft sign-in" variant="cards" options={MFA_OPTIONS} value={mfaMode} onValueChange={(v) => setMfaMode(v as MfaMode)} error={fieldErrors.entraMfaMode}
+            hint="A stricter choice signs out every Microsoft session. Local sign-in always keeps the portal factor." />
+          {mfaMode !== "portal" ? (
+            <Callout tone={mfaMode === "entra" ? "warning" : "info"} title="Recommended: require MFA in Entra ID">
+              Create a Conditional Access policy for this application that requires multi-factor authentication for all users, and keep at least two local administrators with portal MFA for emergencies.
+            </Callout>
+          ) : null}
+          {protocol === "saml" && mfaMode === "claim" ? (
+            <TagInput
+              label="Authentication contexts that prove MFA (optional)"
+              hint="Microsoft's multipleauthn method always counts. Add AuthnContextClassRef values only if your tenant sends them for MFA."
+              value={contexts}
+              onValueChange={setContexts}
+              max={10}
+              maxLength={255}
+              normalize={(v) => v.trim()}
+              validate={(v) => (/^(urn:|https?:\/\/)\S{3,250}$/.test(v) ? null : "Enter a urn: or https:// value.")}
+              error={fieldErrors.acceptedAuthnContexts}
+            />
+          ) : null}
+          <fieldset className="min-w-0" aria-describedby={fieldErrors.allowedRoles ? "sso-allowed-roles-error" : undefined}>
+            <legend className="mb-1.5 text-sm font-medium text-ink">Who can use single sign-on</legend>
+            <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:gap-6">
+              {(Object.keys(ROLE_LABELS) as Role[]).map((role) => (
+                <Checkbox
+                  key={role}
+                  label={ROLE_LABELS[role]}
+                  checked={roles.includes(role)}
+                  onCheckedChange={(on) => setRoles((current) => (on ? [...current, role] : current.filter((r) => r !== role)))}
+                />
+              ))}
+            </div>
+            {fieldErrors.allowedRoles ? <p id="sso-allowed-roles-error" className="mt-1 text-sm text-danger" role="alert">{fieldErrors.allowedRoles}</p> : null}
+          </fieldset>
           <RadioGroup legend="Create accounts on first sign-in" options={JIT_OPTIONS} value={jitMode} onValueChange={(v) => setJitMode(v as JitMode)} error={fieldErrors.jitMode} />
           {jitMode !== "off" ? (
             <div className="grid min-w-0 gap-4 md:grid-cols-2">
@@ -196,7 +276,21 @@ function SsoAdmin({ data, refetch }: { data: AdminView; refetch: () => Promise<v
         </form>
       </Card>
 
+      {data.protocol === "saml" ? <SamlCertificatesCard data={data} onChanged={refetch} /> : null}
+      {data.jitMode !== "off" ? <RoleMappingsCard data={data} onChanged={refetch} /> : null}
+
       <BindCard onChanged={refetch} />
+
+      <ConfirmDialog
+        open={confirmEntra}
+        onOpenChange={setConfirmEntra}
+        title="Let Microsoft Entra ID manage MFA?"
+        description="People who sign in with Microsoft will never be asked for the portal factor. Only continue if a Conditional Access policy requires MFA for this application. This change is recorded in the audit log."
+        confirmLabel="Confirm"
+        destructive
+        confirmText={ENTRA_MODE_CONFIRMATION}
+        onConfirm={async () => { await save(ENTRA_MODE_CONFIRMATION); setConfirmEntra(false); }}
+      />
 
       <ConfirmDialog
         open={confirmEnable !== null}
@@ -215,20 +309,38 @@ function SsoAdmin({ data, refetch }: { data: AdminView; refetch: () => Promise<v
 
 function TestResult({ result }: { result: Record<string, unknown> }) {
   const yes = (v: unknown) => (v === true ? <Badge tone="success">Yes</Badge> : <Badge tone="warning">No</Badge>);
+  // The result arrives after a full-page return from Entra, so a live region alone is not announced:
+  // move focus to the result once so screen readers read it and keyboard users start there.
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => ref.current?.focus(), []);
   return (
+    <div ref={ref} tabIndex={-1} role="region" aria-label="Test sign-in result" className="rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-action">
     <Callout tone="success" title="Test sign-in completed" live="polite">
       <KeyValueList
         columns={2}
         items={[
           { label: "Signature, tenant and audience", value: yes(result.signatureVerified === true && result.tenantMatches === true && result.audienceMatches === true) },
-          { label: "MFA confirmed by Microsoft", value: yes(result.mfaClaimPresent) },
+          { label: "Protocol", value: result.protocol === "saml" ? "SAML 2.0" : "OpenID Connect" },
+          { label: "MFA confirmed by Microsoft", value: yes(result.mfaProven ?? result.mfaClaimPresent) },
+          { label: "Portal factor skipped", value: yes(result.mfaSkippedByMode) },
+          { label: "Role may use single sign-on", value: yes(result.roleAllowed) },
+          ...(typeof result.jitRole === "string" ? [{ label: "New account role", value: result.jitRole === "staff" ? "Staff" : "Customer" }] : []),
           { label: "E-mail domain", value: typeof result.emailDomain === "string" ? result.emailDomain : "Not provided" },
           { label: "Domain allowed", value: yes(result.domainAllowed) },
           { label: "Staff app role assigned", value: yes(result.staffRoleAssigned) },
           { label: "Linked to you", value: yes(result.linkedToYou) },
         ]}
       />
+      {Array.isArray(result.claimNames) && result.claimNames.length > 0 ? (
+        <div className="mt-3 min-w-0">
+          <p className="text-sm font-medium text-ink">Claims received (names only)</p>
+          <ul className="mt-1 flex list-disc flex-col gap-0.5 pl-5 text-sm">
+            {result.claimNames.filter((n): n is string => typeof n === "string").map((name) => <li key={name} className="break-all"><code>{name}</code></li>)}
+          </ul>
+        </div>
+      ) : null}
     </Callout>
+    </div>
   );
 }
 

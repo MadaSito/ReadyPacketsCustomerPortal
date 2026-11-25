@@ -33,9 +33,12 @@ import type {
   TriggerFieldType,
   TriggerRecipient,
 } from "../audit/triggerCatalogue.js";
+import type { StageActions, StageCompletion } from "../../../shared/workflowStages.js";
 
 export type {
   AuditTapEvent,
+  StageActions,
+  StageCompletion,
   TriggerCatalogueEntry,
   TriggerField,
   TriggerFieldType,
@@ -87,6 +90,51 @@ export const AUTOMATION_STEP_STATES = [
   "unknown",
 ] as const;
 export type AutomationStepState = (typeof AUTOMATION_STEP_STATES)[number];
+
+export const ORDER_STAGE_RUN_STATES = [
+  "completed",
+  "partial_failed",
+  "failed",
+] as const;
+export type OrderStageRunState = (typeof ORDER_STAGE_RUN_STATES)[number];
+
+export const STAGE_BUNDLE_SLOTS = [
+  "status",
+  "completion",
+  "email",
+  "webhook",
+  "dashboard_alert",
+] as const;
+export type StageBundleSlotKey = (typeof STAGE_BUNDLE_SLOTS)[number];
+
+export const STAGE_BUNDLE_SLOT_OUTCOMES = [
+  "completed",
+  "scheduled",
+  "skipped",
+  "failed",
+] as const;
+export type StageBundleSlotOutcome = (typeof STAGE_BUNDLE_SLOT_OUTCOMES)[number];
+
+export const COMPLETION_JOB_SOURCES = [
+  "stage_run",
+  "automation_run",
+] as const;
+export type CompletionJobSource = (typeof COMPLETION_JOB_SOURCES)[number];
+
+export const COMPLETION_POLICY_KINDS = [
+  "fixed",
+  "range",
+] as const;
+export type CompletionPolicyKind = (typeof COMPLETION_POLICY_KINDS)[number];
+
+export const COMPLETION_JOB_STATES = [
+  "scheduled",
+  "applied",
+  "superseded",
+  "canceled",
+  "failed",
+] as const;
+export type CompletionJobState = (typeof COMPLETION_JOB_STATES)[number];
 
 export const AUTOMATION_MAX_CONDITION_GROUPS = 10 as const;
 export const AUTOMATION_MAX_CONDITIONS_PER_GROUP = 20 as const;
@@ -208,7 +256,8 @@ export type AutomationConfigFieldType =
   | "email"
   | "https_url"
   | "template_key"
-  | "storage_connection";
+  | "storage_connection"
+  | "webhook_subscription";
 
 export interface AutomationActionConfigField {
   key: string;
@@ -334,7 +383,13 @@ export interface AutomationActionRegistration<C = Record<string, unknown>> {
   key: string;
   label: string;
   description: string;
-  category: "Messaging" | "Support" | "Integrations" | "Storage and sync";
+  category:
+    | "Order progress"
+    | "Messaging"
+    | "Operations"
+    | "Support"
+    | "Integrations"
+    | "Storage and sync";
   owner: "automations" | "mailTemplates" | "engagement" | "integrations" | "storage" | "portable";
   /** Strict Zod object validating non-secret `config` on save and before execution. */
   configSchema: z.ZodType<C>;
@@ -426,6 +481,7 @@ export interface AutomationSummaryView {
   name: string;
   description: string | null;
   enabled: boolean;
+  sortOrder: number;
   version: number;
   trigger: AutomationTriggerConfig;
   conditionGroupCount: number;
@@ -527,17 +583,140 @@ export interface OrderStageStepView {
   automations: readonly OrderStageBoundAutomationView[];
 }
 
+export interface StageBundleSlotPreview {
+  slot: StageBundleSlotKey;
+  label: string;
+  summary: string;
+  warning: string | null;
+}
+
+export interface StageBundleSlotResult {
+  slot: StageBundleSlotKey;
+  outcome: StageBundleSlotOutcome;
+  reasonCode: string | null;
+  safeSummary: string;
+  externalRef: string | null;
+}
+
+export interface OrderStageRunView {
+  publicId: string;
+  orderPublicId: string;
+  stageKey: string;
+  stageLabel: string;
+  state: OrderStageRunState;
+  reasonCode: string | null;
+  triggeredBy: OrderStageRunActorView | null;
+  correlationId: string;
+  bundle: StageActions;
+  statusOverrideReason: string | null;
+  results: readonly StageBundleSlotResult[];
+  createdAt: Date;
+  finishedAt: Date;
+}
+
+export interface OrderCompletionJobView {
+  publicId: string;
+  orderPublicId: string;
+  stageKey: string | null;
+  sourceKind: CompletionJobSource;
+  sourcePublicId: string;
+  policyKind: CompletionPolicyKind;
+  minPercent: number;
+  maxPercent: number;
+  resolvedPercent: number;
+  delayMinutes: number;
+  dueAt: Date;
+  expectedRevision: number;
+  appliedRevision: number | null;
+  state: CompletionJobState;
+  attemptCount: number;
+  reasonCode: string | null;
+  createdBy: OrderStageRunActorView | null;
+  canceledBy: OrderStageRunActorView | null;
+  canceledAt: Date | null;
+  completedAt: Date | null;
+  createdAt: Date;
+}
+
+export interface OrderPhaseBundleStatusTransitionView {
+  targetStatusKey: string;
+  targetStatusLabel: string;
+  alreadyInTargetStatus: boolean;
+  isAllowedStandardTransition: boolean;
+  requiresAdminOverride: boolean;
+}
+
+export interface OrderPhaseBundleView {
+  stageKey: string;
+  customerLabel: string;
+  staffLabel: string;
+  statusKeys: readonly string[];
+  isCurrentStage: boolean;
+  hasConfiguredBundle: boolean;
+  configuredSlotCount: number;
+  bundle: StageActions | null;
+  slots: readonly StageBundleSlotPreview[];
+  statusTransition: OrderPhaseBundleStatusTransitionView | null;
+  activeCompletionJob: OrderCompletionJobView | null;
+  lastStageRun: OrderStageRunView | null;
+}
+
+export interface OrderStageBundlePreviewView {
+  orderPublicId: string;
+  orderReference: string;
+  orderVersion: number;
+  stageKey: string;
+  customerLabel: string;
+  staffLabel: string;
+  currentStatusKey: string;
+  currentProgressPercent: number;
+  completionRevision: number;
+  /**
+   * Server-computed SHA-256 digest binding human confirmation to the pinned workflow version,
+   * live order version/status/owner/lockState/completionRevision, and current slot availability.
+   */
+  confirmationToken: string;
+  requiresStepUp: true;
+  requiresTransitionCapability: boolean;
+  requiresAdminOverrideReason: boolean;
+  canExecute: boolean;
+  blockedReason: string | null;
+  bundle: StageActions;
+  slots: readonly StageBundleSlotPreview[];
+  statusTransition: OrderPhaseBundleStatusTransitionView | null;
+}
+
+export interface RunOrderStageBundleResult {
+  deduplicated: boolean;
+  stageRun: OrderStageRunView;
+  completionJob: OrderCompletionJobView | null;
+}
+
 export interface OrderStageActionsView {
   orderPublicId: string;
   orderReference: string;
   currentStatusKey: string;
+  currentStageKey: string | null;
+  progressPercent: number;
+  completionRevision: number;
   workflowKey: string;
   workflowVersionNumber: number;
+  workflowFormat: 1 | 2 | 3;
   engineEnabled: boolean;
   engineDisabledReason: string | null;
+  stageBundlesEnabled: boolean;
+  stageBundlesDisabledReason: string | null;
   settingsPath: "/admin/automations";
   canManageAutomations: boolean;
+  canRunStageBundles: boolean;
+  canTransitionOrder: boolean;
+  canOverrideStatus: boolean;
+  canCancelCompletionJobs: boolean;
+  requiresStepUp: true;
+  stages: readonly OrderPhaseBundleView[];
   steps: readonly OrderStageStepView[];
+  recentStageRuns: readonly OrderStageRunView[];
+  recentCompletionJobs: readonly OrderCompletionJobView[];
   recentRuns: readonly AutomationRunView[];
 }
 
@@ -562,9 +741,71 @@ export interface AutomationStarterRecipe {
   actions: readonly Omit<AutomationActionStepInput, "secrets">[];
 }
 
+export type CatalogueFieldOptionSourceKey =
+  | "statuses"
+  | "stages"
+  | "workflows"
+  | "paymentMethods"
+  | "paymentProviders"
+  | "intakeQuestionnaires"
+  | "intakeDecisions"
+  | "emailTemplates";
+
+export interface CataloguePickerOption {
+  value: string;
+  label: string;
+  secondaryLabel?: string | null;
+  disabled?: boolean;
+}
+
+export interface EmailTemplatePickerOption {
+  templateKey: string;
+  name: string;
+  vars: readonly string[];
+  compatibleWithPhaseAction: boolean;
+}
+
+export interface WebhookSubscriptionPickerOption {
+  publicId: string;
+  targetKey: string;
+  label: string;
+  enabled: boolean;
+  signingEnabled: boolean;
+}
+
+export interface WebhookTargetPickerOption {
+  targetKey: string;
+  kind: "production" | "subscription";
+  label: string;
+  configured: boolean;
+  enabled: boolean;
+  signingEnabled: boolean;
+}
+
+export interface AutomationCataloguePickerOptions {
+  statuses: readonly CataloguePickerOption[];
+  stages: readonly CataloguePickerOption[];
+  workflows: readonly CataloguePickerOption[];
+  paymentMethods: readonly CataloguePickerOption[];
+  paymentProviders: readonly CataloguePickerOption[];
+  intakeQuestionnaires: readonly CataloguePickerOption[];
+  intakeDecisions: readonly CataloguePickerOption[];
+  emailTemplates: readonly EmailTemplatePickerOption[];
+  phaseEmailTemplates: readonly EmailTemplatePickerOption[];
+  webhookSubscriptions: readonly WebhookSubscriptionPickerOption[];
+  webhookTargets: readonly WebhookTargetPickerOption[];
+  /**
+   * Maps trigger condition field keys (e.g. `to_status`, `from_status`, `stage_key`,
+   * `method`, `provider`, `questionnaire_public_id`, `decision`) to the corresponding
+   * option list in `pickerOptions` for "All occurrences" vs "Specific value" pickers.
+   */
+  fieldOptionSources: Readonly<Record<string, CatalogueFieldOptionSourceKey>>;
+}
+
 export interface AutomationCatalogueView {
   /** Global feature switch (`automations.enabled`); ships `false` by default until an admin enables it. */
   globallyEnabled: boolean;
+  stageBundlesEnabled: boolean;
   limits: {
     globalRunsPerMinute: number;
     defaultPerAutomationRunsPerHour: number;
@@ -591,10 +832,12 @@ export interface AutomationCatalogueView {
   }[];
   operatorsByFieldType: Readonly<Record<TriggerFieldType, readonly ConditionOperator[]>>;
   starterRecipes: readonly AutomationStarterRecipe[];
+  pickerOptions: AutomationCataloguePickerOptions;
 }
 
 export interface AutomationSettingsView {
   enabled: boolean;
+  stageBundlesEnabled: boolean;
   globalRunsPerMinute: number;
   defaultPerAutomationRunsPerHour: number;
   maxPerAutomationRunsPerHour: number;
@@ -737,6 +980,15 @@ export interface AutomationsModule extends ModuleLifecycle {
     input: { publicId: string; expectedVersion: number },
   ): Promise<{ deleted: true }>;
 
+  /**
+   * Increment 07 (D5): Reorders automation rules so evaluation runs in deterministic
+   * `(sortOrder ASC, id ASC)` order. Requires `automations.manage` + fresh MFA step-up.
+   */
+  reorder(
+    principal: SessionPrincipal,
+    input: { orderedPublicIds: readonly string[] },
+  ): Promise<{ orderedPublicIds: string[] }>;
+
   triggerManual(
     principal: SessionPrincipal,
     input: {
@@ -802,6 +1054,62 @@ export interface AutomationsModule extends ModuleLifecycle {
     principal: SessionPrincipal,
     input: { orderPublicId: string; stepKey: string; idempotencyKey: string },
   ): Promise<OrderStageActionsRunResult>;
+
+  /**
+   * Increment 07 (D5): Authoritative preview of the 5-slot phase action bundle configured on
+   * `stageKey` of the order's pinned workflow version before human confirmation.
+   */
+  previewStageBundle(
+    principal: SessionPrincipal,
+    input: { orderPublicId: string; stageKey: string },
+  ): Promise<OrderStageBundlePreviewView>;
+
+  /**
+   * Increment 07 (D5): Executes the pinned 5-slot phase action bundle for `stageKey` after
+   * human confirmation. Requires `orders.stage.run` (with fresh MFA step-up) and additionally
+   * `orders.transition` when `setStatusKey` is configured.
+   */
+  runStageBundle(
+    principal: SessionPrincipal,
+    input: {
+      orderPublicId: string;
+      stageKey: string;
+      idempotencyKey: string;
+      confirmationToken: string;
+      statusOverrideReason?: string | null;
+    },
+  ): Promise<RunOrderStageBundleResult>;
+
+  /**
+   * Increment 07 (D5): Paginated `order_stage_runs` history for an order (optionally filtered by `stageKey`).
+   */
+  listStageBundleRuns(
+    principal: SessionPrincipal,
+    input: { orderPublicId: string; stageKey?: string; cursor?: string; limit?: number },
+  ): Promise<{ items: OrderStageRunView[]; nextCursor: string | null }>;
+
+  /**
+   * Increment 07 (D5): Paginated `order_completion_jobs` history for an order.
+   */
+  listOrderCompletionJobs(
+    principal: SessionPrincipal,
+    input: {
+      orderPublicId: string;
+      stageKey?: string;
+      state?: CompletionJobState;
+      cursor?: string;
+      limit?: number;
+    },
+  ): Promise<{ items: OrderCompletionJobView[]; nextCursor: string | null }>;
+
+  /**
+   * Increment 07 (D5): Administrator cancellation of a scheduled delayed completion update.
+   * Requires administrator role + `orders.stage.run` (fresh MFA step-up).
+   */
+  cancelOrderCompletionJob(
+    principal: SessionPrincipal,
+    input: { completionJobPublicId: string; reason?: string | null },
+  ): Promise<OrderCompletionJobView>;
 }
 
 /* ------------------------------------------------------------------ shared static registry backing */

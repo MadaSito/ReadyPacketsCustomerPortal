@@ -9,6 +9,8 @@ import { ulid } from "../../core/ids.js";
 import type { ActorCheck } from "./actor.js";
 import type { AuditEmitter, Clock, Db, DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { orders, orderWorkflowDrafts, orderWorkflows, orderWorkflowVersionLayouts, orderWorkflowVersions, type WorkflowDraftSource } from "./schema.js";
+import { compileRuntimeDefinition, STANDARD_V3_DEFINITION, STANDARD_V3_WORKFLOW_KEY, STANDARD_V3_WORKFLOW_NAME } from "./stageModel.js";
+import { workflowStageSchema, type WorkflowStage } from "../../../shared/workflowStages.js";
 import { DEFAULT_WORKFLOW, usesWorkflowRules, workflowDefinitionSchema, type WorkflowDefinition } from "./workflowTypes.js";
 import {
   BLANK_DRAFT,
@@ -17,6 +19,7 @@ import {
   layoutSchema,
   pruneLayout,
   toDraft,
+  toPhasesDraft,
   toPublishable,
   validateDraft,
   type WorkflowDraftDefinition,
@@ -32,6 +35,16 @@ export interface WorkflowDeps {
   actorCheck: ActorCheck;
   /** Increment 04: reads `orders.workflow_rules.enabled`. Absent = disabled (fail closed). */
   rulesEnabled?: (tx?: Tx) => Promise<boolean>;
+  /** Increment 07 (D6/D7): integrations / storage checks of phase webhook and file-sync targets (throws on refusal). */
+  checkStageTargets?: (stages: readonly WorkflowStage[], tx: Tx) => Promise<void>;
+}
+
+/** Only phases that already parse are checked on draft save (an unfinished phase is reported by the designer). */
+function parsedStages(stages: readonly unknown[] | undefined): WorkflowStage[] {
+  return (stages ?? []).flatMap((stage) => {
+    const parsed = workflowStageSchema.safeParse(stage);
+    return parsed.success ? [parsed.data] : [];
+  });
 }
 
 export interface BoundWorkflow {
@@ -43,6 +56,8 @@ export interface BoundWorkflow {
 }
 
 const DEFAULT_KEY = "standard";
+
+export type ConvertDefaultResult = { draftId: string; created: boolean; draftName: string; outcome: "created" | "opened" | "needs_confirm" | "converted" };
 
 export function createWorkflowService(deps: WorkflowDeps) {
   /** Versions are immutable, so caching by id is safe. */
@@ -63,7 +78,8 @@ export function createWorkflowService(deps: WorkflowDeps) {
       workflowKey: row.workflowKey,
       versionId: row.version.id,
       versionNumber: row.version.versionNumber,
-      definition: workflowDefinitionSchema.parse(row.version.definition),
+      // Increment 07 (D1): format 3 compiles onto phases / phase locks (stored definition is unchanged).
+      definition: compileRuntimeDefinition(workflowDefinitionSchema.parse(row.version.definition)),
     };
     versionCache.set(versionId, bound);
     return bound;
@@ -253,7 +269,7 @@ export function createWorkflowService(deps: WorkflowDeps) {
      */
     async createDraft(
       principal: SessionPrincipal,
-      input: { from: WorkflowDraftSource; copyVersionId?: string; workflowId?: string; workflowKey?: string; name?: string },
+      input: { from: WorkflowDraftSource | "phases"; copyVersionId?: string; workflowId?: string; workflowKey?: string; name?: string },
     ) {
       return deps.db.transaction(async (tx) => {
         await assertDesigner(principal, tx, false);
@@ -265,7 +281,8 @@ export function createWorkflowService(deps: WorkflowDeps) {
           if (!version) throw notFound("WORKFLOW_VERSION_NOT_FOUND");
           definition = toDraft(workflowDefinitionSchema.parse(version.definition));
           layout = (await layoutOf(tx, version.id)).layout;
-        } else definition = input.from === "standard" ? toDraft(DEFAULT_WORKFLOW) : structuredClone(BLANK_DRAFT);
+        } else if (input.from === "phases") definition = toDraft(STANDARD_V3_DEFINITION);
+        else definition = input.from === "standard" ? toDraft(DEFAULT_WORKFLOW) : structuredClone(BLANK_DRAFT);
 
         let workflowId: number | null = null;
         let baseVersionId: number | null = null;
@@ -295,7 +312,8 @@ export function createWorkflowService(deps: WorkflowDeps) {
           workflowId,
           workflowKey,
           name,
-          source: input.from,
+          // The stored source enum is frozen (0007): a phases draft is stored as "standard"; the audit says "phases".
+          source: input.from === "phases" ? "standard" : input.from,
           baseVersionId,
           definition,
           layout,
@@ -313,11 +331,153 @@ export function createWorkflowService(deps: WorkflowDeps) {
             actor: { userId: principal.userId, role: principal.role },
             resource: { type: "order_workflow_draft", publicId },
             attributes: { source: input.from, existing_workflow: workflowId !== null },
-            safeCounts: { states: definition.states.length, transitions: definition.transitions.length },
+            safeCounts: { states: definition.states.length, transitions: definition.transitions.length, stages: definition.stages?.length ?? 0 },
           },
           tx,
         );
         return { publicId, rowVersion: 1 };
+      });
+    },
+
+    /**
+     * Increment 07 QA: "Add the ReadyPackets phases workflow" from the phases notice. Starts a NEW workflow draft from
+     * the standard phases definition under a free key; existing workflows and drafts are never touched. An open
+     * phases draft started this way is reopened instead of adding another.
+     */
+    async addPhasesWorkflow(principal: SessionPrincipal): Promise<{ draftId: string; created: boolean }> {
+      return deps.db.transaction(async (tx) => {
+        await assertDesigner(principal, tx, false);
+        const family = [STANDARD_V3_WORKFLOW_KEY, ...Array.from({ length: 8 }, (_, i) => `${STANDARD_V3_WORKFLOW_KEY}_${i + 2}`)];
+        const workflowKeys = new Set((await tx.select({ key: orderWorkflows.workflowKey }).from(orderWorkflows).where(inArray(orderWorkflows.workflowKey, family))).map((row) => row.key));
+        const drafts = await tx
+          .select({ publicId: orderWorkflowDrafts.publicId, key: orderWorkflowDrafts.workflowKey, workflowId: orderWorkflowDrafts.workflowId })
+          .from(orderWorkflowDrafts)
+          .where(inArray(orderWorkflowDrafts.workflowKey, family));
+        const open = drafts.find((draft) => draft.workflowId === null);
+        if (open) return { draftId: open.publicId, created: false };
+        const draftKeys = new Set(drafts.map((draft) => draft.key));
+        const workflowKey = family.find((key) => !workflowKeys.has(key) && !draftKeys.has(key));
+        if (!workflowKey) throw conflict("WORKFLOW_KEY_TAKEN", "Every ReadyPackets phases key is in use. Start one with New workflow instead.");
+        const definition = toDraft(STANDARD_V3_DEFINITION);
+        const now = deps.clock.now();
+        const publicId = ulid(now.getTime());
+        await tx.insert(orderWorkflowDrafts).values({
+          publicId,
+          workflowId: null,
+          workflowKey,
+          name: STANDARD_V3_WORKFLOW_NAME,
+          source: "standard",
+          baseVersionId: null,
+          definition,
+          layout: null,
+          createdByUserId: principal.userId,
+          updatedByUserId: principal.userId,
+          createdAt: now,
+          updatedAt: now,
+        });
+        await deps.audit.record(
+          {
+            category: "admin",
+            eventName: "workflow.draft.changed",
+            action: "create",
+            outcome: "completed",
+            actor: { userId: principal.userId, role: principal.role },
+            resource: { type: "order_workflow_draft", publicId },
+            reasonCode: "PHASES_WORKFLOW_DRAFT",
+            attributes: { source: "phases", existing_workflow: false },
+            safeCounts: { states: definition.states.length, transitions: definition.transitions.length, stages: definition.stages?.length ?? 0 },
+          },
+          tx,
+        );
+        return { draftId: publicId, created: true };
+      });
+    },
+
+    /**
+     * Increment 07 QA: "Convert <default> to phases". A draft of the default workflow with phases derived from its
+     * statuses (classic groups removed). Nothing is published. When the workflow already has an open draft:
+     * - the draft has phases → `outcome: "opened"` (unchanged);
+     * - the draft has no phases → `outcome: "needs_confirm"` (unchanged) naming the draft; calling again with
+     *   `convertDraftId` set to that draft converts it in place (same toPhasesDraft) → `outcome: "converted"`.
+     */
+    async convertDefaultToPhases(principal: SessionPrincipal, input: { convertDraftId?: string } = {}): Promise<ConvertDefaultResult> {
+      return deps.db.transaction(async (tx) => {
+        await assertDesigner(principal, tx, false);
+        const [workflow] = await tx.select().from(orderWorkflows).where(eq(orderWorkflows.isDefault, true)).orderBy(asc(orderWorkflows.id)).limit(1).for("update");
+        if (!workflow?.currentVersionId) throw notFound("WORKFLOW_NOT_FOUND");
+        const [open] = await tx
+          .select()
+          .from(orderWorkflowDrafts)
+          .where(eq(orderWorkflowDrafts.workflowId, workflow.id))
+          .orderBy(desc(orderWorkflowDrafts.updatedAt), desc(orderWorkflowDrafts.id))
+          .limit(1)
+          .for("update");
+        if (open) {
+          const base = { draftId: open.publicId, created: false, draftName: open.name };
+          if (open.definition.stages?.length) return { ...base, outcome: "opened" as const };
+          if (input.convertDraftId !== open.publicId) return { ...base, outcome: "needs_confirm" as const };
+          const parsed = workflowDefinitionSchema.safeParse(open.definition);
+          if (!parsed.success)
+            throw conflict("DRAFT_NOT_CONVERTIBLE", "This draft has problems to fix first. Open it, fix them, then add phases on the Phases tab.");
+          const definition = toPhasesDraft(parsed.data);
+          const now = deps.clock.now();
+          await tx
+            .update(orderWorkflowDrafts)
+            .set({ definition, updatedByUserId: principal.userId, updatedAt: now, version: open.version + 1 })
+            .where(eq(orderWorkflowDrafts.id, open.id));
+          await deps.audit.record(
+            {
+              category: "admin",
+              eventName: "workflow.draft.changed",
+              action: "update",
+              outcome: "completed",
+              actor: { userId: principal.userId, role: principal.role },
+              resource: { type: "order_workflow_draft", publicId: open.publicId },
+              reasonCode: "PHASES_CONVERT_DRAFT",
+              attributes: { source: "draft", existing_workflow: true, in_place: true },
+              safeCounts: { states: definition.states.length, transitions: definition.transitions.length, stages: definition.stages?.length ?? 0 },
+            },
+            tx,
+          );
+          return { ...base, outcome: "converted" as const };
+        }
+        const [version] = await tx.select().from(orderWorkflowVersions).where(eq(orderWorkflowVersions.id, workflow.currentVersionId)).limit(1);
+        if (!version) throw notFound("WORKFLOW_VERSION_NOT_FOUND");
+        const current = workflowDefinitionSchema.parse(version.definition);
+        if (current.stages?.length) throw conflict("WORKFLOW_HAS_PHASES", "This workflow already uses phases.");
+        const definition = toPhasesDraft(current);
+        const layout = (await layoutOf(tx, version.id)).layout;
+        const now = deps.clock.now();
+        const publicId = ulid(now.getTime());
+        await tx.insert(orderWorkflowDrafts).values({
+          publicId,
+          workflowId: workflow.id,
+          workflowKey: workflow.workflowKey,
+          name: workflow.name,
+          source: "copy",
+          baseVersionId: workflow.currentVersionId,
+          definition,
+          layout,
+          createdByUserId: principal.userId,
+          updatedByUserId: principal.userId,
+          createdAt: now,
+          updatedAt: now,
+        });
+        await deps.audit.record(
+          {
+            category: "admin",
+            eventName: "workflow.draft.changed",
+            action: "create",
+            outcome: "completed",
+            actor: { userId: principal.userId, role: principal.role },
+            resource: { type: "order_workflow_draft", publicId },
+            reasonCode: "PHASES_CONVERT_DRAFT",
+            attributes: { source: "copy", existing_workflow: true },
+            safeCounts: { states: definition.states.length, transitions: definition.transitions.length, stages: definition.stages?.length ?? 0 },
+          },
+          tx,
+        );
+        return { draftId: publicId, created: true, draftName: workflow.name, outcome: "created" as const };
       });
     },
 
@@ -336,6 +496,7 @@ export function createWorkflowService(deps: WorkflowDeps) {
         await assertDesigner(principal, tx, false);
         const row = await loadDraftRow(tx, input.draftId, true);
         if (row.version !== input.expectedVersion) throw staleDraft();
+        if (definition.stages?.length) await deps.checkStageTargets?.(parsedStages(definition.stages), tx);
         await tx
           .update(orderWorkflowDrafts)
           .set({
@@ -399,6 +560,11 @@ export function createWorkflowService(deps: WorkflowDeps) {
         const issues = assertPublishable(draft);
         const definition = toPublishable(draft);
         await assertRulesAllowed(definition, tx);
+        if (definition.stages?.length) {
+          // Fail closed: a format-3 publish needs the target checks wired.
+          if (!deps.checkStageTargets) throw validation("STAGE_TARGETS_UNCHECKED", "Phase targets could not be checked. Try again later.");
+          await deps.checkStageTargets(definition.stages, tx);
+        }
         const layout = pruneLayout(row.layout ? layoutSchema.parse(row.layout) : null, draft);
         const [hasDefault] = await tx.select({ id: orderWorkflows.id }).from(orderWorkflows).where(eq(orderWorkflows.isDefault, true)).limit(1);
         let workflowRow: typeof orderWorkflows.$inferSelect;
@@ -479,6 +645,7 @@ export function createWorkflowService(deps: WorkflowDeps) {
             createdAt: version.createdAt,
             changeNote: version.changeNote ?? null,
             stateCount: definition.states.length,
+            stageCount: definition.stages?.length ?? 0,
             transitionCount: definition.transitions.length,
             orderCount: byId.get(version.id) ?? 0,
           };

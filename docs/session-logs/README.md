@@ -11,3 +11,4 @@ values redacted. Newest last.
 | 2026-11-22 | [2026-11-22-session-02.md](2026-11-22-session-02.md) | Increment 05: workflow export / import, cart upsell, discount codes, policy acceptance log centre |
 | 2026-11-22 | [2026-11-22-session-03.md](2026-11-22-session-03.md) | Upgrade steps; authenticator setup no longer locks; redelivery decision confirmed; P101 test against the owner's webhook.site address |
 | 2026-11-23 | [2026-11-23-session-01.md](2026-11-23-session-01.md) | Increment 06: recording, phase tasks, reports, sign-in bans, policies and MNDA, receipts, PWA |
+| 2026-11-24 | [2026-11-24-session-01.md](2026-11-24-session-01.md) | Increment 07: phases-first workflow, statuses, progress, phase actions, alerts, Stripe completion, SAML, Microsoft 365 sync |

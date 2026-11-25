@@ -52,3 +52,15 @@ Every table added in increment 06 is either collected under an existing record o
 - **New acceptance columns** (signer and typed-name match results) belong to compliance evidence, which this export does not collect.
 - **Backups** dump every base table, including all of the above. The increment 05 note about field-encryption and blind-index keys still applies.
 
+
+## Increment 07 coverage
+
+Every one of the 16 tables added by migration 0007 is listed in a manifest exclusion. None adds a record type or changes contract 3.0. Older packages import unchanged.
+
+- **`ephemeral-access`** (new): `file_archives`, `file_archive_tickets` and `file_playback_grants`. They are short-lived (30 minutes, 60 seconds, minutes) and bound to one session.
+- **`phase-workspace`** (new): `order_questions`, `order_question_answers`, `order_admin_tasks`, `order_stage_progress`, `order_stage_runs` and `order_completion_jobs`. The derived order columns `progress_percent`, `completion_percent`, `completion_revision`, `attention`, `attention_since`, `payment_state` and `paid_at` are also not exported. Imported orders take the column defaults (`attention = none`, `payment_state = not_required`) until the target's own workflow updates them.
+- **`operational-diagnostics`** (new): `operational_alerts` and `payment_webhook_rejections`.
+- **`installation-configuration`** (new): `sso_role_mappings`, `sso_saml_certificates`, `order_status_catalog`, `storage_managed_order_roots` and `storage_managed_file_copies`. Automations, including the new `automations.sort_order`, are not collected; no automation record type exists in contract 3.0.
+- **Not collected (unchanged).** These tables already sat outside this export, so their new columns don't travel either: SSO configuration and requests, integration dispatches, deliveries and subscriptions, storage connections, payment webhook events, and the two new `file_access_log` columns.
+- **Known limitation.** `order_files.stage_key` is not carried in contract 3.0 (agreed with Files). Imported files land unphased (`Order files`) and must be re-filed to a phase by staff.
+- **Backups** dump every base table (all 205 after 0007), including all of the above. The increment 05 key note still applies.

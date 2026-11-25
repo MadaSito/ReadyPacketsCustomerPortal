@@ -4,7 +4,7 @@
  */
 import type { AuditTap } from "../../audit/tap.js";
 import type { ApiCaller, ApiListQuery, ApiPage, WebhookSubscriptionDto } from "../../publicApi/ports.js";
-import type { ModuleHealth, SessionPrincipal, Tx } from "../../../core/types.js";
+import type { DbOrTx, ModuleHealth, SessionPrincipal, Tx } from "../../../core/types.js";
 
 export const WEBHOOK_SUBSCRIPTION_STATUSES = ["active", "paused", "disabled_failing"] as const;
 export type WebhookSubscriptionStatus = (typeof WEBHOOK_SUBSCRIPTION_STATUSES)[number];
@@ -20,6 +20,7 @@ export const WEBHOOK_DELIVERY_STATUSES = [
   "failed",
   "dead",
   "unknown",
+  "stopped",
   "processed",
   "duplicate",
   "rejected",
@@ -55,6 +56,7 @@ export interface WebhookSubscriptionView {
   targetUrlMasked: string;
   events: string[];
   status: WebhookSubscriptionStatus;
+  signingEnabled: boolean;
   signingSecretLast4: string;
   hasOverlapSecret: boolean;
   overlapExpiresAt: Date | null;
@@ -74,6 +76,7 @@ export interface CreateWebhookSubscriptionInput {
   targetUrl: string;
   events: readonly string[];
   paused?: boolean;
+  signingEnabled?: boolean;
 }
 
 export interface UpdateWebhookSubscriptionInput {
@@ -83,6 +86,7 @@ export interface UpdateWebhookSubscriptionInput {
   description?: string | null;
   targetUrl?: string;
   events?: readonly string[];
+  signingEnabled?: boolean;
 }
 
 export interface WebhookInboundEndpointView {
@@ -144,6 +148,14 @@ export interface WebhookDeliveryListItemView {
   replayOfPublicId: string | null;
   isTest: boolean;
   canReplay: boolean;
+  canRetry: boolean;
+  canStop: boolean;
+  orderPublicId: string | null;
+  stageKey: string | null;
+  manualRetryCount: number;
+  stoppedAt: Date | null;
+  stoppedByPublicId: string | null;
+  stopReason: string | null;
   expiresAt: Date;
   completedAt: Date | null;
   createdAt: Date;
@@ -175,6 +187,7 @@ export interface ListWebhookDeliveriesInput {
   direction?: WebhookDirection;
   subscriptionPublicId?: string;
   inboundEndpointPublicId?: string;
+  orderPublicId?: string;
   eventKey?: string;
   status?: WebhookDeliveryStatus;
   from?: Date;
@@ -190,6 +203,8 @@ export interface WebhookPublishOptions {
   correlationId?: string;
   resourceType?: string;
   resourcePublicId?: string;
+  orderPublicId?: string | null;
+  stageKey?: string | null;
 }
 
 export interface InboundHttpReceiveInput {
@@ -283,6 +298,11 @@ export interface WebhooksService {
     input: ListWebhookDeliveriesInput,
   ): Promise<{ items: WebhookDeliveryListItemView[]; nextCursor: string | null }>;
   getDelivery(principal: SessionPrincipal, publicId: string): Promise<WebhookDeliveryDetailView>;
+  stopDelivery(
+    principal: SessionPrincipal,
+    input: { publicId: string; reason?: string | null },
+  ): Promise<WebhookDeliveryDetailView>;
+  retryDelivery(principal: SessionPrincipal, input: { publicId: string }): Promise<WebhookDeliveryDetailView>;
   redeliver(principal: SessionPrincipal, input: { publicId: string }): Promise<WebhookDeliveryDetailView>;
   reprocessInbound(principal: SessionPrincipal, input: { publicId: string }): Promise<WebhookDeliveryDetailView>;
 
@@ -292,6 +312,48 @@ export interface WebhooksService {
     options?: WebhookPublishOptions,
     tx?: Tx,
   ): Promise<{ queued: number; deliveryPublicIds: string[] }>;
+
+  enqueueWorkflowSubscription(
+    input: {
+      subscriptionPublicId: string;
+      orderPublicId: string | null;
+      stageKey: string | null;
+      triggerSource: string;
+      idempotencyKey: string;
+      correlationId?: string;
+      actor?: SessionPrincipal | null;
+      actorPublicId?: string | null;
+      eventKey?: string | null;
+      payload: Record<string, unknown>;
+    },
+    tx: Tx,
+  ): Promise<{
+    outcome: "queued" | "already_queued_or_delivered" | "refused_precondition" | "disabled";
+    deliveryPublicId: string | null;
+    reasonCode: string | null;
+    message: string | null;
+  }>;
+
+  listSubscriptionTargetsForPicker(tx?: DbOrTx): Promise<
+    Array<{
+      publicId: string;
+      name: string;
+      status: WebhookSubscriptionStatus;
+      signingEnabled: boolean;
+      webhooksEnabled: boolean;
+    }>
+  >;
+
+  getSubscriptionTargetStatus(
+    subscriptionPublicId: string,
+    tx?: DbOrTx,
+  ): Promise<{
+    exists: boolean;
+    name: string | null;
+    status: WebhookSubscriptionStatus | null;
+    signingEnabled: boolean;
+    webhooksEnabled: boolean;
+  }>;
 
   receiveInboundHttp(input: InboundHttpReceiveInput): Promise<InboundHttpReceiveResult>;
 

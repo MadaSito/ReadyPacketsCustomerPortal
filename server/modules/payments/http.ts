@@ -50,10 +50,20 @@ export function createPaymentWebhooksHttpRouter(services: Services): Router {
     }
 
     if (!Buffer.isBuffer(req.body) || req.body.byteLength === 0) {
+      await payments.recordHttpRejection({
+        provider,
+        reasonCode: "WEBHOOK_EMPTY_BODY",
+        httpStatus: 400,
+      });
       res.status(400).json({ ok: false, reasonCode: "WEBHOOK_EMPTY_BODY" });
       return;
     }
     if (req.body.byteLength > MAX_WEBHOOK_RAW_BYTES) {
+      await payments.recordHttpRejection({
+        provider,
+        reasonCode: "WEBHOOK_PAYLOAD_TOO_LARGE",
+        httpStatus: 413,
+      });
       res.status(413).json({ ok: false, reasonCode: "WEBHOOK_PAYLOAD_TOO_LARGE" });
       return;
     }

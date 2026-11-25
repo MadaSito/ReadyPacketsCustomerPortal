@@ -2,6 +2,7 @@ import { bigint, boolean, char, index, int, json, mysqlEnum, mysqlTable, text, u
 import { createdAtColumn, idColumn, publicIdColumn, updatedAtColumn, utcDateTime, versionColumn } from "../../db/columns.js";
 import { STORAGE_PROVIDER_KINDS, STORAGE_PURPOSES, type StorageConfig, type StorageTestCode } from "./contracts.js";
 import { COPY_KINDS, COPY_STATES, COPY_VERIFICATIONS } from "./copyLogTypes.js";
+import { MANAGED_FILE_SYNC_ROLES } from "../../../shared/orderStageFileSync.js";
 
 export const storageConnections = mysqlTable("storage_connections", {
   id: idColumn(),
@@ -16,6 +17,8 @@ export const storageConnections = mysqlTable("storage_connections", {
   destinationVersion: versionColumn("destination_version"),
   lastTestCode: varchar("last_test_code", { length: 32 }).$type<StorageTestCode>(),
   lastTestAt: utcDateTime("last_test_at"),
+  fileSyncMode: mysqlEnum("file_sync_mode", ["phase_files", "receipts"]),
+  fileSyncWriteTestVersion: int("file_sync_write_test_version", { unsigned: true }),
   createdAt: createdAtColumn(),
   updatedAt: updatedAtColumn(),
 }, (t) => [index("storage_connections_enabled_idx").on(t.enabled, t.id)]);
@@ -45,6 +48,37 @@ export const storageFileCopies = mysqlTable("storage_file_copies", {
 }, (t) => [
   uniqueIndex("storage_file_copies_file_connection_uq").on(t.filePublicId, t.connectionPublicId),
   index("storage_file_copies_state_idx").on(t.state, t.updatedAt),
+]);
+
+/** Frozen managed hierarchy shared by all approved targets on an order. */
+export const storageManagedOrderRoots = mysqlTable("storage_managed_order_roots", {
+  id: idColumn(),
+  orderPublicId: char("order_public_id", { length: 26 }).notNull(),
+  rootEnc: text("root_enc").notNull(),
+  createdAt: createdAtColumn(),
+}, (t) => [uniqueIndex("storage_managed_order_roots_order_uq").on(t.orderPublicId)]);
+
+/** Role-scoped immutable intent. The earlier file+connection uniqueness remains unchanged. */
+export const storageManagedFileCopies = mysqlTable("storage_managed_file_copies", {
+  id: idColumn(),
+  publicId: publicIdColumn(),
+  orderPublicId: char("order_public_id", { length: 26 }).notNull(),
+  sourcePublicId: char("source_public_id", { length: 26 }).notNull(),
+  connectionPublicId: char("connection_public_id", { length: 26 }).notNull(),
+  destinationVersion: int("destination_version", { unsigned: true }).notNull(),
+  role: mysqlEnum("role", MANAGED_FILE_SYNC_ROLES).notNull(),
+  state: mysqlEnum("state", ["queued", "copying", "copied", "failed", "blocked", "unknown"]).notNull().default("queued"),
+  targetEnc: text("target_enc").notNull(),
+  remoteIdEnc: text("remote_id_enc"),
+  reasonCode: varchar("reason_code", { length: 64 }),
+  jobPublicId: varchar("job_public_id", { length: 64 }),
+  createdAt: createdAtColumn(),
+  updatedAt: updatedAtColumn(),
+  finishedAt: utcDateTime("finished_at"),
+}, (t) => [
+  uniqueIndex("storage_managed_file_source_role_uq").on(t.sourcePublicId, t.connectionPublicId, t.role),
+  index("storage_managed_file_order_idx").on(t.orderPublicId, t.id),
+  index("storage_managed_file_health_idx").on(t.connectionPublicId, t.state, t.finishedAt),
 ]);
 
 /** Operational history. Deliberately no FK to the source, connection, or job retention lifecycle. */

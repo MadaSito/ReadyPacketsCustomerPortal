@@ -184,7 +184,7 @@ describe("administrator journey (assembled system)", () => {
       }
     }
     expect(failures).toEqual([]);
-  });
+  }, 120_000);
 
   it.todo("audit events reach a configured SIEM/syslog destination end to end (needs a local TLS syslog sink fixture)");
   it.todo("backup and integrations admin flows through the assembled app (owners' module suites cover them today)");

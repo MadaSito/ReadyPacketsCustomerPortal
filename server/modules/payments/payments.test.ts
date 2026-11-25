@@ -196,6 +196,16 @@ function createFakeStripeProtocol() {
       };
     }
 
+    if (opts.method === "GET" && u.pathname === "/v1/checkout/sessions") {
+      const auth = opts.headers?.authorization ?? opts.headers?.Authorization ?? "";
+      const livemode = auth.startsWith("Bearer sk_live_") || auth.startsWith("Bearer rk_live_");
+      return {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({ object: "list", data: [{ livemode }] }), "utf8"),
+      };
+    }
+
     if (opts.method === "GET" && u.pathname.startsWith("/v1/checkout/sessions/")) {
       if (failNextFetch) {
         failNextFetch = false;
@@ -729,12 +739,45 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
       reasonCode: "STRIPE_KEY_MODE_MISMATCH",
     });
 
-    const saved = await h.payments.admin.updateSettings(adminPrincipal, {
-      provider: "stripe",
+    // Direct one-step activation without staging + API verification is refused with STRIPE_API_NOT_VERIFIED.
+    await expect(
+      h.payments.admin.updateSettings(adminPrincipal, {
+        provider: "stripe",
+        mode: "test",
+        currency: "USD",
+        stripeSecretKey: "sk_test_validkey_ABCD",
+        stripeWebhookSecret: "whsec_validsecret_9876",
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      reasonCode: "STRIPE_API_NOT_VERIFIED",
+    });
+
+    // Stage while keeping Pay by invoice active, verify API + self-test webhook, then activate Stripe.
+    await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "none",
       mode: "test",
       currency: "USD",
       stripeSecretKey: "sk_test_validkey_ABCD",
       stripeWebhookSecret: "whsec_validsecret_9876",
+    });
+    expect((await h.payments.admin.testConnection(adminPrincipal)).ok).toBe(true);
+    await expect(
+      h.payments.admin.updateSettings(adminPrincipal, {
+        provider: "stripe",
+        mode: "test",
+        currency: "USD",
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      reasonCode: "STRIPE_WEBHOOK_NOT_VERIFIED",
+    });
+    expect((await h.payments.admin.sendSelfTestWebhook(adminPrincipal)).ok).toBe(true);
+
+    const saved = await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
     });
 
     expect(saved.onlineEnabled).toBe(true);
@@ -761,11 +804,18 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
   it("validates hosted redirect URLs, encrypts redirectUrl at rest, reuses idempotent attempts, and blocks non-owners with NOT_FOUND", async () => {
     const h = createHarness();
     await h.payments.admin.updateSettings(adminPrincipal, {
-      provider: "stripe",
+      provider: "none",
       mode: "test",
       currency: "USD",
       stripeSecretKey: "sk_test_checkout_1111",
       stripeWebhookSecret: "whsec_checkout_2222",
+    });
+    await h.payments.admin.testConnection(adminPrincipal);
+    await h.payments.admin.sendSelfTestWebhook(adminPrincipal);
+    await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
     });
 
     const { invoice } = await h.createIssuedInvoiceForCustomerA(32_500);
@@ -901,11 +951,18 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
     const h = createHarness();
     const webhookSecret = "whsec_doubleverify_secret_9999";
     await h.payments.admin.updateSettings(adminPrincipal, {
-      provider: "stripe",
+      provider: "none",
       mode: "test",
       currency: "USD",
       stripeSecretKey: "sk_test_doubleverify_8888",
       stripeWebhookSecret: webhookSecret,
+    });
+    await h.payments.admin.testConnection(adminPrincipal);
+    await h.payments.admin.sendSelfTestWebhook(adminPrincipal);
+    await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
     });
 
     const { invoice: inv1 } = await h.createIssuedInvoiceForCustomerA(48_000);
@@ -1098,11 +1155,18 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
     const h = createHarness();
     const { invoice } = await h.createIssuedInvoiceForCustomerA(20_000);
     await h.payments.admin.updateSettings(adminPrincipal, {
-      provider: "stripe",
+      provider: "none",
       mode: "test",
       currency: "USD",
       stripeSecretKey: "sk_test_http_route_3333",
       stripeWebhookSecret: "whsec_http_route_4444",
+    });
+    await h.payments.admin.testConnection(adminPrincipal);
+    await h.payments.admin.sendSelfTestWebhook(adminPrincipal);
+    await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
     });
 
     const started = await h.payments.startCheckout(
