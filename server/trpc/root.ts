@@ -27,6 +27,7 @@ import { cartRouter } from "../modules/cart/router.js";
 import { knowledgeRouter } from "../modules/knowledge/router.js";
 import { paymentsRouter } from "../modules/payments/router.js";
 import { opsAlertsRouter } from "../modules/opsAlerts/router.js";
+import { fileArchivesRouter } from "../modules/files/archivesRouter.js";
 
 export const appRouter = router({
   identity: identityRouter,
@@ -56,6 +57,7 @@ export const appRouter = router({
   knowledge: knowledgeRouter,
   payments: paymentsRouter,
   opsAlerts: opsAlertsRouter,
+  fileArchives: fileArchivesRouter,
 });
 
 export type AppRouter = typeof appRouter;
