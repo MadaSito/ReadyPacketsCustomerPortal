@@ -509,3 +509,7 @@ Attention = stage state first (`submitted` / `in_review` ⇒ `staff_review`; ope
 ### Audit events (names agreed with audit_engineer)
 
 `order.stage.advanced`, `order.stage.submitted`, `order.stage.reviewed`, `order.stage.reopened`, `order.stage.status_overridden`, `order.progress.lowered`, `order.payment_state.changed`.
+
+### Phase questions and checklist
+
+See [D4 phase work API](./questions/API.md) for the `orders.questions` and `orders.adminTasks` procedures, version and ownership rules, customer wizard and console slots, and encrypted storage.

@@ -23,7 +23,7 @@ All procedures require a full session, an accessible order and a phase from that
 ### Integration ports
 
 - `assertStageQuestionsAnswered(orderId, workflowVersionId, stageKey, tx)` is called by the stage progression owner, inside the existing order-locked transaction and before advancement. Only active required questions count. Refuses with `QUESTIONS_UNANSWERED` if any has no answer. No question or answer text is returned.
-- Customer: `client/src/features/orders/stages/StageQuestions.tsx` exports `StageQuestions({ orderId, stageKey, readOnly? })`. Mount only when the phase has `actions.answerQuestions`; set `readOnly` for completed phases.
+- Customer: `client/src/features/orders/stages/StageQuestions.tsx` exports `StageQuestions({ orderId, stageKey, readOnly?, headingLevel?: 3 | 4 })`. Mount only when the phase has `actions.answerQuestions`; set `readOnly` for completed phases and use `headingLevel={4}` below the wizard's phase heading.
 - Console: `client/src/features/orders/stages/OrderPhaseConsolePanel.tsx` exports `OrderPhaseConsolePanel({ orderId, renderActions? })`; the optional phase actions slot takes a pinned stage key. Review and reopen go through `orders.stages`, which owns submission authorization, acknowledgement evidence, progress and transitions.
 
 ### Storage and audit

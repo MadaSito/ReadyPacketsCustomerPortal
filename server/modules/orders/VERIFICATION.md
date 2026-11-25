@@ -179,3 +179,7 @@ Not verified: real concurrent redemptions across connections; the HTTP body cap 
 Run: `scripts/dev/test.sh` per file, `scripts/dev/tc.sh` (no errors under `orders/`), ESLint on changed paths.
 
 Not verified: a real browser (320 px, zoom, both themes, screen-reader reading of the findings jump and pause callout); the real `AgreementDialog` inside the order pages (stubbed in orders.test.tsx); the Files recorder and edit-in-portal end to end (files / integrations).
+
+## Increment 07 D4: phase questions, checklist and submission panel
+
+See [D4 verification](./questions/VERIFICATION.md) for automated coverage and browser checks.
