@@ -10,13 +10,16 @@ import type { SessionPrincipal } from "../../core/types.js";
 import { createCallerFactory, router } from "../../trpc/trpc.js";
 import { users } from "../identity/schema.js";
 import { createActorCheck } from "./actor.js";
+import { createOrdersModule } from "./index.js";
 import { createOrderPolicy } from "./policy.js";
 import { answerAad, assertStageQuestionsAnswered, normalizeQuestionText, promptAad } from "./questions.js";
 import type { ResolveQuestionStage } from "./questionsAccess.js";
 import { adminTasksRouter, createPhaseWorkServices, questionsRouter } from "./questionsRouter.js";
 import { orderAdminTasks, orderQuestionAnswers, orderQuestions } from "./questionsSchema.js";
-import { orderGrants, orders } from "./schema.js";
-import { fakeIdentity, insertUser, type TestUser } from "./testSupport.js";
+import { ordersRouter } from "./router.js";
+import { orderGrants, orders, orderWorkflows, orderWorkflowVersions } from "./schema.js";
+import { fakeIdentity, insertUser, ordersTestSchema, type TestUser } from "./testSupport.js";
+import { workflowDefinitionSchema } from "./workflowTypes.js";
 
 describe("plain text and legacy phases", () => {
   it("normalizes Unicode and line endings, limits length, and treats markup as literal text", () => {
@@ -33,6 +36,83 @@ describe("plain text and legacy phases", () => {
     });
     expect(stage).toMatchObject({ key: "intake", actions: { answerQuestions: false }, adminTasks: [] });
   });
+});
+
+it("integrates phase questions with submit, attention, review and administrator reopen", async () => {
+  const db = await createTestDb({ schema: ordersTestSchema });
+  try {
+    const h = createTestDeps({ db: db.db });
+    const mod = createOrdersModule(h.deps);
+    Object.assign(h.services, { orders: mod, identity: fakeIdentity(h, db.db) });
+    // Isolate D4 from global D2 seed data; the runtime falls back to the pinned definition for unseen statuses.
+    vi.spyOn(mod.statusCatalog, "getManyInTx").mockResolvedValue(new Map());
+    const admin = await insertUser(h, db.db, { role: "admin", stepUp: true });
+    const staff = await insertUser(h, db.db, { role: "staff" });
+    const customer = await insertUser(h, db.db);
+    const caller = createCallerFactory(ordersRouter);
+    const as = (session: SessionPrincipal) =>
+      caller({ services: h.services, session, request: newRequestContext("test"), transport: { issue() {}, clear() {} } });
+    const [workflow] = await db.db.insert(orderWorkflows).values({
+      publicId: ulid(), workflowKey: "synthetic_d4", name: "Synthetic D4",
+    }).$returningId();
+    const [pinned] = await db.db.insert(orderWorkflowVersions).values({
+      publicId: ulid(), workflowId: workflow!.id, versionNumber: 1, createdByUserId: admin.id,
+      definition: workflowDefinitionSchema.parse({
+        states: [
+          { key: "start", label: "Intake", customerLabel: "Intake", kind: "initial", tone: "neutral" },
+          { key: "finish", label: "Finished", customerLabel: "Finished", kind: "terminal", tone: "success" },
+        ],
+        transitions: [{ from: "start", to: "finish", allowedBy: ["staff", "admin"], notifyCustomer: false }],
+        stages: [
+          {
+            key: "intake", customerLabel: "Intake", staffLabel: "Intake",
+            statusKeys: ["start"], actions: { answerQuestions: true }, progression: "submit_lock",
+            adminTasks: ["review_submission"],
+          },
+          { key: "delivery", customerLabel: "Delivery", staffLabel: "Delivery", statusKeys: ["finish"], actions: {} },
+        ],
+      }),
+    }).$returningId();
+    const scope = { orderId: ulid(), stageKey: "intake" };
+    await db.db.insert(orders).values({
+      publicId: scope.orderId, reference: scope.orderId, projectName: "Synthetic pinned workspace",
+      ownerUserId: customer.id, workflowVersionId: pinned!.id, statusKey: "start", subtotalMinor: 100, totalMinor: 100, currency: "USD",
+    });
+    const buyer = as(customer.principal);
+    const reviewer = as(staff.principal);
+    const attention = async () => (await db.db.select({ attention: orders.attention }).from(orders)
+      .where(eq(orders.publicId, scope.orderId)))[0]?.attention;
+    const workspace = () => buyer.stages.workspace({ orderId: scope.orderId });
+    const { questionId } = await reviewer.questions.ask({ ...scope, required: true, prompt: "Where is the final evidence?" });
+    expect(await attention()).toBe("customer_response");
+    await expect(buyer.stages.submit({ ...scope, expectedVersion: (await workspace()).version }))
+      .rejects.toMatchObject({ code: "CONFLICT", cause: { reasonCode: "QUESTIONS_UNANSWERED" } });
+    await buyer.questions.answer({ ...scope, questionId, expectedVersion: 0, body: "In the synthetic folder." });
+    expect(await attention()).not.toBe("customer_response");
+    await buyer.stages.submit({ ...scope, expectedVersion: (await workspace()).version });
+    expect(await attention()).toBe("staff_review");
+    await reviewer.stages.review({
+      ...scope, expectedVersion: (await workspace()).version, outcome: "changes_requested", note: "Attach the updated document.",
+    });
+    expect((await workspace()).stages[0]).toMatchObject({ locked: true, review: { outcome: "changes_requested", note: "Attach the updated document." } });
+    const edit = { ...scope, questionId, expectedVersion: 1, body: "Updated evidence." };
+    await expect(buyer.questions.answer(edit)).rejects.toMatchObject({ code: "CONFLICT" });
+    const reopen = { ...scope, expectedVersion: (await workspace()).version, reason: "Allow the customer to update evidence.", confirm: true as const };
+    await expect(reviewer.stages.reopen(reopen)).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(as({ ...admin.principal, stepUpAt: null }).stages.reopen(reopen))
+      .rejects.toMatchObject({ cause: { reasonCode: "STEP_UP_REQUIRED" } });
+    await as(admin.principal).stages.reopen(reopen);
+    expect((await workspace()).stages[0]).toMatchObject({ state: "reopened", locked: false });
+    expect(await buyer.questions.answer(edit)).toEqual({ version: 2 });
+    await buyer.stages.submit({ ...scope, expectedVersion: (await workspace()).version });
+    await reviewer.stages.review({ ...scope, expectedVersion: (await workspace()).version, outcome: "accepted" });
+    expect(await workspace()).toMatchObject({ currentStageKey: "delivery", stages: [
+      expect.objectContaining({ state: "accepted", review: { outcome: "accepted", note: null, at: expect.any(String) } }),
+      expect.objectContaining({ key: "delivery" }),
+    ] });
+  } finally {
+    await db.cleanup();
+  }
 });
 
 describe("phase question and checklist procedures with MySQL order locking", () => {

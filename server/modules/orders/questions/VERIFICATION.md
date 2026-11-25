@@ -6,6 +6,7 @@
 | Required questions block progression; past answers immutable, encrypted and scoped; withdrawn questions remain in console only | Same suite exercises the progression port and inspects stored ciphertext and audit attributes. |
 | Checklist accepts only configured keys; stale changes refused; audit rollback and check/untick events | Same MySQL suite; failure is injected on the audit port, which must roll back the state change. |
 | Format-1/2 orders without an explicit phase model keep derived stages without enabling new actions | Same suite tests legacy phase derivation. |
+| Pinned format-3 order: required answer, attention, submit, changes requested, step-up reopen and accept | Same MySQL suite runs the actual Orders router and phase workspace methods end to end. It uses a synthetic pinned workflow and the runtime's missing-catalogue-entry fallback to isolate D4 from D2 seed data. |
 | Customer answer/version controls, text escaping, focus and read-only state | `scripts/dev/test.sh client/src/features/orders/stages/phaseWork.test.tsx`, built on tRPC fixtures, Testing Library, keyboard input and jsdom axe. |
 | Console question history, checklist, request changes, explicit reopen confirmation and focus return | Same UI suite. |
 
