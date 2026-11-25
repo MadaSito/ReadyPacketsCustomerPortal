@@ -30,7 +30,6 @@ export const operationalAlerts = mysqlTable("operational_alerts", {
   createdAt: createdAtColumn(),
   updatedAt: updatedAtColumn(),
 }, (t) => [
-  uniqueIndex("ops_alert_public_uq").on(t.publicId),
   uniqueIndex("ops_alert_source_key_uq").on(t.source, t.dedupHash),
   index("ops_alert_state_severity_ix").on(t.state, t.severity, t.publicId),
   index("ops_alert_source_public_ix").on(t.source, t.publicId),
