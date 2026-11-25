@@ -144,6 +144,11 @@ export function OrderProgress({ percent, stages, currentIndex, canceled = false,
     fill.current?.style.setProperty("--rp-progress", `${filled ? target : 0}%`);
   }, [filled, target]);
 
+  // Announce later changes (not the first render) politely: "Progress updated: 40 percent, phase 2 of 5: Intake".
+  const valueText = progressValueText({ percent: target, stages, currentIndex, canceled });
+  const [announced, setAnnounced] = useState({ valueText, message: "" });
+  if (announced.valueText !== valueText) setAnnounced({ valueText, message: `Progress updated: ${valueText}` });
+
   const statusLine = canceled
     ? current ? `Canceled during ${current.label}` : "Canceled"
     : complete ? "All phases complete"
@@ -151,6 +156,7 @@ export function OrderProgress({ percent, stages, currentIndex, canceled = false,
 
   return (
     <div className={cn("@container min-w-0", className)} data-variant={variant} data-canceled={canceled || undefined}>
+      <p className="sr-only" role="status">{announced.message}</p>
       <div className="flex min-w-0 flex-wrap items-end justify-between gap-x-4 gap-y-1">
         <div className="min-w-0">
           {caption ? <p id={captionId} className="text-xs font-semibold tracking-wide text-muted uppercase">{caption}</p> : null}
@@ -172,7 +178,7 @@ export function OrderProgress({ percent, stages, currentIndex, canceled = false,
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={target}
-        aria-valuetext={progressValueText({ percent: target, stages, currentIndex, canceled })}
+        aria-valuetext={valueText}
         className={cn(
           "rp-progress-track relative mt-2 overflow-hidden rounded-full bg-surface-sunken rp-forced-border",
           variant === "compact" ? "h-2" : "h-3",

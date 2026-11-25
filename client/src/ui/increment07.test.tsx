@@ -1,5 +1,6 @@
 import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { OrderProgress, progressValueText, stageStates } from "@/ui";
 import { expectNoAxeViolations, renderUi } from "./testing";
@@ -80,4 +81,18 @@ describe("OrderProgress", () => {
     expect(screen.getByRole("progressbar", { name: "Progress for RP-2026-000006" })).toBeInTheDocument();
     expect(screen.queryByRole("list")).toBeNull();
   });
+
+  it("announces later progress changes politely, not the first render", async () => {
+    const user = userEvent.setup();
+    function Live() {
+      const [step, setStep] = useState(0);
+      return (<><OrderProgress percent={step * 20} stages={STAGES} currentIndex={step} /><button type="button" onClick={() => setStep(1)}>Advance</button></>);
+    }
+    const { container } = renderUi(<Live />);
+    const status = () => container.querySelector("[data-variant] > [role=status]");
+    expect(status()).toHaveTextContent(/^$/);
+    await user.click(screen.getByRole("button", { name: "Advance" }));
+    expect(status()).toHaveTextContent("Progress updated: 20 percent, phase 2 of 5: Intake");
+  });
+
 });
