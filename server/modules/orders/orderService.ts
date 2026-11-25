@@ -26,6 +26,7 @@ import type { RequirementsService } from "./requirements.js";
 import type { OrderGatesService } from "./gates.js";
 import type { StageRuntime } from "./stageRuntime.js";
 import { stageIndexOfStatus, stageModelOf, submitLockStageOf } from "./stageModel.js";
+import { assertStageQuestionsAnswered } from "./questions.js";
 import type { OrderAttention, OrderPaymentState as OrderPaymentStateV7 } from "./schema.js";
 import { findState, initialState, isCancelState, transitionActionLabel, transitionsFrom, type WorkflowActor } from "./workflowTypes.js";
 
@@ -1189,6 +1190,8 @@ export function createOrderService(deps: OrderServiceDeps) {
           // change (that skipped the questions, acknowledgement and lock). Staff, admin and API actors are unaffected.
           if (actor === "customer" && !isCancelTarget(bound, transition.to) && (await submitLockPending(tx, view.id, view.workflowVersionId, bound, view.statusKey)))
             throw conflict("STAGE_SUBMIT_REQUIRED", "Finish this phase with Submit and lock first.");
+          // QA: a customer status action that leaves a format-3 phase (e.g. Approve) needs that phase's required questions.
+          if (actor === "customer" && !isCancelTarget(bound, transition.to)) await assertPhaseQuestionsForExit(tx, view.id, view.workflowVersionId, bound, view.statusKey, transition.to);
           // B6: a customer-side phase submit (any move out of a gated status) needs the gate met; cancel is always allowed.
           if (actor === "customer" && !isCancelTarget(bound, transition.to))
             await deps.gates.assertCustomerMayWork({ tx, orderId: view.id, actor: principal, action: "phase_submit", statusKey: view.statusKey });
@@ -1861,4 +1864,14 @@ async function submitLockPending(db: DbOrTx, orderId: number, workflowVersionId:
     .where(and(eq(orderStageProgress.orderId, orderId), eq(orderStageProgress.workflowVersionId, workflowVersionId), eq(orderStageProgress.stageKey, stage.key)))
     .limit(1);
   return !(row && (row.state === "submitted" || row.state === "in_review" || row.state === "accepted"));
+}
+
+/** Format 3: leaving the current phase by a customer status action requires its required questions answered. */
+async function assertPhaseQuestionsForExit(tx: Tx, orderId: number, workflowVersionId: number, bound: BoundWorkflow, fromStatus: string, toStatus: string): Promise<void> {
+  const model = stageModelOf(bound.definition);
+  if (model.derived) return;
+  const from = stageIndexOfStatus(model, fromStatus);
+  if (from < 0 || stageIndexOfStatus(model, toStatus) === from) return;
+  const stage = model.stages[from]!;
+  if (stage.actions.answerQuestions) await assertStageQuestionsAnswered(orderId, workflowVersionId, stage.key, tx);
 }

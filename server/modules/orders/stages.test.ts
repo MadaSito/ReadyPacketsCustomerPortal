@@ -256,6 +256,15 @@ it("a staff status change that passes a phase without a submission is audited in
       attributes: { stage_key: "phase_1_intake", from_status: "in_review", to_status: "in_progress", submitted: "false" },
     });
     expect(h.audit.recordedInTx.at(-1)).toBe(true);
+
+    // Phase 3 review: Approve / Request changes finish the phase, so the panel offers no duplicate Next.
+    await reviewer.transition({ orderId, expectedVersion: await version(), toStatus: "awaiting_customer" });
+    const buyer = as(customer.principal);
+    const review = await buyer.stages.workspace({ orderId });
+    expect(review.stages.find((stage) => stage.key === "phase_3_review")).toMatchObject({ canNext: false, waitingOn: "status_action" });
+    await expect(buyer.stages.next({ orderId, stageKey: "phase_3_review", expectedVersion: review.version }))
+      .rejects.toMatchObject({ cause: { reasonCode: "STAGE_USE_STATUS_ACTION" } });
+    expect((await buyer.get({ orderId })).transitions.map((t) => t.to)).toEqual(expect.arrayContaining(["delivery_preparing", "revisions"]));
   } finally {
     await db.cleanup();
   }

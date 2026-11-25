@@ -66,8 +66,9 @@ export interface StageWorkspaceStage {
   submittedAt: string | null;
   review: { outcome: "accepted" | "changes_requested"; note: string | null; at: string } | null;
   canNext: boolean;
-  /** Current phase, customer view: "payment" = waiting for payment confirmation, "team" = staff complete it. */
-  waitingOn: "payment" | "team" | null;
+  /** Current phase, customer view: "payment" = waiting for payment confirmation, "team" = staff complete it,
+   *  "status_action" = finish it with the order's named actions (e.g. Approve / Request changes). */
+  waitingOn: "payment" | "team" | "status_action" | null;
   canSubmit: boolean;
   canReview: boolean;
   canReopen: boolean;
@@ -237,6 +238,9 @@ export function createStagesService(deps: StagesDeps) {
       const viewable = isViewable(projection, index);
       const current = index === projection.currentIndex;
       const customerCanWork = v3 && owner && current && workingStates.has(state) && !locked && !orderLockedNow && !projection.canceled;
+      // QA (ui_foundation #3): a named customer status action already leaves this phase (e.g. Approve in Phase 3 review),
+      // so Next would only duplicate it; the header's actions finish the phase.
+      const exitsByStatusAction = customerCanWork && pickTransition(bound, view.statusKey, "customer", nextStageTargets(projection.model, index)) !== null;
       const ackPolicy = stage.acknowledgement.policy;
       stages.push({
         key: stage.key,
@@ -260,9 +264,12 @@ export function createStagesService(deps: StagesDeps) {
         ...(staff ? { adminTasks: [...stage.adminTasks] } : {}),
         submittedAt: row?.submittedAt ? row.submittedAt.toISOString() : null,
         review: row?.reviewOutcome && row.reviewedAt ? { outcome: row.reviewOutcome, note: await noteBody(db, row.reviewNotePublicId), at: row.reviewedAt.toISOString() } : null,
-        canNext: customerCanWork && customerMayNext(stage),
+        canNext: customerCanWork && customerMayNext(stage) && !exitsByStatusAction,
         /** Lead ruling (QA e8fe1ec): why the customer has no Next/Submit on the current phase (null = they do, or not theirs). */
-        waitingOn: customerCanWork && !customerMayNext(stage) && stage.progression !== "submit_lock" ? (stage.completesOn === "payment" ? ("payment" as const) : ("team" as const)) : null,
+        waitingOn: !customerCanWork || stage.progression === "submit_lock"
+          ? null
+          : !customerMayNext(stage) ? (stage.completesOn === "payment" ? ("payment" as const) : ("team" as const))
+          : exitsByStatusAction ? ("status_action" as const) : null,
         canSubmit: customerCanWork && stage.progression === "submit_lock",
         canReview: v3 && staff && roleHasCapability(principal.role, "orders.stage.review") && (state === "submitted" || state === "in_review") && !projection.canceled,
         canReopen:
@@ -305,6 +312,8 @@ export function createStagesService(deps: StagesDeps) {
       if (projection.lockedKeys.has(stage.key)) throw stageLocked();
       if (kind === "next" && stage.progression === "next" && !customerMayNext(stage))
         throw conflict("STAGE_NOT_CUSTOMER_ACTIONABLE", stage.completesOn === "payment" ? "This phase completes when payment is confirmed." : "Our team completes this phase. Nothing is needed from you right now.");
+      if (kind === "next" && pickTransition(bound, view.statusKey, "customer", nextStageTargets(projection.model, index)) !== null)
+        throw conflict("STAGE_USE_STATUS_ACTION", "Use the actions at the top of the order, such as Approve or Request changes, to finish this phase.");
       if ((kind === "next") !== (stage.progression === "next"))
         throw conflict("STAGE_PROGRESSION", kind === "next" ? "This phase is finished with Submit and lock." : "This phase is finished with Next.");
       await deps.gates.assertCustomerMayWork({ tx, orderId: view.id, actor: principal, action: "phase_submit", statusKey: view.statusKey });
