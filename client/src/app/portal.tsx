@@ -142,8 +142,9 @@ export function StaffOrderHandoff({ title = "Orders are placed for a customer", 
  * Compact, non-dismissible notice at the top of the customer shell for staff/admin viewers (D3).
  * Renders nothing for customers.
  */
-export function StaffPortalNotice() {
-  const role = useViewerRole();
+export function StaffPortalNotice({ role: roleProp }: { role?: UserRole } = {}) {
+  const viewerRole = useViewerRole();
+  const role = roleProp ?? viewerRole;
   if (!role || !isStaffRole(role)) return null;
   return (
     <div className="border-b border-info/40 bg-info-soft" data-testid="staff-portal-notice">
@@ -156,7 +157,7 @@ export function StaffPortalNotice() {
         </p>
         <div className="flex flex-wrap items-center gap-2">
           <NewOrderForCustomerLink variant="secondary" size="sm" />
-          <PortalSwitch area="customer" />
+          <PortalSwitch area="customer" role={role} />
         </div>
       </div>
     </div>

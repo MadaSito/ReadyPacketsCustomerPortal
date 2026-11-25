@@ -14,7 +14,8 @@ Owner: ui_foundation_engineer. The UI kit is documented in `client/src/ui/README
 
 - `useSignOut()` first revokes the session on the server. It then clears the TanStack cache and Cache Storage, drops the staged recovery batch and navigates to `/sign-in`.
 - If revocation fails, it still wipes local data and then re-checks `me`. If the session is still live, it shows a danger toast and stays on the page.
-- `clearClientCaches()` wipes the client caches only.
+- `clearClientCaches()` wipes the client caches only. It also clears the per-tab customer-portal choice.
+- **Portal switch (07.1)**: `@/app/portal` exports `PortalSwitch`, `StaffPortalNotice`, `StaffOrderHandoff`, `NewOrderForCustomerLink`, `useIsStaffViewer`, `useViewerRole` and re-exports `isStaffRole`. Staff and admins opening `/` go to `/admin` unless this tab chose the customer portal (`@/lib/portal`, sessionStorage). Switching back or signing out clears that choice. In the customer area, `visibleNav` hides `/orders/new` and `/cart` from non-customers.
 
 ## Cache isolation (`@/lib/cacheIsolation`, `app/providers.tsx`)
 

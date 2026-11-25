@@ -54,7 +54,12 @@ export function safeNextPath(raw: string | null | undefined): string | null {
   return raw;
 }
 
-export function decideRoute(access: RouteAccess, path: string, session: SessionView): GuardDecision {
+export interface GuardOptions {
+  /** This tab chose the customer portal through the portal switch (07.1 D2); "/" then stays in the customer portal. */
+  customerPortalChosen?: boolean;
+}
+
+export function decideRoute(access: RouteAccess, path: string, session: SessionView, options: GuardOptions = {}): GuardDecision {
   if (session.status === "loading") return { kind: "loading" };
   if (access === "public") {
     if (!AUTH_ENTRY_PATHS.has(path)) return { kind: "render" };
@@ -74,7 +79,11 @@ export function decideRoute(access: RouteAccess, path: string, session: SessionV
   }
   // full session
   if (access === "transition") return { kind: "redirect", to: homeFor(session.role) };
-  if (access === "customer") return { kind: "render" };
+  if (access === "customer") {
+    // 07.1 D2: staff and admins opening the bare "/" land in the console unless this tab chose the customer portal.
+    if (path === "/" && session.role !== "customer" && !options.customerPortalChosen) return { kind: "redirect", to: "/admin" };
+    return { kind: "render" };
+  }
   if (access === "staff") return session.role === "staff" || session.role === "admin" ? { kind: "render" } : { kind: "not-found" };
   return session.role === "admin" ? { kind: "render" } : { kind: "not-found" };
 }

@@ -12,6 +12,7 @@ import { BrandLogo, Drawer, IconButton, Tooltip } from "@/ui";
 import { cn } from "@/ui/cn";
 import { CookieConsentSlot, CustomerMaintenanceSlot, GlobalSearchSlot, NotificationSlot } from "../slots";
 import { PolicyPromptSlot } from "../policyPromptSlot";
+import { PortalSwitch } from "../portal";
 import { AccountMenu, Footer, navPlacement, MaintenanceBanner, PreviewBanner, SkipLink, ThemeToggle, useCurrentNav, useEnabledNav, visibleNav } from "./common";
 
 function groupNav(items: NavItem[]): Array<{ group: string; items: NavItem[] }> {
@@ -76,7 +77,7 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
               {collapsed ? <BrandLogo appearance="dark" variant="icon" label="" className="h-9" /> : <BrandLogo appearance="dark" label="" className="w-44" />}
             </Link>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto px-3 py-4">
+          <div className="rp-nav-scroll min-h-0 flex-1 overflow-y-auto px-3 py-4">
             <SideNav groups={groups} collapsed={collapsed} />
           </div>
           <div className="border-t border-navy-border p-3">
@@ -116,6 +117,7 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
                 <Search aria-hidden="true" className="size-5" />
               </Link>
               <div className="ml-auto flex shrink-0 items-center gap-1">
+                <PortalSwitch area="console" role={user.role} className="mr-1 hidden md:inline-flex" />
                 <NotificationSlot area="console" />
                 <ThemeToggle />
                 <AccountMenu user={user} area="console" />
@@ -132,6 +134,9 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
       <Drawer open={drawerOpen} onOpenChange={setDrawerOpen} title="Console navigation" side="left" width="sm">
         <div className="rp-nav-panel -m-4 min-h-full p-4 rp-on-navy">
           <SideNav groups={groups} onNavigate={() => setDrawerOpen(false)} />
+          <div className="mt-5 border-t border-navy-border pt-4">
+            <PortalSwitch area="console" role={user.role} appearance="nav" onNavigate={() => setDrawerOpen(false)} />
+          </div>
         </div>
       </Drawer>
     </div>

@@ -8,6 +8,7 @@ import type { NavItem } from "@/lib/routes";
 import { useAuthApi, type MeUser } from "@/lib/authApi";
 import { useSignOut } from "@/lib/signOut";
 import { useConsent } from "@/lib/consent";
+import { portalSwitchHref, portalSwitchLabel, setCustomerPortalChoice, type PortalArea } from "@/lib/portal";
 import { Callout, DropdownMenu, IconButton, useTheme, type ThemePreference } from "@/ui";
 import { cn } from "@/ui/cn";
 import { RUNTIME } from "@/lib/runtime";
@@ -16,9 +17,20 @@ import { PwaInstallDialog, usePwaInstall } from "@/app/PwaInstallEntry";
 export const LEGAL_NAME = "Ready Packets Consulting LLC";
 export const PUBLIC_SITE_URL = "https://www.readypackets.com";
 
+/**
+ * Customer-area entries that only a customer can use (07.1 D4): staff and admins do not own orders or carts, so
+ * "Create an order" and "Cart" (and anything under them) are hidden from them in the customer shell.
+ */
+export const CUSTOMER_ONLY_HREFS = ["/orders/new", "/cart"] as const;
+
+export function isCustomerOnlyHref(href: string): boolean {
+  return CUSTOMER_ONLY_HREFS.some((root) => href === root || href.startsWith(`${root}/`));
+}
+
 export function visibleNav(items: readonly NavItem[], area: NavItem["area"], role: UserRole): NavItem[] {
   return items.filter((item) => {
     if (item.area !== area) return false;
+    if (area === "customer" && role !== "customer" && isCustomerOnlyHref(item.href)) return false;
     if (item.access === "admin") return role === "admin";
     if (item.access === "staff") return role === "staff" || role === "admin";
     return item.access === "customer";
@@ -176,6 +188,21 @@ export function initials(name: string): string {
   return chosen.join("").toLocaleUpperCase() || "?";
 }
 
+/** Avatar-menu twin of the visible portal switch (same wording and the same tab-scoped choice). */
+function portalMenuItem(role: UserRole, area: PortalArea) {
+  const label = portalSwitchLabel(role, area);
+  const Icon = area === "console" ? UserRound : Settings;
+  return {
+    label,
+    icon: <Icon aria-hidden="true" />,
+    asChild: (
+      <Link href={portalSwitchHref(area)} onClick={() => setCustomerPortalChoice(area === "console")}>
+        {label}
+      </Link>
+    ),
+  };
+}
+
 export function AccountMenu({ user, area, items: accountItems }: { user: MeUser; area: "customer" | "console"; items?: readonly NavItem[] }) {
   const signOut = useSignOut();
   const staff = user.role !== "customer";
@@ -220,7 +247,7 @@ export function AccountMenu({ user, area, items: accountItems }: { user: MeUser;
             </Link>
           ),
         })),
-        ...(staff ? [area === "console" ? { label: "Customer view", icon: <UserRound aria-hidden="true" />, asChild: <Link href="/">Customer view</Link> } : { label: "Console", icon: <Settings aria-hidden="true" />, asChild: <Link href="/admin">Console</Link> }] : []),
+        ...(staff ? [portalMenuItem(user.role, area)] : []),
         ...(pwa.available && !pwa.installed ? [{ label: "Install app", icon: <Download aria-hidden="true" />, onSelect: install }] : []),
         "separator" as const,
         { label: "Sign out", icon: <LogOut aria-hidden="true" />, onSelect: () => void signOut() },

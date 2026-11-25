@@ -15,6 +15,8 @@ import { BrandLogo, Drawer, IconButton, ThemeControl, Tooltip } from "@/ui";
 import { cn } from "@/ui/cn";
 import { CartBadgeSlot, CookieConsentSlot, NotificationSlot } from "../slots";
 import { PolicyPromptSlot } from "../policyPromptSlot";
+import { PortalSwitch, StaffPortalNotice } from "../portal";
+import { isStaffRole } from "@/lib/portal";
 import {
   AccountMenu,
   CUSTOMER_SECTIONS,
@@ -90,6 +92,7 @@ function SectionNav({ sections, label, collapsed, onNavigate, isCurrent }: { sec
 
 export function CustomerShell({ user, children }: { user: MeUser; children: ReactNode }) {
   const items = useEnabledNav(visibleNav(ALL_NAV, "customer", user.role));
+  const staff = isStaffRole(user.role);
   const sections = customerNavSections(items);
   const all = [...sections.main, ...sections.Support, ...sections.Account];
   const isCurrent = useCurrentNav(all);
@@ -105,6 +108,7 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
       <PolicyPromptSlot />
       <PreviewBanner />
       <MaintenanceBanner />
+      <StaffPortalNotice role={user.role} />
       <header className="sticky top-0 z-40 border-b border-line bg-surface/95 pt-[env(safe-area-inset-top)] backdrop-blur supports-[backdrop-filter]:bg-surface/85">
         <div className="flex h-16 items-center gap-2 pr-[max(0.75rem,env(safe-area-inset-right))] pl-[max(0.75rem,env(safe-area-inset-left))] sm:px-6">
           <IconButton label="Open navigation menu" icon={<Menu />} className="lg:hidden" onClick={() => setMenuOpen(true)} />
@@ -113,6 +117,7 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
             <BrandLogo label="" variant="icon" className="h-9 sm:hidden" />
           </Link>
           <div className="ml-auto flex shrink-0 items-center gap-1">
+            {staff ? <PortalSwitch area="customer" role={user.role} className="mr-1 hidden md:inline-flex" /> : null}
             <NotificationSlot area="customer" />
             <ThemeControl className="mx-1 hidden sm:inline-flex" />
             <ThemeToggle className="sm:hidden" />
@@ -126,7 +131,7 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
           aria-label="Customer navigation"
           className={cn("rp-nav-panel rp-nav-edge sticky top-16 hidden h-[calc(100dvh-4rem)] shrink-0 flex-col rp-on-navy lg:flex", collapsed ? "w-20" : "w-64")}
         >
-          <div className="min-h-0 flex-1 overflow-y-auto px-3 py-4">
+          <div className="rp-nav-scroll min-h-0 flex-1 overflow-y-auto px-3 py-4">
             <SectionNav sections={sections} label="Customer" collapsed={collapsed} isCurrent={isCurrent} />
           </div>
           <div className="border-t border-navy-border p-3">
@@ -185,6 +190,11 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
       <Drawer open={menuOpen} onOpenChange={setMenuOpen} title="Menu" side="left" width="sm">
         <div className="rp-nav-panel -mx-4 -mt-4 p-4 rp-on-navy">
           <SectionNav sections={sections} label="All sections" onNavigate={() => setMenuOpen(false)} isCurrent={isCurrent} />
+          {staff ? (
+            <div className="mt-5 border-t border-navy-border pt-4">
+              <PortalSwitch area="customer" role={user.role} appearance="nav" onNavigate={() => setMenuOpen(false)} />
+            </div>
+          ) : null}
         </div>
         <div className="mt-6 border-t border-line pt-4 sm:hidden">
           <ThemeControl showLabel />

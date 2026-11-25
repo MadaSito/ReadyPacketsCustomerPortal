@@ -9,6 +9,7 @@ import { ALL_ROUTES } from "./registry";
 import type { RouteDef } from "@/lib/routes";
 import { RUNTIME } from "@/lib/runtime";
 import { clearRecoveryBatch } from "@/lib/recoveryBatch";
+import { clearCustomerPortalChoice, readCustomerPortalChoice } from "@/lib/portal";
 import { useSession } from "@/lib/session";
 import type { MeUser } from "@/lib/authApi";
 import { Spinner, useToast } from "@/ui";
@@ -48,7 +49,10 @@ function useSessionEndNotice(view: SessionView) {
   const toast = useToast();
   useEffect(() => {
     // Definitive signed-out state (not transient errors): drop any staged one-time recovery batch.
-    if (view.status === "anonymous") clearRecoveryBatch();
+    if (view.status === "anonymous") {
+      clearRecoveryBatch();
+      clearCustomerPortalChoice();
+    }
     if ((previous.current === "full" || previous.current === "remediation") && view.status === "anonymous") {
       toast.show({ tone: "warning", title: "Your session has ended", description: "Please sign in again to continue." });
     }
@@ -61,7 +65,7 @@ function RouteGate({ route }: { route: RouteDef }) {
   const { view, me } = useSession();
   const tainted = useRealmTainted();
   useSessionEndNotice(view);
-  const decision = decideRoute(route.access, location, view);
+  const decision = decideRoute(route.access, location, view, { customerPortalChosen: readCustomerPortalChoice() });
   if (decision.kind === "loading") return <PageLoading />;
   if (decision.kind === "redirect") return <Redirect to={decision.to} replace />;
   if (decision.kind === "unavailable") {

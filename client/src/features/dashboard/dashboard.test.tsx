@@ -57,6 +57,19 @@ describe("dashboard", () => {
     await expectNoAxeViolations(container);
   });
 
+  it("07.1 D4: staff and admins see a for-a-customer guide pointing to the console new-order flow", async () => {
+    for (const role of ["staff", "admin"] as const) {
+      const api = fakeAuthApi({ me: async () => me(role), assuranceState: async () => ({ mfaEnrolled: true, recoveryCodesAcknowledged: true, totpEnrolled: true, passkeyCount: 1, recoveryCodesRemaining: 10 }) });
+      const { container, unmount } = renderUi(<CustomerHomePage />, { api });
+      expect(await screen.findByRole("heading", { name: "Orders are placed for a customer" })).toBeInTheDocument();
+      expect(screen.queryByRole("heading", { name: /first order/i })).toBeNull();
+      expect(screen.getByRole("link", { name: "New order for a customer" })).toHaveAttribute("href", "/admin/orders?new=1");
+      expect(screen.getByRole("link", { name: "Go to orders" })).toHaveAttribute("href", "/orders");
+      await expectNoAxeViolations(container);
+      unmount();
+    }
+  });
+
   it("console overview renders an empty state and has no axe violations", async () => {
     const { container } = renderUi(<ConsoleOverviewPage />, { api: fakeAuthApi({ me: async () => me("staff") }) });
     expect(await screen.findByRole("heading", { level: 1, name: "Overview" })).toBeInTheDocument();

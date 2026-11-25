@@ -1,5 +1,6 @@
 import { FileText, MessageSquare, PackagePlus } from "lucide-react";
 import { Link } from "wouter";
+import { NewOrderForCustomerLink, useIsStaffViewer } from "@/app/portal";
 import { WIDGETS } from "@/app/registry";
 import { useSession } from "@/lib/session";
 import { Button, Card, EmptyState, PageHeader } from "@/ui";
@@ -18,17 +19,28 @@ const STEPS = [
 ];
 
 function FirstOrderGuide() {
+  // 07.1 D4: staff and admins do not own orders; they create them for a customer from the console.
+  const staff = useIsStaffViewer();
   return (
     <Card>
       <EmptyState
         icon={PackagePlus}
         className="border-0 px-0"
-        title="Let's get your first order started"
-        description="Your dashboard fills in once you have orders. Here's how it works."
+        title={staff ? "Orders are placed for a customer" : "Let's get your first order started"}
+        description={staff ? "This is the customer portal. Create an order for a customer from the console; it then appears in their portal." : "Your dashboard fills in once you have orders. Here's how it works."}
         action={
-          <Button asChild>
-            <Link href="/orders">Go to orders</Link>
-          </Button>
+          staff ? (
+            <div className="flex flex-wrap justify-center gap-3">
+              <NewOrderForCustomerLink />
+              <Button asChild variant="secondary">
+                <Link href="/orders">Go to orders</Link>
+              </Button>
+            </div>
+          ) : (
+            <Button asChild>
+              <Link href="/orders">Go to orders</Link>
+            </Button>
+          )
         }
       />
       <ol className="mt-2 grid gap-4 border-t border-line pt-6 sm:grid-cols-3">
