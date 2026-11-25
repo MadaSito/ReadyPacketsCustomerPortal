@@ -129,3 +129,28 @@ describe("SAML helpers", () => {
     expect(xml).toContain('WantAssertionsSigned="true"');
   });
 });
+
+describe("node-saml upgrade guard", () => {
+  // saml.ts deep-imports `@node-saml/node-saml/lib/xml.js` (parseDomFromString). It is not a public entry point, so
+  // an upgrade may move or change it: this test fails loudly instead of letting response parsing break silently.
+  it("the deep import lib/xml.js still exists and parses XML", async () => {
+    const xml = await import("@node-saml/node-saml/lib/xml.js");
+    expect(typeof xml.parseDomFromString).toBe("function");
+    const dom = await xml.parseDomFromString("<a><b>c</b></a>");
+    expect(dom.documentElement.nodeName).toBe("a");
+  });
+
+  it("is the pinned, reviewed version", async () => {
+    const { createRequire } = await import("node:module");
+    const { readFileSync } = await import("node:fs");
+    const { dirname, join } = await import("node:path");
+    const require = createRequire(import.meta.url);
+    const main = require.resolve("@node-saml/node-saml");
+    let dir = dirname(main);
+    while (!dir.endsWith("node-saml")) dir = dirname(dir);
+    const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { version: string };
+    // Changing this is a security review: re-check the wrapper in saml.ts and the advisories for node-saml,
+    // xml-crypto and @xmldom/xmldom, then update ADR 0062.
+    expect(pkg.version).toBe("5.2.0");
+  });
+});

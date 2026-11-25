@@ -667,6 +667,81 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
       expect(done.nextStep).not.toBeNull();
     });
 
+    /** Session-bound SAML round trip (link / step-up): prepare → ticket → AuthnRequest → signed response → ACS. */
+    async function samlSessionBound(principal: SessionPrincipal, purpose: "step_up" | "link", objectId: string, extra: Partial<Parameters<typeof buildSignedResponse>[0]> = {}) {
+      const browser = `b-${randomUUID()}`;
+      const { startUrl } = await sso().prepare(principal, purpose, "/account");
+      const ticket = new URL(`https://x.test${startUrl}`).searchParams.get("ticket")!;
+      const url = await sso().startWithTicket({ ticket, session: principal, browser });
+      const request = inflateRawSync(Buffer.from(new URL(url).searchParams.get("SAMLRequest")!, "base64")).toString("utf8");
+      const response = buildSignedResponse({ sp, inResponseTo: requestIdOf(url), nowMs: h.clock.now().getTime(), tenantId: TENANT, objectId, ...extra });
+      const location = await sso().acs({ samlResponse: response });
+      return { request, location, finish: (session: SessionPrincipal | null = principal) => sso().complete({ attempt: attemptOf(location), browser, session, userAgent: "vitest" }) };
+    }
+
+    const PASSWORD_ONLY = ["http://schemas.microsoft.com/ws/2008/06/identity/authenticationmethod/password"];
+
+    async function ssoOnlySession(mode: "claim" | "entra" | "portal") {
+      await configureSaml(mode === "entra" ? {} : { entraMfaMode: mode });
+      if (mode === "entra") {
+        const view = await sso().adminView();
+        await sso().updateConfig(admin, { ...baseConfig({ protocol: "saml", clientId: null, clientSecret: undefined, entraMfaMode: "entra", entraModeConfirmation: "ENTRA MANAGES MFA" }), expectedVersion: view.version });
+      }
+      // SSO-only: no local MFA factor enrolled; signs in with Entra (claim mode gets the MFA claim).
+      const user = await makeUser({ role: "staff", mfa: false });
+      const id = oid();
+      await bind(user.publicId, id);
+      const signed = await (await samlSignIn(id)).finish();
+      if (signed.purpose !== "sign_in") throw new Error("unreachable");
+      let principal = (await identity.sessionResolver.resolve({ token: signed.issued.token, transport: "cookie" }))!;
+      // Portal mode: the session waits for the portal factor; complete it as the MFA step would.
+      if (mode === "portal") principal = (await identity.sessionResolver.resolve({ token: (await identity.sessions.markMfaVerified(principal.sessionId)).token, transport: "cookie" }))!;
+      expect(principal.state).toBe("full");
+      return { user, id, principal };
+    }
+
+    it("step-up for an SSO-only user: ForceAuthn round trip in claim mode needs the MFA claim and a fresh sign-in", async () => {
+      const { id, principal } = await ssoOnlySession("claim");
+      const run = await samlSessionBound(principal, "step_up", id);
+      expect(run.request).toMatch(/ForceAuthn="true"/);
+      const done = await run.finish();
+      expect(done.purpose).toBe("step_up");
+      expect(h.audit.named("auth.step_up.verified")).toHaveLength(1);
+      const fresh = (await identity.sessionResolver.resolve({ token: (done as { issued: { token: string } }).issued.token, transport: "cookie" }))!;
+      // Password only: refused in claim mode.
+      await rejects((await samlSessionBound(fresh, "step_up", id, { methods: PASSWORD_ONLY })).finish(fresh), "SSO_MFA_REQUIRED");
+      // Entra reused an old sign-in despite ForceAuthn: refused at the ACS.
+      const stale = await samlSessionBound(fresh, "step_up", id, { authnInstantMs: h.clock.now().getTime() - 10 * 60_000 });
+      expect(reasonOf(stale.location)).toBe("SSO_FAILED");
+      // Another Entra identity cannot step up this session.
+      await rejects((await samlSessionBound(fresh, "step_up", oid())).finish(fresh), "SSO_WRONG_ACCOUNT");
+    });
+
+    it("step-up in entra mode accepts a fresh Entra sign-in without the MFA claim", async () => {
+      const { id, principal } = await ssoOnlySession("entra");
+      const run = await samlSessionBound(principal, "step_up", id, { methods: PASSWORD_ONLY });
+      expect(run.request).toMatch(/ForceAuthn="true"/);
+      expect((await run.finish()).purpose).toBe("step_up");
+      expect(h.audit.named("auth.step_up.verified")).toHaveLength(1);
+    });
+
+    it("step-up in portal mode never accepts Entra as the second factor", async () => {
+      const { id, principal } = await ssoOnlySession("portal");
+      await rejects((await samlSessionBound(principal, "step_up", id)).finish(), "SSO_MFA_REQUIRED");
+      expect(h.audit.named("auth.step_up.verified")).toHaveLength(0);
+    });
+
+    it("local break-glass sign-in still demands portal MFA in every mode", async () => {
+      for (const mode of ["claim", "entra", "portal"] as const) {
+        const { user } = await ssoOnlySession(mode);
+        const local = await identity.auth.signIn({ email: user.email, password: PW }, { userAgent: "vitest" });
+        expect(local.nextStep, mode).not.toBeNull();
+        const principal = await identity.sessionResolver.resolve({ token: local.issued.token, transport: "cookie" });
+        expect(principal?.authMethod, mode).not.toBe("entra");
+        expect(principal?.state, mode).not.toBe("full");
+      }
+    });
+
     it("a protocol switch cancels pending attempts but keeps sessions", async () => {
       await configureSaml({ clientId: CLIENT, clientSecret: SECRET });
       const user = await makeUser();
