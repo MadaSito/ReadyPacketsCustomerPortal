@@ -45,6 +45,8 @@ import { readSetting, writeSetting } from "../platform/index.js";
 import { ORDER_AGREEMENT_GATE, ORDER_WORKFLOW_RULES_ENABLED, ORDER_WORKFLOW_TRANSFER_ENABLED, parseAgreementGate } from "./settings.js";
 import { createWorkflowTransferService, type WorkflowTransferService } from "./workflowTransferService.js";
 export type { TransferApplyInput, TransferApplyResult, TransferPreview, TransferSelection, TransferStatus } from "./workflowTransferService.js";
+import { createOrderStatusCatalogService, type OrderStatusCatalogService } from "./statusCatalog.js";
+export type { AttentionCountsView, OrderStatusCatalogService } from "./statusCatalog.js";
 
 export type * from "./types.js";
 
@@ -114,6 +116,8 @@ export interface OrdersModule extends ModuleLifecycle {
   workflowTransfer: WorkflowTransferService;
   /** Increment 06 (D14): order agreement (MNDA) setting administration and customer status. */
   agreementGate: AgreementGateService;
+  /** Increment 07 (D2): admin-managed order status catalogue (`orders.statusCatalog.*`). */
+  statusCatalog: OrderStatusCatalogService;
   orders: OrderService;
   sharing: SharingService;
 }
@@ -158,6 +162,7 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
   });
 
   const agreementGate = createAgreementGateService({ db: deps.db, audit: deps.audit, settings: deps.settings, services: deps.services, actorCheck, gates });
+  const statusCatalog = createOrderStatusCatalogService({ db: deps.db, clock: deps.clock, audit: deps.audit, actorCheck });
 
   const apiProvider = createOrdersApiProvider({ db: deps.db, services: deps.services, workflows, catalog, orders });
 
@@ -166,6 +171,11 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
       // Increment 04 (package H): /api/v1 orders provider. Absent public API module ⇒ nothing to register.
       const publicApi = (deps.services as Partial<Services>).publicApi as unknown as { registerProvider?: (key: "orders", provider: unknown) => void } | undefined;
       publicApi?.registerProvider?.("orders", apiProvider);
+      void statusCatalog.ensureSeeded().catch((err: unknown) => {
+        deps.logger.warn("orders status catalogue startup seed deferred", {
+          errorName: err instanceof Error ? err.name : "unknown",
+        });
+      });
     },
     assertCanReadOrder: policy.assertCanReadOrder,
     assertCanWriteOrder: policy.assertCanWriteOrder,
@@ -205,6 +215,7 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     workflows,
     workflowTransfer,
     agreementGate,
+    statusCatalog,
     orders,
     sharing,
     async health(): Promise<ModuleHealth[]> {
