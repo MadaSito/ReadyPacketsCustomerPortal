@@ -17,8 +17,8 @@ import {
 import { ConsoleActions, ReferenceHistory } from "../ConsoleActions";
 import { SharingPanel } from "../SharingPanel";
 import { WorkflowRulesPanel } from "../WorkflowRulesPanel";
-import { OrderPhaseConsolePanel } from "../stages/OrderPhaseConsolePanel";
 // ── increment 07 panel imports (other owners: one import line each, below this anchor) ──
+import { OrderPhaseConsolePanel } from "../stages/OrderPhaseConsolePanel";
 // ── end increment 07 panel imports ──
 import { ACCESS_ROLE_LABELS, LOCK_DESCRIPTIONS, LockBadge, OrderStatusBadge, money, type LockState } from "../shared";
 
