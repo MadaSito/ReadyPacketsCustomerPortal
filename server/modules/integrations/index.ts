@@ -51,6 +51,9 @@ import {
   type GraphReadiness,
   type GraphRequestInput,
   type GraphResponse,
+  type GraphEntraRunbookView,
+  type GraphSitesSelectedWriteCheckInput,
+  type GraphSitesSelectedWriteCheckResult,
   type GraphUploadChunkInput,
   type GraphUploadChunkResult,
   type GraphUploadSessionControlInput,
@@ -121,7 +124,9 @@ import {
   type RequestP201Input,
   type ResendProductionInput,
   type RetryProductionDispatchInput,
+  type StopProductionDispatchInput,
   type UpdateProductionSettingsInput,
+  type WorkflowAutoQueueItemView,
 } from "./production/index.js";
 import {
   createInboundWebhooksHttpRouter,
@@ -154,6 +159,7 @@ import {
   type WebhooksSettingsView,
 } from "./webhooks/index.js";
 import {
+  createWorkflowWebhooksService,
   STAGE_WEBHOOK_TRIGGER_SOURCES,
   WORKFLOW_WEBHOOK_KINDS,
   type EnqueueStageWebhookInput,
@@ -166,7 +172,7 @@ import {
   type WorkflowWebhooksService,
   type WorkflowWebhookTargetKind,
   type WorkflowWebhookValidationResult,
-} from "./workflowWebhooks/types.js";
+} from "./workflowWebhooks/index.js";
 
 // Ensure all `integrations.*` settings/secrets/flags register on module import.
 import "./settings.js";
@@ -237,6 +243,9 @@ export {
   type GraphReadiness,
   type GraphRequestInput,
   type GraphResponse,
+  type GraphEntraRunbookView,
+  type GraphSitesSelectedWriteCheckInput,
+  type GraphSitesSelectedWriteCheckResult,
   type GraphUploadChunkInput,
   type GraphUploadChunkResult,
   type GraphUploadSessionControlInput,
@@ -269,6 +278,7 @@ export {
   type RequestP201Input,
   type ResendProductionInput,
   type RetryProductionDispatchInput,
+  type StopProductionDispatchInput,
   type ResolveEgressInput,
   type SamlScaffoldView,
   type ScaffoldsService,
@@ -307,6 +317,7 @@ export {
   type WebhookSubscriptionView,
   type WebhooksService,
   type WebhooksSettingsView,
+  type WorkflowAutoQueueItemView,
 };
 
 export const PROVIDER_KEYS = ["smtp", "graph", "clarity", "posthog", "stripe", "saml", "sharepoint"] as const;
@@ -349,7 +360,7 @@ export interface IntegrationsModule extends Omit<ModuleLifecycle, "health"> {
   scaffolds: ScaffoldsService;
   production: ProductionWebhookService;
   webhooks: WebhooksService;
-  workflowWebhooks?: WorkflowWebhooksService;
+  workflowWebhooks: WorkflowWebhooksService;
   /** Convenience hook consumed by `server/http` CSP middleware (`services.integrations.analyticsCsp(pathname)`). */
   analyticsCsp(pathname: string): Promise<AnalyticsCspPolicy | null>;
 }
@@ -368,6 +379,7 @@ export function createIntegrationsModule(
   const scaffolds = createScaffoldsService(deps);
   const production = createProductionWebhookService(deps, egress, checks);
   const webhooks = createWebhooksService(deps, egress);
+  const workflowWebhooks = createWorkflowWebhooksService(deps, { production, webhooks });
 
   async function buildAllStatuses(): Promise<ProviderStatus[]> {
     const [
@@ -547,11 +559,13 @@ export function createIntegrationsModule(
     scaffolds,
     production,
     webhooks,
+    workflowWebhooks,
     analyticsCsp: (pathname) => analytics.analyticsCsp(pathname),
 
     init(): void {
       deps.services.jobAdmin?.registerMailTransport?.(graphRuntime.mailTransport);
       webhooks.init();
+      workflowWebhooks.init();
     },
 
     stop(): void {

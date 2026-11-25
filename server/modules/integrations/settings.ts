@@ -253,6 +253,8 @@ const FORBIDDEN_CUSTOM_WEBHOOK_HEADERS = new Set([
   "idempotency-key",
   "x-readypackets-delivery",
   "x-readypackets-redelivery-of",
+  "x-readypackets-signature",
+  "x-readypackets-timestamp",
   "x-correlation-id",
 ]);
 
@@ -283,17 +285,23 @@ export const productionConfigSettingSchema = z.strictObject({
     .refine(
       (v) => v === "" || (/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(v) && hasNoHeaderInjection(v)),
       "Enter a valid canon version string.",
-    ),
+    )
+    .default(""),
   runMode: z
     .string()
     .trim()
-    .refine((v) => /^[a-z][a-z0-9_]{0,31}$/.test(v), "Run mode must match ^[a-z][a-z0-9_]{0,31}$."),
-  timeoutMs: z.number().int().min(1_000).max(30_000),
+    .refine((v) => /^[a-z][a-z0-9_]{0,31}$/.test(v), "Run mode must match ^[a-z][a-z0-9_]{0,31}$.")
+    .default("production"),
+  timeoutMs: z.number().int().min(1_000).max(30_000).default(10_000),
   authHeaderName: z
     .string()
     .trim()
     .max(64)
-    .refine(isValidProductionAuthHeaderName, "Enter a permitted custom HTTP header name."),
+    .refine(isValidProductionAuthHeaderName, "Enter a permitted custom HTTP header name.")
+    .default(""),
+  signingEnabled: z.boolean().default(false),
+  signingSecretLast4: z.string().max(4).nullable().default(null),
+  previousSigningSecretExpiresAt: z.string().nullable().default(null),
 });
 export type ProductionConfigSetting = z.infer<typeof productionConfigSettingSchema>;
 
@@ -302,7 +310,24 @@ export const DEFAULT_PRODUCTION_CONFIG: ProductionConfigSetting = {
   runMode: "production",
   timeoutMs: 10_000,
   authHeaderName: "",
+  signingEnabled: false,
+  signingSecretLast4: null,
+  previousSigningSecretExpiresAt: null,
 };
+
+export const productionWorkflowAutoQueueItemSchema = z.strictObject({
+  workflowKey: z.string().min(1).max(64).optional(),
+  p101OnPaymentConfirmed: z.boolean().default(false),
+  p201OnPhase1Locked: z.boolean().default(false),
+  updatedAt: z.string().nullable().default(null),
+});
+export type ProductionWorkflowAutoQueueItem = z.infer<typeof productionWorkflowAutoQueueItemSchema>;
+
+export const productionWorkflowAutoQueueSchema = z.record(
+  z.string().min(1).max(64),
+  productionWorkflowAutoQueueItemSchema,
+);
+export type ProductionWorkflowAutoQueueMap = z.infer<typeof productionWorkflowAutoQueueSchema>;
 
 /* ----------------------------------------------------- Platform setting registrations */
 
@@ -581,6 +606,37 @@ export const INTEGRATIONS_PRODUCTION_AUTH_VALUE = defineSecret({
   description: "Encrypted shared secret or bearer value sent on P101/P201 requests when an auth header name is configured.",
   exportable: false,
   schema: z.string().min(1).max(1024).refine(hasNoHeaderInjection, "Invalid authentication header characters."),
+});
+
+export const INTEGRATIONS_PRODUCTION_SIGNING_SECRET = defineSecret({
+  key: "integrations.production.signing_secret",
+  owner: "integrations",
+  group: "integrations",
+  label: "Production webhook HMAC signing secret",
+  description: "Optional encrypted HMAC-SHA256 signing secret for outbound P101–P401 production webhook dispatches.",
+  exportable: false,
+  schema: z.string().min(16).max(256).refine(hasNoHeaderInjection, "Invalid signing secret characters."),
+});
+
+export const INTEGRATIONS_PRODUCTION_SIGNING_PREV_SECRET = defineSecret({
+  key: "integrations.production.signing_prev_secret",
+  owner: "integrations",
+  group: "integrations",
+  label: "Previous production webhook HMAC signing secret (overlap)",
+  description: "Encrypted previous HMAC-SHA256 signing secret retained during overlap rotation.",
+  exportable: false,
+  schema: z.string().min(16).max(256).refine(hasNoHeaderInjection, "Invalid signing secret characters."),
+});
+
+export const INTEGRATIONS_PRODUCTION_WORKFLOW_AUTO_QUEUE = defineSetting({
+  key: "integrations.production.workflow_auto_queue",
+  owner: "integrations",
+  group: "integrations",
+  label: "Production webhook lifecycle auto-queue per workflow",
+  description: "Per-workflow opt-in flags for automatic P101 on payment confirmation and P201 on intake phase submission lock.",
+  schema: productionWorkflowAutoQueueSchema,
+  default: {},
+  sensitivity: "internal",
 });
 
 /* ----------------------------------------------------- Increment 04 Package I: Webhooks settings */

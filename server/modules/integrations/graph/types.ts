@@ -139,6 +139,8 @@ export interface GraphConfigView {
   egressReady: boolean;
   lastCheckedAt: Date | null;
   lastOutcome: "succeeded" | "failed" | "unknown" | null;
+  sitesSelectedLastCheckedAt?: Date | null;
+  sitesSelectedLastOutcome?: "succeeded" | "failed" | "unknown" | null;
   mailboxRestrictionNote: string;
 }
 
@@ -209,6 +211,7 @@ export interface GraphEntraRunbookView {
   steps: readonly string[];
   siteGrantEndpointTemplate: string;
   siteGrantPayloadExample: string;
+  powershellExample: string;
   oneDriveNote: string;
 }
 
@@ -218,9 +221,9 @@ export interface GraphAdminService {
   updateConfig(principal: SessionPrincipal, input: UpdateGraphConfigInput): Promise<GraphConfigView>;
   testConnection(principal: SessionPrincipal): Promise<GraphConnectionTestResult>;
   sendTestMessage(principal: SessionPrincipal, input?: { toAddress?: string }): Promise<GraphMailTestResult>;
-  verifySitesSelectedWrite?(
+  verifySitesSelectedWrite(
     principal: SessionPrincipal,
     input?: GraphSitesSelectedWriteCheckInput,
   ): Promise<GraphSitesSelectedWriteCheckResult>;
-  getEntraRunbook?(): GraphEntraRunbookView;
+  getEntraRunbook(): GraphEntraRunbookView;
 }

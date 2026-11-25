@@ -43,11 +43,22 @@ import {
   type GraphConfigView,
   type GraphConnectionTestResult,
   type GraphCredentialsInput,
+  type GraphEntraRunbookView,
   type GraphMailTestResult,
   type GraphReadiness,
+  type GraphSitesSelectedWriteCheckInput,
+  type GraphSitesSelectedWriteCheckResult,
 } from "./types.js";
 
 const MAIL_ADMIN_CAPABILITIES: readonly Capability[] = ["integrations.manage", "mail.manage"];
+const SITES_SELECTED_ADMIN_CAPABILITIES: readonly Capability[] = [
+  "integrations.manage",
+  "storage.manage",
+  "mail.manage",
+];
+const SAFE_SITE_ID_RE = /^[A-Za-z0-9.,_!:-]{3,256}$/;
+const SAFE_DRIVE_ID_RE = /^[A-Za-z0-9!._-]{3,256}$/;
+const SAFE_FOLDER_SEGMENT_RE = /^[A-Za-z0-9 ._()-]{1,120}$/;
 
 const MAILBOX_RESTRICTION_NOTE =
   "Application Mail.Send grants tenant-wide send permission in Microsoft 365 unless you scope this app registration to the dedicated sender mailbox with an Exchange Online ApplicationAccessPolicy (or RBAC for Applications).";
@@ -192,11 +203,76 @@ export function createGraphModuleRuntime(
   checks: ProviderChecksStore,
   tokenCache: GraphTokenCache,
 ): GraphModuleRuntime {
-  async function isGraphPresetEnabled(): Promise<boolean> {
+  async function getGraphEgressPresetStates(): Promise<{
+    graphEnabled: boolean;
+    uploadEnabled: boolean;
+  }> {
     const presets = await egress.listPresets();
     const graphPreset = presets.find((p) => p.key === "microsoft_graph");
-    return Boolean(graphPreset?.enabled);
+    const uploadPreset = presets.find((p) => p.key === "microsoft_graph_upload");
+    return {
+      graphEnabled: Boolean(graphPreset?.enabled),
+      uploadEnabled: Boolean(uploadPreset?.enabled),
+    };
   }
+
+  async function isGraphPresetEnabled(): Promise<boolean> {
+    const states = await getGraphEgressPresetStates();
+    return states.graphEnabled;
+  }
+
+  async function emitGraphOpsAlert(params: {
+    dedupKey: string;
+    severity: "warning" | "error" | "critical";
+    code: string;
+    title: string;
+    text?: string;
+  }): Promise<void> {
+    const opsAlerts = deps.services.opsAlerts;
+    if (!opsAlerts) return;
+    try {
+      await opsAlerts.emit({
+        source: "graph",
+        severity: params.severity,
+        dedupKey: params.dedupKey,
+        code: params.code,
+        title: params.title,
+        ...(params.text ? { text: params.text } : {}),
+      });
+    } catch {
+      // Operational alerts are advisory diagnostics; never fail the caller's request.
+    }
+  }
+
+  async function resolveGraphOpsAlert(dedupKey: string): Promise<void> {
+    const opsAlerts = deps.services.opsAlerts;
+    if (!opsAlerts) return;
+    try {
+      await opsAlerts.resolve({
+        source: "graph",
+        dedupKey,
+      });
+    } catch {
+      // Non-fatal diagnostic resolution.
+    }
+  }
+
+  const clientDiagnostics = {
+    now: () => deps.clock.now(),
+    onResponseDiagnostic: (ev: { kind: "auth_error" | "throttled" | "succeeded"; status: number; reasonCode?: string }) => {
+      if (ev.kind === "auth_error") {
+        void emitGraphOpsAlert({
+          dedupKey: "graph:auth",
+          severity: "error",
+          code: ev.reasonCode ?? `GRAPH_HTTP_${ev.status}`,
+          title: "Microsoft Graph authentication or permission rejected",
+          text: `Microsoft Graph returned HTTP ${ev.status}. Verify Entra client credentials and Sites.Selected / Mail.Send permissions.`,
+        });
+      } else if (ev.kind === "succeeded") {
+        void resolveGraphOpsAlert("graph:auth");
+      }
+    },
+  };
 
   async function resolvePlatformGraphCredentials(): Promise<GraphCredentialsInput | null> {
     const [enabled, cfg, secret, presetEnabled] = await Promise.all([
@@ -221,6 +297,7 @@ export function createGraphModuleRuntime(
     tokenCache,
     resolvePlatformGraphCredentials,
     async () => (await resolvePlatformGraphCredentials()) !== null,
+    clientDiagnostics,
   );
 
   async function resolveAuthoritativeSenderOutsideTx(): Promise<MailSenderIdentity | null> {
@@ -249,15 +326,17 @@ export function createGraphModuleRuntime(
   }
 
   async function loadConfigView(includeJobAdminSender = false): Promise<GraphConfigView> {
-    const [enabled, cfg, secretConfigured, presetEnabled, sharedInStore, smtpCfg, check] = await Promise.all([
+    const [enabled, cfg, secretConfigured, presetStates, sharedInStore, smtpCfg, check, sharepointCheck] = await Promise.all([
       readIntegrationFlag(deps.settings, INTEGRATIONS_GRAPH_FLAG),
       readSetting(deps.settings, INTEGRATIONS_GRAPH_CONFIG),
       isSecretConfigured(deps.settings, INTEGRATIONS_GRAPH_CLIENT_SECRET),
-      isGraphPresetEnabled(),
+      getGraphEgressPresetStates(),
       readSharedMailSenderFromStore(deps.settings),
       readSetting(deps.settings, INTEGRATIONS_SMTP_CONFIG),
       checks.get("graph"),
+      checks.get("sharepoint"),
     ]);
+    const presetEnabled = presetStates.graphEnabled;
 
     let authoritativeSender: MailSenderIdentity | null =
       sharedInStore ??
@@ -296,9 +375,12 @@ export function createGraphModuleRuntime(
       clientSecretLast4: secretConfigured ? (cfg.clientSecretLast4 ?? null) : null,
       senderMailbox: cfg.senderMailbox,
       egressPresetEnabled: presetEnabled,
+      uploadEgressPresetEnabled: presetStates.uploadEnabled,
       egressReady: presetEnabled,
       lastCheckedAt: check?.lastCheckedAt ?? null,
       lastOutcome: check?.lastOutcome ?? null,
+      sitesSelectedLastCheckedAt: sharepointCheck?.lastCheckedAt ?? null,
+      sitesSelectedLastOutcome: sharepointCheck?.lastOutcome ?? null,
       mailboxRestrictionNote: MAILBOX_RESTRICTION_NOTE,
     };
   }
@@ -608,6 +690,18 @@ export function createGraphModuleRuntime(
         );
       });
 
+      if (outcome === "succeeded") {
+        await resolveGraphOpsAlert("graph:auth");
+      } else {
+        await emitGraphOpsAlert({
+          dedupKey: "graph:auth",
+          severity: "error",
+          code: reasonCode,
+          title: "Microsoft Graph token check failed",
+          text: safeMessage,
+        });
+      }
+
       return {
         outcome,
         reasonCode,
@@ -765,6 +859,363 @@ export function createGraphModuleRuntime(
         checkedAt: finishedAt,
       };
     },
+
+    async verifySitesSelectedWrite(
+      principal,
+      input: GraphSitesSelectedWriteCheckInput = {},
+    ): Promise<GraphSitesSelectedWriteCheckResult> {
+      const startedAt = deps.clock.now();
+      assertAdminStepUpAnyPreflight(principal, startedAt, SITES_SELECTED_ADMIN_CAPABILITIES);
+
+      const rawSiteUrlOrId = input.siteUrlOrId?.trim() ? input.siteUrlOrId.trim() : null;
+      const suppliedDriveId =
+        input.driveId !== undefined && input.driveId !== null && input.driveId.trim() !== ""
+          ? input.driveId.trim()
+          : null;
+      if (!rawSiteUrlOrId && !suppliedDriveId) {
+        throw validation(
+          "GRAPH_SITE_OR_DRIVE_REQUIRED",
+          "Enter a SharePoint site URL, Graph site ID, or document library drive ID to test Sites.Selected write access.",
+        );
+      }
+
+      let siteGraphPath: string | null = null;
+      if (rawSiteUrlOrId !== null) {
+        if (!hasNoHeaderInjection(rawSiteUrlOrId)) {
+          throw validation("GRAPH_INVALID_SITE_ID", "Enter a valid SharePoint site URL or identifier.");
+        }
+        if (/^https:\/\//i.test(rawSiteUrlOrId)) {
+          let parsedUrl: URL;
+          try {
+            parsedUrl = new URL(rawSiteUrlOrId);
+          } catch {
+            throw validation("GRAPH_INVALID_SITE_URL", "Enter a valid HTTPS SharePoint site URL.");
+          }
+          if (parsedUrl.protocol !== "https:" || !parsedUrl.hostname.toLowerCase().endsWith(".sharepoint.com")) {
+            throw validation(
+              "GRAPH_INVALID_SITE_URL",
+              "SharePoint site URL must use https:// on a *.sharepoint.com hostname.",
+            );
+          }
+          const cleanPath = parsedUrl.pathname.replace(/\/+$/, "");
+          siteGraphPath = cleanPath && cleanPath !== ""
+            ? `/sites/${encodeURIComponent(parsedUrl.hostname)}:${cleanPath}`
+            : `/sites/${encodeURIComponent(parsedUrl.hostname)}`;
+        } else {
+          if (!SAFE_SITE_ID_RE.test(rawSiteUrlOrId)) {
+            throw validation(
+              "GRAPH_INVALID_SITE_ID",
+              "Enter a valid SharePoint site identifier (for example hostname,siteGuid,webGuid) or HTTPS SharePoint URL.",
+            );
+          }
+          siteGraphPath = `/sites/${encodeURIComponent(rawSiteUrlOrId)}`;
+        }
+      }
+
+      if (suppliedDriveId !== null && (!SAFE_DRIVE_ID_RE.test(suppliedDriveId) || !hasNoHeaderInjection(suppliedDriveId))) {
+        throw validation("GRAPH_INVALID_DRIVE_ID", "Enter a valid SharePoint document library drive ID.");
+      }
+
+      const folderSegments: string[] = [];
+      if (input.probeFolderPath !== undefined && input.probeFolderPath !== null && input.probeFolderPath.trim() !== "") {
+        const rawSegments = input.probeFolderPath
+          .split("/")
+          .map((s: string) => s.trim())
+          .filter((s: string) => s.length > 0);
+        if (rawSegments.length > 10 || input.probeFolderPath.length > 256) {
+          throw validation("GRAPH_INVALID_PROBE_FOLDER", "Probe folder path is too deep or exceeds 256 characters.");
+        }
+        for (const seg of rawSegments) {
+          if (seg === "." || seg === ".." || !SAFE_FOLDER_SEGMENT_RE.test(seg) || !hasNoHeaderInjection(seg)) {
+            throw validation(
+              "GRAPH_INVALID_PROBE_FOLDER",
+              "Probe folder path contains unsupported or relative path characters.",
+            );
+          }
+          folderSegments.push(seg);
+        }
+      }
+
+      const presetStates = await getGraphEgressPresetStates();
+      const creds = await deps.db.transaction(async (tx) => {
+        await assertAdminStepUpAnyInTx(deps, principal, tx, SITES_SELECTED_ADMIN_CAPABILITIES);
+        if (input.credentials) {
+          if (
+            !isValidSingleTenantGuid(input.credentials.tenantId) ||
+            !isValidEntraClientGuid(input.credentials.clientId) ||
+            !input.credentials.clientSecret
+          ) {
+            throw validation(
+              "GRAPH_INVALID_CREDENTIALS",
+              "Provide a valid single-tenant Entra directory GUID, client GUID, and client secret.",
+            );
+          }
+          return input.credentials;
+        }
+        const cfg = await readSetting(deps.settings, INTEGRATIONS_GRAPH_CONFIG, tx);
+        const secret = await readSecret(deps.settings, INTEGRATIONS_GRAPH_CLIENT_SECRET, tx);
+        if (!secret || !isCompleteGraphCredentials(cfg, true)) {
+          throw new DomainError(
+            "NOT_CONFIGURED",
+            "GRAPH_NOT_CONFIGURED",
+            "Save the single-tenant Entra directory GUID, application client GUID, and client secret before testing SharePoint write access.",
+          );
+        }
+        return {
+          tenantId: cfg.tenantId,
+          clientId: cfg.clientId,
+          clientSecret: secret,
+          credentialVersion: cfg.credentialVersion ?? 0,
+        };
+      });
+
+      const steps = {
+        egressGraphReady: presetStates.graphEnabled,
+        egressUploadReady: presetStates.uploadEnabled,
+        tokenAcquired: false,
+        siteReadSucceeded: false,
+        uploadSessionCreated: false,
+        uploadSessionCanceled: false,
+      };
+
+      let outcome: "succeeded" | "failed" = "failed";
+      let reasonCode = "GRAPH_SITES_SELECTED_FAILED";
+      let safeMessage: string;
+
+      if (!presetStates.graphEnabled || !presetStates.uploadEnabled) {
+        reasonCode = !presetStates.graphEnabled
+          ? "GRAPH_EGRESS_PRESET_REQUIRED"
+          : "GRAPH_UPLOAD_EGRESS_PRESET_REQUIRED";
+        safeMessage = !presetStates.graphEnabled
+          ? "Enable the Microsoft Graph outbound egress preset before testing SharePoint write access."
+          : "Enable the SharePoint Upload Session egress preset (*.sharepoint.com, *.files.1drv.com) before testing SharePoint write access.";
+      } else {
+        tokenCache.invalidate(creds);
+        const testClient = createGraphClientFromResolver(
+          egress,
+          tokenCache,
+          async () => creds,
+          undefined,
+          clientDiagnostics,
+        );
+        try {
+          await tokenCache.getAccessToken(creds);
+          steps.tokenAcquired = true;
+
+          let resolvedDriveId = suppliedDriveId;
+          if (siteGraphPath !== null) {
+            const siteRes = await testClient.request<{ id?: unknown }>({
+              method: "GET",
+              path: siteGraphPath,
+            });
+            const siteJson = siteRes.json();
+            const canonicalSiteId =
+              siteJson && typeof siteJson.id === "string" && SAFE_SITE_ID_RE.test(siteJson.id)
+                ? siteJson.id
+                : null;
+            const effectiveSitePrefix = canonicalSiteId
+              ? `/sites/${encodeURIComponent(canonicalSiteId)}`
+              : siteGraphPath;
+
+            if (resolvedDriveId) {
+              await testClient.request({
+                method: "GET",
+                path: `${effectiveSitePrefix}/drives/${encodeURIComponent(resolvedDriveId)}`,
+              });
+            } else {
+              const driveRes = await testClient.request<{ id?: unknown }>({
+                method: "GET",
+                path: `${effectiveSitePrefix}/drive`,
+              });
+              const driveJson = driveRes.json();
+              if (!driveJson || typeof driveJson.id !== "string" || !SAFE_DRIVE_ID_RE.test(driveJson.id)) {
+                throw new GraphApiError({
+                  code: "VALIDATION",
+                  reasonCode: "GRAPH_DRIVE_NOT_RESOLVED",
+                  safeMessage: "Microsoft Graph did not return a valid default document library drive ID for the site.",
+                  status: driveRes.status,
+                  retryable: false,
+                  requestSent: true,
+                });
+              }
+              resolvedDriveId = driveJson.id;
+            }
+          } else if (resolvedDriveId) {
+            await testClient.request({
+              method: "GET",
+              path: `/drives/${encodeURIComponent(resolvedDriveId)}`,
+            });
+          }
+
+          if (!resolvedDriveId) {
+            throw validation("GRAPH_DRIVE_NOT_RESOLVED", "Could not resolve target SharePoint drive ID.");
+          }
+          steps.siteReadSucceeded = true;
+
+          const probeFileName = `.readypackets-write-probe-${startedAt.getTime()}.tmp`;
+          const allSegments = [...folderSegments, probeFileName].map((s) => encodeURIComponent(s));
+          const sessionRes = await testClient.request<{ uploadUrl?: unknown }>({
+            method: "POST",
+            path: `/drives/${encodeURIComponent(resolvedDriveId)}/root:/${allSegments.join("/")}:/createUploadSession`,
+            body: {
+              item: {
+                "@microsoft.graph.conflictBehavior": "fail",
+                name: probeFileName,
+              },
+            },
+          });
+          const sessionJson = sessionRes.json();
+          const uploadUrl = typeof sessionJson?.uploadUrl === "string" ? sessionJson.uploadUrl : "";
+          if (!uploadUrl) {
+            throw new GraphApiError({
+              code: "UNAVAILABLE",
+              reasonCode: "GRAPH_UPLOAD_SESSION_MISSING_URL",
+              safeMessage: "Microsoft Graph createUploadSession succeeded without returning an upload session URL.",
+              status: sessionRes.status,
+              retryable: false,
+              requestSent: true,
+            });
+          }
+          steps.uploadSessionCreated = true;
+
+          // Immediately cancel the empty upload session via DELETE so zero file bytes are committed in SharePoint.
+          await testClient.uploadSessionControl({
+            uploadUrl,
+            method: "DELETE",
+          });
+          steps.uploadSessionCanceled = true;
+
+          outcome = "succeeded";
+          reasonCode = "GRAPH_SITES_SELECTED_WRITE_VERIFIED";
+          safeMessage =
+            "Verified single-tenant Entra token, SharePoint site/drive read, and Sites.Selected write permission via non-destructive upload session creation and immediate cancellation.";
+        } catch (error) {
+          outcome = "failed";
+          if (error instanceof GraphApiError) {
+            if (error.status === 403 && steps.siteReadSucceeded && !steps.uploadSessionCreated) {
+              reasonCode = "GRAPH_SITES_SELECTED_WRITE_DENIED";
+              safeMessage =
+                "SharePoint site metadata read succeeded, but write permission was denied (HTTP 403). Grant this Entra app registration the 'write' role on the target SharePoint site via Sites.Selected.";
+            } else if (error.status === 403) {
+              reasonCode = "GRAPH_SITES_SELECTED_ACCESS_DENIED";
+              safeMessage =
+                "SharePoint denied access to the site (HTTP 403). Ensure Sites.Selected admin consent is granted and this Entra app has explicit site permissions.";
+            } else {
+              reasonCode = error.reasonCode;
+              safeMessage = error.safeMessage;
+            }
+          } else if (error instanceof DomainError) {
+            reasonCode = error.reasonCode;
+            safeMessage = error.safeMessage;
+          } else {
+            reasonCode = "GRAPH_SITES_SELECTED_FAILED";
+            safeMessage = "SharePoint Sites.Selected write check failed.";
+          }
+        }
+      }
+
+      const finishedAt = deps.clock.now();
+      const durationMs = Math.max(0, finishedAt.getTime() - startedAt.getTime());
+
+      await deps.db.transaction(async (tx) => {
+        await checks.recordOutcome("sharepoint", outcome, reasonCode, tx);
+        await deps.audit.record(
+          {
+            category: "integration",
+            eventName: "integration.graph.sites_selected_checked",
+            action: "test",
+            outcome: outcome === "succeeded" ? "completed" : "failed",
+            severity: outcome === "succeeded" ? "INFO" : "WARN",
+            reasonCode,
+            provider: "sharepoint",
+            durationMs,
+            resource: { type: "integration_provider", publicId: "sharepoint" },
+            attributes: {
+              egress_graph_ready: steps.egressGraphReady,
+              egress_upload_ready: steps.egressUploadReady,
+              token_acquired: steps.tokenAcquired,
+              site_read_succeeded: steps.siteReadSucceeded,
+              upload_session_created: steps.uploadSessionCreated,
+              upload_session_canceled: steps.uploadSessionCanceled,
+            },
+          },
+          tx,
+        );
+      });
+
+      if (outcome === "succeeded") {
+        await resolveGraphOpsAlert("graph:sites_selected");
+      } else {
+        await emitGraphOpsAlert({
+          dedupKey: "graph:sites_selected",
+          severity: "error",
+          code: reasonCode,
+          title: "SharePoint Sites.Selected write check failed",
+          text: safeMessage,
+        });
+      }
+
+      return {
+        outcome,
+        reasonCode,
+        safeMessage,
+        graphEgressEnabled: steps.egressGraphReady,
+        uploadEgressEnabled: steps.egressUploadReady,
+        tokenAcquired: steps.tokenAcquired,
+        readVerified: steps.siteReadSucceeded,
+        writeVerified: steps.uploadSessionCreated && steps.uploadSessionCanceled,
+        durationMs,
+        checkedAt: finishedAt,
+      };
+    },
+
+    getEntraRunbook(): GraphEntraRunbookView {
+      return {
+        requiredApplicationPermission: "Sites.Selected",
+        discouragedBroadPermissions: [
+          "Sites.ReadWrite.All",
+          "Sites.FullControl.All",
+          "Files.ReadWrite.All",
+        ],
+        steps: [
+          "Register a single-tenant Microsoft Entra application in your organization's directory (Accounts in this organizational directory only).",
+          "Add Microsoft Graph Application permission Sites.Selected and grant tenant admin consent (never grant Sites.ReadWrite.All or Files.ReadWrite.All).",
+          "Grant explicit 'write' role on each approved SharePoint site to the ReadyPackets application using Microsoft Graph or Microsoft Graph PowerShell.",
+          "Enable both 'Microsoft Graph' and 'SharePoint Upload Session' outbound presets on /admin/integrations/egress.",
+          "Save the Tenant GUID, Client GUID, and Client Secret, then run the Sites.Selected write check to verify non-destructive upload session creation.",
+        ],
+        siteGrantEndpointTemplate: "POST https://graph.microsoft.com/v1.0/sites/{site-id}/permissions",
+        siteGrantPayloadExample: JSON.stringify(
+          {
+            roles: ["write"],
+            grantedToIdentities: [
+              {
+                application: {
+                  id: "<ENTRA_CLIENT_ID_GUID>",
+                  displayName: "ReadyPackets Portal",
+                },
+              },
+            ],
+          },
+          null,
+          2,
+        ),
+        powershellExample: [
+          "# Run once per approved SharePoint site as a SharePoint Administrator:",
+          "Connect-MgGraph -Scopes 'Sites.FullControl.All'",
+          "$SiteId = '<hostname>,<siteCollectionGuid>,<webGuid>'",
+          "$Body = @{",
+          "  roles = @('write')",
+          "  grantedToIdentities = @(@{",
+          "    application = @{ id = '<ENTRA_CLIENT_ID_GUID>'; displayName = 'ReadyPackets Portal' }",
+          "  })",
+          "}",
+          "New-MgSitePermission -SiteId $SiteId -BodyParameter $Body",
+        ].join("\n"),
+        oneDriveNote:
+          "OneDrive for Business drives live inside personal SharePoint site collections (https://<tenant>-my.sharepoint.com/personal/<user>); grant Sites.Selected 'write' on that personal site collection rather than Files.ReadWrite.All.",
+      };
+    },
   };
 
   const mailTransport: MailTransport = {
@@ -866,7 +1317,7 @@ export function createGraphModuleRuntime(
     createScopedClient(credentials) {
       if (credentials === undefined) return platformClient;
       const resolver = typeof credentials === "function" ? credentials : async () => credentials;
-      return createGraphClientFromResolver(egress, tokenCache, resolver);
+      return createGraphClientFromResolver(egress, tokenCache, resolver, undefined, clientDiagnostics);
     },
   };
 }

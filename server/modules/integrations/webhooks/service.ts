@@ -30,13 +30,15 @@ function currentCorrelationId(): string {
   const ctx = getRequestContext();
   return ctx?.correlationId ?? ctx?.requestId ?? ulid();
 }
-import type { ClaimedJob, JobResult, ModuleHealth, SessionPrincipal, Tx } from "../../../core/types.js";
+import type { ClaimedJob, DbOrTx, JobResult, ModuleHealth, SessionPrincipal, Tx } from "../../../core/types.js";
 import type { AuditTap, AuditTapEvent } from "../../audit/tap.js";
 import { TRIGGER_CATALOGUE, entriesForEvent, type TriggerCatalogueEntry } from "../../audit/triggerCatalogue.js";
 import { registerAutomationTrigger } from "../../automations/contracts.js";
 import { readSetting, writeSetting } from "../../platform/index.js";
 import type { ApiCaller, ApiListQuery, ApiPage, WebhookSubscriptionDto } from "../../publicApi/ports.js";
 import {
+  assertAdminStepUpAnyInTx,
+  assertAdminStepUpAnyPreflight,
   assertApiReplayInTx,
   assertApiReplayPreflight,
   assertWebhooksManageInTx,
@@ -281,10 +283,64 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
         row.status === "delivered" ||
         row.status === "failed" ||
         row.status === "dead" ||
-        row.status === "unknown"
+        row.status === "unknown" ||
+        row.status === "stopped"
       );
     }
     return row.status === "processed" || row.status === "duplicate";
+  }
+
+  function canStopDelivery(row: DeliveryRow): boolean {
+    if (row.direction !== "outbound") return false;
+    return row.status === "queued" || row.status === "retrying";
+  }
+
+  function canRetryDelivery(row: DeliveryRow, now: Date): boolean {
+    if (row.direction !== "outbound") return false;
+    if (row.bodyTruncated || row.bodyPurged || row.expiresAt.getTime() <= now.getTime()) return false;
+    if (!row.payloadEnc && !row.tapEventEnc) return false;
+    return row.status === "failed" || row.status === "dead" || row.status === "stopped";
+  }
+
+  async function emitWebhookOpsAlert(params: {
+    dedupKey: string;
+    severity: "warning" | "error" | "critical";
+    code: string;
+    title: string;
+    text?: string;
+    orderPublicId?: string | null;
+    correlationId?: string;
+  }): Promise<void> {
+    const opsAlerts = deps.services.opsAlerts;
+    if (!opsAlerts) return;
+    try {
+      await opsAlerts.emit({
+        source: "webhook",
+        severity: params.severity,
+        dedupKey: params.dedupKey,
+        code: params.code,
+        title: params.title,
+        ...(params.text ? { text: params.text } : {}),
+        ...(params.orderPublicId ? { orderPublicId: params.orderPublicId } : {}),
+        ...(params.correlationId ? { correlationId: params.correlationId } : {}),
+      });
+    } catch {
+      // Operational alerts are advisory diagnostics; never roll back webhook state updates.
+    }
+  }
+
+  async function resolveWebhookOpsAlert(dedupKey: string, correlationId?: string): Promise<void> {
+    const opsAlerts = deps.services.opsAlerts;
+    if (!opsAlerts) return;
+    try {
+      await opsAlerts.resolve({
+        source: "webhook",
+        dedupKey,
+        ...(correlationId ? { correlationId } : {}),
+      });
+    } catch {
+      // Non-fatal diagnostic resolution.
+    }
   }
 
   function toSubscriptionView(row: SubscriptionRow, now: Date): WebhookSubscriptionView {
@@ -307,6 +363,7 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
       targetUrlMasked: row.targetUrlMasked,
       events,
       status: row.status as WebhookSubscriptionStatus,
+      signingEnabled: row.signingEnabled !== false,
       signingSecretLast4: row.signingSecretLast4,
       hasOverlapSecret: overlapActive,
       overlapExpiresAt: overlapActive ? row.previousSecretExpiresAt : null,
@@ -372,6 +429,14 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
       replayOfPublicId: row.replayOfPublicId,
       isTest: row.isTest,
       canReplay: canReplayDelivery(row, now),
+      canRetry: canRetryDelivery(row, now),
+      canStop: canStopDelivery(row),
+      orderPublicId: row.orderPublicId ?? null,
+      stageKey: row.stageKey ?? null,
+      manualRetryCount: row.manualRetryCount ?? 0,
+      stoppedAt: row.stoppedAt ?? null,
+      stoppedByPublicId: row.stoppedByPublicId ?? null,
+      stopReason: row.stopReason ?? null,
       expiresAt: row.expiresAt,
       completedAt: row.completedAt,
       createdAt: row.createdAt,
@@ -489,6 +554,9 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
     if (!row || row.direction !== "outbound" || !row.subscriptionId) {
       return { outcome: "canceled", reasonCode: "DELIVERY_NOT_FOUND" };
     }
+    if (row.status === "stopped") {
+      return { outcome: "canceled", reasonCode: "DELIVERY_STOPPED" };
+    }
     if (
       row.status === "delivered" ||
       row.status === "failed" ||
@@ -575,17 +643,20 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
 
     const rawBodyBuf = Buffer.from(bodyResult.rawJson, "utf8");
     const targetUrl = deps.crypto.decrypt(sub.targetUrlEnc, subscriptionUrlAad(sub.publicId));
-    const primarySecret = deps.crypto.decrypt(sub.signingSecretEnc, subscriptionSecretAad(sub.publicId));
     const sendNow = deps.clock.now();
-    const overlapSecret =
-      sub.previousSecretEnc &&
-      sub.previousSecretExpiresAt instanceof Date &&
-      sendNow.getTime() < sub.previousSecretExpiresAt.getTime()
-        ? deps.crypto.decrypt(sub.previousSecretEnc, subscriptionSecretAad(sub.publicId))
-        : null;
-
     const timestampSec = Math.floor(sendNow.getTime() / 1000);
-    const signatureHeader = signWebhookPayload(rawBodyBuf, timestampSec, primarySecret, overlapSecret);
+    const signingEnabled = sub.signingEnabled !== false;
+    let signatureHeader: string | null = null;
+    if (signingEnabled) {
+      const primarySecret = deps.crypto.decrypt(sub.signingSecretEnc, subscriptionSecretAad(sub.publicId));
+      const overlapSecret =
+        sub.previousSecretEnc &&
+        sub.previousSecretExpiresAt instanceof Date &&
+        sendNow.getTime() < sub.previousSecretExpiresAt.getTime()
+          ? deps.crypto.decrypt(sub.previousSecretEnc, subscriptionSecretAad(sub.publicId))
+          : null;
+      signatureHeader = signWebhookPayload(rawBodyBuf, timestampSec, primarySecret, overlapSecret);
+    }
 
     const requestHeaders: Record<string, string> = {
       "Content-Type": "application/json; charset=utf-8",
@@ -593,7 +664,7 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
       "X-ReadyPackets-Event": row.eventKey,
       "X-ReadyPackets-Delivery": row.publicId,
       "X-ReadyPackets-Timestamp": String(timestampSec),
-      "X-ReadyPackets-Signature": signatureHeader,
+      ...(signatureHeader ? { "X-ReadyPackets-Signature": signatureHeader } : {}),
       "X-Correlation-Id": row.correlationId,
     };
     if (row.isReplay) {
@@ -791,7 +862,47 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
         }
       });
 
-      if (succeeded) return { outcome: "completed" };
+      if (succeeded) {
+        if (!row.isTest) {
+          await resolveWebhookOpsAlert(`webhook:sub:${sub.publicId}`, row.correlationId);
+        }
+        return { outcome: "completed" };
+      }
+      if (!row.isTest) {
+        const subDisabled =
+          isTerminal && sub.status === "active" && sub.consecutiveFailures + 1 >= cfg.autoDisableThreshold;
+        if (subDisabled) {
+          await emitWebhookOpsAlert({
+            dedupKey: `webhook:sub:${sub.publicId}`,
+            severity: "critical",
+            code: "CONSECUTIVE_FAILURES_EXCEEDED",
+            title: `Webhook subscription '${sub.name}' auto-disabled after repeated failures`,
+            text: `Outbound webhook subscription '${sub.name}' reached ${sub.consecutiveFailures + 1} consecutive terminal failures (${reasonCode ?? "DELIVERY_FAILED"}).`,
+            orderPublicId: row.orderPublicId ?? null,
+            correlationId: row.correlationId,
+          });
+        } else if (isTerminal) {
+          await emitWebhookOpsAlert({
+            dedupKey: `webhook:sub:${sub.publicId}`,
+            severity: "error",
+            code: reasonCode ?? "DELIVERY_FAILED",
+            title: `Webhook delivery failed for '${sub.name}'`,
+            text: `Outbound webhook '${row.eventKey}' ended with ${nextStatus} (${reasonCode ?? "DELIVERY_FAILED"}).`,
+            orderPublicId: row.orderPublicId ?? null,
+            correlationId: row.correlationId,
+          });
+        } else if (attemptNumber >= 2) {
+          await emitWebhookOpsAlert({
+            dedupKey: `webhook:sub:${sub.publicId}`,
+            severity: "warning",
+            code: reasonCode ?? "DELIVERY_RETRYING",
+            title: `Webhook delivery retrying for '${sub.name}'`,
+            text: `Attempt ${attemptNumber} of ${row.maxAttempts} failed with ${reasonCode ?? "DELIVERY_RETRYING"} and is scheduled to retry.`,
+            orderPublicId: row.orderPublicId ?? null,
+            correlationId: row.correlationId,
+          });
+        }
+      }
       return {
         outcome: "failed",
         reasonCode: reasonCode ?? "DELIVERY_FAILED",
@@ -909,6 +1020,45 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
         }
       });
 
+      if (!row.isTest) {
+        const subDisabled =
+          isTerminal &&
+          !ambiguousPostWire &&
+          sub.status === "active" &&
+          sub.consecutiveFailures + 1 >= cfg.autoDisableThreshold;
+        if (subDisabled) {
+          await emitWebhookOpsAlert({
+            dedupKey: `webhook:sub:${sub.publicId}`,
+            severity: "critical",
+            code: "CONSECUTIVE_FAILURES_EXCEEDED",
+            title: `Webhook subscription '${sub.name}' auto-disabled after repeated failures`,
+            text: `Outbound webhook subscription '${sub.name}' reached ${sub.consecutiveFailures + 1} consecutive terminal failures (${reasonCode}).`,
+            orderPublicId: row.orderPublicId ?? null,
+            correlationId: row.correlationId,
+          });
+        } else if (isTerminal) {
+          await emitWebhookOpsAlert({
+            dedupKey: `webhook:sub:${sub.publicId}`,
+            severity: "error",
+            code: reasonCode,
+            title: `Webhook delivery failed for '${sub.name}'`,
+            text: `Outbound webhook '${row.eventKey}' ended with ${nextStatus} (${reasonCode}).`,
+            orderPublicId: row.orderPublicId ?? null,
+            correlationId: row.correlationId,
+          });
+        } else if (attemptNumber >= 2) {
+          await emitWebhookOpsAlert({
+            dedupKey: `webhook:sub:${sub.publicId}`,
+            severity: "warning",
+            code: reasonCode,
+            title: `Webhook delivery retrying for '${sub.name}'`,
+            text: `Attempt ${attemptNumber} of ${row.maxAttempts} failed with ${reasonCode} and is scheduled to retry.`,
+            orderPublicId: row.orderPublicId ?? null,
+            correlationId: row.correlationId,
+          });
+        }
+      }
+
       if (ambiguousPostWire) {
         return { outcome: "unknown", reasonCode };
       }
@@ -1003,6 +1153,14 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
 
       const now = deps.clock.now();
       const expiresAt = computeExpiry(now, cfg.retentionDays);
+      const tapOrderPublicId =
+        event.resource?.type === "order" && typeof event.resource.publicId === "string"
+          ? event.resource.publicId
+          : typeof event.attributes?.order_public_id === "string"
+            ? event.attributes.order_public_id
+            : null;
+      const tapStageKey =
+        typeof event.attributes?.stage_key === "string" ? event.attributes.stage_key.slice(0, 64) : null;
 
       for (const entry of matchedEntries) {
         for (const sub of activeSubs) {
@@ -1026,6 +1184,8 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
             targetLabel,
             "queued",
             event.correlationId,
+            tapOrderPublicId,
+            tapStageKey,
           ]);
 
           const existing = await dbOrTx
@@ -1057,6 +1217,8 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
             direction: "outbound",
             subscriptionId: sub.id,
             subscriptionPublicId: sub.publicId,
+            orderPublicId: tapOrderPublicId,
+            stageKey: tapStageKey,
             targetLabel,
             eventKey: entry.key,
             externalEventId: event.eventId,
@@ -1291,6 +1453,7 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
       const targetUrlEnc = deps.crypto.encrypt(input.targetUrl.trim(), subscriptionUrlAad(publicId));
       const signingSecretEnc = deps.crypto.encrypt(secret, subscriptionSecretAad(publicId));
       const status: WebhookSubscriptionStatus = input.paused ? "paused" : "active";
+      const signingEnabled = input.signingEnabled !== false;
 
       const row = await deps.db.transaction(async (tx) => {
         await assertWebhooksManageInTx(deps, principal, tx);
@@ -1303,6 +1466,7 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
           targetUrlMasked: masked.maskedUrl,
           eventsJson: JSON.stringify(events),
           status,
+          signingEnabled,
           signingSecretEnc,
           signingSecretLast4: last4,
           createdByUserId: principal.userId,
@@ -1399,6 +1563,7 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
                 }
               : {}),
             ...(nextEvents ? { eventsJson: JSON.stringify(nextEvents) } : {}),
+            ...(input.signingEnabled !== undefined ? { signingEnabled: input.signingEnabled } : {}),
             updatedByUserId: principal.userId,
             updatedAt: now,
             version: existing.version + 1,
@@ -1497,6 +1662,10 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
           .limit(1);
         return reloaded[0]!;
       });
+
+      if (!input.paused) {
+        await resolveWebhookOpsAlert(`webhook:sub:${updated.publicId}`);
+      }
 
       return toSubscriptionView(updated, deps.clock.now());
     },
@@ -2131,6 +2300,9 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
       if (input.inboundEndpointPublicId) {
         predicates.push(eq(integrationWebhookDeliveries.inboundEndpointPublicId, input.inboundEndpointPublicId));
       }
+      if (input.orderPublicId?.trim()) {
+        predicates.push(eq(integrationWebhookDeliveries.orderPublicId, input.orderPublicId.trim()));
+      }
       if (input.eventKey?.trim()) {
         predicates.push(eq(integrationWebhookDeliveries.eventKey, input.eventKey.trim()));
       }
@@ -2190,6 +2362,243 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
       const row = rows[0];
       if (!row) throw notFound("WEBHOOK_DELIVERY_NOT_FOUND", "Webhook delivery record not found.");
       return loadDeliveryDetail(row, deps.clock.now());
+    },
+
+    async stopDelivery(
+      principal: SessionPrincipal,
+      input: { publicId: string; reason?: string | null },
+    ): Promise<WebhookDeliveryDetailView> {
+      const stopCaps = ["webhooks.manage", "api.replay"] as const;
+      assertAdminStepUpAnyPreflight(principal, deps.clock.now(), stopCaps);
+      const cleanReason = input.reason?.trim() ? input.reason.trim().slice(0, 280) : null;
+      if (cleanReason !== null && !hasNoHeaderInjection(cleanReason)) {
+        throw validation("INVALID_STOP_REASON", "Enter a valid stop reason without control characters.");
+      }
+      const correlationId = currentCorrelationId();
+
+      await deps.db.transaction(async (tx) => {
+        await assertAdminStepUpAnyInTx(deps, principal, tx, stopCaps);
+        const rows = await tx
+          .select()
+          .from(integrationWebhookDeliveries)
+          .where(eq(integrationWebhookDeliveries.publicId, input.publicId))
+          .limit(1);
+        const target = rows[0];
+        if (!target || target.direction !== "outbound") {
+          throw notFound("WEBHOOK_DELIVERY_NOT_FOUND", "Outbound webhook delivery not found.");
+        }
+
+        if (target.jobPublicId && deps.services.jobAdmin?.reconcileOutboxJob) {
+          const disp = await deps.services.jobAdmin.reconcileOutboxJob(target.jobPublicId, tx, {
+            cancelQueued: true,
+          });
+          if (disp.state === "running_live") {
+            throw conflict(
+              "WEBHOOK_DELIVERY_IN_FLIGHT",
+              "This webhook delivery is actively transmitting right now and cannot be stopped mid-flight.",
+            );
+          }
+        }
+
+        const [locked] = await tx
+          .select()
+          .from(integrationWebhookDeliveries)
+          .where(eq(integrationWebhookDeliveries.id, target.id))
+          .for("update")
+          .limit(1);
+        if (!locked || (locked.status !== "queued" && locked.status !== "retrying")) {
+          throw conflict(
+            "WEBHOOK_DELIVERY_NOT_STOPPABLE",
+            "Only queued or retrying outbound webhook deliveries can be stopped.",
+          );
+        }
+
+        const now = deps.clock.now();
+        await tx
+          .update(integrationWebhookDeliveries)
+          .set({
+            status: "stopped",
+            reasonCode: "STOPPED_BY_OPERATOR",
+            activeFencingToken: 0,
+            stoppedAt: now,
+            stoppedByUserId: principal.userId,
+            stoppedByPublicId: principal.userPublicId,
+            stopReason: cleanReason,
+            completedAt: now,
+            updatedAt: now,
+            version: locked.version + 1,
+          })
+          .where(
+            and(
+              eq(integrationWebhookDeliveries.id, locked.id),
+              eq(integrationWebhookDeliveries.version, locked.version),
+            ),
+          );
+
+        await deps.audit.record(
+          {
+            category: "integration",
+            eventName: "integration.webhook.delivery_stopped",
+            action: "cancel",
+            outcome: "completed",
+            severity: "WARN",
+            reasonCode: "STOPPED_BY_OPERATOR",
+            resource: {
+              type: "webhook_subscription",
+              publicId: locked.subscriptionPublicId ?? locked.publicId,
+            },
+            deliveryId: locked.publicId,
+            correlationId,
+            ...(locked.orderPublicId ? { orderPublicId: locked.orderPublicId } : {}),
+            attributes: {
+              delivery_public_id: locked.publicId,
+              event_key: safeAuditToken(locked.eventKey, "event"),
+              previous_status: locked.status,
+              attempt_count: locked.attemptCount,
+            },
+            ...(cleanReason ? { safeCounts: { reason_length: cleanReason.length } } : {}),
+          },
+          tx,
+        );
+      });
+
+      return this.getDelivery(principal, input.publicId);
+    },
+
+    async retryDelivery(
+      principal: SessionPrincipal,
+      input: { publicId: string },
+    ): Promise<WebhookDeliveryDetailView> {
+      const retryCaps = ["webhooks.manage", "api.replay"] as const;
+      assertAdminStepUpAnyPreflight(principal, deps.clock.now(), retryCaps);
+      const correlationId = currentCorrelationId();
+
+      await deps.db.transaction(async (tx) => {
+        await assertAdminStepUpAnyInTx(deps, principal, tx, retryCaps);
+        const cfg = await readConfig(tx);
+        if (!cfg.enabled) {
+          throw unavailable("WEBHOOKS_DISABLED", "Enable webhooks before retrying an outbound delivery.");
+        }
+
+        const [locked] = await tx
+          .select()
+          .from(integrationWebhookDeliveries)
+          .where(eq(integrationWebhookDeliveries.publicId, input.publicId))
+          .for("update")
+          .limit(1);
+        if (!locked || locked.direction !== "outbound" || !locked.subscriptionId) {
+          throw notFound("WEBHOOK_DELIVERY_NOT_FOUND", "Outbound webhook delivery not found.");
+        }
+
+        if (locked.status === "delivered") {
+          throw conflict(
+            "WEBHOOK_ALREADY_DELIVERED",
+            "Delivered webhooks cannot be retried in place; use Redeliver to create a separate replay delivery.",
+          );
+        }
+        if (locked.status === "unknown") {
+          throw conflict(
+            "WEBHOOK_OUTCOME_UNCERTAIN",
+            "This webhook attempt ended with an uncertain network outcome; verify the receiver first and use Redeliver if needed.",
+          );
+        }
+        if (locked.status !== "failed" && locked.status !== "dead" && locked.status !== "stopped") {
+          throw conflict(
+            "WEBHOOK_DELIVERY_NOT_RETRYABLE",
+            "Only failed, dead-lettered, or stopped outbound webhook deliveries can be retried.",
+          );
+        }
+
+        const now = deps.clock.now();
+        if (locked.bodyTruncated) {
+          throw conflict(
+            "WEBHOOK_BODY_TRUNCATED",
+            "This webhook cannot be retried because its stored body exceeded 64 KiB and was truncated.",
+          );
+        }
+        if (locked.bodyPurged || locked.expiresAt.getTime() <= now.getTime() || (!locked.payloadEnc && !locked.tapEventEnc)) {
+          throw conflict(
+            "WEBHOOK_BODY_PURGED",
+            "This webhook cannot be retried because its stored payload body has been purged under the retention policy.",
+          );
+        }
+
+        const subRows = await tx
+          .select()
+          .from(integrationWebhookSubscriptions)
+          .where(eq(integrationWebhookSubscriptions.id, locked.subscriptionId))
+          .limit(1);
+        const sub = subRows[0];
+        if (!sub) {
+          throw conflict("SUBSCRIPTION_DELETED", "The destination subscription no longer exists.");
+        }
+        if (sub.status !== "active") {
+          throw conflict(
+            "SUBSCRIPTION_INACTIVE",
+            "Resume or enable the webhook subscription before retrying this delivery.",
+          );
+        }
+
+        const nextManualRetryCount = (locked.manualRetryCount ?? 0) + 1;
+        const { jobId } = await deps.jobs.enqueue(
+          WEBHOOK_DELIVER_JOB,
+          { deliveryPublicId: locked.publicId },
+          {
+            idempotencyKey: `webhook_deliver:${locked.publicId}:retry:${nextManualRetryCount}`,
+            maxAttempts: WEBHOOK_MAX_ATTEMPTS,
+            correlationId,
+          },
+          tx,
+        );
+
+        await tx
+          .update(integrationWebhookDeliveries)
+          .set({
+            status: "queued",
+            maxAttempts: locked.attemptCount + WEBHOOK_MAX_ATTEMPTS,
+            manualRetryCount: nextManualRetryCount,
+            jobPublicId: jobId,
+            reasonCode: null,
+            activeFencingToken: 0,
+            stoppedAt: null,
+            stoppedByUserId: null,
+            stoppedByPublicId: null,
+            stopReason: null,
+            completedAt: null,
+            updatedAt: now,
+            version: locked.version + 1,
+          })
+          .where(
+            and(
+              eq(integrationWebhookDeliveries.id, locked.id),
+              eq(integrationWebhookDeliveries.version, locked.version),
+            ),
+          );
+
+        await deps.audit.record(
+          {
+            category: "integration",
+            eventName: "integration.webhook.delivery_retried",
+            action: "retry",
+            outcome: "completed",
+            severity: "INFO",
+            resource: { type: "webhook_subscription", publicId: sub.publicId },
+            deliveryId: locked.publicId,
+            correlationId,
+            ...(locked.orderPublicId ? { orderPublicId: locked.orderPublicId } : {}),
+            attributes: {
+              delivery_public_id: locked.publicId,
+              subscription_public_id: sub.publicId,
+              event_key: safeAuditToken(locked.eventKey, "event"),
+              manual_retry_count: nextManualRetryCount,
+              prior_attempt_count: locked.attemptCount,
+            },
+          },
+          tx,
+        );
+      });
+
+      return this.getDelivery(principal, input.publicId);
     },
 
     async redeliver(
@@ -2262,6 +2671,8 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
           direction: "outbound",
           subscriptionId: sub.id,
           subscriptionPublicId: sub.publicId,
+          orderPublicId: original.orderPublicId ?? null,
+          stageKey: original.stageKey ?? null,
           targetLabel,
           eventKey: original.eventKey,
           externalEventId: original.externalEventId,
@@ -2587,11 +2998,18 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
             tx,
           );
 
+          const pubOrderPublicId =
+            options?.orderPublicId ??
+            (options?.resourceType === "order" && options.resourcePublicId ? options.resourcePublicId : null);
+          const pubStageKey = options?.stageKey ? options.stageKey.slice(0, 64) : null;
+
           await tx.insert(integrationWebhookDeliveries).values({
             publicId: deliveryPublicId,
             direction: "outbound",
             subscriptionId: sub.id,
             subscriptionPublicId: sub.publicId,
+            orderPublicId: pubOrderPublicId,
+            stageKey: pubStageKey,
             targetLabel,
             eventKey: cleanEventKey,
             externalEventId: options?.deduplicationKey?.slice(0, 128) ?? deliveryPublicId,
@@ -2611,7 +3029,15 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
             bodyPurged: false,
             isReplay: false,
             isTest: false,
-            searchText: buildSearchText([deliveryPublicId, cleanEventKey, targetLabel, "queued", correlationId]),
+            searchText: buildSearchText([
+              deliveryPublicId,
+              cleanEventKey,
+              targetLabel,
+              "queued",
+              correlationId,
+              pubOrderPublicId,
+              pubStageKey,
+            ]),
             expiresAt,
           });
           deliveryPublicIds.push(deliveryPublicId);
@@ -2622,6 +3048,230 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
 
       if (outerTx) return runInTx(outerTx);
       return deps.db.transaction(runInTx);
+    },
+
+    async enqueueWorkflowSubscription(
+      input: {
+        subscriptionPublicId: string;
+        orderPublicId: string | null;
+        stageKey: string | null;
+        triggerSource: string;
+        idempotencyKey: string;
+        correlationId?: string;
+        actor?: SessionPrincipal | null;
+        actorPublicId?: string | null;
+        eventKey?: string | null;
+        payload: Record<string, unknown>;
+      },
+      tx: Tx,
+    ) {
+      const cfg = await readConfig(tx);
+      if (!cfg.enabled) {
+        return {
+          outcome: "disabled" as const,
+          deliveryPublicId: null,
+          reasonCode: "WEBHOOKS_DISABLED",
+          message: "Outbound webhook subscriptions are currently disabled.",
+        };
+      }
+
+      const subRows = await tx
+        .select()
+        .from(integrationWebhookSubscriptions)
+        .where(eq(integrationWebhookSubscriptions.publicId, input.subscriptionPublicId))
+        .limit(1);
+      const sub = subRows[0];
+      if (!sub) {
+        return {
+          outcome: "refused_precondition" as const,
+          deliveryPublicId: null,
+          reasonCode: "SUBSCRIPTION_NOT_FOUND",
+          message: "The selected webhook subscription no longer exists.",
+        };
+      }
+      if (sub.status !== "active") {
+        return {
+          outcome: "disabled" as const,
+          deliveryPublicId: null,
+          reasonCode: sub.status === "disabled_failing" ? "SUBSCRIPTION_DISABLED_FAILING" : "SUBSCRIPTION_PAUSED",
+          message:
+            sub.status === "disabled_failing"
+              ? "The selected webhook subscription is disabled due to repeated failures."
+              : "The selected webhook subscription is currently paused.",
+        };
+      }
+
+      const dedupeKey = `wf:${sub.publicId}:${input.idempotencyKey}`.slice(0, 160);
+      const existingRows = await tx
+        .select({
+          publicId: integrationWebhookDeliveries.publicId,
+          status: integrationWebhookDeliveries.status,
+        })
+        .from(integrationWebhookDeliveries)
+        .where(
+          and(
+            eq(integrationWebhookDeliveries.direction, "outbound"),
+            eq(integrationWebhookDeliveries.deduplicationKey, dedupeKey),
+          ),
+        )
+        .limit(1);
+      const existing = existingRows[0];
+      if (existing) {
+        return {
+          outcome: "already_queued_or_delivered" as const,
+          deliveryPublicId: existing.publicId,
+          reasonCode: "WEBHOOK_ALREADY_QUEUED",
+          message: "A delivery for this stage webhook run has already been queued.",
+        };
+      }
+
+      const now = deps.clock.now();
+      const correlationId = input.correlationId ?? currentCorrelationId();
+      const deliveryPublicId = ulid();
+      const rawEventKey = input.eventKey?.trim() ?? "";
+      const eventKey =
+        rawEventKey && EVENT_KEY_RE.test(rawEventKey)
+          ? rawEventKey
+          : input.stageKey
+            ? "order.stage_webhook_triggered"
+            : "automation.webhook_triggered";
+      const envelopeObj = {
+        id: deliveryPublicId,
+        event: eventKey,
+        createdAt: now.toISOString(),
+        correlationId,
+        resource: input.orderPublicId
+          ? { type: "order", id: input.orderPublicId }
+          : { type: "automation", id: input.idempotencyKey.slice(0, 64) },
+        data: {
+          ...(input.orderPublicId ? { orderPublicId: input.orderPublicId } : {}),
+          ...(input.stageKey ? { stageKey: input.stageKey } : {}),
+          triggerSource: input.triggerSource,
+          ...input.payload,
+        },
+      };
+      const redacted = redactAndBoundBody(JSON.stringify(envelopeObj));
+      const payloadEnc = encryptDeliveryPayload(deps.crypto, deliveryPublicId, {
+        requestHeaders: {},
+        requestBody: redacted.body,
+        responseHeaders: null,
+        responseBody: null,
+      });
+      const targetLabel = `${sub.name} (${sub.targetUrlHost})`.slice(0, 255);
+      const actorLabel = input.actor
+        ? `${input.actor.role}:${input.actor.userPublicId}`
+        : input.actorPublicId
+          ? `staff:${input.actorPublicId}`
+          : "system";
+
+      const { jobId } = await deps.jobs.enqueue(
+        WEBHOOK_DELIVER_JOB,
+        { deliveryPublicId },
+        {
+          idempotencyKey: `webhook_deliver:${deliveryPublicId}`,
+          maxAttempts: WEBHOOK_MAX_ATTEMPTS,
+          correlationId,
+        },
+        tx,
+      );
+
+      await tx.insert(integrationWebhookDeliveries).values({
+        publicId: deliveryPublicId,
+        direction: "outbound",
+        subscriptionId: sub.id,
+        subscriptionPublicId: sub.publicId,
+        orderPublicId: input.orderPublicId,
+        stageKey: input.stageKey ? input.stageKey.slice(0, 64) : null,
+        targetLabel,
+        eventKey,
+        externalEventId: input.idempotencyKey.slice(0, 128),
+        deduplicationKey: dedupeKey,
+        status: "queued",
+        httpMethod: "POST",
+        httpPath: sub.targetUrlMasked.slice(0, 255),
+        requestBytes: Buffer.byteLength(redacted.body, "utf8"),
+        attemptCount: 0,
+        maxAttempts: WEBHOOK_MAX_ATTEMPTS,
+        jobPublicId: jobId,
+        correlationId,
+        actorLabel,
+        payloadSha256: sha256Hex(redacted.body),
+        payloadEnc,
+        bodyTruncated: redacted.truncated,
+        bodyPurged: false,
+        isReplay: false,
+        isTest: false,
+        searchText: buildSearchText([
+          deliveryPublicId,
+          eventKey,
+          targetLabel,
+          "queued",
+          correlationId,
+          input.orderPublicId,
+          input.stageKey,
+        ]),
+        expiresAt: computeExpiry(now, cfg.retentionDays),
+      });
+
+      return {
+        outcome: "queued" as const,
+        deliveryPublicId,
+        reasonCode: null,
+        message: null,
+      };
+    },
+
+    async listSubscriptionTargetsForPicker(tx?: DbOrTx) {
+      const dbOrTx = tx ?? deps.db;
+      const cfg = await readConfig(tx as Tx | undefined);
+      const rows = await dbOrTx
+        .select({
+          publicId: integrationWebhookSubscriptions.publicId,
+          name: integrationWebhookSubscriptions.name,
+          status: integrationWebhookSubscriptions.status,
+          signingEnabled: integrationWebhookSubscriptions.signingEnabled,
+        })
+        .from(integrationWebhookSubscriptions)
+        .orderBy(asc(integrationWebhookSubscriptions.name), asc(integrationWebhookSubscriptions.id))
+        .limit(200);
+      return rows.map((r) => ({
+        publicId: r.publicId,
+        name: r.name,
+        status: r.status as WebhookSubscriptionStatus,
+        signingEnabled: r.signingEnabled !== false,
+        webhooksEnabled: cfg.enabled,
+      }));
+    },
+
+    async getSubscriptionTargetStatus(subscriptionPublicId: string, tx?: DbOrTx) {
+      const dbOrTx = tx ?? deps.db;
+      const cfg = await readConfig(tx as Tx | undefined);
+      const rows = await dbOrTx
+        .select({
+          name: integrationWebhookSubscriptions.name,
+          status: integrationWebhookSubscriptions.status,
+          signingEnabled: integrationWebhookSubscriptions.signingEnabled,
+        })
+        .from(integrationWebhookSubscriptions)
+        .where(eq(integrationWebhookSubscriptions.publicId, subscriptionPublicId))
+        .limit(1);
+      const row = rows[0];
+      if (!row) {
+        return {
+          exists: false,
+          name: null,
+          status: null,
+          signingEnabled: true,
+          webhooksEnabled: cfg.enabled,
+        };
+      }
+      return {
+        exists: true,
+        name: row.name,
+        status: row.status as WebhookSubscriptionStatus,
+        signingEnabled: row.signingEnabled !== false,
+        webhooksEnabled: cfg.enabled,
+      };
     },
 
     /* ------------------------------------------------- raw HTTP inbound receiver */
