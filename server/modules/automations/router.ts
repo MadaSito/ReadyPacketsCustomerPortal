@@ -12,6 +12,7 @@ import {
   AUTOMATION_MIN_SCHEDULE_MINUTES,
   AUTOMATION_RUN_STATES,
   AUTOMATION_TRIGGER_MODES,
+  COMPLETION_JOB_STATES,
   type AutomationActionStepInput,
   type AutomationCanvasLayout,
   type AutomationTriggerConfig,
@@ -20,16 +21,27 @@ import {
 const readProc = adminProcedure.use(requireCapability("automations.read"));
 const manageProc = adminProcedure.use(requireCapability("automations.manage"));
 const stageActionsProc = staffProcedure.use(requireCapability("orders.automations.run"));
+const stageBundleRunProc = staffProcedure.use(requireCapability("orders.stage.run"));
 
 const stageStepKeySchema = z
   .string()
   .trim()
   .regex(/^[a-z][a-z0-9_]{1,47}$/, "Invalid workflow step key.");
 
+const stageKeySchema = z
+  .string()
+  .trim()
+  .regex(/^[a-z][a-z0-9_]{1,47}$/, "Invalid workflow stage key.");
+
 const stageIdempotencyKeySchema = z
   .string()
   .trim()
   .regex(/^[A-Za-z0-9:_-]{8,64}$/, "Invalid idempotency key.");
+
+const confirmationTokenSchema = z
+  .string()
+  .trim()
+  .regex(/^stgc1_[0-9a-f]{64}$/, "Invalid stage confirmation token.");
 
 const ulidSchema = z
   .string()
@@ -101,6 +113,7 @@ export const automationsRouter = router({
       .input(
         z.strictObject({
           enabled: z.boolean().optional(),
+          stageBundlesEnabled: z.boolean().optional(),
           globalRunsPerMinute: z.number().int().min(5).max(2_000).optional(),
           defaultPerAutomationRunsPerHour: z.number().int().min(1).max(600).optional(),
           maxPerAutomationRunsPerHour: z.number().int().min(5).max(1_200).optional(),
@@ -215,6 +228,16 @@ export const automationsRouter = router({
       return ctx.services.automations.remove(ctx.session, input);
     }),
 
+  reorder: manageProc
+    .input(
+      z.strictObject({
+        orderedPublicIds: z.array(ulidSchema).max(500),
+      }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      return ctx.services.automations.reorder(ctx.session, input);
+    }),
+
   triggerManual: manageProc
     .input(
       z.strictObject({
@@ -324,6 +347,91 @@ export const automationsRouter = router({
       )
       .mutation(async ({ ctx, input }) => {
         return ctx.services.automations.runForOrder(ctx.session, input);
+      }),
+
+    previewBundle: stageActionsProc
+      .input(
+        z.strictObject({
+          orderPublicId: ulidSchema,
+          stageKey: stageKeySchema,
+        }),
+      )
+      .query(async ({ ctx, input }) => {
+        return ctx.services.automations.previewStageBundle(ctx.session, input);
+      }),
+
+    runBundle: stageBundleRunProc
+      .input(
+        z.strictObject({
+          orderPublicId: ulidSchema,
+          stageKey: stageKeySchema,
+          idempotencyKey: stageIdempotencyKeySchema,
+          confirmationToken: confirmationTokenSchema,
+          statusOverrideReason: z.string().trim().max(500).nullish(),
+        }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        return ctx.services.automations.runStageBundle(ctx.session, {
+          orderPublicId: input.orderPublicId,
+          stageKey: input.stageKey,
+          idempotencyKey: input.idempotencyKey,
+          confirmationToken: input.confirmationToken,
+          ...(input.statusOverrideReason !== undefined
+            ? { statusOverrideReason: input.statusOverrideReason }
+            : {}),
+        });
+      }),
+
+    listBundleRuns: stageActionsProc
+      .input(
+        z.strictObject({
+          orderPublicId: ulidSchema,
+          stageKey: stageKeySchema.optional(),
+          cursor: cursorSchema,
+          limit: z.number().int().min(1).max(50).optional(),
+        }),
+      )
+      .query(async ({ ctx, input }) => {
+        return ctx.services.automations.listStageBundleRuns(ctx.session, {
+          orderPublicId: input.orderPublicId,
+          ...(input.stageKey ? { stageKey: input.stageKey } : {}),
+          ...(input.cursor ? { cursor: input.cursor } : {}),
+          ...(input.limit !== undefined ? { limit: input.limit } : {}),
+        });
+      }),
+
+    listCompletionJobs: stageActionsProc
+      .input(
+        z.strictObject({
+          orderPublicId: ulidSchema,
+          stageKey: stageKeySchema.optional(),
+          state: z.enum(COMPLETION_JOB_STATES).optional(),
+          cursor: cursorSchema,
+          limit: z.number().int().min(1).max(50).optional(),
+        }),
+      )
+      .query(async ({ ctx, input }) => {
+        return ctx.services.automations.listOrderCompletionJobs(ctx.session, {
+          orderPublicId: input.orderPublicId,
+          ...(input.stageKey ? { stageKey: input.stageKey } : {}),
+          ...(input.state ? { state: input.state } : {}),
+          ...(input.cursor ? { cursor: input.cursor } : {}),
+          ...(input.limit !== undefined ? { limit: input.limit } : {}),
+        });
+      }),
+
+    cancelCompletionJob: manageProc
+      .input(
+        z.strictObject({
+          completionJobPublicId: ulidSchema,
+          reason: z.string().trim().max(500).nullish(),
+        }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        return ctx.services.automations.cancelOrderCompletionJob(ctx.session, {
+          completionJobPublicId: input.completionJobPublicId,
+          ...(input.reason !== undefined ? { reason: input.reason } : {}),
+        });
       }),
   }),
 });

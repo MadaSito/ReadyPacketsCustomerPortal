@@ -50,7 +50,9 @@ function throwStepUpRequired(capability: Capability): never {
 export type AutomationsCheckedCapability =
   | "automations.read"
   | "automations.manage"
-  | "orders.automations.run";
+  | "orders.automations.run"
+  | "orders.stage.run"
+  | "orders.transition";
 
 export async function recordAutomationsDenied(
   deps: ModuleDeps,
@@ -66,7 +68,9 @@ export async function recordAutomationsDenied(
       action:
         capability === "automations.manage"
           ? "manage"
-          : capability === "orders.automations.run"
+          : capability === "orders.automations.run" ||
+              capability === "orders.stage.run" ||
+              capability === "orders.transition"
             ? "execute"
             : "read",
       outcome: "denied",
