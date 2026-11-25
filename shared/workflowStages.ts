@@ -7,7 +7,7 @@
  * shows derived stages (see `deriveStages`).
  */
 import { z } from "zod";
-import { isOrderFileFolderTemplate } from "./orderFileFolder.js";
+import { DEFAULT_STAGE_FILE_SYNC, DEFAULT_STAGE_FOLDERS, stageFileSyncSchema, stageFoldersSchema } from "./orderStageFileSync.js";
 
 export const MAX_STAGES = 20;
 export const MAX_STAGE_STATUSES = 10;
@@ -37,7 +37,6 @@ export type StageRunState = (typeof STAGE_RUN_STATES)[number];
 export const STAGE_UPLOAD_INTENTS = ["document", "recording", "prerecorded_audio", "document_edit", "legacy"] as const;
 export type StageUploadIntent = (typeof STAGE_UPLOAD_INTENTS)[number];
 
-const ULID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 export const stageKeySchema = z
   .string()
   .min(2)
@@ -72,18 +71,9 @@ export const stageGovernanceSchema = z.strictObject({
 });
 export type StageGovernance = z.output<typeof stageGovernanceSchema>;
 
-const folderTemplate = z
-  .string()
-  .trim()
-  .max(STAGE_FOLDER_MAX)
-  .refine((value) => isOrderFileFolderTemplate(value), "Use a relative folder path of at most 8 parts with the listed tokens only.");
-
-/** D12 folders inside the managed order root. Absent = the phase's safe default (`{phase_key}/Docs`, `{phase_key}/Audio`). */
-export const stageFoldersSchema = z.strictObject({ documents: folderTemplate.optional(), audio: folderTemplate.optional() });
-
-/** D12 file sync targets: an approved storage target public id, or null = "Do not transfer". Validated by portable_ops. */
-const syncTarget = z.string().regex(ULID).nullable();
-export const stageFileSyncSchema = z.strictObject({ originals: syncTarget, conversionStaging: syncTarget, intakeDelivery: syncTarget });
+/** D12 folders and file sync targets: owned by portable_ops (shared/orderStageFileSync.ts); re-exported here. */
+export { stageFileSyncSchema, stageFoldersSchema } from "./orderStageFileSync.js";
+export type { StageFileSync, StageFileSyncPlan, StageFolders } from "./orderStageFileSync.js";
 
 export const stageAcknowledgementSchema = z.strictObject({
   policy: z.enum(STAGE_ACK_POLICIES),
@@ -128,8 +118,8 @@ export const workflowStageSchema = z.strictObject({
   statusKeys: z.array(stageKeySchema).min(1).max(MAX_STAGE_STATUSES),
   actions: stageActionsEnabledSchema,
   governance: stageGovernanceSchema.optional(),
-  folders: stageFoldersSchema.optional(),
-  fileSync: stageFileSyncSchema.optional(),
+  folders: stageFoldersSchema,
+  fileSync: stageFileSyncSchema,
   acknowledgement: stageAcknowledgementSchema.default({ policy: "none" }),
   content: stageContentSchema.optional(),
   progression: z.enum(STAGE_PROGRESSIONS).default("next"),
@@ -204,6 +194,8 @@ export function deriveStages(definition: DerivableDefinition): WorkflowStage[] {
     staffLabel,
     statusKeys,
     actions: { uploadDocuments: false, answerQuestions: false, recordAudio: false, uploadAudio: false, teamFileReview: false },
+    folders: { ...DEFAULT_STAGE_FOLDERS },
+    fileSync: { ...DEFAULT_STAGE_FILE_SYNC },
     acknowledgement: { policy: "none" },
     progression: "next",
     adminTasks: [],
