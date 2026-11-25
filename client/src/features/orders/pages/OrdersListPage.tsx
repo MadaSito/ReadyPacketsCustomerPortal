@@ -6,6 +6,7 @@ import { Link } from "wouter";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import { Button, Card, DataTable, DateTime, EmptyState, LoadMore, Money, PageHeader, useToast } from "@/ui";
 import { ACCESS_ROLE_LABELS, LockBadge, OrderStatusBadge, money, type LockState } from "../shared";
+import { OrderListProgress } from "../stages/OrderListProgress";
 
 export default function OrdersListPage() {
   const trpc = useTRPC();
@@ -55,6 +56,7 @@ export default function OrdersListPage() {
                 </span>
               ),
             },
+            { key: "progress", header: "Progress", cell: (order) => <OrderListProgress name={order.projectName} progressPercent={order.progressPercent} phaseLabel={order.phaseLabel} phaseIndex={order.phaseIndex} phaseTotal={order.phaseTotal} canceled={order.progressCanceled} className="min-w-40" /> },
             { key: "access", header: "Access", hideOnMobile: true, cell: (order) => ACCESS_ROLE_LABELS[order.accessRole] ?? order.accessRole },
             { key: "updatedAt", header: "Updated", cell: (order) => <DateTime value={order.updatedAt} format="relative" /> },
             { key: "total", header: "Total", align: "end", cell: (order) => <Money value={money(order.totalMinor, order.currency)} /> },
