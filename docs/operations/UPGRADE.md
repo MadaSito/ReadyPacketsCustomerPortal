@@ -138,6 +138,39 @@ Migration `0005_increment_05` is additive. It adds eight tables: one workflow im
 - **PDF previews**: `pdfjs-dist` runs in the browser and requires Node.js 22.13.0 or later to install. `@napi-rs/canvas` is a development-only dependency for test rendering. `pnpm-workspace.yaml` ignores PDF.js's optional native canvas dependency, and native and Docker release packaging prune development dependencies, so the production runtime does not ship the native canvas binary.
 - **Emergency access**: Keep the [break-glass runbook](BREAK_GLASS.md) available off-host and verify operator access before enabling ban or policy enforcement. These are narrow overrides for different controls, not alternatives to local administrator MFA.
 
+## Increment 07 and migration `0007`
+
+<!-- platform_engineer with http_security_engineer. D11 proxy and upgrade testing: PENDING-LEAD (not yet run as of this draft). Table and column counts: PENDING-LEAD. -->
+
+`0007_increment_07` is additive: new tables, nullable columns or columns with defaults, new indexes and enum widening. It drops and renames nothing. Seeding and backfill run in code at start-up and are idempotent; the migration contains no data SQL. Table and column counts: _PENDING-LEAD_.
+
+Existing orders keep their pinned workflow version. The upgrade prepares a phases (format 3) **draft** of the standard workflow for review and publishes nothing.
+
+- **Native upgrade.** Follow sections 2–5 without `--yes`, with the same backup, fence and `BACKUP-VERIFIED` steps as for increment 06.
+  - Release validation requires the SQL file and journal entry `0007_increment_07`.
+  - Install and upgrade compare its SHA-256 with exactly one migration journal row. Never run the SQL by hand or mark it applied.
+  - The seeded native baseline used in CI (`f251a10`) checks that an existing order keeps its workflow pin after the upgrade.
+  - If the migration is interrupted, follow [section 6](#6-recovery-if-an-upgrade-stops-mid-way).
+- **Docker Compose.** The image build requires the same SQL and journal entry, and the Compose smoke test checks the hash against exactly one journal row. Follow the [Compose backup and upgrade instructions](../../deploy/docker/README.md); the wrapper does not take the native verified backup.
+- **Refresh the proxy while ingress is still fenced.** The bundled Nginx and Caddy configurations contain the rules below. If you manage your own proxy, install the equivalent rules, validate them and reload before reopening.
+  - **SAML** (only the canonical host over HTTPS; requests over HTTP or on alias hosts are rejected, not redirected):
+    - `GET /api/identity/saml/metadata`
+    - `GET /api/identity/saml/start`
+    - `POST /api/identity/saml/acs`. The match is exact and POST only. The body is a flat URL-encoded form of at most 256 KiB, with no decompression and no caching.
+    - Sensitive fields (the SAML form body and identity headers) are stripped from proxy logs.
+  - **Audio playback** (`GET` / `HEAD /api/files/playback/:grantPublicId`):
+    - `Range` and `If-Range` are forwarded to the portal unchanged;
+    - the proxy must not buffer or build its own 206 answer.
+    - The POSTs that create playback grants and ZIP archives keep the existing Origin and CSRF checks.
+  - **Stripe webhook** (`POST /api/payments/webhooks/stripe`, canonical host):
+    - it skips only the built-in country allow-list;
+    - the IP deny list, rate limits, the 256 KiB cap and signature (HMAC) verification all stay.
+- **After the upgrade:**
+  - confirm readiness, local administrator MFA, and that a pre-existing order still shows its status and now shows a progress bar;
+  - **Stripe:** check `/admin/payments/setup` (webhook URL, events, egress switch, self-test) before relying on Stripe completion;
+  - **SAML:** keep at least one local administrator with MFA before switching it on;
+  - **Off until configured:** SAML, file sync targets, receipts to Microsoft 365, P101 / P201 auto-queue, phase action bundles and attention reminders. Test each with synthetic data before using it with customers.
+
 ---
 
 ## 6. Recovery if an upgrade stops mid-way
