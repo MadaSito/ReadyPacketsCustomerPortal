@@ -12,24 +12,13 @@ import {
   ORDER_STATUS_ATTENTIONS,
   ORDER_STATUS_CATEGORIES,
   ORDER_STATUS_TONES,
-  statusKeySchema,
+  statusCatalogKeySchema,
+  statusCatalogLabelSchema,
   validateStatusCancelCategoryRule,
 } from "../../../shared/orderStatusCatalog.js";
 import { adminProcedure, requireCapability, router, staffProcedure } from "../../trpc/trpc.js";
 
 const expectedVersionSchema = z.number().int().min(1).max(2_147_483_647);
-
-const safeLabelSchema = z
-  .string()
-  // eslint-disable-next-line no-control-regex -- strip control characters cleanly
-  .transform((value) => value.normalize("NFC").replace(/[\u0000-\u001f\u007f]/g, "").trim())
-  .pipe(
-    z
-      .string()
-      .min(1, "Enter a label.")
-      .max(80, "Use 80 characters or fewer.")
-      .refine((value) => !/<\s*[a-z!/?]/i.test(value), "Use plain text without markup."),
-  );
 
 const listInputSchema = z
   .strictObject({
@@ -40,9 +29,9 @@ const listInputSchema = z
 
 const createInputSchema = z
   .strictObject({
-    key: statusKeySchema,
-    staffLabel: safeLabelSchema,
-    customerLabel: safeLabelSchema,
+    key: statusCatalogKeySchema,
+    staffLabel: statusCatalogLabelSchema,
+    customerLabel: statusCatalogLabelSchema,
     tone: z.enum(ORDER_STATUS_TONES),
     category: z.enum(ORDER_STATUS_CATEGORIES),
     attention: z.enum(ORDER_STATUS_ATTENTIONS),
@@ -56,10 +45,10 @@ const createInputSchema = z
 
 const updateInputSchema = z
   .strictObject({
-    key: statusKeySchema,
+    key: statusCatalogKeySchema,
     expectedVersion: expectedVersionSchema,
-    staffLabel: safeLabelSchema,
-    customerLabel: safeLabelSchema,
+    staffLabel: statusCatalogLabelSchema,
+    customerLabel: statusCatalogLabelSchema,
     tone: z.enum(ORDER_STATUS_TONES),
     category: z.enum(ORDER_STATUS_CATEGORIES),
     attention: z.enum(ORDER_STATUS_ATTENTIONS),
@@ -72,11 +61,11 @@ const updateInputSchema = z
   });
 
 const reorderInputSchema = z.strictObject({
-  orderedKeys: z.array(statusKeySchema).min(1).max(200),
+  orderedKeys: z.array(statusCatalogKeySchema).min(1).max(200),
 });
 
 const versionedKeyInputSchema = z.strictObject({
-  key: statusKeySchema,
+  key: statusCatalogKeySchema,
   expectedVersion: expectedVersionSchema,
 });
 

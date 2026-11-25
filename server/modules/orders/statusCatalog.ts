@@ -77,7 +77,7 @@ export interface OrderStatusCatalogService {
   /** Trusted internal port (used by `engagement` automations catalogue & internal callers). */
   listEntries(opts?: { includeRetired?: boolean; tx?: DbOrTx }): Promise<StatusCatalogItem[]>;
   /**
-   * Trusted in-tx read port for `orders_engineer`: resolves status keys to `{ key, category, attention, staffLabel, customerLabel, tone, isRetired }`.
+   * Trusted in-tx read port for `orders_engineer`: resolves status keys to `{ key, category, attention, staffLabel, customerLabel, tone, retired }`.
    * Missing keys fall back deterministically via `fallbackStatusCatalogLookup(key)` rather than failing old workflows.
    */
   getManyInTx(keys: readonly string[], tx?: DbOrTx): Promise<Map<string, StatusCatalogLookup>>;
@@ -103,7 +103,8 @@ function rowToItem(row: OrderStatusCatalogRow, usage?: StatusCatalogUsage): Stat
     tone: row.tone,
     category: row.category,
     attention: row.attention,
-    sortOrder: row.sortOrder,
+    position: row.position,
+    retired: row.retired,
     retiredAt: row.retiredAt ? row.retiredAt.toISOString() : null,
     version: row.version,
     ...(usage ? { usage } : {}),
@@ -118,47 +119,27 @@ function rowToLookup(row: OrderStatusCatalogRow): StatusCatalogLookup {
     tone: row.tone,
     category: row.category,
     attention: row.attention,
-    isRetired: row.retiredAt !== null,
+    retired: row.retired,
   };
 }
 
 /** Derives a safe seed candidate for a custom status key found in a published workflow version. */
-function deriveSeedFromWorkflowState(state: WorkflowState, sortOrder: number) {
-  const isCancel = state.key.includes("cancel");
-  let category: OrderStatusCategory;
-  if (isCancel) {
-    category = "canceled";
-  } else if (state.kind === "initial") {
-    category = "start";
-  } else if (state.kind === "terminal") {
-    category = "done";
-  } else if (state.key.includes("await") || state.key.includes("customer") || state.key.includes("intake")) {
-    category = "waiting";
-  } else {
-    category = "working";
-  }
-
-  let attention: OrderStatusAttention = "none";
-  if (category !== "done" && category !== "canceled") {
-    if (state.key.includes("customer") || state.key.includes("intake")) {
-      attention = "customer_response";
-    } else if (state.key.includes("review") || state.key === "submitted") {
-      attention = "staff_review";
-    }
-  }
-
-  const fallback = fallbackStatusCatalogLookup(state.key);
-  const staffLabel = state.label.trim().slice(0, 80) || fallback.staffLabel;
-  const customerLabel = state.customerLabel.trim().slice(0, 80) || staffLabel;
+function deriveSeedFromWorkflowState(state: WorkflowState, position: number) {
+  const derived = fallbackStatusCatalogLookup(state.key, {
+    staffLabel: state.label.trim().slice(0, 60) || undefined,
+    customerLabel: state.customerLabel.trim().slice(0, 60) || undefined,
+    tone: state.tone,
+    kind: state.kind,
+  });
 
   return {
-    key: state.key,
-    staffLabel,
-    customerLabel,
-    tone: isCancel && state.tone === "success" ? ("neutral" as const) : state.tone,
-    category,
-    attention,
-    sortOrder,
+    key: derived.key,
+    staffLabel: derived.staffLabel.slice(0, 60),
+    customerLabel: derived.customerLabel.slice(0, 60),
+    tone: derived.category === "canceled" && derived.tone === "success" ? ("neutral" as const) : derived.tone,
+    category: derived.category,
+    attention: derived.attention,
+    position,
   };
 }
 
@@ -217,10 +198,10 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
 
   async function runSeed(conn: DbOrTx): Promise<void> {
     const existingRows = await conn
-      .select({ key: orderStatusCatalog.key, sortOrder: orderStatusCatalog.sortOrder })
+      .select({ key: orderStatusCatalog.key, position: orderStatusCatalog.position })
       .from(orderStatusCatalog);
     const existingKeys = new Set(existingRows.map((r) => r.key));
-    let maxSortOrder = existingRows.reduce((max, r) => (r.sortOrder > max ? r.sortOrder : max), 0);
+    let nextPos = existingRows.length > 0 ? Math.max(...existingRows.map((r) => r.position)) + 1 : 0;
 
     const candidates: {
       key: string;
@@ -229,15 +210,15 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
       tone: OrderStatusTone;
       category: OrderStatusCategory;
       attention: OrderStatusAttention;
-      sortOrder: number;
+      position: number;
     }[] = [];
     const seenCandidateKeys = new Set<string>(existingKeys);
 
     for (const builtIn of BUILT_IN_STATUS_CATALOG) {
       if (seenCandidateKeys.has(builtIn.key)) continue;
       seenCandidateKeys.add(builtIn.key);
-      const sortOrder = Math.max(builtIn.sortOrder, maxSortOrder + 10);
-      maxSortOrder = sortOrder;
+      const pos = Math.max(builtIn.position, nextPos);
+      nextPos = pos + 1;
       candidates.push({
         key: builtIn.key,
         staffLabel: builtIn.staffLabel,
@@ -245,7 +226,7 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
         tone: builtIn.tone,
         category: builtIn.category,
         attention: builtIn.attention,
-        sortOrder,
+        position: pos,
       });
     }
 
@@ -262,8 +243,9 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
         if (!state || typeof state.key !== "string" || state.key.length < 2 || state.key.length > 48) continue;
         if (seenCandidateKeys.has(state.key)) continue;
         seenCandidateKeys.add(state.key);
-        maxSortOrder += 10;
-        candidates.push(deriveSeedFromWorkflowState(state, maxSortOrder));
+        const pos = nextPos;
+        nextPos += 1;
+        candidates.push(deriveSeedFromWorkflowState(state, pos));
       }
     }
 
@@ -282,7 +264,8 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
           tone: candidate.tone,
           category: candidate.category,
           attention: candidate.attention,
-          sortOrder: candidate.sortOrder,
+          position: candidate.position,
+          retired: false,
           retiredAt: null,
         })
         // Never overwrite an existing row on concurrent startup race.
@@ -313,7 +296,7 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
     const ensureEntry = (key: string): StatusCatalogUsage => {
       let u = usageByKey.get(key);
       if (!u) {
-        u = { draftCount: 0, draftNames: [], publishedWorkflowCount: 0, orderCount: 0 };
+        u = { activeOrderCount: 0, draftCount: 0, publishedVersionCount: 0 };
         usageByKey.set(key, u);
       }
       return u;
@@ -321,7 +304,7 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
 
     const [draftRows, activeWorkflowRows, orderGroupRows] = await Promise.all([
       conn
-        .select({ name: orderWorkflowDrafts.name, definition: orderWorkflowDrafts.definition })
+        .select({ definition: orderWorkflowDrafts.definition })
         .from(orderWorkflowDrafts)
         .orderBy(asc(orderWorkflowDrafts.id))
         .limit(500),
@@ -339,11 +322,7 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
     for (const draft of draftRows) {
       const keys = collectDraftStatusKeys(draft.definition);
       for (const k of keys) {
-        const entry = ensureEntry(k);
-        entry.draftCount += 1;
-        if (entry.draftNames.length < 10) {
-          entry.draftNames.push(draft.name);
-        }
+        ensureEntry(k).draftCount += 1;
       }
     }
 
@@ -354,13 +333,13 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
       for (const state of def.states) {
         if (state && typeof state.key === "string" && !seenInWf.has(state.key)) {
           seenInWf.add(state.key);
-          ensureEntry(state.key).publishedWorkflowCount += 1;
+          ensureEntry(state.key).publishedVersionCount += 1;
         }
       }
     }
 
     for (const group of orderGroupRows) {
-      ensureEntry(group.statusKey).orderCount = Number(group.total ?? 0);
+      ensureEntry(group.statusKey).activeOrderCount = Number(group.total ?? 0);
     }
 
     return usageByKey;
@@ -374,8 +353,8 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
     const rows = await conn
       .select()
       .from(orderStatusCatalog)
-      .where(includeRetired ? undefined : sql`${orderStatusCatalog.retiredAt} IS NULL`)
-      .orderBy(asc(orderStatusCatalog.sortOrder), asc(orderStatusCatalog.id))
+      .where(includeRetired ? undefined : eq(orderStatusCatalog.retired, false))
+      .orderBy(asc(orderStatusCatalog.position), asc(orderStatusCatalog.id))
       .limit(500);
 
     if (!opts?.includeUsage) {
@@ -387,10 +366,9 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
       rowToItem(
         r,
         usageMap.get(r.key) ?? {
+          activeOrderCount: 0,
           draftCount: 0,
-          draftNames: [],
-          publishedWorkflowCount: 0,
-          orderCount: 0,
+          publishedVersionCount: 0,
         },
       ),
     );
@@ -487,9 +465,9 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
         }
 
         const [maxRow] = await tx
-          .select({ maxSort: sql<number>`COALESCE(MAX(${orderStatusCatalog.sortOrder}), 0)` })
+          .select({ maxPos: sql<number>`COALESCE(MAX(${orderStatusCatalog.position}), -1)` })
           .from(orderStatusCatalog);
-        const sortOrder = Number(maxRow?.maxSort ?? 0) + 10;
+        const position = Number(maxRow?.maxPos ?? -1) + 1;
         const publicId = ulid(deps.clock.now().getTime());
 
         await tx.insert(orderStatusCatalog).values({
@@ -500,7 +478,8 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
           tone: input.tone,
           category: input.category,
           attention: input.attention,
-          sortOrder,
+          position,
+          retired: false,
           retiredAt: null,
         });
 
@@ -626,7 +605,7 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
 
         const passedSet = new Set(orderedKeys);
         for (const row of rows) {
-          if (row.retiredAt === null && !passedSet.has(row.key)) {
+          if (!row.retired && !passedSet.has(row.key)) {
             throw validation(
               "INCOMPLETE_STATUS_ORDER",
               "All active statuses must be included when reordering the catalogue.",
@@ -637,7 +616,7 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
         // Preserve relative order of any omitted retired statuses after the explicitly ordered keys.
         const remainingRetired = rows
           .filter((r) => !passedSet.has(r.key))
-          .sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id);
+          .sort((a, b) => a.position - b.position || a.id - b.id);
         const finalSequence = [
           ...orderedKeys.map((k) => byKey.get(k)!),
           ...remainingRetired,
@@ -645,12 +624,11 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
 
         for (let idx = 0; idx < finalSequence.length; idx += 1) {
           const row = finalSequence[idx]!;
-          const nextSort = (idx + 1) * 10;
-          if (row.sortOrder !== nextSort) {
+          if (row.position !== idx) {
             await tx
               .update(orderStatusCatalog)
               .set({
-                sortOrder: nextSort,
+                position: idx,
                 version: row.version + 1,
               })
               .where(eq(orderStatusCatalog.id, row.id));
@@ -695,7 +673,7 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
         if (row.version !== input.expectedVersion) {
           throw conflict("VERSION_CONFLICT", "This status was updated by another administrator. Reload and try again.");
         }
-        if (row.retiredAt !== null) {
+        if (row.retired) {
           return rowToItem(row);
         }
 
@@ -726,6 +704,7 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
         await tx
           .update(orderStatusCatalog)
           .set({
+            retired: true,
             retiredAt,
             version: nextVersion,
           })
@@ -776,7 +755,7 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
         if (row.version !== input.expectedVersion) {
           throw conflict("VERSION_CONFLICT", "This status was updated by another administrator. Reload and try again.");
         }
-        if (row.retiredAt === null) {
+        if (!row.retired) {
           return rowToItem(row);
         }
 
@@ -784,6 +763,7 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
         await tx
           .update(orderStatusCatalog)
           .set({
+            retired: false,
             retiredAt: null,
             version: nextVersion,
           })
