@@ -1,7 +1,7 @@
 /**
  * Increment 07 D3: the order progress bar and phase stepper the customer sees first.
  *
- * - `role="progressbar"` with aria-valuenow/min/max and aria-valuetext ("40 percent, phase 2 of 5: Intake").
+ * - `role="progressbar"` with aria-valuenow/min/max and aria-valuetext ("40 percent, step 2 of 5: Intake").
  * - The number is always visible as text; phase state is given by icon + text, never colour alone.
  * - Smooth fill and count-up; no animation at all with `prefers-reduced-motion: reduce`.
  * - A canceled order shows its last value frozen, with the word "Canceled".
@@ -34,8 +34,9 @@ export interface OrderProgressProps {
   /**
    * `full`: bar, number, current-phase line and stepper (order page, console).
    * `compact`: bar, number and current-phase line only (order list rows, dashboard cards).
+   * `steps`: the stepper only; no bar, number or live announcement (pair with a separate `compact` bar).
    */
-  variant?: "full" | "compact";
+  variant?: "full" | "compact" | "steps";
   /** Accessible name of the progress bar. */
   label?: string;
   /** Heading-like caption above the bar (visual); defaults to "Progress". Pass null to hide. */
@@ -67,11 +68,11 @@ export function stageStates(stages: readonly OrderProgressStage[], currentIndex:
   });
 }
 
-/** "40 percent, phase 2 of 5: Intake" (+ ", canceled"). Exported so tests and hosts can match it. */
+/** "40 percent, step 2 of 5: Intake" (+ ", canceled"). Exported so tests and hosts can match it. */
 export function progressValueText({ percent, stages, currentIndex, canceled }: Pick<OrderProgressProps, "percent" | "stages" | "currentIndex" | "canceled">): string {
   const value = `${clampPercent(percent)} percent`;
   const current = currentIndex >= 0 ? stages[currentIndex] : undefined;
-  const phase = current ? `, phase ${currentIndex + 1} of ${stages.length}: ${current.label}` : clampPercent(percent) >= 100 && stages.length ? ", all phases complete" : "";
+  const phase = current ? `, step ${currentIndex + 1} of ${stages.length}: ${current.label}` : clampPercent(percent) >= 100 && stages.length ? ", all phases complete" : "";
   return `${value}${canceled ? ", canceled" : ""}${phase}`;
 }
 
@@ -101,10 +102,12 @@ function useCountUp(target: number, animate: boolean): number {
     const start = from.current;
     if (start === target) return;
     let frame = 0;
-    const began = performance.now();
+    // The clock starts at the first frame's own timestamp, and t is clamped to [0, 1], so the value never leaves start..target.
+    let began: number | undefined;
     const duration = 700;
     const tick = (now: number) => {
-      const t = Math.min(1, (now - began) / duration);
+      began ??= now;
+      const t = Math.max(0, Math.min(1, (now - began) / duration));
       const eased = 1 - Math.pow(1 - t, 3);
       const value = Math.round(start + (target - start) * eased);
       from.current = value;
@@ -117,7 +120,22 @@ function useCountUp(target: number, animate: boolean): number {
   return animate && typeof window !== "undefined" && typeof window.requestAnimationFrame === "function" ? shown : target;
 }
 
-export function OrderProgress({ percent, stages, currentIndex, canceled = false, variant = "full", label = "Order progress", caption = "Progress", onStageSelect, className }: OrderProgressProps) {
+export function OrderProgress(props: OrderProgressProps) {
+  // Component switch (not an early return) so each variant keeps a stable hook order.
+  return props.variant === "steps" ? <StepsOnly {...props} /> : <ProgressWithBar {...props} />;
+}
+
+/** The stepper alone; `label` names the list (default "Order phases"). */
+function StepsOnly({ percent, stages, currentIndex, canceled = false, label = "Order phases", onStageSelect, className }: OrderProgressProps) {
+  if (!stages.length) return null;
+  return (
+    <div className={cn("@container min-w-0", className)} data-variant="steps" data-canceled={canceled || undefined}>
+      <PhaseSteps stages={stages} states={stageStates(stages, currentIndex, clampPercent(percent))} label={label} onStageSelect={onStageSelect} />
+    </div>
+  );
+}
+
+function ProgressWithBar({ percent, stages, currentIndex, canceled = false, variant = "full", label = "Order progress", caption = "Progress", onStageSelect, className }: OrderProgressProps) {
   const target = clampPercent(percent);
   const reduced = usePrefersReducedMotion();
   // A canceled order is frozen: no count-up, no fill animation.
@@ -144,7 +162,7 @@ export function OrderProgress({ percent, stages, currentIndex, canceled = false,
     fill.current?.style.setProperty("--rp-progress", `${filled ? target : 0}%`);
   }, [filled, target]);
 
-  // Announce later changes (not the first render) politely: "Progress updated: 40 percent, phase 2 of 5: Intake".
+  // Announce later changes (not the first render) politely: "Progress updated: 40 percent, step 2 of 5: Intake".
   const valueText = progressValueText({ percent: target, stages, currentIndex, canceled });
   const [announced, setAnnounced] = useState({ valueText, message: "" });
   if (announced.valueText !== valueText) setAnnounced({ valueText, message: `Progress updated: ${valueText}` });
@@ -152,7 +170,7 @@ export function OrderProgress({ percent, stages, currentIndex, canceled = false,
   const statusLine = canceled
     ? current ? `Canceled during ${current.label}` : "Canceled"
     : complete ? "All phases complete"
-    : current ? `Phase ${currentIndex + 1} of ${stages.length}: ${current.label}` : stages.length ? "Not started" : null;
+    : current ? `Step ${currentIndex + 1} of ${stages.length}: ${current.label}` : stages.length ? "Not started" : null;
 
   return (
     <div className={cn("@container min-w-0", className)} data-variant={variant} data-canceled={canceled || undefined}>
@@ -193,64 +211,76 @@ export function OrderProgress({ percent, stages, currentIndex, canceled = false,
           )}
         />
       </div>
-      {variant === "full" && stages.length ? (
-        <ol aria-label="Order phases" className={cn("rp-progress-steps mt-4 grid min-w-0 gap-2", stages.length <= 7 ? "@xl:auto-cols-fr @xl:grid-flow-col @xl:gap-1" : "@md:grid-cols-[repeat(auto-fill,minmax(9rem,1fr))]")}>
-          {stages.map((stage, index) => {
-            const state = states[index]!;
-            const meta = STATE_META[state];
-            const Icon = meta.icon;
-            const body = (
-              <>
-                <span
-                  aria-hidden="true"
-                  className={cn(
-                    "flex size-7 shrink-0 items-center justify-center rounded-full border text-xs font-semibold",
-                    state === "done" && "border-success bg-success-soft text-success",
-                    state === "current" && "border-action bg-action text-on-action",
-                    state === "upcoming" && "border-line bg-surface text-muted",
-                    state === "locked" && "border-line bg-surface-sunken text-muted",
-                  )}
-                >
-                  {state === "current" ? index + 1 : <Icon className="size-4" />}
-                </span>
-                <span className="flex min-w-0 flex-col">
-                  <span className={cn("text-sm break-words [overflow-wrap:anywhere]", state === "current" ? "font-semibold text-ink" : state === "done" ? "font-medium text-ink" : "text-body")}>
-                    <span className="sr-only">Phase {index + 1} of {stages.length}: </span>
-                    {stage.label}
-                    <span className="sr-only">, {meta.text}</span>
-                  </span>
-                  <span aria-hidden="true" className="text-xs text-muted @xl:hidden">{state === "current" ? "Current" : state === "done" ? "Completed" : state === "locked" ? "Locked" : "Not started"}</span>
-                  {stage.note ? <span className="text-xs break-words text-muted [overflow-wrap:anywhere]">{stage.note}</span> : null}
-                </span>
-              </>
-            );
-            return (
-              <li
-                key={stage.key}
-                aria-current={state === "current" ? "step" : undefined}
-                className={cn(
-                  "rp-progress-step relative flex min-w-0 items-start gap-2 @xl:flex-col @xl:items-center @xl:text-center",
-                  state === "current" && "rp-progress-step-current",
-                )}
-                data-state={state}
-              >
-                {onStageSelect && state === "done" ? (
-                  <button
-                    type="button"
-                    onClick={() => onStageSelect(stage.key)}
-                    className="flex min-h-11 min-w-0 items-start gap-2 rounded-[var(--radius-control)] text-left hover:underline @xl:flex-col @xl:items-center @xl:text-center"
-                  >
-                    {body}
-                    <span className="sr-only"> (review)</span>
-                  </button>
-                ) : (
-                  <span className="flex min-w-0 items-start gap-2 @xl:flex-col @xl:items-center">{body}</span>
-                )}
-              </li>
-            );
-          })}
-        </ol>
-      ) : null}
+      {variant === "full" && stages.length ? <PhaseSteps stages={stages} states={states} label="Order phases" onStageSelect={onStageSelect} className="mt-4" /> : null}
     </div>
+  );
+}
+
+interface PhaseStepsProps {
+  stages: readonly OrderProgressStage[];
+  states: readonly OrderProgressStageState[];
+  label: string;
+  onStageSelect?: (key: string) => void;
+  className?: string;
+}
+
+function PhaseSteps({ stages, states, label, onStageSelect, className }: PhaseStepsProps) {
+  return (
+    <ol aria-label={label} className={cn("rp-progress-steps grid min-w-0 gap-2", stages.length <= 7 ? "@xl:auto-cols-fr @xl:grid-flow-col @xl:gap-1" : "@md:grid-cols-[repeat(auto-fill,minmax(9rem,1fr))]", className)}>
+      {stages.map((stage, index) => {
+        const state = states[index]!;
+        const meta = STATE_META[state];
+        const Icon = meta.icon;
+        const body = (
+          <>
+            <span
+              aria-hidden="true"
+              className={cn(
+                "flex size-7 shrink-0 items-center justify-center rounded-full border text-xs font-semibold",
+                state === "done" && "border-success bg-success-soft text-success",
+                state === "current" && "border-action bg-action text-on-action",
+                state === "upcoming" && "border-line bg-surface text-muted",
+                state === "locked" && "border-line bg-surface-sunken text-muted",
+              )}
+            >
+              {state === "current" ? index + 1 : <Icon className="size-4" />}
+            </span>
+            <span className="flex min-w-0 flex-col">
+              <span className={cn("text-sm break-words [overflow-wrap:anywhere]", state === "current" ? "font-semibold text-ink" : state === "done" ? "font-medium text-ink" : "text-body")}>
+                <span className="sr-only">Step {index + 1} of {stages.length}: </span>
+                {stage.label}
+                <span className="sr-only">, {meta.text}</span>
+              </span>
+              <span aria-hidden="true" className="text-xs text-muted @xl:hidden">{state === "current" ? "Current" : state === "done" ? "Completed" : state === "locked" ? "Locked" : "Not started"}</span>
+              {stage.note ? <span className="text-xs break-words text-muted [overflow-wrap:anywhere]">{stage.note}</span> : null}
+            </span>
+          </>
+        );
+        return (
+          <li
+            key={stage.key}
+            aria-current={state === "current" ? "step" : undefined}
+            className={cn(
+              "rp-progress-step relative flex min-w-0 items-start gap-2 @xl:flex-col @xl:items-center @xl:text-center",
+              state === "current" && "rp-progress-step-current",
+            )}
+            data-state={state}
+          >
+            {onStageSelect && state === "done" ? (
+              <button
+                type="button"
+                onClick={() => onStageSelect(stage.key)}
+                className="flex min-h-11 min-w-0 items-start gap-2 rounded-[var(--radius-control)] text-left hover:underline @xl:flex-col @xl:items-center @xl:text-center"
+              >
+                {body}
+                <span className="sr-only"> (review)</span>
+              </button>
+            ) : (
+              <span className="flex min-w-0 items-start gap-2 @xl:flex-col @xl:items-center">{body}</span>
+            )}
+          </li>
+        );
+      })}
+    </ol>
   );
 }

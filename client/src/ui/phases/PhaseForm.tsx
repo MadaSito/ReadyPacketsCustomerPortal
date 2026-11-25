@@ -200,7 +200,7 @@ export function PhaseForm({ stage, index, onChange, statusOptions, takenStatuses
             onChange={(event) => set("key", event.currentTarget.value.toLowerCase().replace(/[^a-z0-9_]/g, ""))} />
         </Field>
         <div className="grid min-w-0 gap-4 @md:grid-cols-2">
-          <Field id={id("weight")} label="Progress weight" hint={`1–${STAGE_WEIGHT_MAX}. Heavier phases move the bar further.`} error={errors.weight}>
+          <Field id={id("weight")} label="Progress weight" hint={`Share of the progress bar this phase represents (1–${STAGE_WEIGHT_MAX}).`} error={errors.weight}>
             <Input inputMode="numeric" value={String(stage.weight)} disabled={disabled}
               onChange={(event) => {
                 const n = Number(event.currentTarget.value.replace(/\D/g, "").slice(0, 3));
