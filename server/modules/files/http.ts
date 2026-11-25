@@ -10,6 +10,7 @@ import { ULID_PATTERN } from "../../core/ids.js";
 import { sendPrivateDownload } from "../../http/downloads.js";
 import { getHttpState, requireFullSession } from "../../http/requestState.js";
 import { readCookie } from "../../http/sessionTransport.js";
+import { registerFileArchiveHttpRoutes } from "./archivesHttp.js";
 import { playbackLifetimeMs, type StagedUpload, type UploadAuthorization } from "./index.js";
 import { uploadIntents } from "./governance.js";
 import { fileCategories, fileVisibilities } from "./schema.js";
@@ -340,4 +341,5 @@ export function registerFilesHttpRoutes(router: Router, services: Services): voi
         .catch(() => services.logger.error("Private download outcome could not be recorded"));
     }
   });
+  registerFileArchiveHttpRoutes(router, services);
 }
