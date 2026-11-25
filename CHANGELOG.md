@@ -7,7 +7,7 @@ procedure.
 
 ## Increment 07.1 (fixes after increment 07)
 
-Requested by the owner on 2026-11-25 (prompts 28 and 29). Client-side only: no server permission, schema or migration change, and the upgrade commands are unchanged. See the [session log](docs/session-logs/2026-11-25-session-01.md).
+Requested by the owner on 2026-11-25 (prompts 28 and 29). PR #19. Mostly client-side: the one server change is the single-page app fallback for dotted mail template keys. There is no server permission, schema or migration change, and the upgrade commands are unchanged. See the [session log](docs/session-logs/2026-11-25-session-01.md).
 
 ### Fixed
 
@@ -15,23 +15,49 @@ Requested by the owner on 2026-11-25 (prompts 28 and 29). Client-side only: no s
   - `/orders/new`, `/cart`, `/cart/checkout`, `/checkout/return` and `/checkout/cancel` now show staff a handoff panel, "Orders are placed for a customer".
   - The panel's **New order for a customer** button goes to `/admin/orders?new=1`, which opens the console dialog. That dialog accepts a discount code.
   - No cart requests are made for staff, and the customer navigation hides **Create an order** and **Cart** for them.
+- **Mail template editor links with a dot in the key.** A full page load, reload or bookmark of an editor such as `/admin/email-templates/auth.password_reset` returned 404 (`916f52a`, `d9f9c50`).
+  - The single-page app now serves its page for registered built-in keys and `custom.<slug>` keys only.
+  - Other dotted or extension paths, and dotfiles, still return 404.
+- **Narrow-width layout.** Several pages no longer overflow or clip at narrow widths:
+  - the customer `/orders` progress bar (`6856d8b`);
+  - the cart suggestion "Add-on" badge at 1024 px (`6afac07`);
+  - the policy acceptances log, coverage tab and the customer Policies tab (`e0aeb58`, `42f0fac`);
+  - Graph & SharePoint, which overflowed by 8 px at 320 px, and the production pipeline (`7cef9cb`);
+  - the custom report builder's query-mode control (`21a1e30`);
+  - the shared DataTable phone cards, which cap the label column at 40% and stack below 320 px (`3178353`);
+  - the mail template sensitive-variable badge below 320 px (`b6bd3cf`).
 
 ### Changed
 
 - **Visible portal switch.** **Customer portal** is in the console top bar (medium screens and up) and drawer. **Admin portal** or **Staff portal** is in the customer shell top bar, drawer and a staff notice that cannot be dismissed.
   - Staff and administrators opening `/` land on `/admin`, unless this browser tab chose the customer portal. The choice is per tab and is cleared at sign-out.
   - Customers never see the switch.
+  - The switch is first in both mobile drawers. The staff notice shows its switch button only below medium width, because the top bar has one above that (`92d3c3b`).
+- **Phone tab bar labels.** They are now Home / Orders / New order / Messages / More.
 - **Discount code hints.**
   - The field is in the cart summary once the cart has an item, and at checkout. Both depend on **Discount codes** being switched on at `/admin/promotions` (off when shipped) and the cart being on at `/admin/settings/features`.
   - An empty cart says "Have a discount code? Add an item first to apply it here or at checkout."
   - The order form's Review step says "Have a discount code? You can enter it in your cart and at checkout."
-- **QA tools.** `scripts/qa` gained an opt-in context-reuse mode and deferred retries ([scripts/qa/README.md](scripts/qa/README.md)).
+- **QA tools.** `scripts/qa` gained an opt-in context-reuse mode and deferred retries, plus fixtures for staff in the customer portal and for forms ([scripts/qa/README.md](scripts/qa/README.md)).
 
 ### Accessibility and responsive
 
 - **Scrollbars.** Both navigation rails have a thin themed scrollbar, with a forced-colours fallback.
-- **Sweep.** A responsive and accessibility sweep covered widths 240–2560 px, light and dark themes, axe checks against WCAG 2.2 AA, and a manual keyboard and zoom pass. The results are in [STATUS.md](docs/application-context/STATUS.md#verification-for-increment-071). The interfaces are designed and tested against WCAG 2.2 AA.
-- **Limitations.** No screen-reader pass and no physical-device pass were done.
+- **Landmarks.** The staff, preview and maintenance notices are named complementary landmarks (axe `region`, `cf39e10`).
+- **Accessible names.** Prohibited accessible names were removed in 8 files, and a source guard test was added (`6e215e6`).
+- **Canvas targets.** The flow canvas fit zoom floor went from 0.75 to 0.8, so step and transition targets stay above 24 px (`389dfa6`).
+- **Sweep.** All runs used Chromium, synthetic QA data and QA builds of this branch.
+  - **Responsive matrix:** 3,712 cases (232 states × 8 widths from 240 to 2560 px × light and dark). 3,656 passed on the first fix build, with 24 failures in 12 states, all fixed since.
+  - **axe (WCAG 2.2 A and AA plus best practice):** 1,392 cases, with 33 cases of violations, all cleared. The final confirmation runs had no violations.
+  - **Manual checks:** a keyboard and zoom pass, including 200% and 400% browser zoom.
+  - **Not checked:** 16 route states that have no fixture.
+  - Details are in [STATUS.md](docs/application-context/STATUS.md#verification-for-increment-071).
+- **Limits.**
+  - Chromium only; no Safari or Firefox run.
+  - No physical phones or tablets.
+  - No screen-reader pass (NVDA, JAWS, VoiceOver or TalkBack).
+  - The axe incomplete items, mainly contrast, were not reviewed by hand.
+  - The interfaces are designed and tested against WCAG 2.2 AA. This is not a conformance claim.
 
 ## Fixes after increment 05
 

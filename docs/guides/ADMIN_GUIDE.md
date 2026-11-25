@@ -52,6 +52,7 @@ TLS, upgrades, and go-live checks are in the [deployment profiles](../../deploy/
   - [Why admins cannot use the cart](#why-admins-cannot-use-the-cart)
   - [Turning on discount codes](#turning-on-discount-codes)
   - [Troubleshooting: "You do not have permission to perform this action"](#troubleshooting-you-do-not-have-permission-to-perform-this-action)
+  - [Troubleshooting: a mail template editor link returns 404](#troubleshooting-a-mail-template-editor-link-returns-404)
 - [Customer tasks and the order agreement](./WORKFLOW_CUSTOMER_TASKS.md)
 
 ## Increment 04 operating guides
@@ -508,7 +509,7 @@ Files land under `CustomerName-CustomerID/OrderNumber/<phase folder>`. The first
 
 ## Increment 07.1: ordering for customers and the portal switch
 
-These changes are in the web app only. Server permissions are unchanged. Background is in the [session log of 2026-11-25](../session-logs/2026-11-25-session-01.md).
+These changes are mostly in the web app. Server permissions are unchanged. Background is in the [session log of 2026-11-25](../session-logs/2026-11-25-session-01.md).
 
 ### Placing an order for a customer
 
@@ -528,11 +529,11 @@ You need the `orders.manage` capability. Staff and administrators who open **Cre
 
 ### Switching between the admin and customer portals
 
-- **In the console**, choose **Customer portal**. It is in the top bar on medium and larger screens, and in the menu drawer on small screens.
+- **In the console**, choose **Customer portal**. It is in the top bar on medium and larger screens. On small screens it is the first item in the menu drawer.
 - **In the customer portal**, choose **Admin portal** (administrators) or **Staff portal** (staff). It is in:
   - the top bar on medium and larger screens;
-  - the menu drawer;
-  - the notice at the top of every page: "You are viewing the customer portal as {role}. Orders, carts and checkout belong to customer accounts." The notice cannot be dismissed, so you always know which portal you are in.
+  - the menu drawer, as the first item;
+  - the notice at the top of every page, which shows the button below medium width: "You are viewing the customer portal as {role}. Orders, carts and checkout belong to customer accounts." The notice cannot be dismissed, so you always know which portal you are in.
 - **Landing page.** Staff and administrators who open `/` go to `/admin`, unless they chose the customer portal in this browser tab.
   - The choice is per tab and is not shared with other tabs.
   - It ends when you switch back or sign out.
@@ -565,6 +566,12 @@ Then:
 - **In the console.** The **New order for a customer** dialog shows the field whenever discount codes are on.
 
 Create at least one active code ([Creating a code](#creating-a-code)). Otherwise every code entered is refused.
+
+### Troubleshooting: a mail template editor link returns 404
+
+On builds before 07.1, reloading or bookmarking a template editor whose key has a dot returned "Not found". An example is `/admin/email-templates/auth.password_reset`.
+- **On older builds**, open the template from **E-mail templates** instead.
+- **From 07.1**, such links work for built-in keys and `custom.<slug>` keys. Other paths with a file extension still return 404 by design.
 
 ### Troubleshooting: "You do not have permission to perform this action"
 

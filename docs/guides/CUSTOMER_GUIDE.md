@@ -131,6 +131,8 @@ You cannot change your own email address or customer reference in the portal; co
 
 **Available** — `/`. Shows required actions, a greeting, a short first-order guide and your recent orders.
 
+On a phone, the tab bar at the bottom has **Home**, **Orders**, **New order**, **Messages** and **More**.
+
 ## Orders
 
 **Available** — `/orders`, `/orders/new`, `/orders/:orderId`.

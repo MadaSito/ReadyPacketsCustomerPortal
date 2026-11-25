@@ -98,8 +98,8 @@ Staff cannot manage staff accounts, catalog imports or bundle rules, settings, t
 
 ## Switching between the console and the customer portal
 
-- **From the console**, choose **Customer portal**. It is in the top bar on medium and larger screens, and in the menu drawer.
-- **From the customer portal**, choose **Staff portal**. It is in the top bar, the menu drawer, and the notice at the top of each page: "You are viewing the customer portal as {role}. Orders, carts and checkout belong to customer accounts."
+- **From the console**, choose **Customer portal**. It is in the top bar on medium and larger screens, and first in the menu drawer.
+- **From the customer portal**, choose **Staff portal**. It is in the top bar, first in the menu drawer, and (below medium width) in the notice at the top of each page: "You are viewing the customer portal as {role}. Orders, carts and checkout belong to customer accounts."
 - **Landing page.** Opening `/` takes you to the console (`/admin`), unless you chose the customer portal in this browser tab. That choice lasts for the tab only and ends when you switch back or sign out.
 
 Switching grants nothing; the server checks every request. Details: [Admin guide — Switching between the admin and customer portals](./ADMIN_GUIDE.md#switching-between-the-admin-and-customer-portals).

@@ -1,6 +1,6 @@
 # ReadyPackets Portal — Status
 
-Last updated: 2026-11-25 (increment 07 merged to `main` as `c337492` through PR #16; fix pack 07.1 on `fix/increment-07-1`, PR and merge commit filled at merge). Keep this file current; it is the honest state of the build,
+Last updated: 2026-11-25 (increment 07 merged to `main` as `c337492` through PR #16; fix pack 07.1 on `fix/increment-07-1`, PR #19, merge commit filled at merge). Keep this file current; it is the honest state of the build,
 not a certification. "Verified" below means the integrator ran the check and saw the result. Anything not
 listed under "Verified" has not been proven and must not be described as working in production.
 
@@ -80,7 +80,7 @@ listed under "Verified" has not been proven and must not be described as working
 | Microsoft 365 file sync (increment 07) | one-way per phase to SharePoint, write check, bounded resync, health and alerts (off until configured); ADR 0061 | `server/modules/{storage,sharepoint}` |
 | SAML with Entra ID (increment 07) | SP-initiated SAML 2.0 with a hardened wrapper, pinned certificates, MFA modes `claim` / `entra` / `portal`, allowed roles, daily metadata check (off until configured); ADR 0062 | `server/modules/identity/sso`, `client/src/features/identity/sso` |
 | Migration (increment 07) | `migrations/0007_increment_07.sql`, additive: 16 tables, 40 columns on 11 tables, one widened enum, 96 statements, no `DROP` | `migrations/` |
-| Staff ordering handoff and portal switch (increment 07.1, client only) | staff and administrators get a handoff panel on `/orders/new`, `/cart`, `/cart/checkout`, `/checkout/return` and `/checkout/cancel` with **New order for a customer** → `/admin/orders?new=1`; visible **Customer portal** / **Admin portal** / **Staff portal** switch; staff landing on `/admin` with a per-tab choice; discount code hints | `client/src/app/portal.tsx`, `client/src/lib/portal.ts`, `client/src/features/{cart,orders}` |
+| Staff ordering handoff and portal switch (increment 07.1) | staff and administrators get a handoff panel on `/orders/new`, `/cart`, `/cart/checkout`, `/checkout/return` and `/checkout/cancel` with **New order for a customer** → `/admin/orders?new=1`; visible **Customer portal** / **Admin portal** / **Staff portal** switch; staff landing on `/admin` with a per-tab choice; discount code hints | `client/src/app/portal.tsx`, `client/src/lib/portal.ts`, `client/src/features/{cart,orders}` |
 | Documentation | 62 ADRs, threat model, security reviews, guides for customers / staff / admins, runbooks, requirements register | `docs/` |
 
 ## Verified in session 01 (integrator's own runs)
@@ -383,7 +383,7 @@ Details are in `docs/session-logs/2026-11-22-session-03.md`.
 
 ## Verification for increment 07.1
 
-Fix pack for the owner's prompts 28 and 29 of 2026-11-25 ([session log](../session-logs/2026-11-25-session-01.md)). Client-side only: no server permission, schema or migration change, and the upgrade commands are unchanged.
+Fix pack for the owner's prompts 28 and 29 of 2026-11-25 ([session log](../session-logs/2026-11-25-session-01.md)). Mostly client-side. The one server change is the single-page app fallback for dotted mail template keys (`916f52a`). There is no server permission, schema or migration change, and the upgrade commands are unchanged. PR #19; the merge commit will be filled at merge.
 
 ### What changed
 
@@ -401,22 +401,85 @@ Fix pack for the owner's prompts 28 and 29 of 2026-11-25 ([session log](../sessi
   - An empty cart shows "Have a discount code? Add an item first to apply it here or at checkout." The order form's Review step shows "Have a discount code? You can enter it in your cart and at checkout."
   - With the cart off, the code field stays on the order form's Review step (the direct order path).
 - **Navigation rails.** Both rails have a thin themed scrollbar, with a forced-colours fallback.
-- **QA tools.** `scripts/qa` has an opt-in context-reuse mode and deferred retries ([scripts/qa/README.md](../../scripts/qa/README.md)).
+- **QA tools.** `scripts/qa` has an opt-in context-reuse mode and deferred retries. It also has fixtures for staff in the customer portal and for forms ([scripts/qa/README.md](../../scripts/qa/README.md)).
+- **Shell, layout, accessibility and server fixes from the sweep.** These are listed under Sweep results below.
 
-### Sweep results (to be filled by lead)
+### Sweep results
 
-> **PLACEHOLDER — PENDING-LEAD (07.1 sweep).** The lead supplies these results:
-> - widths 240–2560 px, light and dark;
-> - axe checks against WCAG 2.2 AA, with the counts per route;
-> - the manual keyboard and zoom pass;
-> - the findings fixed;
-> - the routes NOT CHECKED;
-> - the gates (vitest, type check, eslint, audit, gitleaks).
+All runs used Chromium with synthetic QA data, against QA builds of `fix/increment-07-1`. The QA sweep runner reported the numbers, and the lead spot-checked them in a browser. During the sweep, the QA rate budgets were raised temporarily and then restored. That applied to the QA environment only and is not a product change.
+
+**Full responsive matrix (first fix build).**
+- 3,712 cases were scheduled: 232 route and role states × 8 widths (240, 320, 390, 768, 1024, 1440, 1920, 2560 px) × light and dark.
+- 3,656 passed, 24 failed, and 32 were not checked at that point.
+- The 24 failures were 12 distinct route states, and all but two failed only at 240 px. Two were within the WCAG reflow scope:
+  - **Graph & SharePoint** overflowed by 8 px at 320 px;
+  - the cart suggestion "Add-on" badge clipped at 1024 px.
+
+**axe (WCAG 2.2 A and AA plus best practice), at 1280, 640 and 320 px in both themes.**
+- 1,392 cases were scheduled. 1,351 passed, 33 had violations, 2 failed reflow (the Graph page), and 6 were not checked.
+- The 33 cases with violations were:
+  - 30 `region`, from the new staff notice;
+  - 2 `aria-prohibited-attr`, on the SharePoint order sync loading state;
+  - 1 intermittent `target-size`, on the workflow version canvas.
+- 712 cases had axe "incomplete" items that need human judgement: 704 colour contrast, 18 heading order and 6 `aria-hidden-focus`, and one case can have more than one. These items were not reviewed one by one.
+
+**Fixes made after the first build.**
+- **Notices and the switch** (`92d3c3b`, `cf39e10`):
+  - the staff, preview and maintenance notices are now named complementary landmarks, which clears the `region` cases;
+  - the portal switch is first in both mobile drawers;
+  - the phone tab bar labels are Home / Orders / New order / Messages / More;
+  - the staff notice shows its switch button only below medium width.
+- **Layout fixes at narrow widths:**
+  - the progress bar on the customer `/orders` list (`6856d8b`);
+  - the cart suggestion card, which now wraps so the "Add-on" badge no longer clips at 1024 px (`6afac07`);
+  - the policy acceptances log, the coverage tab and the customer Policies tab (`e0aeb58`, `42f0fac`);
+  - Graph & SharePoint, where the long URL now wraps and the 8 px overflow at 320 px is gone, and the production pipeline (`7cef9cb`);
+  - the custom report builder's query-mode control (`21a1e30`);
+  - the shared DataTable phone cards, which cap the label column at 40% and stack below 320 px (`3178353`);
+  - the mail template sensitive-variable badge, which wraps below 320 px (`b6bd3cf`).
+- **Accessible names:** prohibited accessible names were removed in 8 files, with a source guard test (`6e215e6`).
+- **Canvas zoom:** the flow canvas fit zoom floor went from 0.75 to 0.8, so step and transition targets stay above 24 px (`389dfa6`).
+- **Server:** a full page load, reload or bookmark of a mail template editor whose key contains a dot (for example `/admin/email-templates/auth.password_reset`) returned 404 (`916f52a`, `d9f9c50`).
+  - The single-page app now serves its page for registered built-in keys and `custom.<slug>` keys only.
+  - Other dotted or extension paths, and dotfiles, still return 404.
+
+**Confirmation runs on later builds.**
+- **Responsive:** 384 cases over 24 states, covering every route with a finding, DataTable samples, the order form's Review step with the hint, and an administrator inside the customer shell. All passed except the mail badge clip at 240 px, which was fixed afterwards in `b6bd3cf`.
+- **Mail editor confirmation** (on the build with `b6bd3cf`): responsive 16 of 16 passed, including 240 px in both themes. axe 6 of 6 with no violations, and 2 colour-contrast incompletes.
+- **Outcome:** after the fixes, there is no known open responsive or axe failure in the set of routes that was checked. The NOT CHECKED routes below are outside that set.
+- **axe:** 144 of 144 with no violations, and all 30 `region` cases cleared. On the final build, 54 of 54 with no violations and no `aria-prohibited-attr`.
+- **Workflow canvas:** 15 transition targets, the shortest 25.6 px, with no violation in 3 runs per theme.
+
+**Manual keyboard and zoom pass.**
+- 32 of 32 samples: the skip link reaches the main content, with no overflow.
+- Order form step headings receive focus: 4 of 4.
+- Dialog focus stays inside, and Escape returns focus:
+  - 4 of 4 when opened with a button;
+  - 4 of 4 from `/admin/orders?new=1`, including clearing the address parameter.
+- Native browser zoom at 200% and 400% on eight routes: 16 of 16 with no overflow.
+
+**Lead browser checks.**
+- The portal switch both ways, the landing rule and the handoff pages.
+- The `?new=1` dialog.
+- The customer cart and checkout discount field.
+- The empty-cart hint at 240, 320 and 768 px in both themes.
+- Every route with a finding, measured again after the fixes.
+- A dotted template deep link returned 200, while `/missing.png`, `/.env`, `/foo.php` and `/admin/email-templates/x.png` still return 404.
+
+**NOT CHECKED (16 route states without a fixture).**
+- **Need a live token or callback:** `/reset-password`, `/activate`, `/verify-email`, `/sso/complete`.
+- **Need a mid-sign-in session:** `/mfa/enrol`, `/mfa/recovery-codes`, `/change-password`, `/accept-policy`.
+- **No seeded resource:** `/admin/siem/:id` and its `/edit`, `/admin/automations/:automationId` and its `/edit`, `/admin/storage/:publicId/edit`.
+- **No operation record:** `/admin/portable/import/:importId`, `/admin/backups/:backupId`, `/admin/api/log/:requestId`.
+- **Also not measured:** the order Messages tab with an attachment.
 
 ### Limits
 
-- **Not done.** No screen-reader pass and no physical-device pass were done. The sweep used automated browsers at set widths.
-- **What is claimed.** The interfaces are designed and tested against WCAG 2.2 AA. This is not a claim of conformance.
+- **Browsers:** Chromium only. No Safari or Firefox run was done.
+- **Devices:** no physical phones or tablets were used.
+- **Screen readers:** no pass with NVDA, JAWS, VoiceOver or TalkBack was done.
+- **axe incompletes:** the items flagged as incomplete, mainly colour contrast, were not reviewed by hand.
+- **No conformance claim:** this is not a legal or ADA conformance claim. The interfaces are designed and tested against WCAG 2.2 AA.
 
 ## Verification for increment 07
 
