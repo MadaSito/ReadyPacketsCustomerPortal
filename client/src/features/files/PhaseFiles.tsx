@@ -1,11 +1,12 @@
-import { useState } from "react";
-import { Download } from "lucide-react";
+import { useRef, useState } from "react";
+import { Download, Headphones } from "lucide-react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { FileRecord, UploadIntent } from "@server/modules/files/index";
 import { apiUrl } from "@/lib/runtime";
 import { sessionFetch } from "@/lib/sessionTransport";
 import { useTRPC, useTRPCClient } from "@/lib/trpc";
-import { Button, Callout, LoadMore } from "@/ui";
+import { Button, Callout, DateTime, LoadMore } from "@/ui";
+import { FileAudioDialog } from "./FileAudioDialog";
 import { FileUploadPanel, type FileUploadPanelProps } from "./FileUploadPanel";
 import { formatAudioTimeRemaining, formatBytes } from "./format";
 import { saveFileBlob } from "./fileDownload";
@@ -30,7 +31,7 @@ type PhaseUploadProps = {
 };
 
 export function PhaseUploadPanel({ readOnly, ...props }: PhaseUploadProps) {
-  return readOnly ? <PhaseReadOnlyFiles orderId={props.orderId} stageKey={props.stageKey} intent={props.intent} /> : <PhaseUploadForm {...props} />;
+  return readOnly ? <PhaseUploadedFiles orderId={props.orderId} stageKey={props.stageKey} intent={props.intent} /> : <PhaseUploadForm {...props} />;
 }
 
 function PhaseUploadForm({ orderId, stageKey, intent, staff = false, onPendingChange, onChanged }: PhaseUploadProps) {
@@ -81,23 +82,32 @@ export function PhaseTeamFiles({ orderId, stageKey }: { orderId: string; stageKe
   return <PhaseFileItems files={files} label="Team files" empty="There are no team files to review in this phase." />;
 }
 
-function PhaseReadOnlyFiles({ orderId, stageKey, intent }: Pick<PhaseUploadProps, "orderId" | "stageKey" | "intent">) {
+export function PhaseUploadedFiles({ orderId, stageKey, intent, headingLevel = 5 }:
+  Pick<PhaseUploadProps, "orderId" | "stageKey" | "intent"> & { headingLevel?: 3 | 4 | 5 | 6 }) {
   const trpc = useTRPC();
+  const phaseUploadKind = intent === "document" ? "document" : "audio";
   const files = useInfiniteQuery(trpc.files.list.infiniteQueryOptions(
-    { orderId, stageKey, limit: 25 }, { getNextPageParam: (page) => page.nextCursor, retry: false },
+    { orderId, stageKey, phaseUploadKind, limit: 25 }, { getNextPageParam: (page) => page.nextCursor, retry: false },
   ));
-  return <PhaseFileItems files={files} label="Submitted phase files" empty="There are no submitted files of this type in this phase."
-    include={(file) => file.category !== "deliverable" && file.contentType.startsWith("audio/") === (intent !== "document")} />;
+  const Heading = `h${headingLevel}` as const;
+  return <div className="grid min-w-0 gap-2">
+    <Heading className="text-sm font-semibold text-ink">Uploaded in this phase</Heading>
+    <PhaseFileItems files={files} label="Uploaded in this phase" empty="Nothing uploaded yet." orderId={orderId}
+      include={(file) => file.visibility === "customer_visible" && !file.deletedAt && !file.supersededAt &&
+        file.category !== "deliverable" && file.contentType.startsWith("audio/") === (phaseUploadKind === "audio")} />
+  </div>;
 }
 
-function PhaseFileItems({ files, label, empty, include }: {
+function PhaseFileItems({ files, label, empty, include, orderId }: {
   files: { data?: { pages: Array<{ items: FileRecord[] }> }; isPending: boolean; isError: boolean; hasNextPage: boolean;
     isFetchingNextPage: boolean; fetchNextPage: () => Promise<unknown>; refetch: () => Promise<unknown> };
-  label: string; empty: string; include?: (file: FileRecord) => boolean;
+  label: string; empty: string; include?: (file: FileRecord) => boolean; orderId?: string;
 }) {
   const api = useTRPCClient();
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState(false);
+  const [playing, setPlaying] = useState<FileRecord | null>(null);
+  const listenTrigger = useRef<HTMLButtonElement | null>(null);
   const allItems = files.data?.pages.flatMap((page) => page.items) ?? [];
   const items = include ? allItems.filter(include) : allItems;
   async function download(file: FileRecord) {
@@ -122,16 +132,29 @@ function PhaseFileItems({ files, label, empty, include }: {
   </Callout>;
   return <div className="grid min-w-0 gap-3">
     {items.length ? <ul className="grid min-w-0 gap-2" aria-label={label}>
-      {items.map((file) => <li key={file.publicId} className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-md border border-line p-3">
+      {items.map((file) => <li key={file.publicId} className="grid min-w-0 items-center gap-2 rounded-md border border-line p-3 sm:grid-cols-[minmax(0,1fr)_auto]">
         <div className="min-w-0">
-          <span className="block break-all font-medium text-ink">{file.displayName}</span>
-          <span className="text-sm text-body">{formatBytes(file.size)} · Version {file.version}</span>
+          <span className="block font-medium text-ink [overflow-wrap:anywhere]">{file.displayName}</span>
+          <span className="text-sm text-body">{orderId
+            ? <>{file.extension.toUpperCase()} · {formatBytes(file.size)} · <DateTime value={file.createdAt} format="date" /></>
+            : <>{formatBytes(file.size)} · Version {file.version}</>}</span>
         </div>
-        <Button size="sm" variant="secondary" leadingIcon={<Download aria-hidden />} aria-disabled={busy !== null || undefined}
-          loading={busy === file.publicId} aria-label={`Download ${file.displayName}`} onClick={() => { void download(file); }}>Download</Button>
+        <div className="flex min-w-0 flex-wrap gap-2">
+          <Button size="sm" variant="secondary" leadingIcon={<Download aria-hidden />} aria-disabled={busy !== null || undefined}
+            loading={busy === file.publicId} aria-label={`Download ${file.displayName}`} onClick={() => { void download(file); }}>Download</Button>
+          {orderId && file.contentType.startsWith("audio/") ? <Button size="sm" variant="secondary" leadingIcon={<Headphones aria-hidden />}
+            aria-label={`Listen to ${file.displayName}`} onClick={(event) => {
+              listenTrigger.current = event.currentTarget;
+              setPlaying(file);
+            }}>Listen</Button> : null}
+        </div>
       </li>)}
     </ul> : <p className="text-sm text-body">{files.hasNextPage ? "No matching files on this page." : empty}</p>}
     {notice ? <Callout tone="warning" live="polite" title="Download not available">Refresh this phase and try again.</Callout> : null}
     <LoadMore hasMore={files.hasNextPage} loading={files.isFetchingNextPage} onLoadMore={() => { void files.fetchNextPage(); }} />
+    {orderId ? <FileAudioDialog orderId={orderId} file={playing} onClose={() => {
+      setPlaying(null);
+      window.requestAnimationFrame(() => listenTrigger.current?.focus());
+    }} /> : null}
   </div>;
 }

@@ -1,4 +1,4 @@
-import { and, count, eq, gt, gte, inArray, isNotNull, isNull, lte, ne, notExists, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notExists, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/mysql-core";
 import type { Readable } from "node:stream";
 import type { ModuleDeps } from "../../container.js";
@@ -69,6 +69,7 @@ export interface ListOptions {
   includeDeleted?: boolean;
   preferConvertedAudio?: boolean;
   stageKey?: string;
+  phaseUploadKind?: "document" | "audio";
 }
 type Page<T> = { items: T[]; nextCursor: string | null };
 type DeliverableFile = FileRecord & { stageKey: string | null };
@@ -539,6 +540,21 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     const stageKeys = stages?.stages.filter((entry) => entry.viewable).map((entry) => entry.key) ?? [];
     const selectedPhase = options.stageKey ? phaseFilter(options.stageKey, stageStatusKeys(stages, options.stageKey)) :
       or(isNull(orderFiles.stageKey), stageKeys.length ? inArray(orderFiles.stageKey, stageKeys) : undefined);
+    const phaseUploads = options.phaseUploadKind;
+    if (phaseUploads && (!options.stageKey || options.includeDeleted || options.includeVersions)) {
+      throw validation("INVALID_PHASE_FILES_QUERY", "Select a phase to list current uploads.");
+    }
+    const orderScope = and(eq(orderFiles.orderId, order.id), eq(orderFiles.orderPublicId, order.publicId),
+      eq(orderFiles.ownerUserId, order.ownerUserId), selectedPhase);
+    const uploadScope = phaseUploads ? and(eq(orderFiles.visibility, "customer_visible"), ne(orderFiles.category, "deliverable"),
+      phaseUploads === "audio" ? sql`${orderFiles.contentType} LIKE 'audio/%'` : sql`${orderFiles.contentType} NOT LIKE 'audio/%'`) : undefined;
+    const pivot = phaseUploads && after
+      ? (await tx.select({ createdAt: orderFiles.createdAt }).from(orderFiles)
+        .where(and(orderScope, uploadScope, eq(orderFiles.publicId, after))).limit(1))[0]
+      : undefined;
+    if (phaseUploads && after && !pivot) throw validation("INVALID_PHASE_FILES_CURSOR", "Refresh the phase files and try again.");
+    const pageBoundary = after ? pivot ? or(lt(orderFiles.createdAt, pivot.createdAt),
+      and(eq(orderFiles.createdAt, pivot.createdAt), lt(orderFiles.publicId, after))) : gt(orderFiles.publicId, after) : undefined;
     if (options.includeDeleted && !staff) throw forbidden("CAPABILITY_NOT_GRANTED");
     let canUpload = ["owner", "contributor", "staff", "admin"].includes(order.accessRole) &&
       (order.lockState === "none" || (staff && order.lockState === "review"));
@@ -553,16 +569,16 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       }
     }
     const rows = await tx.select().from(orderFiles).where(and(
-      eq(orderFiles.orderId, order.id), eq(orderFiles.orderPublicId, order.publicId), eq(orderFiles.ownerUserId, order.ownerUserId),
-      selectedPhase,
+      orderScope,
+      uploadScope,
       isNull(orderFiles.purgedAt),
       options.includeDeleted ? undefined : isNull(orderFiles.deletedAt),
       options.includeVersions ? undefined : isNull(orderFiles.supersededAt),
-      options.preferConvertedAudio && !staff && !options.includeVersions
+      options.preferConvertedAudio && (!staff || phaseUploads) && !options.includeVersions
         ? sql`(${orderFiles.conversionState} IS NULL OR ${orderFiles.conversionState} <> 'converted')` : undefined,
       staff ? undefined : eq(orderFiles.visibility, "customer_visible"),
-      after ? gt(orderFiles.publicId, after) : undefined,
-    )).orderBy(orderFiles.publicId).limit(limit + 1).for("update");
+      pageBoundary,
+    )).orderBy(...(phaseUploads ? [desc(orderFiles.createdAt), desc(orderFiles.publicId)] : [orderFiles.publicId])).limit(limit + 1).for("update");
     return {
       items: rows.slice(0, limit).map((row) => ({ ...output(row),
         groupStageKey: row.stageKey ?? (stages?.format !== 3 ? statusStage(stages, row.statusKey) : null) })),

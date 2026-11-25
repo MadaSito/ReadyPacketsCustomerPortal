@@ -4,14 +4,14 @@ import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-q
 import { Link, useSearch } from "wouter";
 import type { FileRecord, UploadIntent } from "@server/modules/files/index";
 import { orderDocumentEditHref } from "@/lib/docconvert";
-import { apiUrl, RUNTIME } from "@/lib/runtime";
+import { apiUrl } from "@/lib/runtime";
 import { sessionFetch } from "@/lib/sessionTransport";
 import { errorMessage, useTRPC, useTRPCClient } from "@/lib/trpc";
 import {
   Badge, Button, Callout, Card, Checkbox, ConfirmDialog, DataTable, DateTime, Dialog, DropdownMenu,
   EmptyState, Field, IconButton, LoadMore, Section, Select, useToast,
 } from "@/ui";
-import { formatDuration } from "./AudioRecorder";
+import { FileAudioDialog } from "./FileAudioDialog";
 import { categoryLabels, FileUploadPanel, visibilityLabels } from "./FileUploadPanel";
 import { OrderArchiveAction, PhaseArchiveAction } from "./archives/ArchiveAction";
 import { PhaseUploadPanel } from "./PhaseFiles";
@@ -33,55 +33,6 @@ const intentChoices = [
   { value: "recording", label: "Record audio" },
   { value: "prerecorded_audio", label: "Upload prerecorded audio" },
 ] satisfies Array<{ value: UploadIntent; label: string }>;
-
-function AudioPlayback({ file, load }: { file: FileRecord; load: (signal: AbortSignal) => Promise<{ url: string; transcript: string | null }> }) {
-  const [duration, setDuration] = useState(file.durationSeconds);
-  const [state, setState] = useState<{ url: string; transcript: string | null } | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const active = useRef<AbortController | null>(null);
-  const playbackDetails = useRef<HTMLParagraphElement>(null);
-  useEffect(() => () => { active.current?.abort(); }, []);
-  useEffect(() => () => { if (state?.url.startsWith("blob:")) URL.revokeObjectURL(state.url); }, [state]);
-  useEffect(() => { if (state) playbackDetails.current?.focus(); }, [state]);
-
-  async function openAudio() {
-    if (active.current) return;
-    const controller = new AbortController();
-    active.current = controller;
-    setBusy(true);
-    if (!state) setNotice(null);
-    try {
-      const { url, transcript } = await load(controller.signal);
-      if (!controller.signal.aborted) {
-        setState({ url, transcript });
-        setNotice(null);
-      }
-      else if (url.startsWith("blob:")) URL.revokeObjectURL(url);
-    } catch {
-      if (!controller.signal.aborted) setNotice("The recording could not be loaded. Check your access or download the original from the file list.");
-    } finally {
-      active.current = null;
-      if (!controller.signal.aborted) setBusy(false);
-    }
-  }
-
-  return <div className="grid min-w-0 gap-3">
-    {!state ? <div><Button loading={busy} onClick={() => { void openAudio(); }}>Load audio and transcript</Button></div> : <>
-      <p ref={playbackDetails} tabIndex={-1} className="text-sm text-body">Duration: {duration === null ? "Not available" : formatDuration(duration)}</p>
-      {/* eslint-disable-next-line jsx-a11y/media-has-caption -- Audio-only content exposes the provided transcript alongside the player. */}
-      <audio controls preload="metadata" className="w-full min-w-0" aria-label={`Play ${file.displayName}`} src={state.url}
-        onLoadedMetadata={(event) => { if (Number.isFinite(event.currentTarget.duration)) setDuration(event.currentTarget.duration); }}
-        onError={() => setNotice("The browser could not continue playback. Try refreshing access or download the file from the library.")} />
-      <p className="font-medium text-ink">Transcript</p>
-      <p className="whitespace-pre-wrap break-words text-sm text-body">{state.transcript || "No transcript was supplied."}</p>
-    </>}
-    {notice ? <Callout tone="warning" title="Audio playback notice" live="polite">
-      <p>{notice}</p>
-      {state ? <Button variant="secondary" size="sm" loading={busy} onClick={() => { void openAudio(); }}>Refresh playback access</Button> : null}
-    </Callout> : null}
-  </div>;
-}
 
 export default function OrderFilesTab({ orderId, area }: Props) {
   const consoleArea = area === "console";
@@ -320,26 +271,7 @@ export default function OrderFilesTab({ orderId, area }: Props) {
             intent: replacementSlot ? undefined : replacement.contentType.startsWith("audio/") ? "prerecorded_audio" : "document" } : undefined}
           replace={{ id: replacement.publicId, category: replacement.category, visibility: replacement.visibility }} /> : null}
       </Dialog>
-      <Dialog title="Listen to order audio" description={playing?.displayName} open={!!playing} onOpenChange={(open) => { if (!open) setPlaying(null); }}>
-        {playing ? <AudioPlayback key={playing.publicId} file={playing} load={async (signal) => {
-          const source = playing.derivedFromPublicId ?? playing.publicId;
-          const { transcript } = await api.files.readTranscript.mutate({ fileId: source }, { signal });
-          // The sandbox preview uses an in-memory header session, which native audio cannot send.
-          if (RUNTIME.preview) {
-            const blob = await readBlob(playing, signal);
-            if (!blob || blob.size !== playing.size) throw Error("Audio unavailable");
-            return { url: URL.createObjectURL(new Blob([blob], { type: playing.contentType })), transcript };
-          }
-          const { ticket } = await api.files.issuePlaybackTicket.mutate({ orderId, fileId: playing.publicId }, { signal });
-          const response = await sessionFetch(apiUrl("/api/files/playback"), {
-            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ticket }), cache: "no-store", signal,
-          });
-          if (!response.ok) throw Error("Audio unavailable");
-          const result: { grantPublicId?: string } = await response.json();
-          if (!/^[0-9A-HJKMNP-TV-Z]{26}$/u.test(result.grantPublicId ?? "")) throw Error("Audio unavailable");
-          return { url: apiUrl(`/api/files/playback/${result.grantPublicId}`), transcript };
-        }} /> : null}
-      </Dialog>
+      <FileAudioDialog orderId={orderId} file={playing} onClose={() => setPlaying(null)} />
       <ConfirmDialog open={!!action} onOpenChange={(open) => { if (!open) setAction(null); }}
         title={action?.kind === "remove" ? "Move file to trash?" : action?.kind === "restore" ? "Restore this file?" : "Change file visibility?"}
         description={action ? `${descriptions[action.kind]} File: ${action.file.displayName}` : undefined}

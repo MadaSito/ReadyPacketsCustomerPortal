@@ -780,6 +780,27 @@ describe("phase files", () => {
     return () => files.commitUpload(principal, plan, staged).finally(() => files.cleanUpload(staged));
   }
 
+  it("pages customer-visible phase uploads newest first, excluding team deliverables and previous versions", async () => {
+    setPhase({});
+    const oldest = await (await prepare(owner, documentUpload, "oldest.pdf"))();
+    h.clock.advance(1000);
+    const retired = await (await prepare(owner, documentUpload, "retired.pdf"))();
+    h.clock.advance(1000);
+    const current = await (await prepare(owner, { ...documentUpload, versionOf: retired.publicId }, "current.pdf"))();
+    await (await prepare(staff, { ...documentUpload, visibility: "staff_only" }, "private.pdf"))();
+    await (await prepare(staff, { ...documentUpload, category: "deliverable" }, "deliverable.pdf"))();
+    // Publication IDs and display dates can differ for restored history.
+    await t.db.update(orderFiles).set({ createdAt: new Date(current.createdAt.getTime() + 1000) }).where(eq(orderFiles.publicId, oldest.publicId));
+    const options = { stageKey, phaseUploadKind: "document", limit: 1 } as const;
+    const first = await files.list(staff, orderPublicId, options);
+    expect(first.items.map(({ publicId }) => publicId)).toEqual([oldest.publicId]);
+    expect(first.nextCursor).not.toBeNull();
+    const next = await files.list(staff, orderPublicId, { ...options, cursor: first.nextCursor! });
+    expect(next.items.map(({ publicId }) => publicId)).toEqual([current.publicId]);
+    expect(next.nextCursor).toBeNull();
+    await expect(files.list(owner, orderPublicId, { stageKey, phaseUploadKind: "audio" })).resolves.toMatchObject({ items: [] });
+  });
+
   it("binds stable phases and serializes concurrent quota checks before publication", async () => {
     setPhase({ documentCount: 1 });
     await expect(files.beginUpload(owner, orderPublicId, upload)).rejects.toMatchObject({ reasonCode: "STAGE_REQUIRED" });

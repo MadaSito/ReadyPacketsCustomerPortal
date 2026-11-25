@@ -35,6 +35,7 @@ export const filesRouter = router({
     limit: z.number().int().min(1).max(100).optional(),
     includeVersions: z.boolean().optional(),
     includeDeleted: z.boolean().optional(),
+    phaseUploadKind: z.enum(["document", "audio"]).optional(),
   })).query(({ ctx, input }) => ctx.services.files.list(ctx.session, input.orderId, { ...input, preferConvertedAudio: true })),
   issueDownloadTicket: protectedProcedure.meta({ rateLimit: "expensive" }).input(file)
     .mutation(({ ctx, input }) => ctx.services.files.issueDownloadTicket(ctx.session, input.fileId)),

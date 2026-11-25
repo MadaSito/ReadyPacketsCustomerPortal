@@ -9,7 +9,7 @@ import { expectNoAxeViolations, renderUi } from "@/ui/testing";
 import { FileUploadPanel } from "./FileUploadPanel";
 import { FilesAdminContent } from "./FilesAdminPage";
 import OrderFilesTab from "./OrderFilesTab";
-import { PhaseUploadPanel } from "./PhaseFiles";
+import { PhaseUploadedFiles, PhaseUploadPanel } from "./PhaseFiles";
 import { RecordingPreflight } from "./RecordingPreflight";
 import { formatAudioTimeRemaining } from "./format";
 
@@ -333,10 +333,12 @@ describe("order file tab", () => {
   it("renders a completed phase as a read-only, downloadable list", async () => {
     let finish = (_response: Response) => {};
     fetchMock.mockReturnValue(new Promise<Response>((resolve) => { finish = resolve; }));
-    const { container } = renderUi(<><h1>Completed phase</h1>
+    const { container } = renderUi(<><h1>Order</h1><h2>Phases</h2><h3>Completed phase</h3><h4>Documents</h4>
       <PhaseUploadPanel orderId={orderId} stageKey="intake_phase" intent="document" readOnly /></>);
-    const list = await screen.findByRole("list", { name: "Submitted phase files" });
+    const list = await screen.findByRole("list", { name: "Uploaded in this phase" });
     const download = within(list).getByRole("button", { name: `Download ${sample.displayName}` });
+    expect(within(list).getByText("PDF · 8 B ·", { exact: false })).toBeInTheDocument();
+    expect(list.querySelector("time")).toHaveAttribute("datetime", sample.createdAt.toISOString());
     expect(screen.queryByRole("button", { name: "Choose files" })).not.toBeInTheDocument();
     expect(container.querySelector("input[type=file]")).toBeNull();
     await expectNoAxeViolations(container);
@@ -347,6 +349,27 @@ describe("order file tab", () => {
     finish(new Response(null, { status: 404 }));
     expect(await screen.findByText("Download not available")).toBeInTheDocument();
     expect(download).toHaveFocus();
+  });
+
+  it("shows the uploaded audio list and launches the same ticket-based playback as the order library", async () => {
+    const file = { ...sample, displayName: "Recorded evidence.webm", contentType: "audio/webm", extension: "webm" };
+    const grantPublicId = `${sample.publicId.slice(0, -1)}4`;
+    view.mockResolvedValue({ items: [file, { ...sample, displayName: "Staff note.wav", contentType: "audio/wav", visibility: "staff_only" }],
+      nextCursor: null, canUpload: false, uploadPolicy: null });
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ grantPublicId })));
+    const user = userEvent.setup();
+    renderUi(<PhaseUploadedFiles orderId={orderId} stageKey="intake_phase" intent="recording" />);
+    expect(screen.getByRole("heading", { level: 5, name: "Uploaded in this phase" })).toBeInTheDocument();
+    await user.click(await screen.findByRole("button", { name: `Listen to ${file.displayName}` }));
+    expect(screen.queryByText("Staff note.wav")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Load audio and transcript" }));
+    expect(await screen.findByLabelText(`Play ${file.displayName}`)).toHaveAttribute("src", expect.stringContaining(`/api/files/playback/${grantPublicId}`));
+  });
+
+  it("shows an empty state for a phase with no uploads", async () => {
+    view.mockResolvedValue({ items: [], nextCursor: null, canUpload: false, uploadPolicy: null });
+    renderUi(<PhaseUploadedFiles orderId={orderId} stageKey="intake_phase" intent="document" />);
+    expect(await screen.findByText("Nothing uploaded yet.")).toBeInTheDocument();
   });
 
   it("uses the playback grant handle as the media URL without putting the ticket in it", async () => {
