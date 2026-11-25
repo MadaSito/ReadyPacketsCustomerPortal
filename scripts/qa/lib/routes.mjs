@@ -109,9 +109,9 @@ const HASHED_ASSET = /^\/(assets|fonts)\/[^/]+[.-][A-Za-z0-9_-]{8,}\.(js|css|wof
 
 /**
  * Same-origin routing for a fresh QA context: blocks other origins and serves immutable, content-hashed
- * /assets and /fonts files from a per-process memory cache after their first successful fetch. Every scan still
- * uses a fresh context, but chunks are not downloaded again for each one (the edge pre-gate counts every request
- * per IP). Navigations, API calls and unhashed files always go to the server.
+ * /assets and /fonts files from a per-process memory cache after their first successful fetch. Chunks are not
+ * downloaded again for each scan (the edge pre-gate counts every request per IP). Navigations, API calls and
+ * unhashed files always go to the server.
  */
 export async function routeQaContext(context, baseUrl) {
   await context.route("**/*", async (route) => {

@@ -5,8 +5,8 @@
 // (WCAG 2.2 SC 2.5.8 minimum; inline links inside running text are exempt, as the criterion allows).
 // Requires QA_BASE_URL (disposable QA origin). Optional: QA_CHROMIUM_PATH, QA_ROUTE_FIXTURES, QA_ROUTE_FILTER,
 // QA_WIDTHS (comma list, partial run). Never prints raw Playwright errors (they may include tokens).
-import { launchQaBrowser } from "./lib/browser.mjs";
-import { openQaRoute, qaRouteScenarios, QaRateLimitedError, routeQaContext, withQaRateLimitRetry } from "./lib/routes.mjs";
+import { createQaPages, launchQaBrowser } from "./lib/browser.mjs";
+import { openQaRoute, qaRouteScenarios, QaRateLimitedError, withQaRateLimitRetry } from "./lib/routes.mjs";
 
 const ALL_WIDTHS = [240, 320, 390, 768, 1024, 1440, 1920, 2560];
 const MIN_TARGET = 24;
@@ -78,58 +78,63 @@ async function measure(page, minTarget) {
 async function main() {
   const { list, partial: partialWidths } = widths();
   const { browser, baseUrl } = await launchQaBrowser();
+  const reuse = process.env.QA_REUSE_CONTEXT === "1";
+  const pages = createQaPages(browser, baseUrl, reuse);
+  console.log(`Browser context mode: ${reuse ? "reuse within scenario/theme/input mode; fresh page at every width" : "fresh context and page at every width"}.`);
   let runs = 0;
   let failures = 0;
   let rateLimited = 0;
+  let unchecked = 0;
   try {
     const { cases, missing, partial } = await qaRouteScenarios();
     if (partial || partialWidths) console.log("Partial run: QA_ROUTE_FILTER or QA_WIDTHS was supplied. Not release-wide responsive evidence.");
     for (const message of missing) console.error(`NOT CHECKED ${message}`);
-    for (const scenario of cases) {
-      for (const theme of ["light", "dark"]) {
-        for (const width of list) {
-          const height = width < 768 ? 800 : 900;
-          const scope = `${scenario.name} · ${theme} · ${width}px`;
-          runs++;
-          let context;
-          try {
-            let page;
-            await withQaRateLimitRetry(async () => {
-              await context?.close();
-              context = await browser.newContext({
-                colorScheme: theme, viewport: { width, height }, storageState: scenario.storageState,
-                acceptDownloads: false, serviceWorkers: "block", hasTouch: width < 1024, isMobile: false,
-              });
-              await routeQaContext(context, baseUrl);
-              page = await context.newPage();
-              await openQaRoute(page, baseUrl, scenario, theme);
-            }, (line) => console.log(line));
-            const result = await measure(page, MIN_TARGET);
-            const problems = [];
-            if (result.width > width) problems.push(`viewport did not reflow to ${width}px`);
-            if (result.overflow > 1) problems.push(`horizontal overflow ${result.overflow}px`);
-            if (result.clipped.length) problems.push(`clipped text: ${result.clipped.join(", ")}`);
-            if (result.small.length) problems.push(`tap targets < ${MIN_TARGET}px: ${result.small.join(", ")}`);
-            if (problems.length) {
-              failures++;
-              console.error(`FAIL ${scope}: ${problems.join("; ")}`);
-            } else console.log(`PASS ${scope}`);
-          } catch (error) {
-            failures++;
-            if (error instanceof QaRateLimitedError) {
-              rateLimited++;
-              console.error(`FAIL ${scope}: rate limited by the QA instance twice (not a page result; re-run this route).`);
-              continue;
-            }
-            console.error(`FAIL ${scope}: browser could not reach or measure the expected state (check QA origin, features and fixture).`);
-          } finally {
-            await context?.close();
-          }
-        }
-      }
+    const matrix = cases.flatMap((scenario) => ["light", "dark"].flatMap((theme) =>
+      list.map((width) => ({ scenario, theme, width, retry: false }))));
+    for (const { scenario, theme, width, retry } of matrix) {
+    const height = width < 768 ? 800 : 900;
+    const scope = `${scenario.name} · ${theme} · ${width}px`;
+    if (!retry) runs++;
+    else {
+      console.log(`RETRY ${scope}`);
+      await pages.finish(true);
     }
-    console.log(`Responsive check: ${runs} executed, ${failures} failed (${rateLimited} rate limited), ${missing.length} missing fixture entries. Widths: ${list.join(", ")}.`);
-    if (!runs || failures || missing.length) process.exitCode = 1;
+    try {
+      let page;
+      let attempt = 0;
+      await withQaRateLimitRetry(async () => {
+        if (attempt++ > 0) await pages.finish(true);
+        page = await pages.open(scenario, theme, { width, height }, width < 1024);
+        await openQaRoute(page, baseUrl, scenario, theme);
+      }, (line) => console.log(line));
+      const result = await measure(page, MIN_TARGET);
+      const problems = [];
+      if (result.width > width) problems.push(`viewport did not reflow to ${width}px`);
+      if (result.overflow > 1) problems.push(`horizontal overflow ${result.overflow}px`);
+      if (result.clipped.length) problems.push(`clipped text: ${result.clipped.join(", ")}`);
+      if (result.small.length) problems.push(`tap targets < ${MIN_TARGET}px: ${result.small.join(", ")}`);
+      if (problems.length) {
+        failures++;
+        console.error(`FAIL ${scope}: ${problems.join("; ")}`);
+      } else console.log(`PASS ${scope}`);
+    } catch (error) {
+      if (!browser.isConnected()) throw new Error("Chromium disconnected before the responsive matrix completed.", { cause: error });
+      const throttled = error instanceof QaRateLimitedError;
+      const reason = throttled ? "rate limited by the QA instance" : "browser could not reach or measure the expected state";
+      if (!retry) {
+        matrix.push({ scenario, theme, width, retry: true });
+        console.error(`DEFERRED ${scope}: ${reason}; will retry after the matrix.`);
+      } else {
+        unchecked++;
+        if (throttled) rateLimited++;
+        console.error(`NOT CHECKED ${scope}: ${reason} after retry (not a page result).`);
+      }
+    } finally {
+      await pages.finish();
+    }
+    }
+    console.log(`Responsive check: ${runs} scheduled, ${runs - failures - unchecked} passed, ${failures} measured failures, ${unchecked} not checked after retry (${rateLimited} rate limited), ${missing.length} missing fixture entries. Widths: ${list.join(", ")}.`);
+    if (!runs || failures || unchecked || missing.length) process.exitCode = 1;
   } finally {
     await browser.close();
   }

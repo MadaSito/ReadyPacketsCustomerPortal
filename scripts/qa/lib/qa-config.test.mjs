@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { parseQaBaseUrl, qaChromiumPath } from "./browser.mjs";
+import { createQaPages, parseQaBaseUrl, qaChromiumPath } from "./browser.mjs";
 import { matchesQaRoute, QaRateLimitedError, resolveQaScenarios, withQaRateLimitRetry } from "./routes.mjs";
 import { setLiteralZoom } from "./zoom.mjs";
 
@@ -12,6 +12,57 @@ test("QA setup accepts only plain HTTP origins", () => {
   for (const rejected of ["https://user@example.test", "https://example.test/?secret=1", "file:///tmp", "https://example.test/qa"]) {
     assert.throws(() => parseQaBaseUrl(rejected), /QA_BASE_URL/);
   }
+});
+
+test("context reuse starts a fresh page and resets state at each width, but never mixes themes or input modes", async () => {
+  const contexts = [];
+  const browser = {
+    async newContext(options) {
+      const history = { options, pages: [], cleared: 0, closed: false };
+      contexts.push(history);
+      return {
+        async route() {},
+        async addInitScript() {},
+        async clearCookies() { history.cleared++; },
+        async close() { history.closed = true; },
+        async newPage() {
+          const page = {
+            async close() { this.closed = true; },
+            async setViewportSize(viewport) { this.viewport = viewport; },
+            async emulateMedia(media) { this.media = media; },
+          };
+          history.pages.push(page);
+          return page;
+        },
+      };
+    },
+  };
+  const scenario = { name: "anonymous case", path: "/sign-in" };
+  const narrow = { width: 320, height: 800 };
+  const wide = { width: 390, height: 800 };
+  const reuse = createQaPages(browser, "http://127.0.0.1:5044", true);
+  const first = await reuse.open(scenario, "light", narrow, true);
+  await reuse.finish();
+  const second = await reuse.open(scenario, "light", wide, true);
+  assert.notEqual(first, second);
+  assert.equal(first.closed, true);
+  assert.deepEqual(second.viewport, wide);
+  assert.deepEqual(second.media, { colorScheme: "light" });
+  assert.equal(contexts.length, 1);
+  assert.equal(contexts[0].cleared, 1);
+  await reuse.open(scenario, "dark", wide, true);
+  await reuse.open(scenario, "dark", wide, false);
+  await reuse.finish(true);
+  assert.equal(contexts.length, 3);
+  assert.ok(contexts.every(({ closed }) => closed));
+
+  const fresh = createQaPages(browser, "http://127.0.0.1:5044", false);
+  await fresh.open(scenario, "light", narrow, true);
+  await fresh.finish();
+  await fresh.open(scenario, "light", wide, true);
+  await fresh.finish();
+  assert.equal(contexts.length, 5);
+  assert.ok(contexts.every(({ closed }) => closed));
 });
 
 test("Chromium resolution selects the newest executable, with no implicit downloads", async () => {

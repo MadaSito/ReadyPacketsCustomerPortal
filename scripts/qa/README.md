@@ -17,6 +17,14 @@ run as partial, which is not release evidence. Missing fixtures (for example the
 Maintenance console, which need seeded state) are reported as `NOT CHECKED` and make the run exit non-zero.
 Raw browser errors are never printed because they can contain tokens.
 
+By default matrix cases use a fresh browser context and page for every width. Opt in with `QA_REUSE_CONTEXT=1`
+to retain the context only within the same route fixture, theme and input mode, while opening a fresh page and
+restoring the fixture cookies, storage and viewport for every measurement. Theme and scroll start fresh at each
+width; throttled retries always start from a fresh browser context. Both scripts name the mode in the log header.
+Literal native zoom (`QA_LITERAL_ZOOM=1`) always uses a fresh profile and ignores context reuse.
+Unreadable or unreachable cases are retried once at the end of the matrix in a fresh context. If they
+still cannot be measured, they are `NOT CHECKED`, not a product finding or a passing result.
+
 ## Shared fixtures and sessions
 
 `fixtures.example.json` is the shared `QA_ROUTE_FIXTURES` template. Copy it outside the repo and add seeded `cases`
@@ -34,8 +42,8 @@ lands anywhere else. Any other redirect still fails the case.
 
 Every QA browser shares one client IP, so a full run can exceed the instance's per-IP budgets (each page load makes
 several tRPC calls). If the instance answers 429, the runners wait for `Retry-After` (5–120 s) and retry the
-scenario once in a fresh context. A second 429 is reported as `rate limited … (not a page result)` and counted
-separately in the summary; it is never a pass or a page defect. On a disposable QA instance an administrator can raise
+scenario once in a fresh context. Continued rate limiting defers the case to the end of the matrix; if it still
+cannot be measured, it is `NOT CHECKED` and counted separately in the summary. On a disposable QA instance an administrator can raise
 the `api` and `standard_browsing` budgets within their safe bounds in Console → Protection → Rate limits, then
 restore the defaults afterwards. The process-local edge pre-gate (120 requests per 10 s per IP, static files
 included) is not configurable, so the runners serve content-hashed `/assets` files from an in-process memory cache after
