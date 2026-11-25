@@ -42,6 +42,20 @@ describe("operations alert persistence", () => {
     expect(await service.list({})).toEqual({ items: [], nextCursor: null });
   });
 
+  it("requires current admin step-up before changing reminder settings", async () => {
+    const principal = fakePrincipal({ role: "admin", stepUpAt: harness.clock.now() });
+    let currentStepUpAt: Date | null = null;
+    harness.services.identity = {
+      sessions: { assertCurrent: async () => ({ role: "admin", pendingSteps: [], stepUpAt: currentStepUpAt }) },
+    } as unknown as TestHarness["services"]["identity"];
+    const input = { enabled: true, hours: 36 };
+    await expect(service.updateReminderConfig(principal, input)).rejects.toMatchObject({ reasonCode: "STEP_UP_REQUIRED" });
+    expect(await service.reminderConfig()).toEqual({ enabled: false, hours: 48 });
+    currentStepUpAt = harness.clock.now();
+    await expect(service.updateReminderConfig(principal, input)).resolves.toEqual(input);
+    expect(await service.reminderConfig()).toEqual(input);
+  });
+
   it("writes one alert per overdue waiting episode and checks its fencing token before writing", async () => {
     const now = harness.clock.now();
     const owner = ulid(now.getTime());

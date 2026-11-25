@@ -7,6 +7,7 @@ import type { SessionPrincipal, Tx } from "../../core/types.js";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import { scanValue } from "../../observability/redact.js";
 import { currentCorrelation, keyHash } from "../jobs/queue.js";
+import { createActorGuard } from "../platform/actorGuard.js";
 import { readSetting, writeSetting } from "../platform/index.js";
 import { ATTENTION_ALERT_HOURS, ATTENTION_ALERTS_ENABLED, registerAttentionReminder } from "./attention.js";
 import { OPS_ALERT_SEVERITIES, OPS_ALERT_SOURCES, OPS_ALERT_STATES, operationalAlerts } from "./schema.js";
@@ -125,7 +126,7 @@ export function createOpsAlertsModule(deps: ModuleDeps) {
       const { severity, state, source, cursor, limit = 30 } = parsed.data;
       const rows = await db.select().from(operationalAlerts).where(and(
         severity && eq(operationalAlerts.severity, severity), state && eq(operationalAlerts.state, state),
-        source && eq(operationalAlerts.source, source), cursor && lt(operationalAlerts.publicId, cursor),
+        source && eq(operationalAlerts.source, source), cursor ? lt(operationalAlerts.publicId, cursor) : undefined,
       )).orderBy(desc(operationalAlerts.publicId)).limit(limit + 1);
       return { items: rows.slice(0, limit).map(view), nextCursor: rows.length > limit ? rows[limit - 1]!.publicId : null };
     },
@@ -148,7 +149,7 @@ export function createOpsAlertsModule(deps: ModuleDeps) {
     },
     async updateReminderConfig(principal: SessionPrincipal, config: { enabled: boolean; hours: number }) {
       return db.transaction(async (tx) => {
-        await deps.services.platform.actorGuard(principal)(tx);
+        await createActorGuard(deps.services, clock, principal)(tx);
         await writeSetting(deps.settings, ATTENTION_ALERTS_ENABLED, config.enabled, tx);
         await writeSetting(deps.settings, ATTENTION_ALERT_HOURS, config.hours, tx);
         await audit.record({
