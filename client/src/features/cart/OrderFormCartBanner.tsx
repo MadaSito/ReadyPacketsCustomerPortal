@@ -14,10 +14,12 @@ import { Link } from "wouter";
 import { useFeatureEnabled } from "@/lib/features";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import { Button, buttonClasses, Callout, Card, Field, Input, Select, Section } from "@/ui";
+import { useCartViewerGate } from "./viewerGate";
 
 export function OrderFormCartBanner({ children }: { children: ReactNode }) {
+  const { pending, staffViewer } = useCartViewerGate();
   const enabled = useFeatureEnabled("cart");
-  if (!enabled) return <>{children}</>;
+  if (!enabled || pending || staffViewer) return <>{children}</>;
   return (
     <div className="space-y-8">
       {children}

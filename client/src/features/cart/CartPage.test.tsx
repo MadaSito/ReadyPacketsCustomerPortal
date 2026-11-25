@@ -1,11 +1,24 @@
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { MeResult, MeUser } from "@/lib/authApi";
 import type * as trpcModule from "@/lib/trpc";
 import { pageA11y } from "@/test/a11y";
-import { renderUi } from "@/ui/testing";
+import { fakeAuthApi, renderUi } from "@/ui/testing";
 import { CartBadge, cartCountLabel } from "./CartBadge";
 import { canCheckout, CartPage, STALE_MESSAGE } from "./CartPage";
+import { OrderFormCartBanner } from "./OrderFormCartBanner";
+
+const asRole = (role: MeUser["role"]) => ({
+  api: fakeAuthApi({
+    me: async (): Promise<MeResult> => ({
+      user: { publicId: `u_${role}`, role, name: "Synthetic Viewer", email: `${role}@example.test`, status: "active" },
+      state: "full",
+      pendingSteps: [],
+      nextStep: null,
+    }),
+  }),
+});
 
 const { handlers, calls } = vi.hoisted(() => ({
   handlers: new Map<string, (input: unknown) => unknown>(),
@@ -136,19 +149,67 @@ describe("CartPage", () => {
     await userEvent.click(screen.getByRole("button", { name: "Add to cart" }));
     await waitFor(() => expect(calls.find((c) => c.path === "cart.addItems")?.input).toEqual({ items: [{ productPublicId: "PADD", quantity: 1 }] }));
   });
+
+  it("explains on an empty cart that a discount code can be applied after adding an item when promotions are enabled", async () => {
+    handlers.set("cart.get", () => cart([], { promotionsEnabled: true, totals: { ...cart([]).totals, currency: null, subtotalMinor: 0, subtotalAfterDiscountMinor: 0, totalMinor: 0 } }));
+    renderUi(<CartPage />, { path: "/cart", ...asRole("customer") });
+    expect(await screen.findByText("Have a discount code? Add an item first to apply it here or at checkout.")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Discount code")).not.toBeInTheDocument();
+  });
+
+  it("renders StaffOrderHandoff for admin and staff on /cart without calling any cart or catalog procedures", async () => {
+    for (const [role, portalLabel] of [["admin", "Admin portal"], ["staff", "Staff portal"]] as const) {
+      calls.length = 0;
+      const view = renderUi(<CartPage />, { path: "/cart", ...asRole(role) });
+      expect(await screen.findByRole("heading", { level: 1, name: "Carts belong to customer accounts" })).toBeInTheDocument();
+      expect(screen.getByRole("link", { name: "New order for a customer" })).toHaveAttribute("href", "/admin/orders?new=1");
+      expect(screen.getByRole("link", { name: portalLabel })).toHaveAttribute("href", "/admin");
+      expect(calls.filter((c) => c.path.startsWith("cart.") || c.path === "orders.catalog.list")).toEqual([]);
+      view.unmount();
+    }
+  });
 });
 
 describe("CartBadge", () => {
   it("renders an accessible count when enabled and non-zero", async () => {
-    renderUi(<CartBadge />);
+    renderUi(<CartBadge />, asRole("customer"));
     expect(await screen.findByRole("img", { name: "2 items in cart" })).toHaveTextContent("2");
     expect(cartCountLabel(1)).toBe("1 item in cart");
   });
   it("renders nothing for zero items", async () => {
     handlers.set("cart.badgeCount", () => ({ enabled: true, itemCount: 0 }));
-    renderUi(<CartBadge />);
+    renderUi(<CartBadge />, asRole("customer"));
     await waitFor(() => expect(calls.some((c) => c.path === "cart.badgeCount")).toBe(true));
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
+  it("does not query cart.badgeCount for staff or admin viewers", async () => {
+    for (const role of ["admin", "staff"] as const) {
+      calls.length = 0;
+      const view = renderUi(<CartBadge />, asRole(role));
+      await waitFor(() => expect(calls.some((c) => c.path === "platform.bootstrap")).toBe(true));
+      expect(calls.filter((c) => c.path.startsWith("cart."))).toEqual([]);
+      expect(screen.queryByRole("img")).not.toBeInTheDocument();
+      view.unmount();
+    }
+  });
+});
+
+describe("OrderFormCartBanner", () => {
+  it("passes children through without rendering quick-cart controls or querying catalog for staff and admin", async () => {
+    for (const role of ["admin", "staff"] as const) {
+      calls.length = 0;
+      const view = renderUi(
+        <OrderFormCartBanner>
+          <h1>Orders are placed for a customer</h1>
+        </OrderFormCartBanner>,
+        asRole(role),
+      );
+      expect(await screen.findByRole("heading", { level: 1, name: "Orders are placed for a customer" })).toBeInTheDocument();
+      await waitFor(() => expect(calls.some((c) => c.path === "platform.bootstrap")).toBe(true));
+      expect(screen.queryByRole("heading", { name: "Save items to your cart" })).not.toBeInTheDocument();
+      expect(calls.filter((c) => c.path.startsWith("cart.") || c.path === "orders.catalog.list")).toEqual([]);
+      view.unmount();
+    }
   });
 });
 
@@ -163,5 +224,16 @@ describe("cart page a11y", () => {
       { path: "/cart" },
     );
     await screen.findByRole("heading", { name: "Items" });
+  });
+
+  pageA11y("cart staff handoff", async () => {
+    document.title = "Cart · ReadyPackets";
+    renderUi(
+      <main>
+        <CartPage />
+      </main>,
+      { path: "/cart", ...asRole("admin") },
+    );
+    await screen.findByRole("heading", { level: 1, name: "Carts belong to customer accounts" });
   });
 });
