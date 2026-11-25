@@ -14,6 +14,7 @@ import { STANDARD_V3_DEFINITION, stageModelOf, workflowFormatOf } from "./stageM
 import { createStageStartup } from "./stageStartup.js";
 import { fakeIdentity, insertUser, ordersTestSchema } from "./testSupport.js";
 import { transferFormatVersionFor } from "./workflowTransfer.js";
+import { validateDraft } from "./workflowDesign.js";
 import { DEFAULT_WORKFLOW, workflowDefinitionSchema } from "./workflowTypes.js";
 
 describe("stored shapes", () => {
@@ -180,7 +181,7 @@ it("start-up work installs the standard phases once on a fresh install and is id
   }
 });
 
-it("start-up work on an existing install creates one phases draft and backfills paid orders without moving them", async () => {
+it("start-up work on an existing install creates no draft and backfills paid orders without moving them", async () => {
   const db = await createTestDb({ schema: ordersTestSchema });
   try {
     const h = createTestDeps({ db: db.db });
@@ -202,12 +203,8 @@ it("start-up work on an existing install creates one phases draft and backfills 
       db: db.db, clock: h.clock, audit: h.deps.audit, logger: h.deps.logger,
       paymentSummary: () => async (ids) => new Map(ids.map((id) => [id, { state: id === paidId ? "paid" : "unpaid" }])),
     });
-    expect(await startup.run()).toBe("upgrade_draft_created");
     expect(await startup.run()).toBe("nothing_to_do");
-    const drafts = await db.db.select().from(orderWorkflowDrafts);
-    expect(drafts).toHaveLength(1);
-    expect(drafts[0]!.workflowId).toBe(workflow!.id);
-    expect((drafts[0]!.definition as { stages?: unknown[] }).stages?.length).toBeGreaterThan(0);
+    expect(await db.db.select().from(orderWorkflowDrafts)).toHaveLength(0);
     expect((await db.db.select().from(orderWorkflowVersions)).length).toBe(1);
 
     expect(await startup.backfillPaid()).toBe(1);
@@ -215,6 +212,66 @@ it("start-up work on an existing install creates one phases draft and backfills 
     const rows = await db.db.select().from(orders);
     expect(rows.find((row) => row.publicId === paidId)).toMatchObject({ paymentState: "paid", statusKey: initial, workflowVersionId: version!.id });
     expect(rows.find((row) => row.publicId === openId)).toMatchObject({ paymentState: "not_required" });
+  } finally {
+    await db.cleanup();
+  }
+});
+
+it("phases notice actions: add the standard phases workflow and convert the default, admin only, audited, idempotent", async () => {
+  const db = await createTestDb({ schema: ordersTestSchema });
+  try {
+    const h = createTestDeps({ db: db.db });
+    const mod = createOrdersModule(h.deps);
+    Object.assign(h.services, { orders: mod, identity: fakeIdentity(h, db.db) });
+    const admin = await insertUser(h, db.db, { role: "admin" });
+    const staff = await insertUser(h, db.db, { role: "staff" });
+    const caller = createCallerFactory(ordersRouter);
+    const as = (session: SessionPrincipal) =>
+      caller({ services: h.services, session, request: newRequestContext("test"), transport: { issue() {}, clear() {} } });
+    // A classic default that uses the older status groups (format 2): converting must drop them.
+    const classic = workflowDefinitionSchema.parse({
+      ...DEFAULT_WORKFLOW,
+      phases: [{ key: "intake", label: "Intake" }],
+      states: DEFAULT_WORKFLOW.states.map((state, index) => (index === 0 ? { ...state, phase: "intake" } : state)),
+    });
+    const [workflow] = await db.db.insert(orderWorkflows).values({ publicId: ulid(), workflowKey: "standard", name: "Standard", isDefault: true }).$returningId();
+    const [version] = await db.db.insert(orderWorkflowVersions).values({ publicId: ulid(), workflowId: workflow!.id, versionNumber: 1, definition: classic }).$returningId();
+    await db.db.update(orderWorkflows).set({ currentVersionId: version!.id }).where(eq(orderWorkflows.id, workflow!.id));
+    const owner = as(admin.principal);
+
+    await expect(as(staff.principal).admin.workflows.phases.addStandard()).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(as(staff.principal).admin.workflows.phases.convertDefault()).rejects.toMatchObject({ code: "FORBIDDEN" });
+
+    h.audit.clear();
+    const added = await owner.admin.workflows.phases.addStandard();
+    expect(added.created).toBe(true);
+    expect(await owner.admin.workflows.phases.addStandard()).toEqual({ draftId: added.draftId, created: false });
+    const [addedRow] = await db.db.select().from(orderWorkflowDrafts).where(eq(orderWorkflowDrafts.publicId, added.draftId));
+    expect(addedRow).toMatchObject({ workflowId: null, workflowKey: "readypackets_standard", source: "standard" });
+    expect((addedRow!.definition as { stages?: unknown[] }).stages).toHaveLength(STANDARD_V3_DEFINITION.stages!.length);
+    expect(h.audit.named("workflow.draft.changed").at(-1)).toMatchObject({ reasonCode: "PHASES_WORKFLOW_DRAFT" });
+    expect(h.audit.recordedInTx.at(-1)).toBe(true);
+
+    const converted = await owner.admin.workflows.phases.convertDefault();
+    expect(converted.created).toBe(true);
+    expect(await owner.admin.workflows.phases.convertDefault()).toEqual({ draftId: converted.draftId, created: false });
+    const [convertedRow] = await db.db.select().from(orderWorkflowDrafts).where(eq(orderWorkflowDrafts.publicId, converted.draftId));
+    expect(convertedRow).toMatchObject({ workflowId: workflow!.id, baseVersionId: version!.id });
+    const definition = convertedRow!.definition as Parameters<typeof validateDraft>[0];
+    expect(definition.stages?.length).toBeGreaterThan(0);
+    expect(definition.phases ?? []).toHaveLength(0);
+    expect(validateDraft(definition).filter((issue) => issue.severity === "error")).toEqual([]);
+    expect(h.audit.named("workflow.draft.changed").at(-1)).toMatchObject({ reasonCode: "PHASES_CONVERT_DRAFT" });
+
+    // New workflow dialog: "phases" starts from the standard phases definition (stored source "standard").
+    const created = await owner.admin.workflows.drafts.create({ from: "phases", workflowKey: "phases_two", name: "Phases two" });
+    const [createdRow] = await db.db.select().from(orderWorkflowDrafts).where(eq(orderWorkflowDrafts.publicId, created.publicId));
+    expect(createdRow!.source).toBe("standard");
+    expect((createdRow!.definition as { stages?: unknown[] }).stages).toHaveLength(STANDARD_V3_DEFINITION.stages!.length);
+
+    // Existing workflows are never touched.
+    expect(await db.db.select().from(orderWorkflowVersions)).toHaveLength(1);
+    expect((await db.db.select().from(orderWorkflows))).toHaveLength(1);
   } finally {
     await db.cleanup();
   }

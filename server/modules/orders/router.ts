@@ -173,6 +173,15 @@ const workflowsAdmin = router({
     .use(requireCapability("workflows.manage"))
     .input(z.strictObject({ versionId: id }))
     .query(({ ctx, input }) => ctx.services.orders.workflows.getVersion(input.versionId)),
+  /** Increment 07 QA: the phases notice on /admin/workflows (drafts only; never publishes or edits a workflow). */
+  phases: router({
+    addStandard: adminProcedure
+      .use(requireCapability("workflows.manage"))
+      .mutation(({ ctx }) => ctx.services.orders.workflows.addPhasesWorkflow(ctx.session)),
+    convertDefault: adminProcedure
+      .use(requireCapability("workflows.manage"))
+      .mutation(({ ctx }) => ctx.services.orders.workflows.convertDefaultToPhases(ctx.session)),
+  }),
   drafts: router({
     list: adminProcedure.use(requireCapability("workflows.manage")).query(({ ctx }) => ctx.services.orders.workflows.listDrafts()),
     get: adminProcedure
@@ -183,7 +192,8 @@ const workflowsAdmin = router({
       .use(requireCapability("workflows.manage"))
       .input(
         z.strictObject({
-          from: z.enum(WORKFLOW_DRAFT_SOURCES),
+          // Increment 07 QA: "phases" = the ReadyPackets phases workflow (stored with source "standard").
+          from: z.enum([...WORKFLOW_DRAFT_SOURCES, "phases"]),
           copyVersionId: id.optional(),
           workflowId: id.optional(),
           workflowKey: statusKey.optional(),

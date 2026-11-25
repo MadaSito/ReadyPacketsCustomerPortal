@@ -8,7 +8,7 @@
  * Data only: no code, scripts, expressions or URLs.
  */
 import { z } from "zod";
-import { MAX_STAGES, validateStages, workflowStagesSchema } from "../../../shared/workflowStages.js";
+import { deriveStages, MAX_STAGES, validateStages, workflowStagesSchema } from "../../../shared/workflowStages.js";
 import { isOrderFileFolderTemplate } from "../../../shared/orderFileFolder.js";
 import {
   ACK_BODY_MAX,
@@ -452,6 +452,16 @@ function validateDraftStages(definition: WorkflowDraftDefinition, statusIndex: M
 /** A published definition as an editable draft (deep copy; requiresNote made explicit). */
 export function toDraft(definition: WorkflowDefinition): WorkflowDraftDefinition {
   return draftDefinitionSchema.parse(JSON.parse(JSON.stringify(definition)));
+}
+
+/**
+ * Increment 07 QA: a classic definition converted to phases. Stages are derived from the phase groups (or statuses),
+ * and the classic groups are removed in the same step: a draft may not use both (STAGES_WITH_PHASES).
+ */
+export function toPhasesDraft(definition: WorkflowDefinition): WorkflowDraftDefinition {
+  const stages = deriveStages(definition);
+  const { phases: _classic, ...rest } = definition;
+  return toDraft({ ...rest, states: definition.states.map(({ phase: _group, ...state }) => state), stages } as WorkflowDefinition);
 }
 
 /** Drops layout entries for keys that are not states (stale positions after renames/removals). */
