@@ -370,6 +370,11 @@ Details are in `docs/session-logs/2026-11-22-session-03.md`.
   not started; the pipeline switch was turned off afterwards. webhook.site is a request inspector, so this
   proves delivery and format, not the production receiver.
 
+## Verification for increment 07
+
+> **PLACEHOLDER — PENDING-LEAD.** platform_engineer has not seen any increment 07 check run. Increment 07
+> is in progress; nothing in it is verified until /root replaces this block with the checks it ran and saw.
+
 ## Verified for increment 06 (integrator's own runs)
 
 The lead checked these live in a real Chromium browser, against a QA build with strict CSP and synthetic data, on 2026-11-23.

@@ -208,6 +208,28 @@ Verification status:
 | Receipts and small totals (`compliance`, `payments`, `jobs`) | One receipt per confirmed payment, with a PDF snapshot, e-mail and portal list. Amounts below the provider minimum are waived or blocked ([ADR 0054](../adr/0054-receipts.md)). | `payments.receipts`, on. `payments.small_totals`, `waive`. |
 | Discount limits (`promotions`, `cart`) | Percentages with two decimals up to 100 %, a fixed cap, zero totals and the new `set_total` kind. | `promotions.policy` (old values still parse). |
 
+## Increment 07: phases-first workflow, statuses, progress, Stripe completion, SAML, Microsoft 365 sync
+
+The owner requested this on 2026-11-24 (prompt 26). The contract is [INCREMENT_07_CONTRACT.md](../engineering/INCREMENT_07_CONTRACT.md), decisions D1–D13, recorded in ADRs 0055–0062.
+
+**Naming.** Users read "Phase"; code says `stages`.
+
+**Defaults.** Safe features are on after upgrade. Anything that sends something outside, or changes orders by itself, is off until configured.
+
+_Verification status: PENDING-LEAD — /root supplies the verified / not verified facts._
+
+| Area | What it does | Switch and guard |
+| --- | --- | --- |
+| Phases (`orders`) | Definition format 3 `stages[]` on the existing slots, locks and gates; `order_stage_progress`; customer wizard; questions and admin tasks ([ADR 0055](../adr/0055-phases-first-order-workflow.md)). | On. Uses `orders.stage.review`, `orders.stage.reopen` (step-up) and `orders.questions.manage`. |
+| Statuses and attention (`orders`) | `order_status_catalog`; `orders.attention`; filter chips ([ADR 0056](../adr/0056-status-catalogue-and-attention.md)). | On. `orders.statuses.manage` (step-up). |
+| Progress (`orders`, UI) | `orders.progress_percent` is the higher of the derived and explicit values; `OrderProgress` progressbar. | On. |
+| Phase actions and rules (`automations`) | `order_stage_runs`, `order_completion_jobs`, new rule triggers and actions; no unattended status change ([ADR 0057](../adr/0057-phase-actions-completion-rules.md)). | Bundles empty = nothing runs; `orders.stage.run` (step-up). |
+| Alerts and webhooks (`opsAlerts`, `integrations`) | `operational_alerts`; P101 / P201 auto-queue; signing; delivery controls ([ADR 0058](../adr/0058-outbound-webhooks-and-operational-alerts.md)). | `ops.alerts.read` / `ops.alerts.manage`; auto-queue and reminders off. |
+| Phase files (`files`) | `stage_key` on files, governance, playback grants, `file_archives` ([ADR 0059](../adr/0059-phase-bound-files.md)). | Phase ZIP on; whole-order ZIP `files.archive.order` (step-up). |
+| Stripe completion (`payments`, `compliance`) | `orders.payment_state`, `paid_at`; `/admin/payments/setup`; `payment_webhook_rejections` ([ADR 0060](../adr/0060-stripe-completion-and-payment-state.md)). | Provider configuration as before. |
+| Microsoft 365 sync (`storage`, `sharepoint`) | One-way per phase; three targets; write test; resync ([ADR 0061](../adr/0061-microsoft-365-file-sync.md)). | Targets off until configured. |
+| SAML (`identity`) | Entra SAML SP with mandatory checks and MFA modes ([ADR 0062](../adr/0062-saml-entra-id.md)). | Off until configured; `/admin/settings/sso`. |
+
 ## Deployment profiles
 
 | Profile | Purpose | Session transport | Routing |

@@ -18,6 +18,56 @@ procedure.
 
 - The owner confirmed the redelivery and retry rules of ADR 0041 (no code change).
 
+## Increment 07
+
+<!-- platform_engineer: drafted from INCREMENT_07_CONTRACT.md; corrected against owners' API.md as packages land. Verification is recorded in STATUS.md (PENDING-LEAD). -->
+
+### Added
+
+- **Phases-first workflows** ([ADR 0055](docs/adr/0055-phases-first-order-workflow.md)):
+  - definition format 3, with up to 20 named phases the customer sees;
+  - a customer phase wizard with Next and Submit and lock, acknowledgement evidence, staff review and an administrator reopen with a reason;
+  - questions with versioned answers, and an administrator checklist.
+  - Formats 1 and 2 keep working and show derived phases. Existing orders are never re-pinned.
+- **Progress bar** on every order: the weighted share of completed phases, or an explicit percentage, whichever is higher. It has no animation under reduced motion.
+- **Status catalogue** (`/admin/workflows/statuses`, [ADR 0056](docs/adr/0056-status-catalogue-and-attention.md)) and the "Awaiting staff review" / "Awaiting customer response" filters on `/admin/orders`.
+- **Phase actions** ([ADR 0057](docs/adr/0057-phase-actions-completion-rules.md)):
+  - a human-confirmed bundle of status, completion (fixed or a range drawn once), e-mail, webhook and dashboard alert, with an optional delay of up to 30 days;
+  - rule ordering and new payment, intake and phase triggers;
+  - unattended rules never change status.
+- **Operational alerts** (`/admin/alerts` and an `/admin` widget, [ADR 0058](docs/adr/0058-outbound-webhooks-and-operational-alerts.md)):
+  - P101 / P201 lifecycle auto-queue, opt-in per workflow;
+  - optional HMAC signing on production endpoints;
+  - stop, retry and redeliver on deliveries.
+- **Phase-bound files** ([ADR 0059](docs/adr/0059-phase-bound-files.md)):
+  - per-phase limits, with audio duration checked on the server;
+  - playback grants with range requests;
+  - phase ZIP, and a whole-order ZIP for administrators.
+- **Stripe completion** (`/admin/payments/setup`, [ADR 0060](docs/adr/0060-stripe-completion-and-payment-state.md)):
+  - an order payment state, and a "Pay online" button on invoices;
+  - bank debits wait for the asynchronous success event;
+  - a setup checklist, self-tests and a rejections log.
+- **Microsoft 365 / SharePoint sync** ([ADR 0061](docs/adr/0061-microsoft-365-file-sync.md)):
+  - one-way, per phase, with originals, conversion-staging and intake-delivery targets under `CustomerName-CustomerID/OrderNumber`;
+  - a write test, and resync with a dry run.
+- **SAML 2.0 with Microsoft Entra ID** (`/admin/settings/sso`, [ADR 0062](docs/adr/0062-saml-entra-id.md)):
+  - SP-initiated, with signed assertions and pinned certificates;
+  - MFA modes `claim` (default), `entra` (behind a typed confirmation) and `portal`;
+  - a local administrator with MFA always remains.
+
+### Not built
+
+- **Document conversion profiles** (they need LibreOffice or Ghostscript on the server).
+- **Two-way SharePoint sync.**
+- **Unattended status changes.**
+- **Some SAML features:** IdP-initiated SAML, single logout and encrypted assertions.
+- **Stripe Elements.**
+
+### Operations
+
+- **Migration `0007_increment_07`**: additive. Details: _PENDING-LEAD — table and column counts._
+- **Upgrade notes:** _PENDING — section in `docs/operations/UPGRADE.md`, written with http_security_engineer (SAML ACS and metadata proxy paths, range pass-through)._
+
 ## Increment 06
 
 <!-- platform_engineer: from INCREMENT_06_CONTRACT.md and the owners' handoffs. Verification is recorded in docs/application-context/STATUS.md; PR #13. -->
