@@ -15,6 +15,7 @@ const attemptStates: Record<PaymentAttemptStatus, string> = {
 };
 const webhookStates: Record<PaymentWebhookStatus, string> = {
   processed: "Processed", ignored: "Ignored", retry_pending: "Retry pending", verification_mismatch: "Verification mismatch",
+  awaiting_settlement: "Awaiting settlement", attention_required: "Attention required",
 };
 function options(states: Record<string, string>) {
   return [{ value: "", label: "All statuses" }, ...Object.entries(states).map(([value, label]) => ({ value, label }))];
@@ -24,8 +25,8 @@ function attemptBadge(status: PaymentAttemptStatus) {
     status === "redirected" ? "info" : "neutral"}>{attemptStates[status]}</Badge>;
 }
 function webhookBadge(status: PaymentWebhookStatus) {
-  return <Badge tone={status === "processed" ? "success" : status === "verification_mismatch" ? "danger" :
-    status === "retry_pending" ? "warning" : "neutral"}>{webhookStates[status]}</Badge>;
+  return <Badge tone={status === "processed" ? "success" : status === "verification_mismatch" || status === "attention_required" ? "danger" :
+    status === "retry_pending" || status === "awaiting_settlement" ? "warning" : "neutral"}>{webhookStates[status]}</Badge>;
 }
 function providerBadge(provider: ActivePaymentProvider, environment: "test" | "live") {
   return <span className="flex flex-wrap items-center gap-2">{providerLabels[provider]}

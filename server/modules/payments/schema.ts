@@ -11,12 +11,14 @@ import {
   char,
   foreignKey,
   index,
+  int,
   mysqlEnum,
   mysqlTable,
   text,
   uniqueIndex,
   varchar,
 } from "drizzle-orm/mysql-core";
+import { sql } from "drizzle-orm";
 import {
   amountMinorColumn,
   createdAtColumn,
@@ -54,8 +56,13 @@ export const PAYMENT_WEBHOOK_STATUSES = [
   "ignored",
   "retry_pending",
   "verification_mismatch",
+  "awaiting_settlement",
+  "attention_required",
 ] as const;
 export type PaymentWebhookStatus = (typeof PAYMENT_WEBHOOK_STATUSES)[number];
+
+export const PAYMENT_WEBHOOK_ENV_HINTS = ["test", "live", "unknown"] as const;
+export type PaymentWebhookEnvHint = (typeof PAYMENT_WEBHOOK_ENV_HINTS)[number];
 
 export const PAYMENT_REFUND_STATUSES = [
   "pending",
@@ -147,6 +154,10 @@ export const paymentWebhookEvents = mysqlTable(
     providerRefundRef: varchar("provider_refund_ref", { length: 128 }),
     status: mysqlEnum("status", PAYMENT_WEBHOOK_STATUSES).notNull(),
     reasonCode: varchar("reason_code", { length: 64 }),
+    /** Safe server-owned error code when post-verify `fetchPayment` / `lookupRefund` fails or requires attention. */
+    lastErrorCode: varchar("last_error_code", { length: 64 }),
+    /** Bounded verification/reconciliation attempt counter (default 1). */
+    attemptCount: int("attempt_count", { unsigned: true }).notNull().default(1),
     occurredAt: utcDateTime("occurred_at").notNull(),
     receivedAt: utcDateTime("received_at").notNull(),
     processedAt: utcDateTime("processed_at"),
@@ -232,6 +243,29 @@ export const paymentRefunds = mysqlTable(
   ],
 );
 
+export const paymentWebhookRejections = mysqlTable(
+  "payment_webhook_rejections",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    provider: mysqlEnum("provider", ACTIVE_PAYMENT_PROVIDERS).notNull(),
+    environmentHint: mysqlEnum("environment_hint", PAYMENT_WEBHOOK_ENV_HINTS).notNull().default("unknown"),
+    /** Safe server-owned reason code (`^[A-Z][A-Z0-9_]{0,63}$`); never raw payload, headers, IP, or secrets. */
+    reasonCode: varchar("reason_code", { length: 64 }).notNull(),
+    httpStatus: int("http_status", { unsigned: true }).notNull(),
+    /** Optional observed timestamp skew in seconds when `STRIPE_TIMESTAMP_OUT_OF_RANGE` / `SQUARE_TIMESTAMP_OUT_OF_RANGE`. */
+    skewSeconds: int("skew_seconds"),
+    receivedAt: utcDateTime("received_at")
+      .notNull()
+      .default(sql`CURRENT_TIMESTAMP(3)`),
+  },
+  (t) => [
+    index("pmt_wh_rej_rec_idx").on(t.receivedAt, t.id),
+    index("pmt_wh_rej_prov_rec_idx").on(t.provider, t.receivedAt, t.id),
+  ],
+);
+
 export type PaymentAttemptRow = typeof paymentAttempts.$inferSelect;
 export type PaymentWebhookEventRow = typeof paymentWebhookEvents.$inferSelect;
 export type PaymentRefundRow = typeof paymentRefunds.$inferSelect;
+export type PaymentWebhookRejectionRow = typeof paymentWebhookRejections.$inferSelect;
