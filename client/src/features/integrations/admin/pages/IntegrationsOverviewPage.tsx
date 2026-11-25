@@ -72,8 +72,8 @@ const META: Record<
     icon: FileStack,
     href: "/admin/storage",
     manage: "Configure storage",
-    secondaryHref: "/admin/storage/sharepoint-orders",
-    secondaryLabel: "SharePoint folders",
+    secondaryHref: "/admin/storage/file-sync",
+    secondaryLabel: "File sync",
     blurb: "Managed customer order folder sync with Microsoft 365 using Entra Sites.Selected least-privilege grants.",
   },
 };

@@ -208,36 +208,6 @@ export const DEFAULT_STRIPE_CONFIG: StripeConfigSetting = {
   webhookToleranceSeconds: 300,
 };
 
-export const samlScaffoldSettingSchema = z.strictObject({
-  idpEntityId: z.string().trim().max(255),
-  idpSsoUrl: z
-    .string()
-    .trim()
-    .max(500)
-    .refine((v) => {
-      if (v === "") return true;
-      try {
-        const u = new URL(v);
-        return u.protocol === "https:" && !u.username && !u.password;
-      } catch {
-        return false;
-      }
-    }, "IdP SSO URL must be an HTTPS URL without credentials."),
-  spEntityId: z.string().trim().max(255),
-  nameIdFormat: z.enum([
-    "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
-    "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
-  ]),
-});
-export type SamlScaffoldSetting = z.infer<typeof samlScaffoldSettingSchema>;
-
-export const DEFAULT_SAML_SCAFFOLD: SamlScaffoldSetting = {
-  idpEntityId: "",
-  idpSsoUrl: "",
-  spEntityId: "",
-  nameIdFormat: "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
-};
-
 const FORBIDDEN_CUSTOM_WEBHOOK_HEADERS = new Set([
   "host",
   "content-length",
@@ -357,12 +327,15 @@ export const INTEGRATIONS_POSTHOG_FLAG = defineFeatureFlag({
   description: "Enable consent-gated PostHog events on allowlisted non-sensitive public routes only.",
 });
 
+const PAYMENTS_SETUP_MANAGED_BY = { label: "Payment setup", href: "/admin/payments/setup" } as const;
+
 export const INTEGRATIONS_STRIPE_FLAG = defineFeatureFlag({
   flag: "integrations.stripe",
   owner: "integrations",
   group: "integrations",
-  label: "Stripe webhook adapter",
-  description: "Enable signature-verified Stripe payment webhook ingestion.",
+  label: "Inert Stripe webhook diagnostic receiver",
+  description:
+    "Diagnostic signature-verification flag for /api/integrations/webhooks/stripe; live Stripe Checkout and webhooks are configured in Payment setup.",
 });
 
 export const INTEGRATIONS_SMTP_CONFIG = defineSetting({
@@ -475,48 +448,43 @@ export const INTEGRATIONS_STRIPE_CONFIG = defineSetting({
   key: "integrations.stripe.config",
   owner: "integrations",
   group: "integrations",
-  label: "Stripe adapter settings",
-  description: "Non-secret Stripe publishable key and webhook timestamp tolerance.",
+  label: "Inert Stripe webhook diagnostic settings",
+  description:
+    "Non-secret parameters for the inert /api/integrations/webhooks/stripe signature-verification receiver; live Stripe Checkout is configured in Payment setup.",
   schema: stripeConfigSettingSchema,
   default: DEFAULT_STRIPE_CONFIG,
   sensitivity: "internal",
+  managedBy: PAYMENTS_SETUP_MANAGED_BY,
 });
 
 export const INTEGRATIONS_STRIPE_SECRET_KEY = defineSecret({
   key: "integrations.stripe.secret_key",
   owner: "integrations",
   group: "integrations",
-  label: "Stripe secret key",
-  description: "Encrypted Stripe API secret key (rk_ or sk_).",
+  label: "Inert Stripe diagnostic key",
+  description:
+    "Optional diagnostic Stripe key for the inert integrations webhook receiver; live Stripe keys are configured in Payment setup.",
   schema: z
     .string()
     .min(12)
     .max(256)
     .refine((v) => /^(?:sk|rk)_(?:test|live)_[A-Za-z0-9]{10,220}$/.test(v), "Invalid Stripe secret key format."),
+  managedBy: PAYMENTS_SETUP_MANAGED_BY,
 });
 
 export const INTEGRATIONS_STRIPE_WEBHOOK_SECRET = defineSecret({
   key: "integrations.stripe.webhook_secret",
   owner: "integrations",
   group: "integrations",
-  label: "Stripe webhook signing secret",
-  description: "Encrypted Stripe webhook endpoint signing secret (whsec_).",
+  label: "Inert Stripe diagnostic webhook secret",
+  description:
+    "Optional signing secret (whsec_) for the inert /api/integrations/webhooks/stripe diagnostic receiver; live Stripe webhook secrets are configured in Payment setup.",
   schema: z
     .string()
     .min(12)
     .max(256)
     .refine((v) => /^whsec_[A-Za-z0-9_]{10,220}$/.test(v), "Invalid Stripe webhook signing secret format."),
-});
-
-export const INTEGRATIONS_SAML_SCAFFOLD = defineSetting({
-  key: "integrations.saml.scaffold",
-  owner: "integrations",
-  group: "integrations",
-  label: "SAML SSO planning metadata (disabled)",
-  description: "Non-active metadata stored for future SAML 2.0 support; SAML sign-in is disabled in this release.",
-  schema: samlScaffoldSettingSchema,
-  default: DEFAULT_SAML_SCAFFOLD,
-  sensitivity: "internal",
+  managedBy: PAYMENTS_SETUP_MANAGED_BY,
 });
 
 export const INTEGRATIONS_PRODUCTION_FLAG = defineFeatureFlag({

@@ -5,6 +5,7 @@ import type { ReactElement } from "react";
 import superjson from "superjson";
 import { describe, expect, it } from "vitest";
 import type { AppRouter } from "@server/trpc/root";
+import { ALL_ROUTES } from "@/app/registry";
 import { RouteFocus } from "@/app/RouteFocus";
 import type { MeResult } from "@/lib/authApi";
 import { TRPCProvider } from "@/lib/trpc";
@@ -145,7 +146,7 @@ describe("Integrations overview", () => {
     const spCard = await card("Microsoft 365 / SharePoint Sync");
     expect(within(spCard).queryByText("Not available in this release")).toBeNull();
     expect(within(spCard).getByRole("link", { name: /Configure storage/ })).toHaveAttribute("href", "/admin/storage");
-    expect(within(spCard).getByRole("link", { name: /SharePoint folders/ })).toHaveAttribute("href", "/admin/storage/sharepoint-orders");
+    expect(within(spCard).getByRole("link", { name: /File sync/ })).toHaveAttribute("href", "/admin/storage/file-sync");
 
     const samlCard = await card("Enterprise SAML 2.0 SSO");
     expect(within(samlCard).getByRole("link", { name: /Configure single sign-on/ })).toHaveAttribute("href", "/admin/sso");
@@ -156,6 +157,21 @@ describe("Integrations overview", () => {
     expect(screen.getByRole("link", { name: "Review allowlist" })).toHaveAttribute("href", "/admin/integrations/egress");
     expect(container.querySelectorAll("h1")).toHaveLength(1);
     await expectNoAxeViolations(container);
+  });
+
+  it("resolves every href on the Integrations hub to a registered route in the app route table", async () => {
+    renderPage(<IntegrationsOverviewPage />, { "integrations.admin.providers": () => providers });
+    await screen.findByRole("heading", { level: 1, name: "Integrations" });
+
+    const registeredPaths = new Set(ALL_ROUTES.map((route) => route.path));
+    const links = screen.getAllByRole("link");
+    expect(links.length).toBeGreaterThanOrEqual(12);
+
+    for (const link of links) {
+      const href = link.getAttribute("href");
+      expect(href, `expected link "${link.textContent ?? ""}" to carry an href`).toBeTruthy();
+      expect(registeredPaths.has(href!), `hub link "${link.textContent ?? ""}" -> "${href}" is not a registered route`).toBe(true);
+    }
   });
 });
 

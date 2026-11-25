@@ -143,25 +143,36 @@ describe("integrations journey (assembled system)", () => {
     expect(Browser.ok(await admin.browser.query<{ passwordConfigured: boolean }>("integrations.admin.smtp.get")).passwordConfigured).toBe(false);
   });
 
-  it("reports Stripe, SAML, and SharePoint as available-but-disabled adapters and refuses to enable Stripe before setup prerequisites", async () => {
+  it("reports truthful live states for Stripe, SAML SSO, and SharePoint file sync and directs Stripe activation to Payment Setup", async () => {
     const providers = Browser.ok(
-      await admin.browser.query<{ key: string; scaffoldOnly: boolean; state: string; verified: boolean }[]>(
+      await admin.browser.query<{ key: string; scaffoldOnly: boolean; state: string; verified: boolean; summary: string }[]>(
         "integrations.admin.providers",
       ),
     );
-    for (const key of ["stripe", "saml", "sharepoint"]) {
-      expect(providers.find((p) => p.key === key)).toMatchObject({
-        scaffoldOnly: false,
-        state: "disabled",
-        verified: false,
-      });
-    }
+    expect(providers.find((p) => p.key === "stripe")).toMatchObject({
+      scaffoldOnly: false,
+      state: "disabled",
+      verified: false,
+    });
+    const saml = providers.find((p) => p.key === "saml");
+    expect(saml).toMatchObject({
+      scaffoldOnly: false,
+      state: "not_configured",
+      verified: false,
+    });
+    expect(saml?.summary).toContain("OpenID Connect (Entra ID) · MFA claim required");
 
-    const legacyScaffoldEnable = await admin.browser.mutate("integrations.admin.stripe.update", {
+    expect(providers.find((p) => p.key === "sharepoint")).toMatchObject({
+      scaffoldOnly: false,
+      state: "not_configured",
+      verified: false,
+    });
+
+    const legacyDiagnosticEnable = await admin.browser.mutate("integrations.admin.stripe.update", {
       enabled: true,
       publishableKey: "",
     });
-    expect(legacyScaffoldEnable.error?.safe?.reasonCode).toBe("STRIPE_NOT_AVAILABLE_IN_RELEASE");
+    expect(legacyDiagnosticEnable.error?.safe?.reasonCode).toBe("STRIPE_MANAGED_IN_PAYMENTS");
 
     const readiness = Browser.ok(
       await admin.browser.query<{

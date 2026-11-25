@@ -76,17 +76,6 @@ const updateStripeInputSchema = z.strictObject({
   webhookSecret: z.string().max(256).nullable().optional(),
 });
 
-const updateSamlInputSchema = z.strictObject({
-  idpEntityId: z.string().trim().max(255),
-  idpSsoUrl: z.string().trim().max(500),
-  spEntityId: z.string().trim().max(255),
-  nameIdFormat: z.enum([
-    "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
-    "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
-  ]),
-  enabled: z.boolean().optional(),
-});
-
 const createEgressRuleSchema = z.strictObject({
   purpose: z.enum(EGRESS_PURPOSES),
   matchType: z.enum(["host", "ip", "cidr"]),
@@ -300,17 +289,6 @@ export const integrationsRouter = router({
       update: manageProcedure
         .input(updateStripeInputSchema)
         .mutation(({ ctx, input }) => ctx.services.integrations.stripe.updateConfig(ctx.session, input)),
-    }),
-
-    saml: router({
-      get: adminProcedure.query(({ ctx }) => ctx.services.integrations.scaffolds.getSamlScaffold()),
-      updateMetadata: manageProcedure
-        .input(updateSamlInputSchema)
-        .mutation(({ ctx, input }) => ctx.services.integrations.scaffolds.updateSamlMetadata(ctx.session, input)),
-    }),
-
-    sharepoint: router({
-      get: adminProcedure.query(({ ctx }) => ctx.services.integrations.scaffolds.getSharePointScaffold()),
     }),
 
     egress: router({

@@ -153,9 +153,12 @@ export type ProviderState = "disabled" | "not_configured" | "configured" | "degr
   - When `consent.enabled()` (`privacy.consent` feature on): suppresses the legacy banner, gates PostHog on `consent.has("analytics")` (`opt_in_capturing` / `opt_out_capturing`, cookieless fetch transport), gates Clarity on `consent.has("session_replay")` (`clarity("consent")` on grant, `clarity("consent", false)` + script/realm teardown on withdrawal).
   - When `consent.enabled()` is false: preserves existing strict opt-in behaviour.
 
-### 1.6 Disabled Scaffolds (`stripe`, `saml`, `sharepoint`) & Production Webhooks (`production`)
+### 1.6 Live Hub Provider Derivations (`stripe`, `saml`, `sharepoint`) & Production Webhooks (`production`)
 
-- **`stripe`**, **`saml`**, **`sharepoint`** remain backwards-compatible scaffolds (`STRIPE_LEDGER_MUTATION_ENABLED = false`; console links administrators to `/admin/payments` for hosted checkout).
+- **`stripe`**, **`saml`**, and **`sharepoint`** report live operational states (`scaffoldOnly: false`) derived from their owning modules (Increment 03 planning scaffolds `scaffolds.ts`, `admin.saml.*`, and `admin.sharepoint.get` have been removed):
+  - **`saml`**: reads `services.identity.sso.statusSummary()` (`/admin/sso`), reporting `not_configured` (no tenant/certificate), `disabled` (configured, switched off), `degraded` (enabled without verified sign-in/metadata check or SAML signing certificate expiring within 30 days), `failing` (no valid certificate or incomplete enabled deployment), and `configured` + `verified: true` (`ok`) when enabled with a valid certificate (>30 days) and a succeeded sign-in or metadata check; `summary` always names protocol and MFA mode (`"Portal MFA always"` / `"MFA claim required"` / `"Entra manages MFA"`).
+  - **`sharepoint`**: reads `services.storageConnections.fileSync.statusSummary()` (`/admin/storage` & `/admin/storage/file-sync`) combined with `microsoft_graph` and `microsoft_graph_upload` egress presets and `verifySitesSelectedWrite` probe (`not_configured`, `disabled`, `degraded`, `failing`, and `configured` + `verified: true` / `ok`).
+  - **`stripe`**: reads `services.payments.healthCounts()`, `"payments.config"`, and `egress.isPresetEnabled("stripe")` (`/admin/payments/setup`); the legacy `stripe.ts` diagnostic webhook receiver keeps `STRIPE_LEDGER_MUTATION_ENABLED = false` and returns `STRIPE_MANAGED_IN_PAYMENTS` if `enabled: true` is requested directly.
 - **`production`** (`P101`, `P201`, and optional `P301` / `P401`) implements fenced outbox webhook delivery per `docs/integrations/PRODUCTION_WEBHOOKS.md` and Increment 04 Part B (Decision B4):
   ```ts
   export type ProductionPhase = "P101" | "P201" | "P301" | "P401";
@@ -390,7 +393,7 @@ export interface WebhooksService {
 
 All `admin.*` queries require `adminProcedure`. Step-up mutations re-validate sessions in-transaction via `identity.sessions.assertCurrent`.
 
-- **`publicAnalyticsConfig`**, **`admin.providers`**, **`admin.smtpReadiness`**, **`admin.smtp.*`**, **`admin.graph.*`**, **`admin.analytics.*`**, **`admin.stripe.*`**, **`admin.saml.*`**, **`admin.sharepoint.get`**, **`production.*`** — unchanged.
+- **`publicAnalyticsConfig`**, **`admin.providers`**, **`admin.smtpReadiness`**, **`admin.smtp.*`**, **`admin.graph.*`**, **`admin.analytics.*`**, **`admin.stripe.*`**, **`production.*`** — `admin.saml.*` and `admin.sharepoint.get` planning scaffolds removed in Increment 07; SSO is managed under `identity.sso.*` (`/admin/sso`) and SharePoint/Microsoft 365 file sync under `storageConnections.*` (`/admin/storage`, `/admin/storage/file-sync`).
 - **`admin.egress.*`** — `purpose` accepts all 15 `EGRESS_PURPOSES` (including `"square"`); `presetKey` accepts all 12 `EGRESS_PRESET_KEYS` (including `"stripe"`, `"square"`, `"square_sandbox"`, gated by `integrations.manage` or `payments.manage`).
 - **`admin.webhooks.settings.get`** (`query`, `adminProcedure`) -> `WebhooksSettingsView` (`{ enabled, retentionDays, autoDisableThreshold, deliveryTimeoutMs }`)
 - **`admin.webhooks.settings.update`** (`mutation`, `webhooks.manage` step-up) -> `WebhooksSettingsView`
@@ -420,7 +423,7 @@ All `admin.*` queries require `adminProcedure`. Step-up mutations re-validate se
 ## 3. Raw HTTP Routes
 
 - `server/modules/integrations/http.ts` (`registerSignedIntegrationWebhooks`, unchanged):
-  - `POST /api/integrations/webhooks/stripe` — legacy inert scaffold receiver.
+  - `POST /api/integrations/webhooks/stripe` — legacy inert diagnostic receiver (`STRIPE_INERT_DIAGNOSTIC_RECEIVER`; active Stripe payment webhooks are handled by `server/modules/payments`).
 - `server/modules/integrations/webhooks/http.ts` (mounted by `http_security_engineer` at `/api/webhooks/inbound`):
   - `export function createInboundWebhooksHttpRouter(services: Services): Router` (`Router({ caseSensitive: true, strict: true })`).
   - `POST /:endpointPublicId` — expects raw `Buffer` on `req.body` (max 256 KiB, no decompression, no session/CSRF/CORS), verifies HMAC-SHA256 signature and ±5m timestamp before JSON parse, deduplicates event ID, logs redacted encrypted envelope, and triggers automations only.

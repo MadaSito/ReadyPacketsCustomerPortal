@@ -1,16 +1,17 @@
 /**
- * Disabled Stripe Scaffold & Inert Signature-Verified Webhook (`services.integrations.stripe`).
+ * Inert Signature-Verified Stripe Diagnostic Webhook (`services.integrations.stripe`).
  *
- * Release posture & security invariants (binding architecture & integrator decision):
- *  - Stripe is a DISABLED SCAFFOLD ONLY in this release (`STRIPE_LEDGER_MUTATION_ENABLED === false`).
- *  - Cannot be enabled by any runtime setting or feature flag: `isOnlinePaymentConfigured()` always
- *    returns `false`, `updateConfig({ enabled: true, ... })` is refused with `STRIPE_NOT_AVAILABLE_IN_RELEASE`,
- *    and the admin surface reports `"Not available in this release"`.
- *  - No provider event can ever book, complete, or refund a payment in the compliance ledger; payments
- *    are recorded manually by authorized staff with `invoices.manage` + fresh step-up.
+ * Security invariants:
+ *  - Live Stripe Checkout and signed payment webhooks live in the `payments` module (`/admin/payments/setup`
+ *    and `POST /api/payments/webhooks/stripe`).
+ *  - This integrations receiver (`/api/integrations/webhooks/stripe`) is strictly an inert diagnostic
+ *    signature-verification endpoint (`STRIPE_LEDGER_MUTATION_ENABLED === false`): `isOnlinePaymentConfigured()`
+ *    on this diagnostic adapter always returns `false`, `updateConfig({ enabled: true, ... })` directs callers
+ *    to Payment Setup (`STRIPE_MANAGED_IN_PAYMENTS`), and no event on `/api/integrations/webhooks/stripe`
+ *    can ever book, complete, or refund a payment in the compliance ledger.
  *  - Keys (`secretKey`, `webhookSecret`) are stored exclusively via `defineSecret` (`FieldCrypto`
  *    AES-256-GCM at rest, non-exportable) and are write-only in administrative APIs.
- *  - `/api/integrations/webhooks/stripe` remains inert (`503`) when no signing secret is configured;
+ *  - `/api/integrations/webhooks/stripe` remains inert (`503`) when no diagnostic signing secret is configured;
  *    when a signing secret is configured for integration testing, it verifies `Stripe-Signature`
  *    (`t=...,v1=...` HMAC-SHA256 + replay window) over the raw `Buffer`, durably records the received
  *    event row (`status: "ignored"`) + audit note, and acknowledges with zero ledger effect.
@@ -35,19 +36,17 @@ import {
 } from "./settings.js";
 import type { ProviderState } from "./smtp.js";
 
-/** Compile-time constant: automatic provider ledger mutations are hard-disabled in this release. */
+/** Compile-time constant: the legacy integrations diagnostic receiver never mutates the compliance ledger. */
 export const STRIPE_LEDGER_MUTATION_ENABLED = false as const;
 
-export const STRIPE_RELEASE_BANNER =
-  "Not available in this release — online checkout and automatic ledger booking are disabled; staff record payments manually.";
+export const STRIPE_PAYMENTS_SETUP_NOTICE =
+  "Live Stripe Checkout and webhook processing are configured in Payment Setup (/admin/payments/setup); /api/integrations/webhooks/stripe is an inert signature-verification diagnostic receiver.";
 
 const STRIPE_VERIFICATION_NOTE =
-  "Disabled scaffold in this release (implemented signature-verified inert webhook receiver only; never mutates the compliance ledger and not exercised against live Stripe APIs).";
+  "Inert signature-verification diagnostic receiver (/api/integrations/webhooks/stripe); never mutates the compliance ledger. Configure live Stripe Checkout and webhooks in Payment Setup (/admin/payments/setup).";
 
 export interface StripeConfigView {
   enabled: false;
-  availableInRelease: false;
-  releaseBanner: string;
   configured: boolean;
   verified: boolean;
   state: ProviderState;
@@ -57,12 +56,13 @@ export interface StripeConfigView {
   webhookSecretConfigured: boolean;
   webhookToleranceSeconds: number;
   webhookPath: "/api/integrations/webhooks/stripe";
+  paymentsSetupPath: "/admin/payments/setup";
   lastCheckedAt: Date | null;
   verificationNote: string;
 }
 
 export interface UpdateStripeConfigInput {
-  /** Must not be `true`; attempting to enable Stripe throws `NOT_CONFIGURED / STRIPE_NOT_AVAILABLE_IN_RELEASE`. */
+  /** Must not be `true`; live Stripe activation lives in Payment Setup (`NOT_CONFIGURED / STRIPE_MANAGED_IN_PAYMENTS`). */
   enabled: boolean;
   publishableKey: string;
   webhookToleranceSeconds?: number;
@@ -171,17 +171,16 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
 
     return {
       enabled: false,
-      availableInRelease: false,
-      releaseBanner: STRIPE_RELEASE_BANNER,
       configured,
       verified,
       state: "disabled",
-      summary: STRIPE_RELEASE_BANNER,
+      summary: STRIPE_PAYMENTS_SETUP_NOTICE,
       publishableKey: cfg.publishableKey,
       secretKeyConfigured: hasSecretKey,
       webhookSecretConfigured: hasWebhookSecret,
       webhookToleranceSeconds: cfg.webhookToleranceSeconds,
       webhookPath: "/api/integrations/webhooks/stripe",
+      paymentsSetupPath: "/admin/payments/setup",
       lastCheckedAt: check?.lastCheckedAt ?? null,
       verificationNote: STRIPE_VERIFICATION_NOTE,
     };
@@ -189,7 +188,7 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
 
   return {
     async isOnlinePaymentConfigured(): Promise<boolean> {
-      // Compile-time disabled in this release regardless of stored settings or flags.
+      // Diagnostic integrations receiver never books payments; live Stripe Checkout lives in `payments`.
       return STRIPE_LEDGER_MUTATION_ENABLED;
     },
 
@@ -204,8 +203,8 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
       if (input.enabled) {
         throw new DomainError(
           "NOT_CONFIGURED",
-          "STRIPE_NOT_AVAILABLE_IN_RELEASE",
-          STRIPE_RELEASE_BANNER,
+          "STRIPE_MANAGED_IN_PAYMENTS",
+          STRIPE_PAYMENTS_SETUP_NOTICE,
         );
       }
 
@@ -275,7 +274,7 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
         await deps.audit.record(
           {
             category: "integration",
-            eventName: "integration.stripe.scaffold_updated",
+            eventName: "integration.stripe.diagnostic_updated",
             action: "update",
             outcome: "completed",
             severity: "INFO",
@@ -283,7 +282,6 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
             resource: { type: "integration_provider", publicId: "stripe" },
             attributes: {
               enabled: false,
-              available_in_release: false,
               secret_key_updated: input.secretKey !== undefined,
               webhook_secret_updated: input.webhookSecret !== undefined,
               tolerance_seconds: tolerance,
@@ -436,7 +434,7 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
             eventType: event.type,
             payloadSha256,
             status: "ignored",
-            reasonCode: "STRIPE_DISABLED_IN_RELEASE",
+            reasonCode: "STRIPE_INERT_DIAGNOSTIC_RECEIVER",
             providerTimestamp,
             processedAt: now,
             createdAt: now,
@@ -455,7 +453,7 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
           throw err;
         }
 
-        await checks.recordOutcome("stripe", "succeeded", "STRIPE_DISABLED_IN_RELEASE", tx);
+        await checks.recordOutcome("stripe", "succeeded", "STRIPE_INERT_DIAGNOSTIC_RECEIVER", tx);
 
         await deps.audit.record(
           {
@@ -464,7 +462,7 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
             action: "receive",
             outcome: "completed",
             severity: "INFO",
-            reasonCode: "STRIPE_DISABLED_IN_RELEASE",
+            reasonCode: "STRIPE_INERT_DIAGNOSTIC_RECEIVER",
             provider: "stripe",
             actor: { role: "system" },
             resource: { type: "integration_webhook", publicId: eventPublicId },
@@ -481,7 +479,7 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
           action: "receive",
           outcome: "completed",
           severity: "INFO",
-          reasonCode: "STRIPE_DISABLED_IN_RELEASE",
+          reasonCode: "STRIPE_INERT_DIAGNOSTIC_RECEIVER",
           provider: "stripe",
           actor: { role: "system" },
           resource: { type: "integration_webhook", publicId: eventPublicId },
@@ -492,7 +490,7 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
           accepted: true,
           duplicate: false,
           ledgerMutated: false as const,
-          reasonCode: "STRIPE_DISABLED_IN_RELEASE",
+          reasonCode: "STRIPE_INERT_DIAGNOSTIC_RECEIVER",
         };
       });
     },
