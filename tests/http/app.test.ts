@@ -928,9 +928,11 @@ describe("HTTP edge: bounds, errors, static assets and rendering", () => {
 
   it("nonces navigations to dotted mail-template identifiers without serving the shell for file probes", async () => {
     const h = harness({ staticDir: STATIC });
-    h.services.jobAdmin = { getBuiltinMailTemplates: () => [
-      { key: "auth.password_reset" }, { key: "orders.phase_update" },
-    ] } as typeof h.services.jobAdmin;
+    const jobAdmin: Pick<typeof h.services.jobAdmin, "getBuiltinMailTemplates"> = {
+      getBuiltinMailTemplates: () => ["auth.password_reset", "orders.phase_update"]
+        .map((key) => ({ key, vars: [], subject: () => "", text: () => "" })),
+    };
+    Object.assign(h.services, { jobAdmin });
     const get = (path: string) => h.http.get(path).set("Host", HOST).set("Accept", "text/html");
     for (const path of [
       "/admin/email-templates/auth.password_reset", "/admin/email-templates/auth%2Epassword_reset",
