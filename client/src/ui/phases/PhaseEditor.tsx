@@ -100,7 +100,7 @@ export function PhaseEditor({
     const original = originalKeys.get(cardId);
     const stage = value[index]!;
     return publishedKeys && original && publishedKeys.has(original) && stage.key !== original
-      ? `The published version uses the key ${original}. Its existing files and questions will show as "phase not specified" after publishing.`
+      ? `The published version uses the key ${original}. Orders already on that version keep it. In the new version, this phase gets a new identity: reports and integrations that use the old key stop matching it.`
       : undefined;
   };
 

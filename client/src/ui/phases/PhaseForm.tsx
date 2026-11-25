@@ -321,7 +321,8 @@ export function PhaseForm({ stage, index, onChange, statusOptions, takenStatuses
                 onChange={(event) => set("content", { markdown: event.currentTarget.value })} />
             </Field>
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <p className="text-xs text-muted" aria-live="polite">{stage.content.markdown.length} of {STAGE_MARKDOWN_MAX} characters</p>
+              <p className="text-xs text-muted">{stage.content.markdown.length} of {STAGE_MARKDOWN_MAX} characters</p>
+              <p className="sr-only" role="status">{stage.content.markdown.length >= STAGE_MARKDOWN_MAX ? "Character limit reached." : stage.content.markdown.length >= STAGE_MARKDOWN_MAX * 0.9 ? "Approaching the character limit." : ""}</p>
               <button type="button" className="min-h-11 rounded-[var(--radius-control)] px-2 text-sm font-semibold text-action underline underline-offset-2" aria-expanded={preview} aria-controls={id("preview")} onClick={() => setPreview((v) => !v)}>
                 {preview ? "Hide preview" : "Preview as the customer sees it"}
               </button>
