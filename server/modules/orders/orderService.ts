@@ -152,6 +152,32 @@ export function createOrderService(deps: OrderServiceDeps) {
   }
 
   /**
+   * Lead QA: a phase with customer work passed by a status change before the customer submitted or finished it.
+   * Same transaction as the status change; the status history row carries the same who/when.
+   */
+  async function auditPassedByStatus(
+    tx: Tx,
+    stageKeys: string[] | undefined,
+    input: { actor: Parameters<AuditEmitter["record"]>[0]["actor"]; orderPublicId: string; fromStatus: string; toStatus: string; reasonCode: string },
+  ) {
+    for (const stageKey of stageKeys ?? []) {
+      await deps.audit.record(
+        {
+          category: "business",
+          eventName: "order.stage.passed_by_status",
+          action: "update",
+          outcome: "completed",
+          actor: input.actor,
+          resource: { type: "order", publicId: input.orderPublicId },
+          reasonCode: input.reasonCode,
+          attributes: { stage_key: stageKey, from_status: input.fromStatus, to_status: input.toStatus, submitted: "false" },
+        },
+        tx,
+      );
+    }
+  }
+
+  /**
    * Authorization and projection read from ONE consistent snapshot (O-02): a transfer or grant revoke that
    * commits after the snapshot is invisible to both, so a former owner/grantee can never see post-revocation
    * data. No row locks. (Not `accessMode: "read only"`: Drizzle renders it with the snapshot clause as invalid
@@ -1130,7 +1156,8 @@ export function createOrderService(deps: OrderServiceDeps) {
         );
       }
       await emitChange(tx, { orderId: row.id, orderPublicId: row.publicId, kind: "status_changed" });
-      await deps.stageRuntime?.afterStatusChangeInTx(tx, { orderId: row.id, bound, fromStatus: row.statusKey, toStatus: input.toStatus });
+      const passedApply = await deps.stageRuntime?.afterStatusChangeInTx(tx, { orderId: row.id, bound, fromStatus: row.statusKey, toStatus: input.toStatus });
+      await auditPassedByStatus(tx, passedApply?.passedWithoutSubmission, { actor, orderPublicId: row.publicId, fromStatus: row.statusKey, toStatus: input.toStatus, reasonCode: input.reasonCode });
       return { fromStatus: row.statusKey, toStatus: input.toStatus, version: row.version + 1, notify, view: { ...view, statusKey: input.toStatus, version: row.version + 1 }, bound };
     },
 
@@ -1188,7 +1215,8 @@ export function createOrderService(deps: OrderServiceDeps) {
             noteId: note?.id ?? null,
             occurredAt: now,
           });
-          await deps.stageRuntime?.afterStatusChangeInTx(tx, { orderId: view.id, bound, fromStatus: view.statusKey, toStatus: transition.to });
+          const passed = await deps.stageRuntime?.afterStatusChangeInTx(tx, { orderId: view.id, bound, fromStatus: view.statusKey, toStatus: transition.to });
+          await auditPassedByStatus(tx, passed?.passedWithoutSubmission, { actor: actorOf(principal), orderPublicId: view.publicId, fromStatus: view.statusKey, toStatus: transition.to, reasonCode: "TRANSITION" });
           await deps.audit.record(
             {
               category: "business",
@@ -1296,7 +1324,8 @@ export function createOrderService(deps: OrderServiceDeps) {
           noteId: note?.id ?? null,
           occurredAt: now,
         });
-        await deps.stageRuntime?.afterStatusChangeInTx(tx, { orderId: row.id, bound, fromStatus: row.statusKey, toStatus: transition.to });
+        const passedApi = await deps.stageRuntime?.afterStatusChangeInTx(tx, { orderId: row.id, bound, fromStatus: row.statusKey, toStatus: transition.to });
+        await auditPassedByStatus(tx, passedApi?.passedWithoutSubmission, { actor: { role: "system" }, orderPublicId: row.publicId, fromStatus: row.statusKey, toStatus: transition.to, reasonCode: "API_TRANSITION" });
         await deps.audit.record(
           {
             category: "business",

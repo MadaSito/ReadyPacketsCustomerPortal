@@ -217,6 +217,50 @@ it("derived (old format) workflows refuse stage writes and fill progress on firs
   }
 });
 
+it("a staff status change that passes a phase without a submission is audited in the same transaction; boot enqueues the start-up job", async () => {
+  const db = await createTestDb({ schema: ordersTestSchema });
+  try {
+    const h = createTestDeps({ db: db.db });
+    const mod = createOrdersModule(h.deps);
+    Object.assign(h.services, { orders: mod, identity: fakeIdentity(h, db.db) });
+    mod.init?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(h.jobs.enqueued.some((job) => job.type === "orders.increment07.startup" && job.options?.idempotencyKey?.startsWith("orders.increment07.startup:boot:"))).toBe(true);
+    const admin = await insertUser(h, db.db, { role: "admin" });
+    const staff = await insertUser(h, db.db, { role: "staff" });
+    const customer = await insertUser(h, db.db);
+    const caller = createCallerFactory(ordersRouter);
+    const as = (session: SessionPrincipal) => caller({ services: h.services, session, request: newRequestContext("test"), transport: { issue() {}, clear() {} } });
+    const [workflow] = await db.db.insert(orderWorkflows).values({ publicId: ulid(), workflowKey: "synthetic_pass", name: "Synthetic pass" }).$returningId();
+    const [pinned] = await db.db.insert(orderWorkflowVersions).values({
+      publicId: ulid(), workflowId: workflow!.id, versionNumber: 1, createdByUserId: admin.id, definition: workflowDefinitionSchema.parse(STANDARD_V3_DEFINITION),
+    }).$returningId();
+    const orderId = ulid();
+    await db.db.insert(orders).values({
+      publicId: orderId, reference: orderId, projectName: "Synthetic pass", ownerUserId: customer.id, workflowVersionId: pinned!.id,
+      statusKey: "awaiting_payment", subtotalMinor: 1000, totalMinor: 1000, currency: "USD", paymentState: "unpaid",
+    });
+    const reviewer = as(staff.principal);
+    const version = async () => (await db.db.select().from(orders).where(eq(orders.publicId, orderId)))[0]!.version;
+    h.audit.clear();
+    // Payment phase has no customer work: passing it is not "without a submission".
+    await reviewer.transition({ orderId, expectedVersion: await version(), toStatus: "intake_open" });
+    expect(h.audit.named("order.stage.passed_by_status")).toHaveLength(0);
+    await reviewer.transition({ orderId, expectedVersion: await version(), toStatus: "in_review" });
+    expect(h.audit.named("order.stage.passed_by_status")).toHaveLength(0);
+    await reviewer.transition({ orderId, expectedVersion: await version(), toStatus: "in_progress" });
+    const passed = h.audit.named("order.stage.passed_by_status");
+    expect(passed).toHaveLength(1);
+    expect(passed[0]).toMatchObject({
+      actor: { userId: staff.id, role: "staff" }, resource: { type: "order", publicId: orderId }, reasonCode: "TRANSITION",
+      attributes: { stage_key: "phase_1_intake", from_status: "in_review", to_status: "in_progress", submitted: "false" },
+    });
+    expect(h.audit.recordedInTx.at(-1)).toBe(true);
+  } finally {
+    await db.cleanup();
+  }
+});
+
 it("start-up work installs the standard phases once on a fresh install and is idempotent", async () => {
   const db = await createTestDb({ schema: ordersTestSchema });
   try {

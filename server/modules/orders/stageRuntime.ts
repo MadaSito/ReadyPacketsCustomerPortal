@@ -165,8 +165,11 @@ export function createStageRuntime(deps: StageRuntimeDeps) {
     recalcInTx,
 
     /** Same tx as every status write (transition, system transition, create, stage moves, overrides, payment). */
-    async afterStatusChangeInTx(tx: Tx, input: { orderId: number; bound: BoundWorkflow; fromStatus: string | null; toStatus: string }): Promise<RecalcResult> {
+    async afterStatusChangeInTx(tx: Tx, input: { orderId: number; bound: BoundWorkflow; fromStatus: string | null; toStatus: string }): Promise<RecalcResult & { passedWithoutSubmission: string[] }> {
       const model = stageModelOf(input.bound.definition);
+      // Lead QA: phases with customer work that a status change passes before the customer submitted or finished them
+      // (the caller audits `order.stage.passed_by_status` with its actor in the same transaction).
+      const passedWithoutSubmission: string[] = [];
       if (!model.derived) {
         const rows = await progressRows(tx, input.orderId, input.bound.versionId, true);
         const toIndex = stageIndexOfStatus(model, input.toStatus);
@@ -174,12 +177,13 @@ export function createStageRuntime(deps: StageRuntimeDeps) {
         if (fromIndex >= 0 && toIndex > fromIndex) {
           for (const stage of model.stages.slice(fromIndex, toIndex)) {
             const row = rows.find((candidate) => candidate.stageKey === stage.key);
+            if (row && row.state !== "accepted" && !row.submittedAt && stageHasCustomerWork(stage)) passedWithoutSubmission.push(stage.key);
             if (row) await markAccepted(tx, row, "status");
           }
         }
         if (toIndex >= 0) await openStage(tx, input.orderId, input.bound.versionId, model.stages[toIndex]!, rows);
       }
-      return recalcInTx(tx, input.orderId);
+      return { ...(await recalcInTx(tx, input.orderId)), passedWithoutSubmission };
     },
 
     /** Port for assurance (D4): after a question is asked, answered or withdrawn. Caller holds the order lock. */

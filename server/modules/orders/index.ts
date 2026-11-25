@@ -52,6 +52,7 @@ import { createOrderPaymentsPort, createStagesService } from "./stages.js";
 export type { StageWorkspace, StageViewState } from "./stages.js";
 import { createPhaseWorkServices } from "./questionsRouter.js";
 import { createStageStartup, STAGE_STARTUP_JOB } from "./stageStartup.js";
+import { ulid } from "../../core/ids.js";
 import { checkStageTargets } from "./stageTargets.js";
 
 export type * from "./types.js";
@@ -217,6 +218,13 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
       // Increment 04 (package H): /api/v1 orders provider. Absent public API module ⇒ nothing to register.
       const publicApi = (deps.services as Partial<Services>).publicApi as unknown as { registerProvider?: (key: "orders", provider: unknown) => void } | undefined;
       publicApi?.registerProvider?.("orders", apiProvider);
+      // Lead QA: run the increment-07 start-up work once right after boot as well (the 10-minute schedule stays), so an
+      // upgraded install shows recalculated progress immediately. Per-boot idempotency key; the job itself is idempotent.
+      void deps.jobs
+        .enqueue(STAGE_STARTUP_JOB, {}, { idempotencyKey: `${STAGE_STARTUP_JOB}:boot:${ulid(deps.clock.now().getTime())}` })
+        .catch((err: unknown) => {
+          deps.logger.warn("orders increment 07 start-up enqueue deferred", { errorName: err instanceof Error ? err.name : "unknown" });
+        });
       void statusCatalog.ensureSeeded().catch((err: unknown) => {
         deps.logger.warn("orders status catalogue startup seed deferred", {
           errorName: err instanceof Error ? err.name : "unknown",

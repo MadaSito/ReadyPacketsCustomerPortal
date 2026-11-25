@@ -140,8 +140,9 @@ export const STANDARD_V3_DEFINITION: WorkflowDefinition = {
   stages: [
     {
       key: "payment_confirmed",
-      customerLabel: "Payment confirmed",
-      staffLabel: "Payment confirmed",
+      // Lead QA: "Payment" reads right while the step is current and unpaid (key unchanged; published versions keep theirs).
+      customerLabel: "Payment",
+      staffLabel: "Payment",
       statusKeys: ["awaiting_payment"],
       actions: { ...off },
       folders: { ...folders },
