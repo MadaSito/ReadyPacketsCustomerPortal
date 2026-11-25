@@ -11,8 +11,9 @@ import { FilesAdminContent } from "./FilesAdminPage";
 import OrderFilesTab from "./OrderFilesTab";
 import { PhaseUploadPanel } from "./PhaseFiles";
 import { RecordingPreflight } from "./RecordingPreflight";
+import { formatAudioTimeRemaining } from "./format";
 
-const { fetchMock, view } = vi.hoisted(() => ({ fetchMock: vi.fn(), view: vi.fn() }));
+const { fetchMock, view, phasePolicy } = vi.hoisted(() => ({ fetchMock: vi.fn(), view: vi.fn(), phasePolicy: vi.fn() }));
 vi.mock("@/lib/agreementGate", () => ({
   AgreementDialog: ({ onAccepted }: { onAccepted: () => Promise<void> }) => <button type="button" onClick={() => { void onAccepted(); }}>Accept test agreement</button>,
   parseAgreementRequiredDetails: () => null,
@@ -44,7 +45,11 @@ vi.mock("@/lib/trpc", async (original) => ({
           }),
           pathKey: () => ["file-tabs"],
         },
-        phasePolicy: { queryOptions: () => ({ queryKey: ["phase-policy"], queryFn: async () => null }) },
+        phasePolicy: {
+          queryOptions: () => ({ queryKey: ["phase-policy"], queryFn: phasePolicy }),
+          pathKey: () => ["phase-policy"],
+        },
+        teamFiles: { pathKey: () => ["team-files"] },
         recording: { preflight: { queryOptions: () => ({ queryKey: ["preflight"], queryFn: async () => ({
           enabled: true, conversionAvailable: false, maxMinutes: 2, maxBytes: policy.maxFileBytes, acceptedTypes: ["wav"],
         }) }) } },
@@ -79,6 +84,43 @@ const sample: FileRecord = {
 beforeEach(() => {
   fetchMock.mockReset();
   view.mockReset().mockResolvedValue({ items: [sample], nextCursor: null, canUpload: false, uploadPolicy: null });
+  phasePolicy.mockReset().mockResolvedValue(null);
+});
+
+describe("phase uploader", () => {
+  const phaseDefaults = { enabled: true, disabledReason: null, maxSeconds: 60, policy,
+    remainingDocuments: 3, remainingAudio: 3, remainingAudioSeconds: 7200 };
+
+  it("reports queued and in-flight files until both results are definitive, and clears the count on unmount", async () => {
+    phasePolicy.mockResolvedValue(phaseDefaults);
+    let finish = (_response: Response) => {};
+    fetchMock.mockReturnValue(new Promise<Response>((resolve) => { finish = resolve; }));
+    const pending = vi.fn();
+    const user = userEvent.setup();
+    const props = { orderId, stageKey: "intake_phase", intent: "document", onPendingChange: pending } as const;
+    const { container, unmount } = renderUi(<PhaseUploadPanel {...props} />);
+    await screen.findByRole("button", { name: "Choose files" });
+    const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]')!;
+    const evidence = new File(["synthetic"], "evidence.pdf", { type: "application/pdf" });
+    await user.upload(fileInput, [evidence, new File(["synthetic"], "another.pdf", { type: "application/pdf" })]);
+    expect(pending).toHaveBeenLastCalledWith(2);
+    await user.click(screen.getByRole("button", { name: "Upload 2 files" }));
+    expect(pending).toHaveBeenLastCalledWith(2);
+    finish(new Response(JSON.stringify({ results: [{ index: 0, outcome: "completed" }, { index: 1, outcome: "refused" }] })));
+    expect(await screen.findByText("1 of 2 uploads confirmed.")).toBeInTheDocument();
+    expect(pending).toHaveBeenLastCalledWith(0);
+    await user.upload(fileInput, evidence);
+    expect(pending).toHaveBeenLastCalledWith(1);
+    unmount();
+    expect(pending).toHaveBeenLastCalledWith(0);
+  });
+
+  it("shows the remaining audio allowance as hours and minutes", async () => {
+    phasePolicy.mockResolvedValue({ ...phaseDefaults, remainingAudioSeconds: 5400 });
+    renderUi(<PhaseUploadPanel orderId={orderId} stageKey="intake_phase" intent="prerecorded_audio" />);
+    expect(await screen.findByText("3 files remaining · 1 hour 30 minutes of audio remaining")).toBeInTheDocument();
+    expect([7200, 2700, 59, 0].map(formatAudioTimeRemaining)).toEqual(["2 hours", "45 minutes", "less than 1 minute", "0 minutes"]);
+  });
 });
 
 describe("file upload", () => {
@@ -137,12 +179,16 @@ describe("file upload", () => {
 
   it("keeps a lost connection unknown rather than claiming the file was refused", async () => {
     const user = userEvent.setup();
+    const pending = vi.fn();
     fetchMock.mockRejectedValue(new Error("synthetic transport interruption"));
-    const { container } = renderUi(<FileUploadPanel orderId={orderId} staff policy={policy} onChanged={vi.fn()} />);
+    const { container } = renderUi(<FileUploadPanel orderId={orderId} staff policy={policy} onPendingChange={pending} onChanged={vi.fn()} />);
     await user.upload(container.querySelector("input[type=file]")!, new File(["synthetic"], "audio.wav"));
     await user.click(screen.getByRole("button", { name: "Upload file" }));
     expect(await screen.findByText("Unknown outcome")).toBeInTheDocument();
     expect(screen.getByText("0 of 1 uploads confirmed.")).toBeInTheDocument();
+    expect(pending).toHaveBeenLastCalledWith(1);
+    await user.click(screen.getByRole("button", { name: "Clear results" }));
+    expect(pending).toHaveBeenLastCalledWith(0);
   });
 
   it("uses the device capture control for a recording-only task when the browser has no recorder", async () => {

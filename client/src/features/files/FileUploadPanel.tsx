@@ -1,4 +1,4 @@
-import { useId, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useId, useRef, useState } from "react";
 import { Mic, Upload } from "lucide-react";
 import type { FileCategory, FileUploadSlot, FileVisibility, UploadIntent, UploadPolicy } from "@server/modules/files/index";
 import { apiUrl } from "@/lib/runtime";
@@ -73,11 +73,12 @@ export interface FileUploadPanelProps {
   phase?: { key: string; intent?: UploadIntent };
   maxSeconds?: number;
   disabled?: boolean;
+  onPendingChange?: (count: number) => void;
   onChanged: () => void | Promise<void>;
 }
 
 export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, phase, maxSeconds,
-  disabled = false, launchRecording = false, onChanged }: FileUploadPanelProps) {
+  disabled = false, launchRecording = false, onPendingChange, onChanged }: FileUploadPanelProps) {
   const hintId = useId();
   const captureId = useId();
   const recordButton = useRef<HTMLButtonElement>(null);
@@ -89,7 +90,8 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
   const [recording, setRecording] = useState(false);
   const [results, setResults] = useState<UploadOutcome[]>([]);
   const [agreement, setAgreement] = useState<PendingAgreement | null>(null);
-  const [running, setRunning] = useState(false);
+  const [activeUpload, setActiveUpload] = useState<number[]>([]);
+  const running = activeUpload.length > 0;
   const [message, setMessage] = useState<string | null>(null);
   const [transcript, setTranscript] = useState("");
   const [checking, setChecking] = useState<"record" | "check" | null>(() =>
@@ -110,6 +112,15 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
   const allowsTranscript = selection.length === 1 && (slot?.kind === "audio" ||
     /^(?:audio\/)|\.(?:wav|ogg|webm|m4a|mp4|mp3|aac|caf)$/iu.test(`${selection[0]?.type} ${selection[0]?.name}`));
   const categories = (Object.keys(categoryLabels) as FileCategory[]).filter((key) => staff || key !== "deliverable");
+  const byIndex = new Map(results.map((result) => [result.index, result]));
+  const retryAfterAgreement = agreement && "indices" in agreement ? agreement.indices : [];
+  const pendingCount = selection.filter((_, index) => {
+    const outcome = byIndex.get(index)?.outcome;
+    return activeUpload.includes(index) || retryAfterAgreement.includes(index) || !outcome || outcome === "unknown";
+  }).length;
+  const reportPending = useEffectEvent((count: number) => onPendingChange?.(count));
+  useEffect(() => { reportPending(pendingCount); }, [pendingCount]);
+  useEffect(() => () => { reportPending(0); }, []);
 
   function choose(files: File[], isRecording = false) {
     setMessage(null);
@@ -154,7 +165,7 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
 
   async function upload(indices = selection.map((_, index) => index)) {
     if (!indices.length || running || disabled) return;
-    setRunning(true);
+    setActiveUpload(indices);
     setMessage(null);
     setAgreement(null);
     function update(outcomes: UploadOutcome[]) {
@@ -205,7 +216,7 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
       setMessage("The connection ended before the uploads were confirmed. Reload the file list before retrying.");
       update(indices.map((index) => ({ index, outcome: "unknown" })));
     } finally {
-      setRunning(false);
+      setActiveUpload([]);
       void onChanged();
     }
   }
@@ -278,14 +289,14 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
       {selection.length ? <>
         <ul className="grid min-w-0 divide-y divide-line rounded-[var(--radius-card)] border border-line bg-surface px-3" aria-label="Selected files and upload results">
           {selection.map((file, index) => {
-            const result = results[index];
+            const result = byIndex.get(index);
             return <li key={`${index}-${file.name}`} className="grid min-w-0 gap-1 py-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:gap-3">
               <div className="min-w-0">
                 <p className="break-all font-medium text-ink">{file.name}</p>
                 <p className="text-sm text-muted">{formatBytes(file.size)}</p>
                 {result?.message ? <p className="mt-1 break-words text-sm text-body">{result.message}</p> : null}
               </div>
-              <div><StatusBadge state={result?.outcome ?? (running ? "running" : "queued")} /></div>
+              <div><StatusBadge state={activeUpload.includes(index) ? "running" : result?.outcome ?? "queued"} /></div>
             </li>;
           })}
         </ul>

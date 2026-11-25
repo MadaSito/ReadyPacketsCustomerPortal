@@ -7,7 +7,7 @@ import { sessionFetch } from "@/lib/sessionTransport";
 import { useTRPC, useTRPCClient } from "@/lib/trpc";
 import { Button, Callout, LoadMore } from "@/ui";
 import { FileUploadPanel, type FileUploadPanelProps } from "./FileUploadPanel";
-import { formatBytes } from "./format";
+import { formatAudioTimeRemaining, formatBytes } from "./format";
 import { saveFileBlob } from "./fileDownload";
 
 const disabledMessages: Record<string, string> = {
@@ -24,6 +24,8 @@ const disabledMessages: Record<string, string> = {
 type PhaseUploadProps = {
   orderId: string; stageKey: string; intent: UploadIntent; staff?: boolean;
   onChanged?: FileUploadPanelProps["onChanged"];
+  /** Counts selected files still awaiting a definitive result; reports zero when the form unmounts. */
+  onPendingChange?: FileUploadPanelProps["onPendingChange"];
   readOnly?: boolean;
 };
 
@@ -31,7 +33,7 @@ export function PhaseUploadPanel({ readOnly, ...props }: PhaseUploadProps) {
   return readOnly ? <PhaseReadOnlyFiles orderId={props.orderId} stageKey={props.stageKey} intent={props.intent} /> : <PhaseUploadForm {...props} />;
 }
 
-function PhaseUploadForm({ orderId, stageKey, intent, staff = false, onChanged }: PhaseUploadProps) {
+function PhaseUploadForm({ orderId, stageKey, intent, staff = false, onPendingChange, onChanged }: PhaseUploadProps) {
   const trpc = useTRPC();
   const queryClient = useQueryClient();
   const phase = useQuery(trpc.files.phasePolicy.queryOptions({ orderPublicId: orderId, stageKey, intent }, { retry: false }));
@@ -51,7 +53,7 @@ function PhaseUploadForm({ orderId, stageKey, intent, staff = false, onChanged }
   return <div className="grid min-w-0 gap-4">
     {available !== null ? <p className="text-sm text-body">
       {available} {available === 1 ? "file" : "files"} remaining{remainingAudioSeconds !== null && intent !== "document"
-        ? ` · ${remainingAudioSeconds} seconds of audio remaining` : ""}
+        ? ` · ${formatAudioTimeRemaining(remainingAudioSeconds)} of audio remaining` : ""}
     </p> : null}
     {phase.data.disabledReason === "PHASE_CAPACITY_REACHED" ? <Callout tone="info" title="Phase limit reached">
       {disabledMessages.PHASE_CAPACITY_REACHED}
@@ -59,6 +61,7 @@ function PhaseUploadForm({ orderId, stageKey, intent, staff = false, onChanged }
     <FileUploadPanel key={`${stageKey}:${intent}`} orderId={orderId} staff={staff}
       phase={{ key: stageKey, intent }} disabled={!phase.data.enabled} policy={{ ...policy, maxFiles: Math.max(1, maxFiles) }}
       audio={intent === "recording" ? { enabled: true, maxMinutes: Math.ceil(maxSeconds / 60) } : null} maxSeconds={maxSeconds}
+      onPendingChange={onPendingChange}
       onChanged={async () => {
         await Promise.all([
           queryClient.invalidateQueries({ queryKey: trpc.files.phasePolicy.pathKey() }),
