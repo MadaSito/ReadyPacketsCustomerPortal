@@ -9,12 +9,14 @@ import { activeRecordingType, microphoneConstraints, microphoneHelp, pickRecorde
 type TestRun = { stream?: MediaStream; recorder?: MediaRecorder; context?: AudioContext; meter?: number; stop?: number };
 type State = "ready" | "permission" | "recording" | "done" | "failed";
 
-export function RecordingPreflight({ orderId, slotKey, deviceId, onDevice, onClose, onContinue, onAgreementRequired }: {
-  orderId: string; slotKey?: string; deviceId: string; onDevice: (id: string) => void; onClose: () => void; onContinue: (fallback: boolean) => void;
+export function RecordingPreflight({ orderId, slotKey, stageKey, deviceId, onDevice, onClose, onContinue, onAgreementRequired }: {
+  orderId: string; slotKey?: string; stageKey?: string; deviceId: string; onDevice: (id: string) => void; onClose: () => void;
+  onContinue: (fallback: boolean, maxSeconds: number) => void;
   onAgreementRequired: (agreement: { policyPublicId: string; signatureMode: AgreementSignatureMode }) => void;
 }) {
   const trpc = useTRPC();
-  const check = useQuery(trpc.files.recording.preflight.queryOptions({ orderPublicId: orderId, slotKey }, { retry: false, refetchOnMount: "always" }));
+  const check = useQuery(trpc.files.recording.preflight.queryOptions({ orderPublicId: orderId, slotKey, ...(stageKey ? { stageKey } : {}) },
+    { retry: false, refetchOnMount: "always" }));
   const run = useRef<TestRun | null>(null);
   const preview = useRef<string | null>(null);
   const [state, setState] = useState<State>("ready");
@@ -127,8 +129,10 @@ export function RecordingPreflight({ orderId, slotKey, deviceId, onDevice, onClo
     description="Choose a microphone and record a five-second test. The test stays on this device and is never uploaded."
     footer={<>
       <Button variant="secondary" onClick={onClose}>Close</Button>
-      {check.data?.enabled && !check.isError ? <Button variant="secondary" disabled={check.isFetching} onClick={() => onContinue(true)}>Use device recorder</Button> : null}
-      {check.data?.enabled && micAvailable && !check.isError ? <Button disabled={busy || check.isFetching} onClick={() => onContinue(false)}>Continue to recording</Button> : null}
+      {check.data?.enabled && !check.isError ? <Button variant="secondary" disabled={check.isFetching}
+        onClick={() => onContinue(true, check.data.maxSeconds ?? check.data.maxMinutes * 60)}>Use device recorder</Button> : null}
+      {check.data?.enabled && micAvailable && !check.isError ? <Button disabled={busy || check.isFetching}
+        onClick={() => onContinue(false, check.data.maxSeconds ?? check.data.maxMinutes * 60)}>Continue to recording</Button> : null}
     </>}>
     <div className="grid min-w-0 gap-3">
       <div className="grid gap-1 text-sm text-body" aria-live="polite">
@@ -143,7 +147,8 @@ export function RecordingPreflight({ orderId, slotKey, deviceId, onDevice, onClo
       {check.isError ? <Callout tone="warning" title="Could not check recording settings">Refresh the check before recording. <Button variant="secondary" onClick={() => { void check.refetch(); }}>Try again</Button></Callout> : null}
       {check.data ? <div className="grid min-w-0 gap-2 text-sm text-body">
         {!check.data.enabled ? <Callout tone="warning" title="Recording unavailable">This order or task does not currently accept recordings.</Callout> : <>
-          <p className="break-words">Pass: order accepts {check.data.acceptedTypes.join(", ").toUpperCase()}. Limit: {check.data.maxMinutes} minutes and {formatBytes(check.data.maxBytes)}.</p>
+          <p className="break-words">Pass: order accepts {check.data.acceptedTypes.join(", ").toUpperCase()}. Limit: {stageKey
+            ? `${check.data.maxSeconds} seconds` : `${check.data.maxMinutes} minutes`} and {formatBytes(check.data.maxBytes)}.</p>
           <p>{check.data.conversionAvailable ? "Pass: the server can re-encode supported audio to WebM/Opus. It keeps the original." :
             "Warning: the server cannot re-encode audio right now. It keeps the original; tasks that require a verified duration may be unavailable."}</p>
         </>}

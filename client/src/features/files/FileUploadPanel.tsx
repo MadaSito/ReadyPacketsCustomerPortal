@@ -1,6 +1,6 @@
 import { useId, useRef, useState } from "react";
 import { Mic, Upload } from "lucide-react";
-import type { FileCategory, FileUploadSlot, FileVisibility, UploadPolicy } from "@server/modules/files/index";
+import type { FileCategory, FileUploadSlot, FileVisibility, UploadIntent, UploadPolicy } from "@server/modules/files/index";
 import { apiUrl } from "@/lib/runtime";
 import { AgreementDialog, type AgreementSignatureMode } from "@/lib/agreementGate";
 import { sessionFetch } from "@/lib/sessionTransport";
@@ -68,10 +68,14 @@ export interface FileUploadPanelProps {
   slot?: FileUploadSlot & { statusKey: string };
   audio?: { enabled: boolean; maxMinutes: number } | null;
   launchRecording?: boolean;
+  phase?: { key: string; intent: UploadIntent };
+  maxSeconds?: number;
+  disabled?: boolean;
   onChanged: () => void | Promise<void>;
 }
 
-export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, launchRecording = false, onChanged }: FileUploadPanelProps) {
+export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, phase, maxSeconds,
+  disabled = false, launchRecording = false, onChanged }: FileUploadPanelProps) {
   const hintId = useId();
   const captureId = useId();
   const recordButton = useRef<HTMLButtonElement>(null);
@@ -89,6 +93,7 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
   const [checking, setChecking] = useState<"record" | "check" | null>(() =>
     launchRecording && audio?.enabled && slot?.kind === "audio" && slot.capture !== "upload" ? "record" : null);
   const [preflightComplete, setPreflightComplete] = useState(false);
+  const [checkedMaxSeconds, setCheckedMaxSeconds] = useState<number>();
   const [deviceId, setDeviceId] = useState("");
   const [showRecorder, setShowRecorder] = useState(false);
   const [showCapture, setShowCapture] = useState(false);
@@ -97,8 +102,8 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
     if (slot.allowedTypes.length && !slot.allowedTypes.includes(extension)) return false;
     return (slot.kind === "audio" ? (audioFileExtensions as readonly string[]) : ["pdf", "png", "jpg", "docx"]).includes(extension);
   }) : policy.extensions;
-  const canPick = slot?.acceptsUpload !== false && slot?.capture !== "record";
-  const canRecord = audio?.enabled && slot?.acceptsUpload !== false && slot?.capture !== "upload" &&
+  const canPick = phase?.intent !== "recording" && slot?.acceptsUpload !== false && slot?.capture !== "record";
+  const canRecord = (!phase || phase.intent === "recording") && audio?.enabled && slot?.acceptsUpload !== false && slot?.capture !== "upload" &&
     slot?.kind !== "document" && audioFileExtensions.some((extension) => extensions.includes(extension));
   const allowsTranscript = selection.length === 1 && (slot?.kind === "audio" ||
     /^(?:audio\/)|\.(?:wav|ogg|webm|m4a|mp4|mp3|aac|caf)$/iu.test(`${selection[0]?.type} ${selection[0]?.name}`));
@@ -141,7 +146,7 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
   }
 
   async function upload(indices = selection.map((_, index) => index)) {
-    if (!indices.length || running) return;
+    if (!indices.length || running || disabled) return;
     setRunning(true);
     setMessage(null);
     setAgreement(null);
@@ -149,7 +154,10 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
       setResults((prior) => [...prior.filter((result) => !indices.includes(result.index)), ...outcomes]);
     }
     const query = new URLSearchParams({ category, visibility: slot ? "customer_visible" : visibility });
-    if (recording) query.set("source", "recording");
+    if (phase) {
+      query.set("stageKey", phase.key);
+      query.set("intent", phase.intent);
+    } else if (recording) query.set("source", "recording");
     if (slot) {
       query.set("slotKey", slot.key);
       query.set("statusKey", slot.statusKey);
@@ -199,47 +207,49 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
   const finished = selection.length > 0 && results.length === selection.length;
   return (
     <div className="grid min-w-0 gap-4">
-      {!replace ? <div className="grid gap-4 sm:grid-cols-2">
+      {!replace && (staff || !phase) ? <div className="grid gap-4 sm:grid-cols-2">
         <Field label="File category">
           <Select value={category} onChange={(e) => setCategory(e.target.value as FileCategory)}
-            options={categories.map((value) => ({ value, label: categoryLabels[value] }))} disabled={running} />
+            options={categories.map((value) => ({ value, label: categoryLabels[value] }))} disabled={running || disabled} />
         </Field>
         {staff && !slot ? <Field label="Visibility">
-          <Select value={visibility} onChange={(e) => setVisibility(e.target.value as FileVisibility)} disabled={running}
+          <Select value={visibility} onChange={(e) => setVisibility(e.target.value as FileVisibility)} disabled={running || disabled}
             options={Object.entries(visibilityLabels).map(([value, label]) => ({ value, label }))} />
         </Field> : null}
       </div> : null}
       {slot ? <p className="text-sm text-body">Files in this slot are visible to authorized order readers.</p> : null}
       {canPick && extensions.length ? <FileDropzone onFiles={choose} accept={accept} multiple={maxFiles !== 1} maxSize={policy.maxFileBytes}
-        disabled={running} label={replace ? "Choose replacement file" : "Choose files"}
+        disabled={running || disabled} label={replace ? "Choose replacement file" : "Choose files"}
         hint={`Approved formats: ${extensions.map((ext) => ext.toUpperCase()).join(", ")}. Up to ${maxFiles} per upload.`} /> :
         canPick ? <Callout tone="warning" title="Uploads paused">No file formats are enabled. Existing files remain available to authorized readers.</Callout> : null}
       {canRecord ? <div className="flex flex-wrap gap-2">
-        <Button ref={recordButton} leadingIcon={<Mic aria-hidden />} disabled={running || selection.length > 0} onClick={() => {
+        <Button ref={recordButton} leadingIcon={<Mic aria-hidden />} disabled={running || disabled || selection.length > 0} onClick={() => {
           if (preflightComplete) openRecorder();
           else setChecking("record");
         }}>Record</Button>
-        <Button ref={checkButton} variant="ghost" disabled={running || showRecorder} onClick={() => setChecking("check")}>Check microphone</Button>
+        <Button ref={checkButton} variant="ghost" disabled={running || disabled || showRecorder} onClick={() => setChecking("check")}>Check microphone</Button>
       </div> : null}
-      {checking && canRecord ? <RecordingPreflight orderId={orderId} slotKey={slot?.key} deviceId={deviceId} onDevice={setDeviceId}
+      {checking && canRecord && !disabled ? <RecordingPreflight orderId={orderId} slotKey={slot?.key} stageKey={phase?.key} deviceId={deviceId} onDevice={setDeviceId}
         onAgreementRequired={(pending) => { setAgreement({ ...pending, preflight: checking }); setChecking(null); }}
         onClose={() => {
           const trigger = checking === "record" ? recordButton : checkButton;
           setChecking(null);
           window.requestAnimationFrame(() => trigger.current?.focus());
         }}
-        onContinue={(fallback) => {
+        onContinue={(fallback, seconds) => {
+          setCheckedMaxSeconds(seconds);
           setChecking(null); setPreflightComplete(true); openRecorder(fallback);
           window.requestAnimationFrame(() => document.getElementById(fallback ? captureId : `${captureId}-recorder`)?.focus());
         }} /> : null}
-      {canRecord && showRecorder && !running && !selection.length ?
+      {canRecord && showRecorder && !running && !disabled && !selection.length ?
         <div id={`${captureId}-recorder`} tabIndex={-1} className="min-w-0">
-          <AudioRecorder extensions={extensions} maxSeconds={(slot?.maxMinutes ?? audio.maxMinutes) * 60}
+          <AudioRecorder extensions={extensions} maxSeconds={Math.min(
+            (slot?.maxMinutes ?? audio.maxMinutes) * 60, maxSeconds ?? Infinity, checkedMaxSeconds ?? Infinity)}
           maxBytes={Math.min(policy.maxFileBytes, policy.maxRequestBytes - 1024)}
           deviceId={deviceId} onUnavailable={() => setShowCapture(true)} onChoose={chooseRecording} />
           <Button className="mt-2" variant="ghost" onClick={() => { setShowRecorder(false); window.requestAnimationFrame(() => recordButton.current?.focus()); }}>Close recorder</Button>
         </div> : null}
-      {canRecord && showCapture && !running && !selection.length ? <div className="grid min-w-0 gap-2">
+      {canRecord && showCapture && !running && !disabled && !selection.length ? <div className="grid min-w-0 gap-2">
         <label className="font-medium text-ink" htmlFor={captureId}>Record with your device</label>
         <input className="w-full min-w-0 rounded-md border border-line bg-surface p-2 text-sm text-ink" id={captureId} aria-describedby={`${captureId}-hint`}
           type="file" accept="audio/*" capture onChange={(event) => {
@@ -276,7 +286,8 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
           <Textarea ref={transcriptInput} value={transcript} disabled={running || finished} maxLength={4000} onChange={(event) => setTranscript(event.target.value)} rows={3} />
         </Field> : null}
         <div className="flex flex-wrap items-center gap-2">
-          <Button leadingIcon={<Upload aria-hidden />} onClick={() => { void upload(); }} disabled={running || finished || !extensions.length} loading={running}>
+          <Button leadingIcon={<Upload aria-hidden />} onClick={() => { void upload(); }}
+            disabled={running || disabled || finished || !extensions.length} loading={running}>
             {replace ? "Upload new version" : `Upload ${selection.length === 1 ? "file" : `${selection.length} files`}`}
           </Button>
           <Button variant="ghost" disabled={running} onClick={() => choose([])}>{finished ? "Clear results" : "Clear selection"}</Button>

@@ -2,9 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { Download, FileText, MoreHorizontal } from "lucide-react";
 import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useSearch } from "wouter";
-import type { FileRecord } from "@server/modules/files/index";
+import type { FileRecord, UploadIntent } from "@server/modules/files/index";
 import { orderDocumentEditHref } from "@/lib/docconvert";
-import { apiUrl } from "@/lib/runtime";
+import { apiUrl, RUNTIME } from "@/lib/runtime";
 import { sessionFetch } from "@/lib/sessionTransport";
 import { errorMessage, useTRPC, useTRPCClient } from "@/lib/trpc";
 import {
@@ -13,7 +13,9 @@ import {
 } from "@/ui";
 import { formatDuration } from "./AudioRecorder";
 import { categoryLabels, FileUploadPanel, visibilityLabels } from "./FileUploadPanel";
+import { PhaseUploadPanel } from "./PhaseFiles";
 import { formatBytes } from "./format";
+import { saveFileBlob } from "./fileDownload";
 import { audioFileExtensions } from "./recordingDevice";
 
 type Props = { orderId: string; area: "customer" | "console" };
@@ -24,15 +26,20 @@ const descriptions = {
   restore: "This version will become available again according to its existing visibility.",
   visibility: "Access will change immediately and previously issued download tickets will be invalidated.",
 };
+const intentChoices = [
+  { value: "document", label: "Upload documents" },
+  { value: "recording", label: "Record audio" },
+  { value: "prerecorded_audio", label: "Upload prerecorded audio" },
+] satisfies Array<{ value: UploadIntent; label: string }>;
 
-function AudioPlayback({ file, load }: { file: FileRecord; load: (signal: AbortSignal) => Promise<{ blob: Blob; transcript: string | null }> }) {
+function AudioPlayback({ file, load }: { file: FileRecord; load: (signal: AbortSignal) => Promise<{ url: string; transcript: string | null }> }) {
   const [duration, setDuration] = useState(file.durationSeconds);
   const [state, setState] = useState<{ url: string; transcript: string | null } | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const active = useRef<AbortController | null>(null);
   useEffect(() => () => { active.current?.abort(); }, []);
-  useEffect(() => () => { if (state) URL.revokeObjectURL(state.url); }, [state]);
+  useEffect(() => () => { if (state?.url.startsWith("blob:")) URL.revokeObjectURL(state.url); }, [state]);
 
   async function openAudio() {
     if (active.current) return;
@@ -41,8 +48,9 @@ function AudioPlayback({ file, load }: { file: FileRecord; load: (signal: AbortS
     setBusy(true);
     setNotice(null);
     try {
-      const { blob, transcript } = await load(controller.signal);
-      if (!controller.signal.aborted) setState({ url: URL.createObjectURL(blob), transcript });
+      const { url, transcript } = await load(controller.signal);
+      if (!controller.signal.aborted) setState({ url, transcript });
+      else if (url.startsWith("blob:")) URL.revokeObjectURL(url);
     } catch {
       if (!controller.signal.aborted) setNotice("The recording could not be loaded. Check your access or download the original from the file list.");
     } finally {
@@ -82,6 +90,8 @@ export default function OrderFilesTab({ orderId, area }: Props) {
   const [slotSelection, setSlotSelection] = useState<{ search: string; key: string } | null>(null);
   const panelHeading = useRef<HTMLSpanElement>(null);
   const [playing, setPlaying] = useState<FileRecord | null>(null);
+  const [uploadPhaseKey, setUploadPhaseKey] = useState("");
+  const [intent, setIntent] = useState<UploadIntent>("document");
   const list = useInfiniteQuery(trpc.files.list.infiniteQueryOptions(
     { orderId, limit: 25, includeVersions: versions, includeDeleted: consoleArea && trash },
     { getNextPageParam: (page) => page.nextCursor,
@@ -92,6 +102,15 @@ export default function OrderFilesTab({ orderId, area }: Props) {
   const restore = useMutation(trpc.files.restore.mutationOptions());
   const rows = list.data?.pages.flatMap((page) => page.items) ?? [];
   const first = list.data?.pages[0];
+  const phases = first?.phases ?? [];
+  const uploadPhase = phases.find((phase) => phase.key === uploadPhaseKey) ?? phases.at(-1);
+  const groups = phases.length && rows.length ? [...phases, { key: "", label: "Other order files" }].flatMap((phase) => {
+    const items = rows.filter((file) => (file.groupStageKey ?? file.stageKey ?? "") === phase.key);
+    return items.length ? [{ ...phase, items: items.sort((a, b) =>
+      categoryLabels[a.category].localeCompare(categoryLabels[b.category]) ||
+      visibilityLabels[a.visibility].localeCompare(visibilityLabels[b.visibility]) ||
+      a.logicalPublicId.localeCompare(b.logicalPublicId) || b.version - a.version) }] : [];
+  }) : [];
   const policy = first?.uploadPolicy;
   const slots = first?.uploadSlots;
   const uploadSlots = slots?.slots.filter((slot) => slot.acceptsUpload !== false) ?? [];
@@ -137,16 +156,7 @@ export default function OrderFilesTab({ orderId, area }: Props) {
         toast.show({ title: "Incomplete download", description: "The server did not return the expected file size.", tone: "danger" });
         return;
       }
-      const href = URL.createObjectURL(blob);
-      try {
-        const trigger = document.createElement("a");
-        trigger.href = href;
-        trigger.download = file.displayName;
-        document.body.append(trigger);
-        try { trigger.click(); } finally { trigger.remove(); }
-      } finally {
-        window.setTimeout(() => URL.revokeObjectURL(href), 30_000);
-      }
+      saveFileBlob(blob, file.displayName);
     } catch (error) {
       toast.show({ title: "Download not available", description: errorMessage(error, "The download could not be completed."), tone: "danger" });
     } finally {
@@ -170,34 +180,11 @@ export default function OrderFilesTab({ orderId, area }: Props) {
     }
   }
 
-  return (
-    <Section title="Order files" description="View order documents, supporting evidence, and deliverables. Downloads are limited to your current access.">
-      <div className="grid min-w-0 gap-5">
-        {canChange && policy ? <Card title={<span tabIndex={-1} ref={panelHeading}>
-          {chosenSlot?.label ?? (consoleArea ? "Add an order file" : "Upload supporting files")}
-        </span>} headingLevel={3}
-          description={consoleArea ? "Staff may add deliverables and choose who can see them." : "Add documents requested by your ReadyPackets team."}>
-          <div className="grid min-w-0 gap-4">
-            {uploadSlots.length ? <Field label="Upload to" hint="Choose a workflow requirement, or add a general file that does not count toward a requirement.">
-              <Select value={chosenSlot?.key ?? ""} onChange={(event) => setSlotSelection({ search, key: event.target.value })}
-                options={[{ value: "", label: "General order files" }, ...uploadSlots.map((slot) => ({ value: slot.key, label: slot.label }))]} />
-            </Field> : null}
-            <FileUploadPanel key={`${slots?.statusKey ?? ""}:${chosenSlot?.key ?? ""}:${launchRecording ? "record" : "files"}`} orderId={orderId} staff={consoleArea} policy={policy}
-              slot={chosenSlot && slots ? { ...chosenSlot, statusKey: slots.statusKey } : undefined} audio={first.audio} launchRecording={launchRecording} onChanged={reload} />
-          </div>
-        </Card> : first ? <Callout tone="info" title="File changes unavailable">
-          Your access or the order’s current state does not allow file changes.
-        </Callout> : null}
-        <Card title="File library" headingLevel={3} description="Current versions appear by default. Include previous versions to see file history.">
-          <div className="grid min-w-0 gap-3">
-            <div className="flex flex-wrap gap-x-6 gap-y-2">
-              <Checkbox label="Include previous versions" checked={versions} onCheckedChange={setVersions} />
-              {consoleArea ? <Checkbox label="Include trash" checked={trash} onCheckedChange={setTrash} /> : null}
-            </div>
-            <DataTable<FileRecord>
-              caption="Files for this order"
+  function fileTable(items: FileRecord[], caption: string) {
+    return <DataTable<FileRecord>
+              caption={caption}
               rowKey={(file) => file.publicId}
-              rows={rows} loading={list.isPending} error={list.error} onRetry={() => { void list.refetch(); }}
+              rows={list.isPending ? undefined : items} loading={list.isPending} error={list.error} onRetry={() => { void list.refetch(); }}
               empty={<EmptyState icon={FileText} title="No files to show" description="Uploaded documents and deliverables will appear here when you have access to them." headingLevel={3} />}
               columns={[
                 { key: "name", header: "File name", primary: true, cell: (file) => <div className="min-w-0">
@@ -226,7 +213,7 @@ export default function OrderFilesTab({ orderId, area }: Props) {
                 return <div className="flex flex-wrap items-center gap-1">
                   {!file.deletedAt ? <Button size="sm" variant="secondary" leadingIcon={<Download aria-hidden />} disabled={!!downloading}
                     loading={downloading === file.publicId} onClick={() => { void download(file); }} aria-label={`Download ${file.displayName}`}>Download</Button> : null}
-                  {!file.deletedAt && file.contentType.startsWith("audio/") ?
+                  {!file.deletedAt && !file.supersededAt && file.contentType.startsWith("audio/") ?
                     <Button size="sm" variant="secondary" onClick={() => setPlaying(file)} aria-label={`Listen to ${file.displayName}`}>Listen</Button> : null}
                   {!file.deletedAt && !file.supersededAt && file.extension === "docx" ? <Button asChild size="sm" variant="secondary">
                     <Link href={orderDocumentEditHref(orderId, file.publicId, { area })} aria-label={`Edit ${file.displayName}`}>Edit document</Link>
@@ -244,7 +231,51 @@ export default function OrderFilesTab({ orderId, area }: Props) {
                   /> : null}
                 </div>;
               }}
-            />
+            />;
+  }
+
+  return (
+    <Section title="Order files" description="View order documents, supporting evidence, and deliverables. Downloads are limited to your current access.">
+      <div className="grid min-w-0 gap-5">
+        {canChange && policy ? <Card title={<span tabIndex={-1} ref={panelHeading}>
+          {chosenSlot?.label ?? (consoleArea ? "Add an order file" : "Upload supporting files")}
+        </span>} headingLevel={3}
+          description={consoleArea ? "Staff may add deliverables and choose who can see them." : "Add documents requested by your ReadyPackets team."}>
+          <div className="grid min-w-0 gap-4">
+            {uploadSlots.length ? <Field label="Upload to" hint="Choose a workflow requirement or add a file to a phase.">
+              <Select value={chosenSlot?.key ?? ""} onChange={(event) => setSlotSelection({ search, key: event.target.value })}
+                options={[{ value: "", label: first.stageUploadsRequired ? "Phase files" : "General order files" },
+                  ...uploadSlots.map((slot) => ({ value: slot.key, label: slot.label }))]} />
+            </Field> : null}
+            {first.stageUploadsRequired && !chosenSlot ? uploadPhase ? <>
+              <Field label="Upload phase">
+                <Select value={uploadPhase.key} onChange={(event) => setUploadPhaseKey(event.target.value)}
+                  options={phases.map((phase) => ({ value: phase.key, label: phase.label }))} />
+              </Field>
+              <Field label="Upload action">
+                <Select value={intent} onChange={(event) => setIntent(event.target.value as UploadIntent)} options={intentChoices} />
+              </Field>
+              <PhaseUploadPanel key={`${uploadPhase.key}:${intent}`} orderId={orderId} stageKey={uploadPhase.key}
+                intent={intent} staff={consoleArea} onChanged={reload} />
+            </> : <p className="text-sm text-body">No phase currently accepts files.</p> :
+              <FileUploadPanel key={`${slots?.statusKey ?? ""}:${chosenSlot?.key ?? ""}:${launchRecording ? "record" : "files"}`}
+                orderId={orderId} staff={consoleArea} policy={policy}
+                slot={chosenSlot && slots ? { ...chosenSlot, statusKey: slots.statusKey } : undefined}
+                audio={first.audio} launchRecording={launchRecording} onChanged={reload} />}
+          </div>
+        </Card> : first ? <Callout tone="info" title="File changes unavailable">
+          Your access or the order’s current state does not allow file changes.
+        </Callout> : null}
+        <Card title="File library" headingLevel={3} description="Current versions appear by default. Include previous versions to see file history.">
+          <div className="grid min-w-0 gap-3">
+            <div className="flex flex-wrap gap-x-6 gap-y-2">
+              <Checkbox label="Include previous versions" checked={versions} onCheckedChange={setVersions} />
+              {consoleArea ? <Checkbox label="Include trash" checked={trash} onCheckedChange={setTrash} /> : null}
+            </div>
+            {groups.length && !list.isError ? groups.map((group) => <div key={group.key} className="grid min-w-0 gap-2">
+              <h4 className="break-words text-base font-semibold text-ink">{group.label}</h4>
+              {fileTable(group.items, `Files for ${group.label}`)}
+            </div>) : fileTable(rows, "Files for this order")}
             <LoadMore hasMore={list.hasNextPage} loading={list.isFetchingNextPage} onLoadMore={() => { void list.fetchNextPage(); }}
               summary={rows.length ? `Showing ${rows.length} ${rows.length === 1 ? "file" : "files"}` : undefined} />
           </div>
@@ -254,15 +285,28 @@ export default function OrderFilesTab({ orderId, area }: Props) {
         open={!!replacement} onOpenChange={(open) => { if (!open) setReplacement(null); }}>
         {replacement && policy ? <FileUploadPanel key={replacement.publicId} orderId={orderId} staff={consoleArea} policy={policy} onChanged={reload}
           audio={first?.audio} slot={replacementSlot && slots ? { ...replacementSlot, statusKey: slots.statusKey } : undefined}
+          phase={replacement.stageKey ? { key: replacement.stageKey,
+            intent: replacement.contentType.startsWith("audio/") ? "prerecorded_audio" : "document" } : undefined}
           replace={{ id: replacement.publicId, category: replacement.category, visibility: replacement.visibility }} /> : null}
       </Dialog>
       <Dialog title="Listen to order audio" description={playing?.displayName} open={!!playing} onOpenChange={(open) => { if (!open) setPlaying(null); }}>
         {playing ? <AudioPlayback key={playing.publicId} file={playing} load={async (signal) => {
-          const blob = await readBlob(playing, signal);
-          if (!blob || blob.size !== playing.size) throw Error("Audio unavailable");
           const source = playing.derivedFromPublicId ?? playing.publicId;
           const { transcript } = await api.files.readTranscript.mutate({ fileId: source }, { signal });
-          return { blob: new Blob([blob], { type: playing.contentType }), transcript };
+          // The sandbox preview uses an in-memory header session, which native audio cannot send.
+          if (RUNTIME.preview) {
+            const blob = await readBlob(playing, signal);
+            if (!blob || blob.size !== playing.size) throw Error("Audio unavailable");
+            return { url: URL.createObjectURL(new Blob([blob], { type: playing.contentType })), transcript };
+          }
+          const { ticket } = await api.files.issuePlaybackTicket.mutate({ orderId, fileId: playing.publicId }, { signal });
+          const response = await sessionFetch(apiUrl("/api/files/playback"), {
+            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ticket }), cache: "no-store", signal,
+          });
+          if (!response.ok) throw Error("Audio unavailable");
+          const result: { grantPublicId?: string } = await response.json();
+          if (!/^[0-9A-HJKMNP-TV-Z]{26}$/u.test(result.grantPublicId ?? "")) throw Error("Audio unavailable");
+          return { url: apiUrl(`/api/files/playback/${result.grantPublicId}`), transcript };
         }} /> : null}
       </Dialog>
       <ConfirmDialog open={!!action} onOpenChange={(open) => { if (!open) setAction(null); }}

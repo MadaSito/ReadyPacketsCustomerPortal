@@ -17,6 +17,7 @@ export const orderFiles = mysqlTable("order_files", {
   ownerUserId: refColumn("owner_user_id").notNull(),
   phasePublicId: char("phase_public_id", { length: 26 }),
   statusKey: varchar("status_key", { length: 64 }),
+  stageKey: varchar("stage_key", { length: 64 }),
   slotKey: varchar("slot_key", { length: 64 }),
   derivedFromPublicId: char("derived_from_public_id", { length: 26 }),
   conversionState: mysqlEnum("conversion_state", audioConversionStates),
@@ -44,6 +45,7 @@ export const orderFiles = mysqlTable("order_files", {
   uniqueIndex("order_files_audio_source_uq").on(t.derivedFromPublicId),
   index("order_files_order_public_idx").on(t.orderId, t.publicId),
   index("order_files_slot_idx").on(t.orderId, t.slotKey, t.statusKey),
+  index("order_files_stage_idx").on(t.orderId, t.stageKey, t.supersededAt, t.deletedAt),
   index("order_files_owner_idx").on(t.ownerUserId),
   index("order_files_retention_idx").on(t.purgeAfter, t.purgedAt),
 ]);
@@ -68,6 +70,8 @@ export const fileAccessLog = mysqlTable("file_access_log", {
   id: idColumn(),
   publicId: publicIdColumn(),
   filePublicId: char("file_public_id", { length: 26 }),
+  orderPublicId: char("order_public_id", { length: 26 }),
+  action: varchar("action", { length: 32 }),
   userId: refColumn("user_id"),
   requestId: char("request_id", { length: 26 }),
   traceId: char("trace_id", { length: 32 }),
@@ -78,4 +82,24 @@ export const fileAccessLog = mysqlTable("file_access_log", {
 }, (t) => [
   index("file_access_log_file_idx").on(t.filePublicId, t.createdAt),
   index("file_access_log_actor_idx").on(t.userId, t.createdAt),
+  index("file_access_log_order_idx").on(t.orderPublicId, t.createdAt),
+]);
+
+export const filePlaybackGrants = mysqlTable("file_playback_grants", {
+  id: idColumn(),
+  publicId: publicIdColumn(),
+  tokenHash: char("token_hash", { length: 64 }).notNull(),
+  orderId: refColumn("order_id").notNull(),
+  fileId: refColumn("file_id").notNull(),
+  userId: refColumn("user_id").notNull(),
+  sessionId: varchar("session_id", { length: 80 }).notNull(),
+  issuedAt: createdAtColumn(),
+  redeemedAt: utcDateTime("redeemed_at"),
+  expiresAt: utcDateTime("expires_at").notNull(),
+}, (t) => [
+  uniqueIndex("file_playback_grants_public_uq").on(t.publicId),
+  uniqueIndex("file_playback_grants_hash_uq").on(t.tokenHash),
+  index("file_playback_grants_order_idx").on(t.orderId),
+  index("file_playback_grants_file_idx").on(t.fileId),
+  index("file_playback_grants_exp_idx").on(t.expiresAt),
 ]);
