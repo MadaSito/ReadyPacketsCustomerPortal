@@ -42,9 +42,9 @@ Import types from `server/modules/cart/index.ts`; reach the runtime instance at 
 | `cart.removeCode` | mutation | `{ expectedVersion? }?` | Clears applied discount code from caller's open cart -> `CartView` |
 | `cart.upsell.accept` | mutation | `{ offerPublicId (ULID \| "bundle_completion"), expectedVersion, idempotencyKey (8..128) }` | Atomically adds/upgrades target product(s) from live catalog (`FOR SHARE`) and increments `acceptedCount` -> `CartView` |
 | `cart.upsell.dismiss` | mutation | `{ offerPublicId (ULID \| "bundle_completion"), expectedVersion? }` | Marks suggestion dismissed for this cart and increments `dismissedCount` -> `CartView` |
-| `cart.checkout` | mutation | `{ cartPublicId, expectedVersion, expectedTotalMinor?, projectName, note?, billing, policyAcceptances?, idempotencyKey }` | Atomic promo redemption + order + issued invoice creation in `tx`, or `CONFLICT:PROMO_RECONFIRM_TOTAL` if promo became invalid -> `CheckoutCartResult` |
-| `cart.checkoutStatus` | query | `{ cartPublicId?, attemptPublicId? }` | Strictly read-only return-page status (`CheckoutStatusResult` incl. `promoDiscountMinor`, `promoLabel`) |
-| `cart.restoreCheckout` | mutation | `{ cartPublicId?, attemptPublicId? }` | Cancels unpaid payment attempt and restores items + draft fields to open cart |
+| `cart.checkout` | mutation | `{ cartPublicId, expectedVersion, expectedTotalMinor?, projectName, note?, billing, policyAcceptances?, idempotencyKey }` | Atomic promo redemption + order + issued invoice creation in `tx` (`CONFLICT:PROMO_RECONFIRM_TOTAL` if promo became invalid before commit); Phase 2 starts payment and returns `CheckoutCartResult` (`redirect`, `invoice`, `no_payment_due`, `waived_small_total`, `paid`, or `payment_unavailable` if provider initiation fails after order/invoice commit) |
+| `cart.checkoutStatus` | query | `{ cartPublicId?, attemptPublicId? }` | Strictly read-only return-page status (`CheckoutStatusResult`: distinguishes `pending_confirmation` for `?attempt=` redirected returns vs `awaiting_payment` for unpaid `?cart=` / failed / unstarted checkouts, plus `attemptInFlight`, `onlinePaymentAvailable`, `onlinePaymentUnavailableReason`, `lastAttemptFailureClass`, `promoDiscountMinor`, `promoLabel`) |
+| `cart.restoreCheckout` | mutation | `{ cartPublicId?, attemptPublicId? }` | Cancels unpaid payment attempt (including retry invoice attempts) and restores items + draft fields to open cart |
 
 ### Console & Admin procedures
 
@@ -66,7 +66,7 @@ Import types from `server/modules/cart/index.ts`; reach the runtime instance at 
 
 ## 3. Audit Events (`snake_case` attributes, zero PII / raw promo code strings)
 
-- Customer cart & checkout (`category: "business"`): `cart.item_added`, `cart.item_updated`, `cart.item_removed`, `cart.cleared`, `cart.details_saved`, `cart.promo_applied`, `cart.promo_removed`, `cart.promo_invalidated_at_checkout`, `cart.upsell_accepted`, `cart.upsell_dismissed`, `cart.checked_out`, `cart.checkout_payment_started`, `cart.checkout_completed`, `cart.checkout_restored`, `cart.expired`.
+- Customer cart & checkout (`category: "business"`): `cart.item_added`, `cart.item_updated`, `cart.item_removed`, `cart.cleared`, `cart.details_saved`, `cart.promo_applied`, `cart.promo_removed`, `cart.promo_invalidated_at_checkout`, `cart.upsell_accepted`, `cart.upsell_dismissed`, `cart.checked_out`, `cart.checkout_payment_started`, `cart.checkout_payment_start_failed`, `cart.checkout_completed`, `cart.checkout_restored`, `cart.expired`.
 - Admin cart suggestions (`category: "admin"`): `cart.upsell_offer_created`, `cart.upsell_offer_updated`, `cart.upsell_offer_toggled`, `cart.upsell_offer_deleted`.
 - Security (`category: "security"`, `outcome: "denied"`, `severity: "WARN"`): `authz.cart.denied`.
 

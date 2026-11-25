@@ -1317,9 +1317,13 @@ describe("Increment 06 Package D — Seeded upsells (D3), D5 totals & small_tota
       };
 
       failNextStartCheckout = true;
-      await expect(aliceCaller.cart.checkout(payload1)).rejects.toSatisfy(
-        (err) => extractCodes(err).reasonCode === "PAYMENTS_START_TRANSIENT_FAILURE",
-      );
+      const failRes1 = await aliceCaller.cart.checkout(payload1);
+      expect(failRes1).toMatchObject({
+        mode: "payment_unavailable",
+        cartPublicId: cart1.cartPublicId,
+        totalMinor: 40,
+        reasonCode: "PAYMENTS_START_TRANSIENT_FAILURE",
+      });
 
       // Verify cart did NOT store a predictive waiver or premature `checked_out` state!
       const [cart1AfterFail] = await t.db
@@ -1338,11 +1342,11 @@ describe("Increment 06 Package D — Seeded upsells (D3), D5 totals & small_tota
       expect(checkedOutAudit1?.attributes).not.toHaveProperty("payment_mode");
       expect(checkedOutAudit1?.attributes).not.toHaveProperty("waived_minor");
 
-      // `checkoutStatus` while unpaid reports `pending_confirmation` with `waivedMinor: 0` and `balanceDueMinor: 40`
+      // `checkoutStatus` while unpaid (with `?cart=`) reports `awaiting_payment` with `waivedMinor: 0` and `balanceDueMinor: 40`
       const status1BeforeRetry = await aliceCaller.cart.checkoutStatus({
         cartPublicId: cart1.cartPublicId!,
       });
-      expect(status1BeforeRetry.confirmationState).toBe("pending_confirmation");
+      expect(status1BeforeRetry.confirmationState).toBe("awaiting_payment");
       expect(status1BeforeRetry.invoiceStatus).toBe("issued");
       expect(status1BeforeRetry.waivedMinor).toBe(0);
       expect(status1BeforeRetry.balanceDueMinor).toBe(40);
@@ -1414,18 +1418,26 @@ describe("Increment 06 Package D — Seeded upsells (D3), D5 totals & small_tota
       };
 
       failNextStartCheckout = true;
-      await expect(aliceCaller.cart.checkout(payload2)).rejects.toSatisfy(
-        (err) => extractCodes(err).reasonCode === "PAYMENTS_START_TRANSIENT_FAILURE",
-      );
+      const failRes2 = await aliceCaller.cart.checkout(payload2);
+      expect(failRes2).toMatchObject({
+        mode: "payment_unavailable",
+        cartPublicId: cart2.cartPublicId,
+        reasonCode: "PAYMENTS_START_TRANSIENT_FAILURE",
+      });
 
       // Flip `payments.small_totals` to `"block"` BEFORE Phase 2 ever settled
       await h.settings.set(PAYMENTS_SMALL_TOTALS_SETTING.key, {
         belowProviderMinimum: "block",
       });
 
-      await expect(aliceCaller.cart.checkout(payload2)).rejects.toSatisfy(
-        (err) => extractCodes(err).reasonCode === "AMOUNT_BELOW_PROVIDER_MINIMUM",
-      );
+      const blockedReplay2 = await aliceCaller.cart.checkout(payload2);
+      expect(blockedReplay2).toMatchObject({
+        mode: "payment_unavailable",
+        cartPublicId: cart2.cartPublicId,
+        reasonCode: "AMOUNT_BELOW_PROVIDER_MINIMUM",
+        failureClass: "below_minimum",
+        onlinePaymentAvailable: false,
+      });
 
       const [cart2AfterBlockedReplay] = await t.db
         .select()
@@ -1477,9 +1489,12 @@ describe("Increment 06 Package D — Seeded upsells (D3), D5 totals & small_tota
       };
 
       failNextStartCheckout = true;
-      await expect(aliceCaller.cart.checkout(payload3)).rejects.toSatisfy(
-        (err) => extractCodes(err).reasonCode === "PAYMENTS_START_TRANSIENT_FAILURE",
-      );
+      const failRes3 = await aliceCaller.cart.checkout(payload3);
+      expect(failRes3).toMatchObject({
+        mode: "payment_unavailable",
+        cartPublicId: cart3.cartPublicId,
+        reasonCode: "PAYMENTS_START_TRANSIENT_FAILURE",
+      });
 
       await h.settings.set(PAYMENTS_SMALL_TOTALS_SETTING.key, {
         belowProviderMinimum: "block",
@@ -1528,9 +1543,12 @@ describe("Increment 06 Package D — Seeded upsells (D3), D5 totals & small_tota
       };
 
       simulateCrashAfterLedgerSettle = true;
-      await expect(aliceCaller.cart.checkout(payload4)).rejects.toSatisfy(
-        (err) => extractCodes(err).reasonCode === "PROCESS_CRASH_AFTER_SETTLEMENT",
-      );
+      const crashRes4 = await aliceCaller.cart.checkout(payload4);
+      expect(crashRes4).toMatchObject({
+        mode: "payment_unavailable",
+        cartPublicId: cart4.cartPublicId,
+        reasonCode: "PROCESS_CRASH_AFTER_SETTLEMENT",
+      });
 
       // Increment 07 D9 marks `status = "checked_out"` inside the ledger settlement tx; `checkedOutWaivedMinor` is still 0 until Phase 2 replay reconciles it.
       const [cart4BeforeReconcile] = await t.db

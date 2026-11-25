@@ -15,7 +15,7 @@ import { and, asc, desc, eq, inArray, like, lt, lte, or } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
-import { ulid } from "../../core/ids.js";
+import { ulid, ULID_PATTERN } from "../../core/ids.js";
 import type { ClaimedJob, DbOrTx, JobResult, ModuleHealth, SessionPrincipal, Tx } from "../../core/types.js";
 import { users } from "../identity/schema.js";
 import type { CatalogGroupView, CatalogProductView } from "../orders/catalog.js";
@@ -49,6 +49,7 @@ import {
   type CartView,
   type CheckoutCartResult,
   type CheckoutConfirmationState,
+  type CheckoutPaymentFailureClass,
   type PacketTierName,
   type RestoreCheckoutResult,
 } from "./types.js";
@@ -120,6 +121,111 @@ function formatBillingMemo(billing: BillingDetailsInput): string {
   if (locality) parts.push(locality);
   if (billing.taxId) parts.push(`Tax ID: ${billing.taxId}`);
   return parts.join(" · ").slice(0, 950);
+}
+
+const KNOWN_PAYMENT_FAILURE_CLASSES = new Set<CheckoutPaymentFailureClass>([
+  "configuration",
+  "egress",
+  "provider_auth",
+  "provider_permission",
+  "provider_request",
+  "provider_transient",
+  "provider_response",
+  "untrusted_redirect_url",
+  "below_minimum",
+  "currency_mismatch",
+  "order_locked",
+  "unknown",
+]);
+
+function mapReasonCodeToFailureClass(reasonCode: string): CheckoutPaymentFailureClass {
+  switch (reasonCode) {
+    case "AMOUNT_BELOW_PROVIDER_MINIMUM":
+      return "below_minimum";
+    case "CURRENCY_MISMATCH":
+      return "currency_mismatch";
+    case "ORDER_LOCKED":
+    case "ORDER_CANCELLED":
+    case "IMPORTED_INVOICE_READ_ONLY":
+    case "INVOICE_VOIDED":
+      return "order_locked";
+    case "PROVIDER_NOT_CONFIGURED":
+    case "PROVIDER_VERIFICATION_STALE":
+    case "ONLINE_PAYMENT_DISABLED":
+    case "STRIPE_KEY_MODE_MISMATCH":
+    case "SQUARE_CONFIGURATION_INVALID":
+      return "configuration";
+    case "STRIPE_AUTH_INVALID_KEY":
+      return "provider_auth";
+    case "STRIPE_KEY_MISSING_PERMISSION":
+      return "provider_permission";
+    case "STRIPE_UNTRUSTED_REDIRECT_URL":
+      return "untrusted_redirect_url";
+    case "STRIPE_MODE_MISMATCH":
+    case "STRIPE_INVALID_JSON":
+    case "STRIPE_INVALID_SESSION_ID":
+    case "SQUARE_RESPONSE_INVALID":
+      return "provider_response";
+    case "STRIPE_INVALID_REQUEST":
+    case "SQUARE_REQUEST_REFUSED":
+      return "provider_request";
+    case "STRIPE_RATE_LIMITED":
+    case "STRIPE_UPSTREAM_5XX":
+    case "STRIPE_NETWORK_TIMEOUT":
+    case "PAYMENTS_START_TRANSIENT_FAILURE":
+      return "provider_transient";
+    default:
+      return /^EGRESS_/u.test(reasonCode) ? "egress" : "unknown";
+  }
+}
+
+function customerSafePaymentUnavailableMessage(failureClass: CheckoutPaymentFailureClass): string {
+  switch (failureClass) {
+    case "configuration":
+    case "provider_auth":
+    case "provider_permission":
+    case "egress":
+      return "Online card payment is temporarily unavailable while payment settings are being updated. Your order and invoice are ready.";
+    case "below_minimum":
+      return "This invoice balance is below the online card payment minimum. Open your invoice for payment options.";
+    case "currency_mismatch":
+      return "Online card payment is not available in this invoice's currency. Open your invoice for payment instructions.";
+    case "order_locked":
+      return "Online payment is not available for this order right now. Open your invoice for details.";
+    default:
+      return "We could not open the secure payment page right now. You can select Pay now to try again or open your invoice.";
+  }
+}
+
+function classifyPostCommitPaymentFailure(err: unknown): {
+  reasonCode: string;
+  attemptPublicId: string | null;
+  failureClass: CheckoutPaymentFailureClass;
+  explicitOnlineAvailable: boolean | null;
+  safeMessage: string;
+} {
+  const reasonCode =
+    err instanceof DomainError && /^[A-Z0-9_]{2,64}$/u.test(err.reasonCode)
+      ? err.reasonCode
+      : "PAYMENT_START_FAILED";
+  const details = err instanceof DomainError ? err.details : undefined;
+  const rawAttemptId = details?.attemptPublicId;
+  const attemptPublicId =
+    typeof rawAttemptId === "string" && ULID_PATTERN.test(rawAttemptId) ? rawAttemptId : null;
+  const rawFailureClass = details?.failureClass;
+  const failureClass =
+    typeof rawFailureClass === "string" && KNOWN_PAYMENT_FAILURE_CLASSES.has(rawFailureClass as CheckoutPaymentFailureClass)
+      ? (rawFailureClass as CheckoutPaymentFailureClass)
+      : mapReasonCodeToFailureClass(reasonCode);
+  const explicitOnlineAvailable =
+    typeof details?.onlinePaymentAvailable === "boolean" ? details.onlinePaymentAvailable : null;
+  return {
+    reasonCode,
+    attemptPublicId,
+    failureClass,
+    explicitOnlineAvailable,
+    safeMessage: customerSafePaymentUnavailableMessage(failureClass),
+  };
 }
 
 export function createCartService(deps: ModuleDeps): CartModule {
@@ -1908,12 +2014,13 @@ export function createCartService(deps: ModuleDeps): CartModule {
           },
         );
       } catch (err) {
+        let recoveredSettledStart: Awaited<ReturnType<typeof paymentsSvc.startCheckout>> | null = null;
         if (existingByIdem && err instanceof DomainError && err.reasonCode === "INVOICE_ALREADY_PAID") {
           const ledgerStatus = await paymentsSvc.getCheckoutStatus(principal, {
             invoicePublicId: committed.invoicePublicId,
           });
           if (ledgerStatus.invoiceStatus === "paid" && (ledgerStatus.waivedMinor ?? 0) > 0) {
-            paymentStart = {
+            recoveredSettledStart = {
               mode: "settled",
               settlementKind: "waived_small_total",
               invoicePublicId: committed.invoicePublicId,
@@ -1931,11 +2038,104 @@ export function createCartService(deps: ModuleDeps): CartModule {
               currency: committed.currency,
               totalMinor: committed.totalMinor,
             } satisfies CheckoutCartResult;
-          } else {
-            throw err;
+          } else if (ledgerStatus.invoiceStatus === "paid") {
+            await deps.db.transaction(async (tx) => {
+              const [locked] = await tx.select().from(carts).where(eq(carts.id, committed.cartId)).for("update").limit(1);
+              if (!locked || locked.status === "checked_out") return;
+              const now = deps.clock.now();
+              await tx
+                .update(carts)
+                .set({
+                  status: "checked_out",
+                  version: locked.version + 1,
+                  updatedAt: now,
+                })
+                .where(eq(carts.id, locked.id));
+            });
+            return {
+              mode: "paid",
+              cartPublicId: committed.cartPublicId,
+              orderPublicId: committed.orderPublicId,
+              orderReference: committed.orderReference,
+              invoicePublicId: committed.invoicePublicId,
+              invoiceNumber: committed.invoiceNumber,
+              currency: committed.currency,
+              totalMinor: committed.totalMinor,
+              ...(ledgerStatus.receiptPublicId !== undefined ? { receiptPublicId: ledgerStatus.receiptPublicId } : {}),
+            } satisfies CheckoutCartResult;
           }
+        }
+
+        if (recoveredSettledStart) {
+          paymentStart = recoveredSettledStart;
         } else {
-          throw err;
+          const classified = classifyPostCommitPaymentFailure(err);
+          const onlinePaymentAvailable =
+            classified.explicitOnlineAvailable !== null
+              ? classified.explicitOnlineAvailable
+              : classified.failureClass === "configuration" ||
+                  classified.failureClass === "below_minimum" ||
+                  classified.failureClass === "currency_mismatch" ||
+                  classified.failureClass === "order_locked"
+                ? false
+                : await paymentsSvc.isOnlineCheckoutEnabled().catch(() => false);
+
+          await deps.db.transaction(async (tx) => {
+            const [locked] = await tx.select().from(carts).where(eq(carts.id, committed.cartId)).for("update").limit(1);
+            if (!locked) return;
+            const now = deps.clock.now();
+            if (
+              locked.status === "awaiting_payment" &&
+              classified.attemptPublicId !== null &&
+              locked.paymentAttemptPublicId !== classified.attemptPublicId
+            ) {
+              await tx
+                .update(carts)
+                .set({
+                  paymentAttemptPublicId: classified.attemptPublicId,
+                  version: locked.version + 1,
+                  updatedAt: now,
+                })
+                .where(eq(carts.id, locked.id));
+            }
+            await deps.audit.record(
+              {
+                category: "integration",
+                eventName: "cart.checkout_payment_start_failed",
+                action: "transition",
+                outcome: "failed",
+                severity: "WARN",
+                reasonCode: classified.reasonCode,
+                actor: { userId: principal.userId, role: principal.role },
+                resource: { type: "cart", publicId: committed.cartPublicId },
+                orderPublicId: committed.orderPublicId,
+                attributes: {
+                  order_public_id: committed.orderPublicId,
+                  invoice_public_id: committed.invoicePublicId,
+                  attempt_public_id: classified.attemptPublicId,
+                  failure_class: classified.failureClass,
+                  online_payment_available: onlinePaymentAvailable,
+                },
+              },
+              tx,
+            );
+          });
+
+          return {
+            mode: "payment_unavailable",
+            cartPublicId: committed.cartPublicId,
+            orderPublicId: committed.orderPublicId,
+            orderReference: committed.orderReference,
+            invoicePublicId: committed.invoicePublicId,
+            invoiceNumber: committed.invoiceNumber,
+            attemptPublicId: classified.attemptPublicId,
+            currency: committed.currency,
+            totalMinor: committed.totalMinor,
+            onlinePaymentAvailable,
+            reasonCode: classified.reasonCode,
+            failureClass: classified.failureClass,
+            safeMessage: classified.safeMessage,
+          } satisfies CheckoutCartResult;
         }
       }
 
@@ -2142,41 +2342,106 @@ export function createCartService(deps: ModuleDeps): CartModule {
       await assertCartEnabled();
 
       // Strictly read-only: NEVER mutates cart, attempt, or invoice state (Decision 12).
+      const paymentsSvc = cartPaymentsPort(deps.services);
       let cartRow: CartRow | undefined;
+      let paymentStatus: Awaited<ReturnType<typeof paymentsSvc.getCheckoutStatus>>;
+
       if (input.cartPublicId) {
         const [found] = await deps.db.select().from(carts).where(eq(carts.publicId, input.cartPublicId)).limit(1);
         cartRow = found;
+        if (!cartRow) throw cartNotFound();
+        if (cartRow.ownerUserId !== principal.userId) {
+          await denyCartAuthz(principal, "NOT_CART_OWNER", { type: "cart", publicId: cartRow.publicId });
+          throw cartNotFound();
+        }
+        if (!cartRow.checkoutInvoicePublicId || !cartRow.checkoutOrderPublicId || !cartRow.checkoutOrderReference) {
+          throw conflict("CART_NOT_CHECKED_OUT", "This cart has not completed checkout yet.");
+        }
+        try {
+          paymentStatus = await paymentsSvc.getCheckoutStatus(principal, {
+            invoicePublicId: cartRow.checkoutInvoicePublicId,
+            ...(input.attemptPublicId ? { attemptPublicId: input.attemptPublicId } : {}),
+          });
+        } catch (err) {
+          if (input.attemptPublicId && err instanceof DomainError && err.code === "NOT_FOUND") {
+            throw cartNotFound();
+          }
+          throw err;
+        }
+        if (
+          input.attemptPublicId &&
+          (paymentStatus.attempt?.attemptPublicId !== input.attemptPublicId ||
+            paymentStatus.invoicePublicId !== cartRow.checkoutInvoicePublicId)
+        ) {
+          throw cartNotFound();
+        }
       } else if (input.attemptPublicId) {
-        const [found] = await deps.db
+        const [foundByAttempt] = await deps.db
           .select()
           .from(carts)
           .where(eq(carts.paymentAttemptPublicId, input.attemptPublicId))
           .limit(1);
-        cartRow = found;
-      }
-
-      if (!cartRow) throw cartNotFound();
-      if (cartRow.ownerUserId !== principal.userId) {
-        await denyCartAuthz(principal, "NOT_CART_OWNER", { type: "cart", publicId: cartRow.publicId });
+        if (foundByAttempt) {
+          if (foundByAttempt.ownerUserId !== principal.userId) {
+            await denyCartAuthz(principal, "NOT_CART_OWNER", { type: "cart", publicId: foundByAttempt.publicId });
+            throw cartNotFound();
+          }
+          if (
+            !foundByAttempt.checkoutInvoicePublicId ||
+            !foundByAttempt.checkoutOrderPublicId ||
+            !foundByAttempt.checkoutOrderReference
+          ) {
+            throw conflict("CART_NOT_CHECKED_OUT", "This cart has not completed checkout yet.");
+          }
+          try {
+            paymentStatus = await paymentsSvc.getCheckoutStatus(principal, {
+              invoicePublicId: foundByAttempt.checkoutInvoicePublicId,
+              attemptPublicId: input.attemptPublicId,
+            });
+          } catch (err) {
+            if (err instanceof DomainError && err.code === "NOT_FOUND") {
+              throw cartNotFound();
+            }
+            throw err;
+          }
+          cartRow = foundByAttempt;
+        } else {
+          // Support retry attempts created via `payments.startInvoiceCheckout` for a committed cart's invoice.
+          try {
+            paymentStatus = await paymentsSvc.getCheckoutStatus(principal, {
+              attemptPublicId: input.attemptPublicId,
+            });
+          } catch (err) {
+            if (err instanceof DomainError && err.code === "NOT_FOUND") {
+              throw cartNotFound();
+            }
+            throw err;
+          }
+          const [foundByInvoice] = await deps.db
+            .select()
+            .from(carts)
+            .where(eq(carts.checkoutInvoicePublicId, paymentStatus.invoicePublicId))
+            .orderBy(desc(carts.id))
+            .limit(1);
+          if (!foundByInvoice) throw cartNotFound();
+          if (foundByInvoice.ownerUserId !== principal.userId) {
+            await denyCartAuthz(principal, "NOT_CART_OWNER", { type: "cart", publicId: foundByInvoice.publicId });
+            throw cartNotFound();
+          }
+          if (
+            !foundByInvoice.checkoutInvoicePublicId ||
+            !foundByInvoice.checkoutOrderPublicId ||
+            !foundByInvoice.checkoutOrderReference
+          ) {
+            throw conflict("CART_NOT_CHECKED_OUT", "This cart has not completed checkout yet.");
+          }
+          cartRow = foundByInvoice;
+        }
+      } else {
         throw cartNotFound();
       }
-      if (input.attemptPublicId && cartRow.paymentAttemptPublicId !== input.attemptPublicId) {
-        throw cartNotFound();
-      }
-      if (!cartRow.checkoutInvoicePublicId || !cartRow.checkoutOrderPublicId || !cartRow.checkoutOrderReference) {
-        throw conflict("CART_NOT_CHECKED_OUT", "This cart has not completed checkout yet.");
-      }
 
-      const paymentsSvc = cartPaymentsPort(deps.services);
-      const paymentStatus = await paymentsSvc.getCheckoutStatus(principal, {
-        invoicePublicId: cartRow.checkoutInvoicePublicId,
-        ...(input.attemptPublicId
-          ? { attemptPublicId: input.attemptPublicId }
-          : cartRow.paymentAttemptPublicId
-            ? { attemptPublicId: cartRow.paymentAttemptPublicId }
-            : {}),
-      });
-
+      const now = deps.clock.now();
       const waivedMinor =
         paymentStatus.invoiceStatus === "paid" ? (paymentStatus.waivedMinor ?? 0) : 0;
       const isWaivedSmallTotal = waivedMinor > 0;
@@ -2185,6 +2450,29 @@ export function createCartService(deps: ModuleDeps): CartModule {
         (cartRow.checkedOutTotalMinor ?? paymentStatus.amountMinor) === 0 &&
         cartRow.paymentMode === null;
       const attempt = paymentStatus.attempt;
+      const attemptRedirectedUnexpired = Boolean(
+        attempt &&
+          attempt.status === "redirected" &&
+          (!attempt.expiresAt || attempt.expiresAt.getTime() > now.getTime()),
+      );
+      const attemptInFlight = paymentStatus.attemptInFlight ?? attemptRedirectedUnexpired;
+      const onlinePaymentAvailable =
+        paymentStatus.onlinePaymentAvailable ??
+        (paymentStatus.providerConfigured !== "none" &&
+          paymentStatus.invoiceStatus === "issued" &&
+          paymentStatus.balanceDueMinor > 0);
+      const onlinePaymentUnavailableReason =
+        paymentStatus.onlinePaymentUnavailableReason ??
+        (!onlinePaymentAvailable
+          ? paymentStatus.providerConfigured === "none"
+            ? "provider_off"
+            : "invoice_not_payable"
+          : null);
+      const lastAttemptFailureClass = paymentStatus.lastAttemptFailureClass ?? null;
+      const arrivedFromProviderWithRedirectedAttempt = Boolean(
+        input.attemptPublicId && !input.cartPublicId && attemptRedirectedUnexpired,
+      );
+
       let confirmationState: CheckoutConfirmationState;
       if ((isNoPaymentDue || isWaivedSmallTotal) && paymentStatus.invoiceStatus === "paid") {
         confirmationState = "no_payment_due";
@@ -2194,18 +2482,21 @@ export function createCartService(deps: ModuleDeps): CartModule {
         confirmationState = "invoice_issued";
       } else if (cartRow.status === "restored" || attempt?.status === "cancelled" || paymentStatus.invoiceStatus === "void") {
         confirmationState = "cancelled";
-      } else if (attempt?.status === "failed" || attempt?.status === "expired") {
-        confirmationState = "failed";
-      } else {
+      } else if (arrivedFromProviderWithRedirectedAttempt) {
         confirmationState = "pending_confirmation";
+      } else {
+        confirmationState = "awaiting_payment";
       }
 
       const alreadyRestored = cartRow.status === "restored";
       const canRestoreToCart =
         !alreadyRestored &&
         !isWaivedSmallTotal &&
+        !isNoPaymentDue &&
         paymentStatus.invoiceStatus !== "paid" &&
-        cartRow.paymentMode === "redirect";
+        paymentStatus.invoiceStatus !== "void" &&
+        (cartRow.paymentMode === "redirect" ||
+          (cartRow.status === "awaiting_payment" && cartRow.paymentMode === null));
 
       return {
         cartPublicId: cartRow.publicId,
@@ -2218,10 +2509,14 @@ export function createCartService(deps: ModuleDeps): CartModule {
         provider: attempt?.provider ?? paymentStatus.providerConfigured,
         attemptPublicId: attempt?.attemptPublicId ?? cartRow.paymentAttemptPublicId ?? null,
         attemptStatus: attempt?.status ?? null,
+        attemptInFlight,
+        onlinePaymentAvailable,
+        onlinePaymentUnavailableReason,
+        lastAttemptFailureClass,
         failureReasonCode: attempt?.failureReasonCode ?? null,
-        orderPublicId: cartRow.checkoutOrderPublicId,
-        orderReference: cartRow.checkoutOrderReference,
-        invoicePublicId: cartRow.checkoutInvoicePublicId,
+        orderPublicId: cartRow.checkoutOrderPublicId!,
+        orderReference: cartRow.checkoutOrderReference!,
+        invoicePublicId: cartRow.checkoutInvoicePublicId!,
         invoiceNumber: paymentStatus.invoiceNumber ?? cartRow.checkoutInvoiceNumber ?? null,
         invoiceStatus: paymentStatus.invoiceStatus,
         currency: cartRow.checkedOutCurrency ?? paymentStatus.currency,
@@ -2250,6 +2545,65 @@ export function createCartService(deps: ModuleDeps): CartModule {
       const catalogGroups = await cartOrdersPort(deps.services).listActiveCatalog();
       const catalogMap = indexCatalog(catalogGroups);
 
+      // Pre-resolve retry `attemptPublicId` outside `tx` so single-connection pools never deadlock on `paymentsSvc.getCheckoutStatus`.
+      let resolvedRetryInvoicePublicId: string | null = null;
+      let verifiedRetryAttemptForCart = false;
+      if (!input.cartPublicId && input.attemptPublicId) {
+        const [directByAttempt] = await deps.db
+          .select({ id: carts.id })
+          .from(carts)
+          .where(eq(carts.paymentAttemptPublicId, input.attemptPublicId))
+          .limit(1);
+        if (!directByAttempt) {
+          try {
+            const resolved = await paymentsSvc.getCheckoutStatus(principal, {
+              attemptPublicId: input.attemptPublicId,
+            });
+            resolvedRetryInvoicePublicId = resolved.invoicePublicId;
+          } catch (err) {
+            if (err instanceof DomainError && err.code === "NOT_FOUND") {
+              throw cartNotFound();
+            }
+            throw err;
+          }
+        }
+      } else if (input.cartPublicId && input.attemptPublicId) {
+        const [directCart] = await deps.db
+          .select({
+            ownerUserId: carts.ownerUserId,
+            paymentAttemptPublicId: carts.paymentAttemptPublicId,
+            checkoutInvoicePublicId: carts.checkoutInvoicePublicId,
+          })
+          .from(carts)
+          .where(eq(carts.publicId, input.cartPublicId))
+          .limit(1);
+        if (
+          directCart &&
+          directCart.ownerUserId === principal.userId &&
+          directCart.paymentAttemptPublicId !== input.attemptPublicId
+        ) {
+          if (!directCart.checkoutInvoicePublicId) throw cartNotFound();
+          try {
+            const resolved = await paymentsSvc.getCheckoutStatus(principal, {
+              invoicePublicId: directCart.checkoutInvoicePublicId,
+              attemptPublicId: input.attemptPublicId,
+            });
+            if (
+              resolved.attempt?.attemptPublicId !== input.attemptPublicId ||
+              resolved.invoicePublicId !== directCart.checkoutInvoicePublicId
+            ) {
+              throw cartNotFound();
+            }
+            verifiedRetryAttemptForCart = true;
+          } catch (err) {
+            if (err instanceof DomainError && err.code === "NOT_FOUND") {
+              throw cartNotFound();
+            }
+            throw err;
+          }
+        }
+      }
+
       let deniedOtherCustomer = false;
       let targetCartPublicIdForAudit: string | null = input.cartPublicId ?? null;
       let alreadyRestoredFlag = false;
@@ -2262,12 +2616,20 @@ export function createCartService(deps: ModuleDeps): CartModule {
 
           const [sourceCart] = input.cartPublicId
             ? await tx.select().from(carts).where(eq(carts.publicId, input.cartPublicId)).for("update").limit(1)
-            : await tx
-                .select()
-                .from(carts)
-                .where(eq(carts.paymentAttemptPublicId, input.attemptPublicId!))
-                .for("update")
-                .limit(1);
+            : resolvedRetryInvoicePublicId
+              ? await tx
+                  .select()
+                  .from(carts)
+                  .where(eq(carts.checkoutInvoicePublicId, resolvedRetryInvoicePublicId))
+                  .orderBy(desc(carts.id))
+                  .for("update")
+                  .limit(1)
+              : await tx
+                  .select()
+                  .from(carts)
+                  .where(eq(carts.paymentAttemptPublicId, input.attemptPublicId!))
+                  .for("update")
+                  .limit(1);
 
           if (!sourceCart) throw cartNotFound();
           targetCartPublicIdForAudit = sourceCart.publicId;
@@ -2275,7 +2637,12 @@ export function createCartService(deps: ModuleDeps): CartModule {
             deniedOtherCustomer = true;
             throw cartNotFound();
           }
-          if (input.attemptPublicId && sourceCart.paymentAttemptPublicId !== input.attemptPublicId) {
+          if (
+            input.attemptPublicId &&
+            sourceCart.paymentAttemptPublicId !== input.attemptPublicId &&
+            !resolvedRetryInvoicePublicId &&
+            !verifiedRetryAttemptForCart
+          ) {
             throw cartNotFound();
           }
 

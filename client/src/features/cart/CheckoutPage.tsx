@@ -1,7 +1,12 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useId, useRef, useState, type FormEvent } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { Link, useLocation } from "wouter";
 import { StaffOrderHandoff } from "@/app/portal";
+import {
+  InvoiceOnlinePayAction,
+  invoiceCheckoutNavigation,
+  isHostedCheckoutUrl,
+} from "@/features/compliance/customer/InvoicePages";
 import { PromoCodeField } from "@/features/promotions/PromoCodeField";
 import {
   AgreementDialog,
@@ -13,6 +18,8 @@ import { errorMessage, safeError, useTRPC, useTRPCClient } from "@/lib/trpc";
 import { Button, Callout, Card, Checkbox, EmptyState, ErrorState, Field, Input, Money, PageHeader, Skeleton, Textarea } from "@/ui";
 import type { CartViewData } from "./CartPage";
 import { useCartViewerGate } from "./viewerGate";
+
+export { isHostedCheckoutUrl };
 
 const emptyBilling = {
   fullName: "", company: "", email: "", country: "", region: "", addressLine1: "", addressLine2: "",
@@ -37,15 +44,117 @@ const billingFields: { key: keyof Billing; label: string; maxLength: number; aut
   { key: "country", label: "Country code", maxLength: 2, autocomplete: "billing country", required: true, hint: "Two letters, such as US, CA or GB." },
 ];
 
-export function isHostedCheckoutUrl(raw: string, provider: "stripe" | "square", environment: "test" | "live"): boolean {
-  try {
-    const url = new URL(raw);
-    if (url.protocol !== "https:" || url.username || url.password || url.port) return false;
-    if (provider === "stripe") return url.hostname === "checkout.stripe.com" && url.pathname.startsWith("/c/pay/");
-    if (url.hash) return false;
-    if (environment === "live" && url.hostname === "checkout.square.site") return url.pathname.startsWith("/merchant/");
-    return url.hostname === (environment === "live" ? "square.link" : "sandbox.square.link") && /^\/u\/[A-Za-z0-9_-]{1,160}$/u.test(url.pathname);
-  } catch { return false; }
+type PlacedPaymentHandoff = {
+  kind: "untrusted_redirect_url" | "payment_unavailable";
+  cartPublicId: string;
+  orderPublicId: string;
+  orderReference: string;
+  invoicePublicId: string;
+  invoiceNumber: string;
+  currency: string;
+  totalMinor: number;
+  onlinePaymentAvailable: boolean;
+  safeMessage: string;
+};
+
+function PlacedOrderPaymentHandoff({ handoff }: { handoff: PlacedPaymentHandoff }) {
+  const [, navigate] = useLocation();
+  const alertRef = useRef<HTMLDivElement | null>(null);
+  const retryErrorRef = useRef<HTMLDivElement | null>(null);
+  const [payRetryError, setPayRetryError] = useState<string | null>(null);
+
+  useEffect(() => {
+    alertRef.current?.focus();
+  }, []);
+
+  return (
+    <div className="grid gap-4">
+      <div
+        ref={alertRef}
+        tabIndex={-1}
+        className="rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-action"
+      >
+        <Callout
+          tone="warning"
+          live="assertive"
+          title={`Your order ${handoff.orderReference} is placed, but we could not open the secure payment page`}
+        >
+          <p>{handoff.safeMessage}</p>
+          <p className="mt-1">
+            Your cart has already been converted into order <strong>{handoff.orderReference}</strong> — do not submit
+            this cart again.
+          </p>
+        </Callout>
+      </div>
+
+      {payRetryError ? (
+        <div
+          ref={retryErrorRef}
+          tabIndex={-1}
+          className="rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-action"
+        >
+          <Callout tone="danger" live="assertive" title="Could not open online payment">
+            <p>{payRetryError}</p>
+          </Callout>
+        </div>
+      ) : null}
+
+      <Card title="Order and invoice">
+        <dl className="grid gap-3 text-sm sm:grid-cols-2">
+          <div>
+            <dt className="font-semibold">Order reference</dt>
+            <dd className="break-all">{handoff.orderReference}</dd>
+          </div>
+          <div>
+            <dt className="font-semibold">Invoice number</dt>
+            <dd className="break-all">{handoff.invoiceNumber}</dd>
+          </div>
+          <div>
+            <dt className="font-semibold">Invoice balance</dt>
+            <dd>
+              <Money value={{ amountMinor: handoff.totalMinor, currency: handoff.currency }} />
+            </dd>
+          </div>
+        </dl>
+
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <InvoiceOnlinePayAction
+            invoicePublicId={handoff.invoicePublicId}
+            label="Pay now"
+            variant="primary"
+            successPath="/checkout/return"
+            cancelPath="/checkout/cancel"
+            onCheckoutError={(message) => {
+              setPayRetryError(message);
+              if (message) requestAnimationFrame(() => retryErrorRef.current?.focus());
+            }}
+            onSettled={() => {
+              navigate(`/checkout/return?cart=${encodeURIComponent(handoff.cartPublicId)}`, { replace: true });
+            }}
+          />
+          <Button asChild variant="secondary">
+            <Link href={`/invoices/${encodeURIComponent(handoff.invoicePublicId)}`}>View invoice</Link>
+          </Button>
+          <Button asChild variant="secondary">
+            <Link href={`/orders/${encodeURIComponent(handoff.orderPublicId)}`}>View order</Link>
+          </Button>
+          <Button asChild variant="secondary">
+            <Link href={`/checkout/return?cart=${encodeURIComponent(handoff.cartPublicId)}`}>View payment status</Link>
+          </Button>
+        </div>
+
+        {!handoff.onlinePaymentAvailable ? (
+          <p className="mt-3 text-sm text-muted">
+            If online payment is still unavailable, open your invoice for payment instructions or{" "}
+            <Link href="/support" className="font-semibold text-action underline underline-offset-2">
+              contact support
+            </Link>
+            .
+          </p>
+        ) : null}
+      </Card>
+    </div>
+  );
 }
 
 function CheckoutSummary({
@@ -103,7 +212,15 @@ function CheckoutSummary({
   </Card>;
 }
 
-function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: string }; reload: () => Promise<unknown> }) {
+function CheckoutForm({
+  cart,
+  reload,
+  onPaymentHandoff,
+}: {
+  cart: CartViewData & { cartPublicId: string };
+  reload: () => Promise<unknown>;
+  onPaymentHandoff: (handoff: PlacedPaymentHandoff) => void;
+}) {
   const trpc = useTRPC();
   const client = useTRPCClient();
   const queryClient = useQueryClient();
@@ -220,8 +337,39 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
       });
       void queryClient.invalidateQueries({ queryKey: trpc.cart.badgeCount.queryKey() });
       void queryClient.invalidateQueries({ queryKey: trpc.cart.get.queryKey(), refetchType: "none" });
-      if (result.mode === "redirect" && isHostedCheckoutUrl(result.redirectUrl, result.provider, result.environment)) {
-        window.location.replace(result.redirectUrl);
+      if (result.mode === "redirect") {
+        if (isHostedCheckoutUrl(result.redirectUrl, result.provider, result.environment)) {
+          invoiceCheckoutNavigation.redirectToHostedCheckout(result.redirectUrl);
+          return;
+        }
+        onPaymentHandoff({
+          kind: "untrusted_redirect_url",
+          cartPublicId: result.cartPublicId,
+          orderPublicId: result.orderPublicId,
+          orderReference: result.orderReference,
+          invoicePublicId: result.invoicePublicId,
+          invoiceNumber: result.invoiceNumber,
+          currency: result.currency,
+          totalMinor: result.totalMinor,
+          onlinePaymentAvailable: true,
+          safeMessage:
+            "For your security, we stopped an unexpected payment redirect link. Select Pay now to open a fresh hosted payment session, or open your invoice.",
+        });
+        return;
+      }
+      if (result.mode === "payment_unavailable") {
+        onPaymentHandoff({
+          kind: "payment_unavailable",
+          cartPublicId: result.cartPublicId,
+          orderPublicId: result.orderPublicId,
+          orderReference: result.orderReference,
+          invoicePublicId: result.invoicePublicId,
+          invoiceNumber: result.invoiceNumber,
+          currency: result.currency,
+          totalMinor: result.totalMinor,
+          onlinePaymentAvailable: result.onlinePaymentAvailable,
+          safeMessage: result.safeMessage,
+        });
         return;
       }
       navigate(`/checkout/return?cart=${encodeURIComponent(result.cartPublicId)}`, { replace: true });
@@ -429,17 +577,30 @@ export function CheckoutPage() {
 
 function CustomerCheckoutPage() {
   const trpc = useTRPC();
-  const cart = useQuery(trpc.cart.get.queryOptions(undefined, { refetchOnMount: "always" }));
+  const [placedHandoff, setPlacedHandoff] = useState<PlacedPaymentHandoff | null>(null);
+  const cart = useQuery(
+    trpc.cart.get.queryOptions(undefined, {
+      refetchOnMount: "always",
+      enabled: placedHandoff === null,
+    }),
+  );
   const data = cart.data;
   return <div className="grid gap-6">
     <PageHeader title="Checkout" description="Review your order, billing information and payment options."
       actions={<Button asChild variant="secondary"><Link href="/cart">Back to cart</Link></Button>} />
-    {cart.isPending ? <div role="status" aria-label="Loading checkout"><Skeleton lines={5} /></div> :
+    {placedHandoff ? (
+      <PlacedOrderPaymentHandoff handoff={placedHandoff} />
+    ) : cart.isPending ? <div role="status" aria-label="Loading checkout"><Skeleton lines={5} /></div> :
       cart.isError || !data ? <ErrorState title="Checkout could not be loaded" error={cart.error} onRetry={() => { void cart.refetch(); }} /> :
         !data.cartPublicId || !data.items.length || data.hasUnavailableItems || data.mixedCurrency || !data.totals.currency ?
           <EmptyState title="Review your cart before checking out" description="Checkout needs available items priced in the same currency."
             action={<Button asChild><Link href="/cart">Review cart</Link></Button>} /> :
-          <CheckoutForm key={data.cartPublicId} cart={{ ...data, cartPublicId: data.cartPublicId }} reload={cart.refetch} />}
+          <CheckoutForm
+            key={data.cartPublicId}
+            cart={{ ...data, cartPublicId: data.cartPublicId }}
+            reload={cart.refetch}
+            onPaymentHandoff={setPlacedHandoff}
+          />}
   </div>;
 }
 
