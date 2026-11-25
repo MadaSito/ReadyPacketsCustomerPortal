@@ -1,4 +1,4 @@
-# Cart & Checkout Module API (Increments 04–06 — Package L, Package B & Package D)
+# Cart & Checkout Module API (Increments 04–07 — Package L, Package B, Package D & Package C)
 
 Owner: `recovery_ops_engineer` (`server/modules/cart/**`, `client/src/features/cart/**`).
 Import types from `server/modules/cart/index.ts`; reach the runtime instance at call time via `deps.services.cart`.
@@ -19,6 +19,9 @@ Import types from `server/modules/cart/index.ts`; reach the runtime instance at 
   - At `cart.checkout`, if an applied code became invalid (including lowered `PROMO_LIMIT_*` guardrails), `cart.checkout` clears the stale code, emits `cart.promo.invalidated_at_checkout`, and throws `CONFLICT:PROMO_RECONFIRM_TOTAL` (**order not placed**). When `totalMinor === 0`, customer copy shows `"Nothing to pay — your discount covers this order."`, checkout settles the zero-balance invoice immediately (and records a `zero_total` receipt when Wave-2 `payments.startCheckout` supports settled receipts), and returns `{ mode: "no_payment_due", totalMinor: 0, ... }`. When `0 < totalMinor < minimumMinor` under an online provider: `"block"` rejects checkout inside Phase 1 `tx` with `CONFLICT:AMOUNT_BELOW_PROVIDER_MINIMUM` so the order, invoice, and promo redemption roll back cleanly; `"waive"` leaves the cart in `awaiting_payment` with `checked_out_waived_minor = 0` in Phase 1 (never storing a predictive waiver) and writes `status = "checked_out"` + `checked_out_waived_minor` only when Phase 2 `payments.startCheckout` actually settles `waived_small_total` in the invoice ledger (reconciling replays and `cart.checkoutStatus` directly from the settled ledger outcome even if settings/provider change between or after phases).
 - **Order agreement gate at checkout (Increment 06 Decision D14):**
   - Inside `cart.checkout`'s serializable transaction, `orders.gates.assertCustomerMayPlaceOrder({ tx, actor })` runs before order/invoice creation. When the configured account-level agreement (MNDA) is unmet, checkout rolls back cleanly and throws `CONFLICT:AGREEMENT_REQUIRED` (`{ policyPublicId, signatureMode }`); `CheckoutPage` opens `AgreementDialog` so the customer can read, sign/accept, and automatically retry checkout.
+- **Transactional invoice payment hook (Increment 07 Decision D9):**
+  - `CartService.onInvoicePaidInTx({ invoiceId, tx })` is invoked by `compliance` inside the same database transaction where an invoice transitions to `paid`. It locks any matching `carts` row (`checkout_invoice_id = invoiceId`, `FOR UPDATE`), transitions `awaiting_payment -> checked_out` (`open_customer_key = null`, `version + 1`), records `cart.checkout_completed` (`category: "business"`, `actor: { role: "system" }`), and returns `{ transitioned: boolean; cartPublicId: string | null }` idempotently.
+  - Phase 2 of `cart.checkout` guards against fast payment webhooks (`locked.status === "checked_out"` is never downgraded back to `awaiting_payment`), and `cart.restoreCheckout` rejects restoring any cart whose `status === "checked_out"` with `CONFLICT:CHECKOUT_ALREADY_PAID`.
 
 ---
 
@@ -63,7 +66,7 @@ Import types from `server/modules/cart/index.ts`; reach the runtime instance at 
 
 ## 3. Audit Events (`snake_case` attributes, zero PII / raw promo code strings)
 
-- Customer cart & checkout (`category: "business"`): `cart.item_added`, `cart.item_updated`, `cart.item_removed`, `cart.cleared`, `cart.details_saved`, `cart.promo_applied`, `cart.promo_removed`, `cart.promo_invalidated_at_checkout`, `cart.upsell_accepted`, `cart.upsell_dismissed`, `cart.checked_out`, `cart.checkout_payment_started`, `cart.checkout_restored`, `cart.expired`.
+- Customer cart & checkout (`category: "business"`): `cart.item_added`, `cart.item_updated`, `cart.item_removed`, `cart.cleared`, `cart.details_saved`, `cart.promo_applied`, `cart.promo_removed`, `cart.promo_invalidated_at_checkout`, `cart.upsell_accepted`, `cart.upsell_dismissed`, `cart.checked_out`, `cart.checkout_payment_started`, `cart.checkout_completed`, `cart.checkout_restored`, `cart.expired`.
 - Admin cart suggestions (`category: "admin"`): `cart.upsell_offer_created`, `cart.upsell_offer_updated`, `cart.upsell_offer_toggled`, `cart.upsell_offer_deleted`.
 - Security (`category: "security"`, `outcome: "denied"`, `severity: "WARN"`): `authz.cart.denied`.
 

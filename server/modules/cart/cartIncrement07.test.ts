@@ -95,11 +95,13 @@ class ProgrammableRedirectPaymentsFake implements CartPaymentsPort {
     };
   }
 
-  async getCheckoutStatus(_principal: SessionPrincipal, input: { invoicePublicId: string; attemptPublicId?: string }) {
-    const isPaid = this.paidInvoices.has(input.invoicePublicId);
+  async getCheckoutStatus(_principal: SessionPrincipal, input: { invoicePublicId?: string; attemptPublicId?: string }) {
+    const invoicePublicId = input.invoicePublicId ?? "";
+    const isPaid = this.paidInvoices.has(invoicePublicId);
     return {
       providerConfigured: "stripe" as const,
-      invoicePublicId: input.invoicePublicId,
+      environment: "test" as const,
+      invoicePublicId,
       invoiceNumber: "INV-TEST-007",
       invoiceStatus: isPaid ? ("paid" as const) : ("issued" as const),
       currency: "USD",
@@ -112,7 +114,14 @@ class ProgrammableRedirectPaymentsFake implements CartPaymentsPort {
             attemptPublicId: input.attemptPublicId,
             provider: "stripe" as const,
             environment: "test" as const,
-            status: isPaid ? ("succeeded" as const) : ("redirect_created" as const),
+            status: isPaid ? ("paid" as const) : ("redirected" as const),
+            cartPublicId: null,
+            amountMinor: 5000,
+            currency: "USD",
+            createdAt: new Date("2026-11-24T00:00:00.000Z"),
+            redirectedAt: new Date("2026-11-24T00:00:00.000Z"),
+            paidAt: isPaid ? new Date("2026-11-24T00:01:00.000Z") : null,
+            expiresAt: null,
             failureReasonCode: null,
           }
         : null,
@@ -195,6 +204,7 @@ describe("cart.onInvoicePaidInTx (Increment 07 D9)", () => {
   it("transitions awaiting_payment -> checked_out atomically, is idempotent on replay, and blocks restoreCheckout", async () => {
     const added = await cartMod.addItems(buyer.principal, {
       items: [{ productPublicId, quantity: 1 }],
+      replacePacketTiers: false,
     });
     const checkout = await cartMod.checkout(buyer.principal, {
       cartPublicId: added.cartPublicId!,
@@ -284,6 +294,7 @@ describe("cart.onInvoicePaidInTx (Increment 07 D9)", () => {
   it("preserves checked_out status if a fast webhook runs onInvoicePaidInTx before checkout Phase 2 completes", async () => {
     const added = await cartMod.addItems(buyer.principal, {
       items: [{ productPublicId, quantity: 1 }],
+      replacePacketTiers: false,
     });
 
     paymentsFake.onStartPaymentHook = async (invoicePublicId) => {

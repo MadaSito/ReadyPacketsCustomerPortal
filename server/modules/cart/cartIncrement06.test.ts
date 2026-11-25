@@ -1532,12 +1532,12 @@ describe("Increment 06 Package D — Seeded upsells (D3), D5 totals & small_tota
         (err) => extractCodes(err).reasonCode === "PROCESS_CRASH_AFTER_SETTLEMENT",
       );
 
-      // Cart row has not been reconciled yet (`checkedOutWaivedMinor === 0`), even though the ledger settled!
+      // Increment 07 D9 marks `status = "checked_out"` inside the ledger settlement tx; `checkedOutWaivedMinor` is still 0 until Phase 2 replay reconciles it.
       const [cart4BeforeReconcile] = await t.db
         .select()
         .from(cartTables.carts)
         .where(eq(cartTables.carts.publicId, cart4.cartPublicId!));
-      expect(cart4BeforeReconcile?.status).toBe("awaiting_payment");
+      expect(cart4BeforeReconcile?.status).toBe("checked_out");
       expect(cart4BeforeReconcile?.checkedOutWaivedMinor).toBe(0);
 
       // Even before replay updates the cart row, `checkoutStatus` sees `invoiceStatus === "paid"` and blocks restore!
