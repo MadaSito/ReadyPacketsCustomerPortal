@@ -111,7 +111,7 @@ const catalogue: Catalogue = {
 } as unknown as Catalogue;
 
 const summary = (patch: Partial<AutomationSummaryView> = {}): AutomationSummaryView => ({
-  publicId: AID, name: "Order confirmation", description: null, enabled: false, version: 3, trigger: { kind: "event", triggerKey: "order.created" },
+  publicId: AID, name: "Order confirmation", description: null, enabled: false, sortOrder: 0, version: 3, trigger: { kind: "event", triggerKey: "order.created" },
   conditionGroupCount: 0, actionCount: 1, maxRunsPerHour: 30, lastRun: { publicId: "ar_1", state: "completed", triggerMode: "event", startedAt: NOW, finishedAt: NOW, createdAt: NOW },
   createdAt: NOW, updatedAt: NOW, ...patch,
 });

@@ -1,13 +1,16 @@
 /**
- * automations feature — editor draft model and pure helpers. Owner: audit engineer (client + trigger catalogue).
- * Server contract: server/modules/automations/API.md (engagement engineer). The server re-validates everything;
- * these checks only give early, field-level feedback.
+ * automations feature — editor draft model and pure helpers.
+ * Owner: siem_engineer (Increment 07 Package G client).
+ * Server contract: server/modules/automations/contracts.ts (engagement_engineer). The server re-validates everything;
+ * these checks give immediate, field-level feedback.
  *
  * One draft is edited by both the wizard and the canvas; the canvas is a projection of the same data
  * (trigger → conditions → ordered actions), so the two views can never disagree.
  */
+import { STAGE_ALERT_SEVERITIES, STAGE_COMPLETION_DELAY_MAX_MINUTES } from "@shared/workflowStages";
 import type {
   AutomationActionConfigField,
+  AutomationCataloguePickerOptions,
   AutomationCatalogueView,
   AutomationConditionTree,
   AutomationDetailView,
@@ -19,7 +22,12 @@ import type {
   AutomationTestRunResult,
   AutomationTriggerConfig,
   AutomationVersionView,
+  CatalogueFieldOptionSourceKey,
+  CataloguePickerOption,
+  CompletionJobState,
   ConditionOperator,
+  OrderStageRunState,
+  StageBundleSlotOutcome,
 } from "@server/modules/automations/contracts";
 import type { TriggerCatalogueEntry, TriggerField } from "@server/modules/audit/triggerCatalogue";
 
@@ -27,7 +35,21 @@ export type Catalogue = AutomationCatalogueView;
 export type CatalogueAction = Catalogue["actions"][number];
 export type ConfigField = AutomationActionConfigField;
 export type TriggerEntry = TriggerCatalogueEntry;
-export type { AutomationDetailView, AutomationRunView, AutomationStarterRecipe, AutomationSummaryView, AutomationTestRunResult, AutomationTriggerConfig, AutomationVersionView, ConditionOperator, TriggerField };
+export type {
+  AutomationDetailView,
+  AutomationRunView,
+  AutomationStarterRecipe,
+  AutomationSummaryView,
+  AutomationTestRunResult,
+  AutomationTriggerConfig,
+  AutomationVersionView,
+  CataloguePickerOption,
+  CompletionJobState,
+  ConditionOperator,
+  OrderStageRunState,
+  StageBundleSlotOutcome,
+  TriggerField,
+};
 
 export const BASE = "/admin/automations";
 
@@ -118,11 +140,170 @@ export function draftFromRecipe(recipe: AutomationStarterRecipe, catalogue: Cata
   };
 }
 
-/* ------------------------------------------------------------------ fields and operators */
+/* ------------------------------------------------------------------ fields, picker options and scope */
 
 /** Fields usable in conditions: the trigger's non-personal fields. Manual and scheduled runs have none. */
 export function conditionFields(trigger: AutomationTriggerConfig | null, catalogue: Catalogue | undefined): TriggerField[] {
   return (triggerEntry(trigger, catalogue)?.fields ?? []).filter((f) => !f.personal);
+}
+
+const FALLBACK_FIELD_SOURCES: Readonly<Record<string, CatalogueFieldOptionSourceKey>> = {
+  to_status: "statuses",
+  from_status: "statuses",
+  status_key: "statuses",
+  current_status: "statuses",
+  stage_key: "stages",
+  phase_key: "stages",
+  workflow_key: "workflows",
+  method: "paymentMethods",
+  payment_method: "paymentMethods",
+  provider: "paymentProviders",
+  questionnaire_public_id: "intakeQuestionnaires",
+  questionnaire_key: "intakeQuestionnaires",
+  decision: "intakeDecisions",
+};
+
+function readPickerSource(
+  pickerOptions: AutomationCataloguePickerOptions | undefined,
+  sourceKey: CatalogueFieldOptionSourceKey | undefined,
+): readonly CataloguePickerOption[] {
+  if (!pickerOptions || !sourceKey) return [];
+  if (sourceKey === "emailTemplates") {
+    return (pickerOptions.emailTemplates ?? []).map((tpl) => ({
+      value: tpl.templateKey,
+      label: `${tpl.name} (${tpl.templateKey})`,
+    }));
+  }
+  return pickerOptions[sourceKey] ?? [];
+}
+
+/**
+ * Resolves real option-list choices for a trigger field (statuses, phases, workflows, payment methods/providers,
+ * intake questionnaires/decisions, or static `enumValues`). Returns `[]` when free-form input is expected.
+ */
+export function fieldPickerOptions(field: TriggerField | undefined, catalogue: Catalogue | undefined): CataloguePickerOption[] {
+  if (!field) return [];
+  const picker = catalogue?.pickerOptions;
+  const sourceKey = picker?.fieldOptionSources?.[field.key] ?? FALLBACK_FIELD_SOURCES[field.key];
+  const fromCatalogue = readPickerSource(picker, sourceKey);
+  if (fromCatalogue.length > 0) {
+    return fromCatalogue.map((opt) => ({
+      value: opt.value,
+      label: opt.secondaryLabel ? `${opt.label} (${opt.secondaryLabel})` : opt.label,
+      ...(opt.disabled !== undefined ? { disabled: opt.disabled } : {}),
+    }));
+  }
+  if (field.type === "enum" && field.enumValues && field.enumValues.length > 0) {
+    return field.enumValues.map((v) => ({
+      value: v,
+      label: v.replace(/_/g, " "),
+    }));
+  }
+  return [];
+}
+
+const PRIMARY_SCOPE_FIELD_PRIORITY: readonly string[] = [
+  "to_status",
+  "stage_key",
+  "status_key",
+  "questionnaire_public_id",
+  "decision",
+  "provider",
+  "method",
+  "workflow_key",
+];
+
+/**
+ * Returns the primary option-backed field for the "All occurrences / Specific value" scope selector on an event trigger,
+ * or `undefined` when the event has no option-backed scope field.
+ */
+export function primaryScopeField(trigger: AutomationTriggerConfig | null, catalogue: Catalogue | undefined): TriggerField | undefined {
+  if (trigger?.kind !== "event") return undefined;
+  const fields = conditionFields(trigger, catalogue);
+  for (const key of PRIMARY_SCOPE_FIELD_PRIORITY) {
+    const match = fields.find((f) => f.key === key);
+    if (match && fieldPickerOptions(match, catalogue).length > 0) return match;
+  }
+  return fields.find((f) => fieldPickerOptions(f, catalogue).length > 0);
+}
+
+export type SimpleFieldScope =
+  | { mode: "all" }
+  | { mode: "specific"; value: string }
+  | { mode: "complex"; count: number };
+
+/**
+ * Inspects `draft.groups` for a single `eq` scope leaf on `fieldKey` without losing complex multi-group trees.
+ */
+export function getSimpleFieldScope(draft: Pick<Draft, "groups" | "match">, fieldKey: string): SimpleFieldScope {
+  const matchingLeaves: { groupIndex: number; groupMatch: "all" | "any"; cond: DraftCondition }[] = [];
+  draft.groups.forEach((group, groupIndex) => {
+    for (const cond of group.conditions) {
+      if (cond.field === fieldKey) {
+        matchingLeaves.push({ groupIndex, groupMatch: group.match, cond });
+      }
+    }
+  });
+  if (matchingLeaves.length === 0) return { mode: "all" };
+  if (
+    matchingLeaves.length === 1 &&
+    draft.match === "all" &&
+    matchingLeaves[0]!.groupMatch === "all" &&
+    matchingLeaves[0]!.cond.operator === "eq"
+  ) {
+    return { mode: "specific", value: matchingLeaves[0]!.cond.value };
+  }
+  return { mode: "complex", count: matchingLeaves.length };
+}
+
+/**
+ * Sets or clears a simple `eq` filter on `fieldKey` while preserving all unrelated conditions and groups.
+ */
+export function setSimpleFieldScope(draft: Draft, fieldKey: string, nextValue: string | null): Draft {
+  if (nextValue === null) {
+    const groups = draft.groups
+      .map((g) => ({
+        ...g,
+        conditions: g.conditions.filter((c) => !(c.field === fieldKey && c.operator === "eq")),
+      }))
+      .filter((g) => g.conditions.length > 0);
+    return { ...draft, groups };
+  }
+
+  let updated = false;
+  const groups = draft.groups.map((g) => {
+    if (updated || g.match !== "all") return g;
+    const idx = g.conditions.findIndex((c) => c.field === fieldKey && c.operator === "eq");
+    if (idx < 0) return g;
+    updated = true;
+    const conditions = [...g.conditions];
+    conditions[idx] = { ...conditions[idx]!, value: nextValue };
+    return { ...g, conditions };
+  });
+
+  if (updated) return { ...draft, match: "all", groups };
+
+  const ids = allConditionIds(draft);
+  const condId = nextId("c", ids);
+  if (groups.length > 0 && groups[0]!.match === "all") {
+    const first = groups[0]!;
+    const nextGroups = [...groups];
+    nextGroups[0] = {
+      ...first,
+      conditions: [{ id: condId, field: fieldKey, operator: "eq", value: nextValue }, ...first.conditions],
+    };
+    return { ...draft, match: "all", groups: nextGroups };
+  }
+
+  const groupId = nextId("g", [...ids, condId]);
+  return {
+    ...draft,
+    match: "all",
+    groups: [
+      { id: groupId, match: "all", conditions: [{ id: condId, field: fieldKey, operator: "eq", value: nextValue }] },
+      ...groups,
+    ],
+  };
 }
 
 export function operatorsFor(field: TriggerField | undefined, catalogue: Catalogue | undefined): readonly ConditionOperator[] {
@@ -175,6 +356,8 @@ export type StepId = "trigger" | "conditions" | "actions" | "review";
 export type Errors = Record<string, string>;
 
 const EMAIL_RE = /^[^\s@<>"',;]+@[^\s@<>"',;]+\.[^\s@<>"',;]+$/u;
+const MANAGED_WEBHOOK_TARGET_RE = /^(production:[A-Za-z0-9_-]{2,32}|subscription:[0-9A-HJKMNP-TV-Z]{26})$/;
+const ALERT_CODE_RE = /^[A-Z][A-Z0-9_]{1,63}$/;
 
 export function orderContextAvailable(trigger: AutomationTriggerConfig | null, catalogue: Catalogue | undefined): boolean {
   if (!trigger) return false;
@@ -227,6 +410,88 @@ export function validateConditions(draft: Draft, catalogue: Catalogue | undefine
   return errors;
 }
 
+function validateSpecialActionConfig(step: DraftAction, at: (key: string) => string, errors: Errors): boolean {
+  if (step.actionKey === "order.set_completion") {
+    const kind = step.config.kind;
+    if (kind !== "fixed" && kind !== "range") {
+      errors[at("kind")] = "Choose fixed percentage or random range.";
+      return true;
+    }
+    if (kind === "fixed") {
+      const pct = step.config.percent;
+      if (typeof pct !== "number" || !Number.isInteger(pct) || pct < 0 || pct > 100) {
+        errors[at("percent")] = "Enter a whole percentage from 0 to 100.";
+      }
+    } else {
+      const minP = step.config.minPercent;
+      const maxP = step.config.maxPercent;
+      if (typeof minP !== "number" || !Number.isInteger(minP) || minP < 0 || minP > 100) {
+        errors[at("minPercent")] = "Enter a whole percentage from 0 to 100.";
+      }
+      if (typeof maxP !== "number" || !Number.isInteger(maxP) || maxP < 0 || maxP > 100) {
+        errors[at("maxPercent")] = "Enter a whole percentage from 0 to 100.";
+      }
+      if (
+        typeof minP === "number" &&
+        typeof maxP === "number" &&
+        Number.isInteger(minP) &&
+        Number.isInteger(maxP) &&
+        minP > maxP
+      ) {
+        errors[at("minPercent")] = "The lowest percentage must not be above the highest.";
+      }
+    }
+    const delay = step.config.delayMinutes ?? 0;
+    if (
+      typeof delay !== "number" ||
+      !Number.isInteger(delay) ||
+      delay < 0 ||
+      delay > STAGE_COMPLETION_DELAY_MAX_MINUTES
+    ) {
+      errors[at("delayMinutes")] = `Enter a whole number of minutes from 0 to ${STAGE_COMPLETION_DELAY_MAX_MINUTES}.`;
+    }
+    return true;
+  }
+
+  if (step.actionKey === "webhook.enqueue_subscription") {
+    const targetKey = typeof step.config.targetKey === "string" ? step.config.targetKey.trim() : "";
+    if (!targetKey) {
+      errors[at("targetKey")] = "Choose a managed webhook subscription.";
+    } else if (/^https?:\/\//i.test(targetKey) || !MANAGED_WEBHOOK_TARGET_RE.test(targetKey)) {
+      errors[at("targetKey")] = "Choose a managed webhook subscription instead of a raw URL.";
+    }
+    const eventKey = step.config.eventKey;
+    if (eventKey !== undefined && eventKey !== "" && (typeof eventKey !== "string" || eventKey.length > 80)) {
+      errors[at("eventKey")] = "Keep the custom event key within 80 characters.";
+    }
+    return true;
+  }
+
+  if (step.actionKey === "dashboard.create_alert") {
+    const severity = step.config.severity;
+    if (typeof severity !== "string" || !(STAGE_ALERT_SEVERITIES as readonly string[]).includes(severity)) {
+      errors[at("severity")] = "Choose warning, error or critical.";
+    }
+    const title = typeof step.config.titleTemplate === "string" ? step.config.titleTemplate.trim() : "";
+    if (!title) {
+      errors[at("titleTemplate")] = "Enter an alert title.";
+    } else if (title.length > 120) {
+      errors[at("titleTemplate")] = "Keep the alert title within 120 characters.";
+    }
+    const body = step.config.bodyTemplate;
+    if (typeof body === "string" && body.length > 500) {
+      errors[at("bodyTemplate")] = "Keep the alert details within 500 characters.";
+    }
+    const code = step.config.code;
+    if (typeof code === "string" && code.trim() !== "" && !ALERT_CODE_RE.test(code.trim())) {
+      errors[at("code")] = "Use uppercase letters, digits and underscores (for example AUTOMATION_RULE_ALERT).";
+    }
+    return true;
+  }
+
+  return false;
+}
+
 export function validateActions(draft: Draft, catalogue: Catalogue | undefined): Errors {
   const errors: Errors = {};
   const max = catalogue?.limits.maxActionsPerAutomation ?? 10;
@@ -240,6 +505,7 @@ export function validateActions(draft: Draft, catalogue: Catalogue | undefined):
     if (draft.trigger && !def.supportedTriggerModes.includes(draft.trigger.kind)) errors[at("action")] = `“${def.label}” cannot run from this kind of trigger.`;
     if (def.requiresOrderContext && !orderContextAvailable(draft.trigger, catalogue)) errors[at("action")] = `“${def.label}” needs a trigger about an order.`;
     if (entry?.staffOnly && def.forbidOnStaffOnlyTrigger) errors[at("action")] = `“${def.label}” cannot be used with a staff-only trigger.`;
+    if (validateSpecialActionConfig(step, at, errors)) continue;
     for (const field of def.configFields) {
       const value = step.config[field.key];
       if (field.type === "secret" || field.secret) {
@@ -253,6 +519,9 @@ export function validateActions(draft: Draft, catalogue: Catalogue | undefined):
       }
       if (field.type === "email" && (typeof value !== "string" || !EMAIL_RE.test(value) || value.length > 254)) errors[at(field.key)] = "Enter an e-mail address such as name@example.com.";
       if (field.type === "https_url" && (typeof value !== "string" || !/^https:\/\/[^\s]+$/u.test(value) || value.length > 2048)) errors[at(field.key)] = "Enter an address that starts with https://.";
+      if (field.type === "webhook_subscription" && (typeof value !== "string" || !MANAGED_WEBHOOK_TARGET_RE.test(value))) {
+        errors[at(field.key)] = "Choose a managed webhook subscription.";
+      }
       if (field.type === "number" && (typeof value !== "number" || (field.min !== undefined && value < field.min) || (field.max !== undefined && value > field.max))) {
         errors[at(field.key)] = `Enter a number${field.min !== undefined ? ` from ${field.min}` : ""}${field.max !== undefined ? ` to ${field.max}` : ""}.`;
       }
@@ -306,9 +575,22 @@ export function toSaveInput(draft: Draft, catalogue: Catalogue | undefined) {
 
 /* ------------------------------------------------------------------ draft edits (shared by wizard and canvas) */
 
+function defaultActionConfig(actionKey: string): Record<string, unknown> {
+  if (actionKey === "order.set_completion") {
+    return { kind: "fixed", percent: 50, delayMinutes: 0 };
+  }
+  if (actionKey === "webhook.enqueue_subscription") {
+    return { targetKey: "", includeEvaluatedFields: true };
+  }
+  if (actionKey === "dashboard.create_alert") {
+    return { severity: "warning", titleTemplate: "" };
+  }
+  return {};
+}
+
 export function addAction(draft: Draft, actionKey: string, afterIndex = draft.actions.length - 1): Draft {
   const stepKey = nextId("step_", draft.actions.map((a) => a.stepKey));
-  const step: DraftAction = { stepKey, actionKey, label: "", config: {}, secrets: {}, secretStatus: {} };
+  const step: DraftAction = { stepKey, actionKey, label: "", config: defaultActionConfig(actionKey), secrets: {}, secretStatus: {} };
   const actions = [...draft.actions];
   actions.splice(afterIndex + 1, 0, step);
   return { ...draft, actions };
@@ -375,6 +657,7 @@ export function triggerLabel(trigger: AutomationTriggerConfig | null, catalogue:
 }
 
 export function formatMinutes(minutes: number): string {
+  if (minutes <= 0) return "immediately";
   if (minutes % 1440 === 0) return minutes === 1440 ? "day" : `${minutes / 1440} days`;
   if (minutes % 60 === 0) return minutes === 60 ? "hour" : `${minutes / 60} hours`;
   return `${minutes} minutes`;
@@ -447,6 +730,27 @@ export const STEP_STATE: Record<AutomationStepState, { label: string; tone: Tone
   skipped: { label: "Skipped", tone: "neutral" },
   failed: { label: "Failed", tone: "danger" },
   unknown: { label: "Outcome unknown — not retried automatically", tone: "warning" },
+};
+
+export const STAGE_RUN_STATE_META: Record<OrderStageRunState, { label: string; tone: Tone }> = {
+  completed: { label: "Completed", tone: "success" },
+  partial_failed: { label: "Partially completed", tone: "warning" },
+  failed: { label: "Failed", tone: "danger" },
+};
+
+export const STAGE_SLOT_OUTCOME_META: Record<StageBundleSlotOutcome, { label: string; tone: Tone }> = {
+  completed: { label: "Completed", tone: "success" },
+  scheduled: { label: "Scheduled", tone: "info" },
+  skipped: { label: "Skipped", tone: "neutral" },
+  failed: { label: "Failed", tone: "danger" },
+};
+
+export const COMPLETION_JOB_STATE_META: Record<CompletionJobState, { label: string; tone: Tone }> = {
+  scheduled: { label: "Scheduled", tone: "info" },
+  applied: { label: "Applied", tone: "success" },
+  superseded: { label: "Superseded", tone: "neutral" },
+  canceled: { label: "Canceled", tone: "neutral" },
+  failed: { label: "Failed", tone: "danger" },
 };
 
 export const TRIGGER_MODE_LABEL = { event: "Event", manual: "Manual", schedule: "Schedule" } as const;

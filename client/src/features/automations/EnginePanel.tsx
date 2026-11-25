@@ -1,6 +1,7 @@
 /**
- * Portal-wide automations switch and limits (`automations.settings.*`). The platform Settings page links here
- * ("Managed on Automations"), so this panel is the one place the engine is turned on or off.
+ * Portal-wide automations switches and limits (`automations.settings.*`). The platform Settings page links here
+ * ("Managed on Automations"), so this panel is the one place unattended rules and administrator-run phase bundles
+ * are turned on or off independently.
  */
 import { useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -9,7 +10,7 @@ import { Badge, Button, Callout, Card, Field, Input, StepUpCancelledError, useSt
 import type { AutomationSettingsView } from "@server/modules/automations/contracts";
 import { useAutomationsApi } from "./api";
 
-type LimitKey = Exclude<keyof AutomationSettingsView, "enabled">;
+type LimitKey = Exclude<keyof AutomationSettingsView, "enabled" | "stageBundlesEnabled">;
 
 const LIMITS: { key: LimitKey; label: string; hint: string; min: number; max: number }[] = [
   { key: "globalRunsPerMinute", label: "All automations: runs per minute", hint: "Whole numbers from 5 to 2000.", min: 5, max: 2000 },
@@ -73,11 +74,20 @@ export function EnginePanel() {
   }
   if (!current) return null;
 
+  const stageBundlesOn = current.stageBundlesEnabled === true;
+
   return (
     <Card
       title="Automations engine"
-      description="One switch for the whole portal. While it is off you can still build and test automations, but none of them run."
-      actions={<Badge tone={current.enabled ? "success" : "warning"}>{current.enabled ? "On" : "Off"}</Badge>}
+      description="Control unattended automation rules and administrator-run order phase bundles separately. While a switch is off, you can still configure workflows and rules without running them."
+      actions={
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge tone={current.enabled ? "success" : "warning"}>{current.enabled ? "On" : "Off"}</Badge>
+          <Badge tone={stageBundlesOn ? "success" : "neutral"}>
+            Phase bundles: {stageBundlesOn ? "On" : "Off"}
+          </Badge>
+        </div>
+      }
     >
       <div className="space-y-6">
         {!current.enabled ? (
@@ -86,15 +96,59 @@ export function EnginePanel() {
           </Callout>
         ) : null}
         {problem ? <Callout tone="danger" live="assertive">{problem}</Callout> : null}
-        <div>
-          <Button
-            variant={current.enabled ? "secondary" : "primary"}
-            loading={update.isPending}
-            onClick={() => void save({ enabled: !current.enabled }, current.enabled ? "Automations turned off for the portal" : "Automations turned on for the portal")}
-          >
-            {current.enabled ? "Turn automations off" : "Turn automations on"}
-          </Button>
+
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="flex flex-col justify-between gap-3 rounded-[var(--radius-card)] border border-line bg-surface-soft p-4 rp-forced-border">
+            <div className="space-y-1">
+              <p className="text-sm font-semibold text-ink">Unattended rules</p>
+              <p className="text-sm text-muted">
+                Event, scheduled and manual rules evaluated in deterministic rule order.
+              </p>
+            </div>
+            <div>
+              <Button
+                variant={current.enabled ? "secondary" : "primary"}
+                loading={update.isPending}
+                onClick={() =>
+                  void save(
+                    { enabled: !current.enabled },
+                    current.enabled
+                      ? "Automations turned off for the portal"
+                      : "Automations turned on for the portal",
+                  )
+                }
+              >
+                {current.enabled ? "Turn automations off" : "Turn automations on"}
+              </Button>
+            </div>
+          </div>
+
+          <div className="flex flex-col justify-between gap-3 rounded-[var(--radius-card)] border border-line bg-surface-soft p-4 rp-forced-border">
+            <div className="space-y-1">
+              <p className="text-sm font-semibold text-ink">Administrator-run phase bundles</p>
+              <p className="text-sm text-muted">
+                Preview-and-confirm phase actions on an order&apos;s pinned workflow version. Runs even while unattended rules stay off.
+              </p>
+            </div>
+            <div>
+              <Button
+                variant={stageBundlesOn ? "secondary" : "primary"}
+                loading={update.isPending}
+                onClick={() =>
+                  void save(
+                    { stageBundlesEnabled: !stageBundlesOn },
+                    stageBundlesOn
+                      ? "Administrator-run phase bundles turned off"
+                      : "Administrator-run phase bundles turned on",
+                  )
+                }
+              >
+                {stageBundlesOn ? "Turn phase bundles off" : "Turn phase bundles on"}
+              </Button>
+            </div>
+          </div>
         </div>
+
         <form onSubmit={submitLimits} className="space-y-4" noValidate>
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             {LIMITS.map((limit) => (

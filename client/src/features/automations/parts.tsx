@@ -1,20 +1,71 @@
 /**
  * automations feature — editors shared by the wizard and the canvas side panel, plus small presentational parts.
- * Owner: audit engineer. Every control has a visible label; errors are tied to their fields.
+ * Owner: siem_engineer (Increment 07 Package G client). Every control has a visible label; errors are tied to their fields.
  */
 import { ArrowDown, ArrowUp, Plus, Trash2 } from "lucide-react";
 import type { SelectHTMLAttributes } from "react";
+import { STAGE_ALERT_SEVERITIES, STAGE_COMPLETION_DELAY_MAX_MINUTES } from "@shared/workflowStages";
 import { Badge, Button, Callout, Checkbox, Field, IconButton, Input, KeyValueList, RadioGroup, Select, Textarea, useFieldControl } from "@/ui";
 import {
-  OPERATOR_LABELS, RUN_STATE, STEP_STATE, addAction, addCondition, addGroup, conditionFields, formatDuration, moveAction, operatorNeedsValue,
-  operatorsFor, recipientOptions, removeAction, removeCondition, setTrigger, templateFields, triggerEntry, triggerLabel, updateAction,
-  updateCondition, type AutomationRunView, type AutomationTestRunResult, type Catalogue, type ConfigField, type Draft, type DraftAction, type Errors,
+  COMPLETION_JOB_STATE_META,
+  OPERATOR_LABELS,
+  RUN_STATE,
+  STAGE_RUN_STATE_META,
+  STAGE_SLOT_OUTCOME_META,
+  STEP_STATE,
+  addAction,
+  addCondition,
+  addGroup,
+  conditionFields,
+  fieldPickerOptions,
+  formatDuration,
+  formatMinutes,
+  getSimpleFieldScope,
+  moveAction,
+  operatorNeedsValue,
+  operatorsFor,
+  primaryScopeField,
+  recipientOptions,
+  removeAction,
+  removeCondition,
+  setSimpleFieldScope,
+  setTrigger,
+  templateFields,
+  triggerEntry,
+  triggerLabel,
+  updateAction,
+  updateCondition,
+  type AutomationRunView,
+  type AutomationTestRunResult,
+  type Catalogue,
+  type CompletionJobState,
+  type ConfigField,
+  type Draft,
+  type DraftAction,
+  type Errors,
+  type OrderStageRunState,
+  type StageBundleSlotOutcome,
 } from "./model";
 
 type Change = (next: Draft) => void;
 
 export function RunStateBadge({ state }: { state: keyof typeof RUN_STATE }) {
   const meta = RUN_STATE[state] ?? { label: state, tone: "neutral" as const };
+  return <Badge tone={meta.tone}>{meta.label}</Badge>;
+}
+
+export function StageRunStateBadge({ state }: { state: OrderStageRunState }) {
+  const meta = STAGE_RUN_STATE_META[state] ?? { label: state, tone: "neutral" as const };
+  return <Badge tone={meta.tone}>{meta.label}</Badge>;
+}
+
+export function StageSlotOutcomeBadge({ outcome }: { outcome: StageBundleSlotOutcome }) {
+  const meta = STAGE_SLOT_OUTCOME_META[outcome] ?? { label: outcome, tone: "neutral" as const };
+  return <Badge tone={meta.tone}>{meta.label}</Badge>;
+}
+
+export function CompletionJobStateBadge({ state }: { state: CompletionJobState }) {
+  const meta = COMPLETION_JOB_STATE_META[state] ?? { label: state, tone: "neutral" as const };
   return <Badge tone={meta.tone}>{meta.label}</Badge>;
 }
 
@@ -34,6 +85,10 @@ export function TriggerEditor({ draft, onChange, catalogue, errors }: { draft: D
   const kind = draft.trigger?.kind ?? "";
   const groups = [...new Set(catalogue.triggers.map((t) => t.group))];
   const entry = triggerEntry(draft.trigger, catalogue);
+  const scopeField = primaryScopeField(draft.trigger, catalogue);
+  const scopeOptions = fieldPickerOptions(scopeField, catalogue);
+  const scope = scopeField ? getSimpleFieldScope(draft, scopeField.key) : null;
+
   return (
     <div className="flex flex-col gap-5">
       <Field label="Name" required error={errors.name}>
@@ -72,6 +127,47 @@ export function TriggerEditor({ draft, onChange, catalogue, errors }: { draft: D
           </GroupedSelect>
         </Field>
       ) : null}
+
+      {scopeField && scopeOptions.length > 0 && scope ? (
+        scope.mode === "complex" ? (
+          <Callout tone="info" title={`Filtered in Conditions (${scope.count} rules on ${scopeField.label})`}>
+            This automation uses multi-condition rules for {scopeField.label.toLowerCase()}. Edit them on the Conditions step.
+          </Callout>
+        ) : (
+          <div className="flex flex-col gap-3 rounded-[var(--radius-card)] border border-line bg-surface-soft p-3.5 rp-forced-border">
+            <RadioGroup
+              legend={`Occurrences (${scopeField.label})`}
+              value={scope.mode}
+              onValueChange={(nextMode) => {
+                if (nextMode === "all") {
+                  onChange(setSimpleFieldScope(draft, scopeField.key, null));
+                } else {
+                  const firstVal = scopeOptions.find((o) => !o.disabled)?.value ?? scopeOptions[0]!.value;
+                  onChange(setSimpleFieldScope(draft, scopeField.key, firstVal));
+                }
+              }}
+              options={[
+                { value: "all", label: "All occurrences", description: `Run for every ${entry?.label.toLowerCase() ?? "event"}.` },
+                { value: "specific", label: "Specific value", description: `Run only for a chosen ${scopeField.label.toLowerCase()}.` },
+              ]}
+            />
+            {scope.mode === "specific" ? (
+              <Field label={scopeField.label} required>
+                <Select
+                  value={scope.value}
+                  options={
+                    scopeOptions.some((o) => o.value === scope.value) || !scope.value
+                      ? scopeOptions
+                      : [...scopeOptions, { value: scope.value, label: `${scope.value} (saved value)` }]
+                  }
+                  onChange={(e) => onChange(setSimpleFieldScope(draft, scopeField.key, e.currentTarget.value))}
+                />
+              </Field>
+            ) : null}
+          </div>
+        )
+      ) : null}
+
       {entry?.staffOnly ? <Callout tone="info" title="Staff-only event">Actions can address staff and administrators only.</Callout> : null}
       {draft.trigger?.kind === "schedule" ? (
         <Field label="Run every (minutes)" required error={errors.everyMinutes} hint={`From ${catalogue.limits.minScheduleMinutes} to ${catalogue.limits.maxScheduleMinutes} minutes.`}>
@@ -81,7 +177,7 @@ export function TriggerEditor({ draft, onChange, catalogue, errors }: { draft: D
         </Field>
       ) : null}
       {draft.trigger?.kind === "manual" ? (
-        <Checkbox label="Ask for an order when started" description="Lets order actions (copy files, SharePoint sync) run for the chosen order."
+        <Checkbox label="Ask for an order when started" description="Lets order actions (completion updates, copy files, SharePoint sync) run for the chosen order."
           checked={draft.trigger.requireOrderPublicId === true}
           onCheckedChange={(checked) => onChange({ ...draft, trigger: { kind: "manual", requireOrderPublicId: checked } })} />
       ) : null}
@@ -108,7 +204,7 @@ export function ConditionsEditor({ draft, onChange, catalogue, errors }: { draft
   }
   return (
     <div className="flex flex-col gap-4">
-      <p className="text-sm text-muted">Leave empty to run every time. Values come only from the event; no expressions are evaluated.</p>
+      <p className="text-sm text-muted">Leave empty to run for all occurrences. Values come only from the event and its registered context; no expressions are evaluated.</p>
       {draft.groups.length > 1 ? (
         <RadioGroup legend="Groups" orientation="horizontal" value={draft.match} onValueChange={(v) => onChange({ ...draft, match: v as Draft["match"] })}
           options={[{ value: "all", label: "All groups must match" }, { value: "any", label: "Any group may match" }]} />
@@ -126,6 +222,12 @@ export function ConditionsEditor({ draft, onChange, catalogue, errors }: { draft
           {group.conditions.map((c, ci) => {
             const field = fields.find((f) => f.key === c.field);
             const ops = operatorsFor(field, catalogue);
+            const pickerOpts = fieldPickerOptions(field, catalogue);
+            const usePickerSelect = pickerOpts.length > 0 && c.operator !== "in" && c.operator !== "not_in" && c.operator !== "contains" && c.operator !== "starts_with";
+            const selectOptions =
+              usePickerSelect && c.value && !pickerOpts.some((opt) => opt.value === c.value)
+                ? [...pickerOpts, { value: c.value, label: `${c.value} (saved value)` }]
+                : pickerOpts;
             const n = `${gi + 1}.${ci + 1}`;
             return (
               <div key={c.id} className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_auto] sm:items-start">
@@ -139,8 +241,8 @@ export function ConditionsEditor({ draft, onChange, catalogue, errors }: { draft
                 </Field>
                 {operatorNeedsValue(c.operator) ? (
                   <Field label={`Value ${n}`} error={errors[`${c.id}.value`]} hint={field?.type === "money_minor" ? "Amount, e.g. 12.50" : c.operator === "in" || c.operator === "not_in" ? "Separate values with commas" : undefined}>
-                    {field?.type === "enum" && field.enumValues && c.operator !== "in" && c.operator !== "not_in" ? (
-                      <Select placeholder="Choose…" value={c.value} options={field.enumValues.map((v) => ({ value: v, label: v.replace(/_/g, " ") }))}
+                    {usePickerSelect ? (
+                      <Select placeholder="Choose…" value={c.value} options={selectOptions}
                         onChange={(e) => onChange(updateCondition(draft, c.id, { value: e.target.value }))} />
                     ) : (
                       <Input value={c.value} maxLength={400} inputMode={field?.type === "number" || field?.type === "money_minor" ? "decimal" : undefined}
@@ -170,6 +272,341 @@ export function ConditionsEditor({ draft, onChange, catalogue, errors }: { draft
 
 /* ------------------------------------------------------------------ actions */
 
+function parseWholeNumber(raw: string): number | undefined {
+  if (raw.trim() === "") return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) ? Math.trunc(n) : undefined;
+}
+
+function webhookTargetSelectOptions(catalogue: Catalogue, currentTargetKey: string | undefined) {
+  const picker = catalogue.pickerOptions;
+  const targets = picker?.webhookTargets ?? [];
+  const subs = picker?.webhookSubscriptions ?? [];
+  const seen = new Set<string>();
+  const options: { value: string; label: string; disabled?: boolean }[] = [];
+
+  for (const sub of subs) {
+    seen.add(sub.targetKey);
+    const flags = [
+      sub.signingEnabled ? "signed" : "unsigned",
+      sub.enabled ? null : "disabled",
+    ].filter(Boolean);
+    options.push({
+      value: sub.targetKey,
+      label: `${sub.label} (${flags.join(", ")})`,
+      disabled: !sub.enabled,
+    });
+  }
+  for (const target of targets) {
+    if (seen.has(target.targetKey)) continue;
+    seen.add(target.targetKey);
+    const flags = [
+      target.signingEnabled ? "signed" : "unsigned",
+      target.configured && target.enabled ? null : "unavailable",
+    ].filter(Boolean);
+    options.push({
+      value: target.targetKey,
+      label: `${target.label} (${flags.join(", ")})`,
+      disabled: !target.configured || !target.enabled,
+    });
+  }
+  if (currentTargetKey && !seen.has(currentTargetKey)) {
+    options.push({
+      value: currentTargetKey,
+      label: `Current target (${currentTargetKey})`,
+    });
+  }
+  return options;
+}
+
+function SetCompletionActionEditor({
+  step,
+  draft,
+  onChange,
+  err,
+}: {
+  step: DraftAction;
+  draft: Draft;
+  onChange: Change;
+  err: (key: string) => string | undefined;
+}) {
+  const kind = step.config.kind === "range" ? "range" : "fixed";
+  const delayMinutes = typeof step.config.delayMinutes === "number" ? step.config.delayMinutes : 0;
+  const delayMode = delayMinutes > 0 ? "delayed" : "immediate";
+  const patchConfig = (patch: Record<string, unknown>) =>
+    onChange(updateAction(draft, step.stepKey, { config: { ...step.config, ...patch } }));
+
+  return (
+    <div className="grid gap-4">
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field
+          label="Completion mode"
+          required
+          hint="Fixed percentage or one cryptographically sampled value inside a range."
+          error={err("kind")}
+        >
+          <Select
+            value={kind}
+            options={[
+              { value: "fixed", label: "Fixed percentage" },
+              { value: "range", label: "Random range" },
+            ]}
+            onChange={(event) => {
+              const nextKind = event.currentTarget.value as "fixed" | "range";
+              if (nextKind === "fixed") {
+                const pct =
+                  typeof step.config.percent === "number"
+                    ? step.config.percent
+                    : typeof step.config.minPercent === "number"
+                      ? step.config.minPercent
+                      : 50;
+                onChange(
+                  updateAction(draft, step.stepKey, {
+                    config: { kind: "fixed", percent: pct, delayMinutes },
+                  }),
+                );
+              } else {
+                const base = typeof step.config.percent === "number" ? step.config.percent : 40;
+                onChange(
+                  updateAction(draft, step.stepKey, {
+                    config: {
+                      kind: "range",
+                      minPercent: Math.min(base, 100),
+                      maxPercent: Math.min(Math.max(base + 20, base), 100),
+                      delayMinutes,
+                    },
+                  }),
+                );
+              }
+            }}
+          />
+        </Field>
+
+        <Field
+          label="When to apply"
+          required
+          hint={`Delayed updates can be scheduled up to 30 days (${STAGE_COMPLETION_DELAY_MAX_MINUTES.toLocaleString()} minutes).`}
+        >
+          <Select
+            value={delayMode}
+            options={[
+              { value: "immediate", label: "Apply immediately" },
+              { value: "delayed", label: "Apply after a delay" },
+            ]}
+            onChange={(event) => {
+              const nextDelay = event.currentTarget.value === "delayed" ? Math.max(1, delayMinutes || 60) : 0;
+              patchConfig({ delayMinutes: nextDelay });
+            }}
+          />
+        </Field>
+      </div>
+
+      {kind === "fixed" ? (
+        <Field label="Completion percentage (0–100%)" required error={err("percent")}>
+          <Input
+            type="number"
+            inputMode="numeric"
+            min={0}
+            max={100}
+            step={1}
+            value={typeof step.config.percent === "number" ? String(step.config.percent) : ""}
+            onChange={(event) => patchConfig({ percent: parseWholeNumber(event.currentTarget.value) })}
+          />
+        </Field>
+      ) : (
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="Lowest percentage (0–100%)" required error={err("minPercent")}>
+            <Input
+              type="number"
+              inputMode="numeric"
+              min={0}
+              max={100}
+              step={1}
+              value={typeof step.config.minPercent === "number" ? String(step.config.minPercent) : ""}
+              onChange={(event) => patchConfig({ minPercent: parseWholeNumber(event.currentTarget.value) })}
+            />
+          </Field>
+          <Field label="Highest percentage (0–100%)" required error={err("maxPercent")}>
+            <Input
+              type="number"
+              inputMode="numeric"
+              min={0}
+              max={100}
+              step={1}
+              value={typeof step.config.maxPercent === "number" ? String(step.config.maxPercent) : ""}
+              onChange={(event) => patchConfig({ maxPercent: parseWholeNumber(event.currentTarget.value) })}
+            />
+          </Field>
+        </div>
+      )}
+
+      {delayMode === "delayed" ? (
+        <Field
+          label="Delay (minutes)"
+          required
+          hint={`1 to ${STAGE_COMPLETION_DELAY_MAX_MINUTES.toLocaleString()} minutes (${formatMinutes(delayMinutes)}).`}
+          error={err("delayMinutes")}
+        >
+          <Input
+            type="number"
+            inputMode="numeric"
+            min={1}
+            max={STAGE_COMPLETION_DELAY_MAX_MINUTES}
+            step={1}
+            value={delayMinutes > 0 ? String(delayMinutes) : ""}
+            onChange={(event) => patchConfig({ delayMinutes: parseWholeNumber(event.currentTarget.value) })}
+          />
+        </Field>
+      ) : null}
+    </div>
+  );
+}
+
+function EnqueueWebhookActionEditor({
+  step,
+  draft,
+  onChange,
+  catalogue,
+  err,
+}: {
+  step: DraftAction;
+  draft: Draft;
+  onChange: Change;
+  catalogue: Catalogue;
+  err: (key: string) => string | undefined;
+}) {
+  const targetKey = typeof step.config.targetKey === "string" ? step.config.targetKey : "";
+  const eventKey = typeof step.config.eventKey === "string" ? step.config.eventKey : "";
+  const includeFields = step.config.includeEvaluatedFields !== false;
+  const options = webhookTargetSelectOptions(catalogue, targetKey || undefined);
+  const patchConfig = (patch: Record<string, unknown>) =>
+    onChange(updateAction(draft, step.stepKey, { config: { ...step.config, ...patch } }));
+
+  return (
+    <div className="grid gap-4">
+      <Field
+        label="Webhook subscription"
+        required
+        hint={
+          options.length > 0
+            ? "Queues a signed delivery to a managed subscription or production webhook target. Raw URLs are never stored on rules."
+            : "No managed webhook subscriptions are configured yet. Create one under Integrations → Webhooks first."
+        }
+        error={err("targetKey")}
+      >
+        <Select
+          placeholder="Choose a webhook subscription…"
+          value={targetKey}
+          options={options}
+          onChange={(event) => patchConfig({ targetKey: event.currentTarget.value })}
+        />
+      </Field>
+
+      <Field
+        label="Custom event key"
+        hint="Optional identifier sent in the delivery metadata (defaults to the trigger key)."
+        error={err("eventKey")}
+      >
+        <Input
+          maxLength={80}
+          value={eventKey}
+          onChange={(event) => patchConfig({ eventKey: event.currentTarget.value || undefined })}
+        />
+      </Field>
+
+      <Checkbox
+        label="Include allowlisted event fields"
+        description="Sends non-personal scalar fields from the trigger in the webhook payload."
+        checked={includeFields}
+        onCheckedChange={(checked) => patchConfig({ includeEvaluatedFields: checked })}
+      />
+    </div>
+  );
+}
+
+function DashboardAlertActionEditor({
+  step,
+  draft,
+  onChange,
+  catalogue,
+  err,
+}: {
+  step: DraftAction;
+  draft: Draft;
+  onChange: Change;
+  catalogue: Catalogue;
+  err: (key: string) => string | undefined;
+}) {
+  const severity = typeof step.config.severity === "string" ? step.config.severity : "warning";
+  const titleTemplate = typeof step.config.titleTemplate === "string" ? step.config.titleTemplate : "";
+  const bodyTemplate = typeof step.config.bodyTemplate === "string" ? step.config.bodyTemplate : "";
+  const code = typeof step.config.code === "string" ? step.config.code : "";
+  const vars = templateFields(draft.trigger, catalogue).filter((f) => !f.personal);
+  const placeholderHint = vars.length ? `Placeholders: ${vars.map((v) => `{{${v.key}}}`).join(", ")}` : undefined;
+  const patchConfig = (patch: Record<string, unknown>) =>
+    onChange(updateAction(draft, step.stepKey, { config: { ...step.config, ...patch } }));
+
+  return (
+    <div className="grid gap-4">
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field label="Alert severity" required error={err("severity")}>
+          <Select
+            value={severity}
+            options={STAGE_ALERT_SEVERITIES.map((sev) => ({
+              value: sev,
+              label: sev.charAt(0).toUpperCase() + sev.slice(1),
+            }))}
+            onChange={(event) => patchConfig({ severity: event.currentTarget.value })}
+          />
+        </Field>
+
+        <Field
+          label="Reason code"
+          hint="Optional uppercase code (defaults to AUTOMATION_RULE_ALERT)."
+          error={err("code")}
+        >
+          <Input
+            maxLength={64}
+            placeholder="AUTOMATION_RULE_ALERT"
+            value={code}
+            onChange={(event) =>
+              patchConfig({
+                code: event.currentTarget.value.toUpperCase().replace(/[^A-Z0-9_]/g, "") || undefined,
+              })
+            }
+          />
+        </Field>
+      </div>
+
+      <Field
+        label="Alert title"
+        required
+        hint={["Shown on the operational alerts dashboard (up to 120 characters).", placeholderHint].filter(Boolean).join(" ")}
+        error={err("titleTemplate")}
+      >
+        <Input
+          maxLength={120}
+          value={titleTemplate}
+          onChange={(event) => patchConfig({ titleTemplate: event.currentTarget.value })}
+        />
+      </Field>
+
+      <Field
+        label="Alert details"
+        hint={["Optional plain-text context for staff and administrators (up to 500 characters).", placeholderHint].filter(Boolean).join(" ")}
+        error={err("bodyTemplate")}
+      >
+        <Textarea
+          rows={3}
+          maxLength={500}
+          value={bodyTemplate}
+          onChange={(event) => patchConfig({ bodyTemplate: event.currentTarget.value || undefined })}
+        />
+      </Field>
+    </div>
+  );
+}
+
 function ConfigFieldControl({ field, step, draft, onChange, catalogue, error }: { field: ConfigField; step: DraftAction; draft: Draft; onChange: Change; catalogue: Catalogue; error?: string }) {
   const value = step.config[field.key];
   const set = (v: unknown) => onChange(updateAction(draft, step.stepKey, { config: { ...step.config, [field.key]: v } }));
@@ -192,6 +629,31 @@ function ConfigFieldControl({ field, step, draft, onChange, catalogue, error }: 
     return (
       <Field label={field.label} required={field.required} hint={hint} error={error}>
         <Select placeholder="Choose…" value={typeof value === "string" ? value : ""} options={field.enumOptions ?? []} onChange={(e) => set(e.target.value || undefined)} />
+      </Field>
+    );
+  }
+  if (field.type === "webhook_subscription") {
+    const current = typeof value === "string" ? value : "";
+    const options = webhookTargetSelectOptions(catalogue, current || undefined);
+    return (
+      <Field label={field.label} required={field.required} hint={hint ?? "Choose a managed webhook subscription."} error={error}>
+        <Select placeholder="Choose…" value={current} options={options} onChange={(e) => set(e.target.value || undefined)} />
+      </Field>
+    );
+  }
+  if (field.type === "template_key" && (catalogue.pickerOptions?.emailTemplates?.length ?? 0) > 0) {
+    const current = typeof value === "string" ? value : "";
+    const templates = catalogue.pickerOptions!.emailTemplates;
+    const options = templates.map((tpl) => ({
+      value: tpl.templateKey,
+      label: `${tpl.name} (${tpl.templateKey})`,
+    }));
+    if (current && !options.some((opt) => opt.value === current)) {
+      options.push({ value: current, label: `Current template (${current})` });
+    }
+    return (
+      <Field label={field.label} required={field.required} hint={hint ?? "Choose a published e-mail template."} error={error}>
+        <Select placeholder="Choose a template…" value={current} options={options} onChange={(e) => set(e.target.value || undefined)} />
       </Field>
     );
   }
@@ -264,7 +726,17 @@ export function ActionForm({ step, index, draft, onChange, catalogue, errors }: 
       <Field label={`Step ${index + 1} label`} hint="Optional. Shown in run history and on the canvas.">
         <Input value={step.label} maxLength={80} onChange={(e) => onChange(updateAction(draft, step.stepKey, { label: e.target.value }))} />
       </Field>
-      {def?.configFields.map((field) => <ConfigFieldControl key={field.key} field={field} step={step} draft={draft} onChange={onChange} catalogue={catalogue} error={err(field.key)} />)}
+      {step.actionKey === "order.set_completion" ? (
+        <SetCompletionActionEditor step={step} draft={draft} onChange={onChange} err={err} />
+      ) : step.actionKey === "webhook.enqueue_subscription" ? (
+        <EnqueueWebhookActionEditor step={step} draft={draft} onChange={onChange} catalogue={catalogue} err={err} />
+      ) : step.actionKey === "dashboard.create_alert" ? (
+        <DashboardAlertActionEditor step={step} draft={draft} onChange={onChange} catalogue={catalogue} err={err} />
+      ) : (
+        def?.configFields.map((field) => (
+          <ConfigFieldControl key={field.key} field={field} step={step} draft={draft} onChange={onChange} catalogue={catalogue} error={err(field.key)} />
+        ))
+      )}
     </div>
   );
 }
@@ -274,7 +746,7 @@ export function AddActionPicker({ draft, onChange, catalogue, afterIndex }: { dr
   const mode = draft.trigger?.kind;
   const options = catalogue.actions.map((a) => ({ value: a.key, label: `${a.category}: ${a.label}`, disabled: mode !== undefined && !a.supportedTriggerModes.includes(mode) }));
   return (
-    <Field label="Add an action" hint={full ? `At most ${catalogue.limits.maxActionsPerAutomation} actions.` : "Only registered actions can run. None of them can change an order's status or anyone's permissions."}>
+    <Field label="Add an action" hint={full ? `At most ${catalogue.limits.maxActionsPerAutomation} actions.` : "Only registered actions can run. Unattended rules never change an order's status or anyone's permissions."}>
       <Select placeholder="Choose an action…" value="" disabled={full} options={options}
         onChange={(e) => { if (e.target.value) onChange(addAction(draft, e.target.value, afterIndex)); }} />
     </Field>
@@ -310,6 +782,27 @@ export function ActionsEditor({ draft, onChange, catalogue, errors }: { draft: D
 
 /* ------------------------------------------------------------------ review and test */
 
+function describeDraftAction(step: DraftAction, catalogue: Catalogue): string {
+  const custom = step.label.trim();
+  const base = custom || catalogue.actions.find((d) => d.key === step.actionKey)?.label || step.actionKey;
+  if (step.actionKey === "order.set_completion") {
+    const delay = typeof step.config.delayMinutes === "number" && step.config.delayMinutes > 0
+      ? `after ${formatMinutes(step.config.delayMinutes)}`
+      : "immediately";
+    if (step.config.kind === "range") {
+      return `${base} (${String(step.config.minPercent ?? 0)}%–${String(step.config.maxPercent ?? 100)}%, ${delay})`;
+    }
+    return `${base} (${String(step.config.percent ?? 0)}%, ${delay})`;
+  }
+  if (step.actionKey === "webhook.enqueue_subscription" && typeof step.config.targetKey === "string" && step.config.targetKey) {
+    return `${base} (${step.config.targetKey})`;
+  }
+  if (step.actionKey === "dashboard.create_alert" && typeof step.config.severity === "string") {
+    return `${base} (${step.config.severity})`;
+  }
+  return base;
+}
+
 export function DraftSummary({ draft, catalogue }: { draft: Draft; catalogue: Catalogue }) {
   const fields = conditionFields(draft.trigger, catalogue);
   return (
@@ -321,7 +814,7 @@ export function DraftSummary({ draft, catalogue }: { draft: Draft; catalogue: Ca
       ]} />
       <div>
         <h3 className="mb-1 text-base font-semibold text-ink">Conditions</h3>
-        {draft.groups.length === 0 ? <p className="text-sm text-muted">None — runs every time.</p> : (
+        {draft.groups.length === 0 ? <p className="text-sm text-muted">None — runs for all occurrences.</p> : (
           <ul className="list-disc pl-5 text-sm text-ink">
             {draft.groups.map((g, gi) => (
               <li key={g.id}>
@@ -337,7 +830,7 @@ export function DraftSummary({ draft, catalogue }: { draft: Draft; catalogue: Ca
         <h3 className="mb-1 text-base font-semibold text-ink">Actions, in order</h3>
         {draft.actions.length === 0 ? <p className="text-sm text-muted">None yet.</p> : (
           <ol className="list-decimal pl-5 text-sm text-ink">
-            {draft.actions.map((a) => <li key={a.stepKey}>{a.label.trim() || catalogue.actions.find((d) => d.key === a.actionKey)?.label || a.actionKey}</li>)}
+            {draft.actions.map((a) => <li key={a.stepKey}>{describeDraftAction(a, catalogue)}</li>)}
           </ol>
         )}
       </div>
