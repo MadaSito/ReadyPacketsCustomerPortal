@@ -4,6 +4,7 @@ import { Link } from "wouter";
 import { useTRPC } from "@/lib/trpc";
 import { Button, Card, DateTime, ErrorState, Skeleton } from "@/ui";
 import { OrderStatusBadge } from "./shared";
+import { OrderListProgress } from "./stages/OrderListProgress";
 
 export default function RecentOrdersWidget() {
   const trpc = useTRPC();
@@ -39,6 +40,7 @@ export default function RecentOrdersWidget() {
                 <span className="text-sm text-muted">
                   {order.reference} · updated <DateTime value={order.updatedAt} format="relative" />
                 </span>
+                <OrderListProgress name={order.projectName} progressPercent={order.progressPercent} phaseLabel={order.phaseLabel} phaseIndex={order.phaseIndex} phaseTotal={order.phaseTotal} canceled={order.progressCanceled} className="mt-2 w-full sm:w-64" />
               </span>
               <span className="w-fit shrink-0 self-start sm:self-center">
                 <OrderStatusBadge label={order.statusLabel} tone={order.statusTone} />
