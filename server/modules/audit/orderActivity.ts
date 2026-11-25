@@ -94,6 +94,23 @@ export const ORDER_ACTIVITY_CATALOGUE: readonly CatalogueEntry[] = Object.freeze
   { pattern: "promotion.redeemed", category: "payments", label: "Discount code applied", customer: true },
   { pattern: "promotion.released", category: "payments", label: "Discount code released", customer: true },
   /* Increment 05 (D4): order gate acceptance evidence is already "order.acceptance.recorded" above. */
+  /* Increment 07 (D1, D3–D5, D8, D9): phases, questions, progress, payment state. Names in API.md. Customers see
+     their phase steps, questions and answers, and the payment state; runs, completions and checklists are staff-only. */
+  { pattern: "order.stage.advanced", category: "phases", label: "Phase completed", customer: true },
+  { pattern: "order.stage.submitted", category: "phases", label: "Phase submitted and locked", customer: true },
+  { pattern: "order.stage.reviewed", category: "phases", label: "Phase reviewed", customer: true },
+  { pattern: "order.stage.reopened", category: "phases", label: "Phase reopened", customer: true },
+  { pattern: "order.stage.status_overridden", category: "status", label: "Status set by an administrator", customer: false },
+  { pattern: "order.progress.lowered", category: "status", label: "Progress lowered after a reopen", customer: false },
+  { pattern: "order.question.asked", category: "phases", label: "Question added", customer: true },
+  { pattern: "order.question.answered", category: "phases", label: "Answer saved", customer: true },
+  { pattern: "order.question.withdrawn", category: "phases", label: "Question withdrawn", customer: false },
+  { pattern: "order.admin_task.*", category: "phases", label: "Phase checklist updated", customer: false },
+  { pattern: "order.stage_run.*", category: "automation", label: "Phase actions run", customer: false },
+  { pattern: "order.completion.*", category: "automation", label: "Completion update", customer: false },
+  { pattern: "order.payment_state.changed", category: "payments", label: "Payment status updated", customer: true },
+  { pattern: "file.archive.*", category: "files", label: "File archive (ZIP)", customer: false },
+  { pattern: "file.sync.*", category: "storage", label: "Microsoft 365 file sync", customer: false },
   /* Wildcards label with the humanised event name (see `humanizeEventName`). */
   { pattern: "payment.*", category: "payments", label: "", customer: false },
   { pattern: "invoice.*", category: "payments", label: "", customer: false },
