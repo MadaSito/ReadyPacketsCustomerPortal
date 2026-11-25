@@ -407,3 +407,20 @@ Tests: `client/src/ui/routeTabs.test.tsx`.
 | `ChartFrame` | `title`, `headingLevel?`, `description?`, `summary`, `table`, `legend?: {label, series: 1..6, pattern?}[]`, `actions?`, `loading?`, `error?`, `onRetry?`, `empty?: ReactNode \| true`, `defaultView?` | Section with heading, always-visible text summary, Chart/Table switch (table = complete data alternative), legend with swatches. Inside, the chart SVG uses `useChartIds()` → `labelledBy`, `patternFill(n)`; `role="img"`, `viewBox`, no fixed width. |
 | Chart tokens | `fill-chart-1..6`, `stroke-chart-1..6`, `stroke-line` (grid), `fill-muted` (axis text) | Each series ≥ 3:1 on all surfaces in both themes (tokens.test.ts). Pair with `patternFill(n)` so colour is not the only cue. |
 | Nav tokens (D1) | `.rp-nav-panel`, `.rp-nav-edge`, `.rp-nav-section`, `.rp-nav-item`, `.rp-nav-tab`, `--color-nav-active/accent/hover/edge` | Shell-only. The current entry (`aria-current="page"`) gets a tinted fill, a 4 px accent bar and semibold text; forced colours keep a Highlight outline and bar. |
+
+## Increment 07 (package A): OrderProgress and the phase editor
+
+`OrderProgress` (from `@/ui`): `{ percent, stages: {key,label,state?,note?}[], currentIndex (0-based, -1 none), canceled?, variant?: "full" | "compact", label?, caption?, onStageSelect? }`. `role="progressbar"` with `aria-valuetext` ("40 percent, phase 2 of 5: Intake"), the number shown as text, a stepper whose states are spelled out (never colour alone), count-up and fill animation that are off under reduced motion, forced-colours fill. Canceled freezes the last value with "Canceled". More than 7 phases wrap into a grid instead of one row.
+
+Phase editor (from `@/ui/phases`, admin only, kept out of the main barrel):
+
+```tsx
+<PhaseEditor value={stages} onChange={setStages} statusOptions={options} errors={serverErrorsByPath}
+  publishedKeys={new Set(published.map((s) => s.key))} slots={PHASE_FORM_SLOTS} defaultView="canvas" headingLevel={2} />
+```
+
+- `statusOptions`: `{ key, label, category?, retired? }[]` mapped from `orders.statusCatalog.list` (staffLabel → label).
+- `errors`: server paths such as `stages.2.customerLabel`, `stages.2.statusKeys.0`, `stages` (list-level callout).
+- Canvas: ordered cards; drag by the grip, or the Up / Down buttons (the keyboard and screen-reader path; focus follows the card and moves are announced). Remove asks for confirmation. Guided view: one phase at a time with Previous / Next phase.
+- One shared `PhaseForm`; feature regions come through `PHASE_FORM_SLOTS` (`@/app/slots`): `actions` (automations), `webhook` (integrations), `fileSync` (storage). A missing slot shows a short note instead.
+- Controlled and display-only: the host loads, saves, steps up and validates. Free-form graph editing stays under "Statuses and transitions (advanced)".

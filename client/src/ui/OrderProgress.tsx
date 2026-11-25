@@ -188,7 +188,7 @@ export function OrderProgress({ percent, stages, currentIndex, canceled = false,
         />
       </div>
       {variant === "full" && stages.length ? (
-        <ol aria-label="Order phases" className="rp-progress-steps mt-4 grid min-w-0 gap-2 @xl:auto-cols-fr @xl:grid-flow-col @xl:gap-1">
+        <ol aria-label="Order phases" className={cn("rp-progress-steps mt-4 grid min-w-0 gap-2", stages.length <= 7 ? "@xl:auto-cols-fr @xl:grid-flow-col @xl:gap-1" : "@md:grid-cols-[repeat(auto-fill,minmax(9rem,1fr))]")}>
           {stages.map((stage, index) => {
             const state = states[index]!;
             const meta = STATE_META[state];

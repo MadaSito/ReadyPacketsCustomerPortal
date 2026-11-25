@@ -23,8 +23,8 @@ export interface PhaseSlotContext {
   /** Unique, stable per phase card; prefix every id with it. */
   idPrefix: string;
   disabled: boolean;
-  /** Heading level for the slot's own section headings (3 or 4). */
-  headingLevel: 3 | 4;
+  /** Heading level for the slot's own section headings (3–5). */
+  headingLevel: 3 | 4 | 5;
   /** Server validation messages keyed by path relative to `value` ("" for the whole value). */
   errors: Readonly<Record<string, string>>;
 }
