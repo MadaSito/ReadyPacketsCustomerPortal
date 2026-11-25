@@ -1,6 +1,6 @@
 # 0055 — Phases-first order workflow: definition format 3, customer phase workspace and progress
 
-Status: Proposed (drafted from INCREMENT_07_CONTRACT.md; to be corrected against the owners' API.md as packages land)
+Status: Accepted (2026-11-25, after the lead's integrated QA of increment 07 at `7c6bb71`; verification in [STATUS.md](../application-context/STATUS.md#verification-for-increment-07))
 
 ## Context
 The owner asked for the order workflow to be revamped around named phases the customer sees, with a percentage per order shown in an animated progress bar (prompt 26). The owner's earlier editor is the reference for administrators.
@@ -53,17 +53,22 @@ Workflows today are status graphs. Definition formats 1 and 2 group statuses int
   - the checklist;
   - **Run phase actions**, with history.
 - **Progress.**
-  - **Derived value.** The weight of completed actionable stages ÷ the weight of all actionable stages. A status of category `done` gives 100.
+  - **Weights.** Every phase counts by its `weight` (1–100, default 1). A phase is done when it is accepted or the order has passed it.
+  - **Derived value.** floor(done weight × 100 ÷ total weight), capped at 99 until the order reaches a status of category `done`, which gives 100.
   - **Explicit value.** `orders.completion_percent`, set by a phase action or a rule.
-  - **Shown value.** The higher of the two. It goes down only on an audited administrator reopen.
+  - **Shown value.** The higher of the derived and explicit values. It goes down only on an audited administrator reopen.
   - **Canceled orders.** A canceled order shows its last value, frozen, with the word "Canceled".
-  - **Storage.** The value is stored in `orders.progress_percent` and recalculated in the same transaction as a transition, submit, review, reopen, waive or completion. Old orders are filled on first read.
+  - **Storage.** The value is stored in `orders.progress_percent` and recalculated in the same transaction as a transition, submit, review, reopen, waive or completion. Rows with no stored value are filled on read.
 - **`OrderProgress` component.** It is used on the customer order page, the order list, the dashboard and the console.
   - It is a `role="progressbar"` with `aria-valuenow`, `aria-valuemin` and `aria-valuemax`, and an `aria-valuetext` such as "40 percent, phase 2 of 5: Intake".
   - It shows the number as text and a phase stepper with customer labels.
   - The fill is smooth with a count-up, and there is no animation under reduced motion.
   - It never relies on colour alone, works in both themes and reflows at 320 px.
-- **Seeded workflow.** New installs get a published format-3 "ReadyPackets standard workflow": Payment confirmed, Phase 1 intake, Phase 2 synthesis, Phase 3 review, Phase 4 delivery, Delivered, Closed. On upgrade the existing workflow is untouched. A format-3 **draft** of the standard workflow is prepared, and `/admin/workflows` says "Phases version ready to review and publish".
+- **Seeded workflow.** The start-up job `orders.increment07.startup` runs once at every boot and then every 10 minutes, and is idempotent.
+  - A fresh install with no workflow and no order gets the format-3 "ReadyPackets standard workflow" (`readypackets_standard`) as its default. Its phases are Payment, Phase 1 intake, Phase 2 synthesis, Phase 3 review, Phase 4 delivery, Delivered and Closed.
+  - On upgrade, the existing workflow is untouched. When no published version or draft has phases, the default workflow gets one draft with phases derived from its statuses, ready to review and publish.
+  - Nothing is published automatically, and no order is re-pinned.
+  - The same job recalculates the stored progress of orders on format-3 versions. This can lower a stale value.
 - **Not built.** Free-form graph editing of phases is not built. An ordered list is clearer and keyboard-accessible, and the status graph stays under "Statuses and transitions (advanced)".
 
 ## Assumptions to confirm with the owner
@@ -71,9 +76,21 @@ Workflows today are status graphs. Definition formats 1 and 2 group statuses int
 - The upgrade prepares a draft only. The owner reviews and publishes it; running orders keep their version.
 - The progress percentage shown is the higher of the derived and explicit values.
 
+## As implemented: phases, progress and payment state (package B)
+
+From the owner's [orders API](../../server/modules/orders/API.md) and the lead's QA rulings.
+
+- **Customer Next.** It is offered only on a `next` phase that has at least one enabled customer action and does not complete on payment. Otherwise the workspace says what the phase is waiting on (`payment` or `team`), and `orders.stages.next` refuses with `STAGE_NOT_CUSTOMER_ACTIONABLE` (409).
+- **Submit and lock cannot be bypassed.** On format 3, a customer status change out of a status owned by a `submit_lock` phase is refused with `STAGE_SUBMIT_REQUIRED` (409) until that phase is submitted. Cancel targets stay allowed, and staff, administrator and API actors are unaffected.
+- **Request changes.** `changes_requested` needs a note (`NOTE_REQUIRED`) and keeps the lock; an administrator reopens the phase to let the customer edit.
+- **Formats 1 and 2.** Derived phases are shown, but `next`, `submit`, `review` and `reopen` refuse with `STAGE_ACTION_OFF`. The legacy `orders.phases.unlock` refuses format-3 orders with `USE_STAGE_REOPEN`.
+- **Passing a phase by status.** When staff move an order past a phase with a status change, the phase counts as done and the audit event `order.stage.passed_by_status` is written.
+- **Background jobs.** `sessions.principalForJob(sessionId, expectedUserId, { tx })` is the only way a background job gets a principal; the archive build and the portable import both use it.
+- **Gates.** `AGREEMENT_REQUIRED` and `POLICY_ACCEPTANCE_REQUIRED` are never bypassed.
+
 ## As implemented: questions and checklist (D4)
 
-Package D, from the owner's [API](../../server/modules/orders/questions/API.md) and [admin guide](../../server/modules/orders/questions/ADMIN_GUIDE.md). Verification: **PENDING-LEAD**.
+Package D, from the owner's [API](../../server/modules/orders/questions/API.md) and [admin guide](../../server/modules/orders/questions/ADMIN_GUIDE.md). Verification: see [STATUS.md](../application-context/STATUS.md#verification-for-increment-07); clarification question versioning is covered by peer-reported automated tests.
 
 - **Procedures.** `orders.questions.{customerList, answer, list, ask, withdraw, history}` and `orders.adminTasks.{list, set}`. Staff procedures need `orders.questions.manage`; review and reopen stay in `orders.stages`.
 - **Limits.** A prompt is 1–2,000 characters and an answer 1–8,000. A phase holds at most 40 questions, withdrawn ones included, and a question at most 1,000 answer versions. History is returned newest first, 10 at a time.

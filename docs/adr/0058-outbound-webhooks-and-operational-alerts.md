@@ -1,6 +1,6 @@
 # 0058 — Outbound webhooks for phases, and operational alerts
 
-Status: Proposed (drafted from INCREMENT_07_CONTRACT.md; to be corrected against the owners' API.md as packages land)
+Status: Accepted (2026-11-25, after the lead's integrated QA of increment 07 at `7c6bb71`; verification in [STATUS.md](../application-context/STATUS.md#verification-for-increment-07))
 
 ## Context
 The owner listed potential features, including:
@@ -17,15 +17,15 @@ The production pipeline and signed webhooks exist ([ADR 0023](0023-production-pi
   - `validateTargetKey` checks a target key;
   - `enqueueStageWebhook(input, tx)` queues a phase webhook. P201 still requires a delivered P101 and the intake lock. A refused precondition is recorded as an outcome; it never rolls back the customer's payment or submission.
 - **Lifecycle auto-queue** (opt-in per workflow, off by default):
-  - payment confirmed queues P101;
-  - phase 1 submitted and locked queues P201.
-- **Signing.** Production endpoints gain optional HMAC-SHA256 signing, which stays off for existing endpoints until a secret is set. Subscriptions keep `signing_enabled`, on by default as today.
+  - P101 is queued on `order.payment_state.changed` to `paid`, which needs a real payment record (a Stripe webhook or a recorded manual payment). An administrator status change that only passes the payment phase does not queue it. Nothing is queued retroactively, and the upgrade backfill (`PAYMENT_BACKFILL`) is excluded;
+  - P201 is queued on `order.stage.submitted` of the intake phase, and it needs a delivered P101.
+- **Signing.** Production pipeline payload signing (HMAC-SHA256) is off by default; an administrator generates a secret first. New webhook subscriptions default to signed (`signing_enabled`) and start paused.
 - **Delivery controls:**
   - a queued or retrying delivery can be stopped;
   - **Retry** (eligible deliveries, same record chain) is separate from **Redeliver** (a new record);
   - deliveries can be filtered by order.
 - **Graph readiness:**
-  - `/admin/integrations` gets a live SharePoint card; the "scaffold" text goes;
+  - the `/admin/integrations` hub cards are derived from live state, and the old planning scaffolds are removed (`c720201`);
   - a write-capability check for `Sites.Selected`;
   - `Retry-After` is honoured, and the token is evicted on 401;
   - Entra instructions can be copied.
@@ -42,6 +42,15 @@ The production pipeline and signed webhooks exist ([ADR 0023](0023-production-pi
 
 ## Assumptions to confirm with the owner
 - Lifecycle auto-queue of P101 / P201 and attention reminders stay off until switched on per workflow or setting.
+
+## As implemented
+
+From the owners' [webhooks administration guide](../integrations/WEBHOOKS_ADMIN_GUIDE.md), [production webhooks](../integrations/PRODUCTION_WEBHOOKS.md) and the [alerts API](../../server/modules/opsAlerts/API.md):
+
+- **Retry and Redeliver.** **Retry** re-queues the same delivery record. It is offered only on undelivered failed, dead or stopped deliveries whose payload is still held. **Redeliver** needs step-up and creates a new record linked to the original, marked `X-ReadyPackets-Replay: 1`.
+- **Stop.** Queued or retrying deliveries can be stopped, which cancels the pending job.
+- **Alerts.** `/admin/alerts` filters by severity, source and state, and staff and administrators can acknowledge and resolve. The waiting-order reminder is admin-only, off by default, and needs step-up to save. It runs once a day, raises one warning per waiting episode and sends no customer e-mail.
+- **Lead QA.** In a browser, the lead checked a test delivery, the delivery detail, a Retry (attempt count 2), and acknowledging and resolving alerts. The lead also saw P101 auto-queued after a recorded manual payment. The dispatch reached `https://example.com` and got 405, which proves the transport but not the receiver. Redelivery records, the stop controls and inbound endpoints are covered by peer-reported automated tests.
 
 ## Consequences
 - Failures surface once, on the dashboard and in the SIEM, instead of only in delivery logs.

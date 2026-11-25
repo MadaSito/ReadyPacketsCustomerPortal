@@ -1,6 +1,6 @@
 # 0061 — Microsoft 365 / SharePoint one-way file sync per phase
 
-Status: Proposed (drafted from INCREMENT_07_CONTRACT.md; to be corrected against the owners' API.md as packages land)
+Status: Accepted (2026-11-25, after the lead's integrated QA of increment 07 at `7c6bb71`; verification in [STATUS.md](../application-context/STATUS.md#verification-for-increment-07))
 
 ## Context
 The owner asked for Microsoft 365 / SharePoint sync "so order files can be properly synced". Their earlier editor routed files per phase to originals, conversion-staging and intake-delivery targets under `CustomerName-CustomerID/OrderNumber`. Storage connections and folder routing exist ([ADR 0027](0027-storage-connections.md), [ADR 0040](0040-order-file-sync-folder-routing.md)).
@@ -33,7 +33,7 @@ The owner asked for Microsoft 365 / SharePoint sync "so order files can be prope
 
 ## As implemented
 
-Package L, as reported by the owner:
+Package L, as reported by the owner. Managed file sync against mocked Graph and the `Sites.Selected` write check are covered by peer-reported automated tests; no real SharePoint site or Entra tenant was used.
 
 - **Connection.** File sync uses a dedicated private SharePoint connection with the Graph and Graph upload egress presets.
 - **Write check.** After the ordinary read test, the write check is session-based and creates no file.

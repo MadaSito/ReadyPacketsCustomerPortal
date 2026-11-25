@@ -1,6 +1,6 @@
 # 0060 — Stripe completion and order payment state
 
-Status: Proposed (drafted from INCREMENT_07_CONTRACT.md; to be corrected against the owners' API.md as packages land)
+Status: Accepted (2026-11-25, after the lead's integrated QA of increment 07 at `7c6bb71`; verification in [STATUS.md](../application-context/STATUS.md#verification-for-increment-07))
 
 ## Context
 The owner asked for the Stripe payment webhook to be completed "so orders can be completed". Hosted checkout and verified webhooks exist ([ADR 0035](0035-hosted-checkout-payments.md), [ADR 0038](0038-provider-refunds.md), [ADR 0054](0054-receipts.md)). The gap analysis found these blockers:
@@ -41,6 +41,17 @@ The owner asked for the Stripe payment webhook to be completed "so orders can be
   - the IP deny list, rate limit and the 256 KiB cap stay;
   - a browser return never marks anything paid.
 - **Not built.** Embedded card fields (Stripe Elements), and payment confirmation from the browser return.
+
+## As implemented
+
+From the owner's [payments API](../../server/modules/payments/API.md) and [admin guide](../../server/modules/payments/ADMIN_GUIDE.md), and the lead's QA rulings:
+
+- **Activation.** Turning Stripe on needs three things for the current staged key and mode, matched by fingerprint: the egress preset, a successful API check and a self-test. It also needs a confirmation dialog, and live mode needs the typed words `ACTIVATE LIVE PAYMENTS`. A refusal gives `STRIPE_EGRESS_NOT_ALLOWLISTED`, `STRIPE_API_NOT_VERIFIED` or `STRIPE_WEBHOOK_NOT_VERIFIED`.
+- **Events.** The nine events are `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`, `checkout.session.expired`, `payment_intent.payment_failed`, `charge.refunded`, `refund.created`, `refund.updated` and `charge.refund.updated`.
+- **Unmatched payments.** A paid session that carries portal metadata but matches no order is recorded as `attention_required`, with a warning alert (`UNMATCHED_PORTAL_PAYMENT`).
+- **Rejections.** The log keeps reason codes only and is pruned after 14 days. A non-JSON body (400) or one over 256 KiB (413) stops at the HTTP layer and is not in the rejection log.
+- **Rotation.** A secondary signing secret is accepted alongside the primary one.
+- **Lead QA.** In a browser, the lead checked the setup page gates, a fake-key API test failing gracefully with 401, a signed webhook end to end with a locally signed event, and the rejection log. No real Stripe account was used.
 
 ## Assumptions to confirm with the owner
 - The nine subscribed events are the set listed on the setup page.

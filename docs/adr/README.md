@@ -59,11 +59,11 @@ Records are immutable once accepted; a later decision supersedes an earlier one 
 | 0052 | Editing Word documents in the browser; every save is a new version and the original is kept | Accepted |
 | 0053 | Policy import, update notices, enforcement with session end, the typed-name check and the order agreement (MNDA) | Accepted |
 | 0054 | Receipts for every confirmed payment, including waived amounts below the provider minimum | Accepted |
-| 0055 | Phases-first order workflow: definition format 3 (stages), customer phase workspace and progress | Proposed |
-| 0056 | Status catalogue and order attention | Proposed |
-| 0057 | Phase actions, completion jobs and rule extensions; unattended rules never change status | Proposed |
-| 0058 | Outbound webhooks for phases (lifecycle auto-queue, signing, delivery controls) and operational alerts | Proposed |
-| 0059 | Phase-bound files: governance, playback grants with range requests, ZIP archives | Proposed |
-| 0060 | Stripe completion and order payment state | Proposed |
-| 0061 | Microsoft 365 / SharePoint one-way file sync per phase | Proposed |
-| 0062 | SAML 2.0 single sign-on for Microsoft Entra ID, with MFA modes | Proposed |
+| 0055 | Phases-first order workflow: definition format 3 (stages), customer phase workspace and progress | Accepted |
+| 0056 | Status catalogue and order attention | Accepted |
+| 0057 | Phase actions, completion jobs and rule extensions; unattended rules never change status | Accepted |
+| 0058 | Outbound webhooks for phases (lifecycle auto-queue, signing, delivery controls) and operational alerts | Accepted |
+| 0059 | Phase-bound files: governance, playback grants with range requests, ZIP archives | Accepted |
+| 0060 | Stripe completion and order payment state | Accepted |
+| 0061 | Microsoft 365 / SharePoint one-way file sync per phase | Accepted |
+| 0062 | SAML 2.0 single sign-on for Microsoft Entra ID, with MFA modes | Accepted |
