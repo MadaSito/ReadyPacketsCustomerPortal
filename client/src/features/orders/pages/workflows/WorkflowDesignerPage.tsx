@@ -32,6 +32,9 @@ import {
   Wizard,
   type FlowSelection,
 } from "@/ui";
+import { PhaseEditor, type PhaseStatusOption } from "@/ui/phases";
+import { PHASE_FORM_SLOTS } from "@/app/slots";
+import { deriveStages, type WorkflowStage } from "@shared/workflowStages";
 import { OrderStatusBadge } from "../../shared";
 import { IssueList, StatusFields, TransitionNoticeFields, TransitionRouteFields, TransitionWhoFields } from "./fields";
 import {
@@ -104,7 +107,8 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
   const [publishable, setPublishable] = useState(initial.publishable);
   const [dirty, setDirty] = useState(false);
   const edits = useRef(0);
-  const [tab, setTab] = useState("wizard");
+  // Increment 07 (D1): a format-3 draft opens on its phases.
+  const [tab, setTab] = useState(initial.definition.stages?.length ? "phases" : "wizard");
   const [step, setStep] = useState<WizardStepId>("statuses");
   const [visited, setVisited] = useState<WizardStepId[]>([]);
   const [stepBlocked, setStepBlocked] = useState(false);
@@ -312,10 +316,60 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
               ),
             },
             { value: "canvas", label: "Canvas", content: <CanvasView work={work} issues={issues} edit={edit} setDefinition={setDefinition} /> },
+            { value: "phases", label: "Phases", content: <PhasesView definition={work.definition} issues={issues} disabled={busy} setDefinition={setDefinition} /> },
           ]}
         />
       </div>
     </>
+  );
+}
+
+/** Increment 07 (D1): the phase editor (package A) over `definition.stages`; the server validates on save. */
+function PhasesView(props: { definition: DraftDefinition; issues: WorkflowIssue[]; disabled: boolean; setDefinition: (definition: DraftDefinition) => void }) {
+  const { definition, issues, disabled, setDefinition } = props;
+  const trpc = useTRPC();
+  const catalog = useQuery(trpc.orders.statusCatalog.list.queryOptions({ includeRetired: true }, { retry: false, staleTime: 60_000 }));
+  const stages = (definition.stages ?? []) as WorkflowStage[];
+  const used = new Set(definition.states.map((state) => state.key));
+  const statusOptions: PhaseStatusOption[] = catalog.data
+    ? catalog.data
+        .filter((entry) => !entry.retired || used.has(entry.key))
+        .map((entry) => ({ key: entry.key, label: entry.staffLabel, category: entry.category, retired: entry.retired }))
+    : definition.states.map((state) => ({ key: state.key, label: state.label || state.key }));
+  const errors: Record<string, string> = {};
+  for (const issue of issues) if (issue.severity === "error" && /^stages(\.|$)/.test(issue.path) && !errors[issue.path]) errors[issue.path] = issue.message;
+  const setStages = (next: WorkflowStage[]) => setDefinition({ ...definition, stages: next } as DraftDefinition);
+  if (!stages.length)
+    return (
+      <Card>
+        <div className="flex flex-col gap-3">
+          <h2 className="text-lg font-semibold text-ink">Phases</h2>
+          <p className="text-body">
+            This draft has no phases yet. Customers then see progress by status, as before. Start phases from the statuses below,
+            then review each phase before you publish. Existing orders keep the version they started with.
+          </p>
+          <div>
+            <Button variant="secondary" disabled={disabled || definition.states.length === 0} onClick={() => setStages(deriveStages(definition))}>
+              Start phases from statuses
+            </Button>
+          </div>
+        </div>
+      </Card>
+    );
+  return (
+    <div className="flex flex-col gap-3">
+      {catalog.isError ? <Callout tone="warning">The status catalogue could not be loaded; showing this draft's statuses instead.</Callout> : null}
+      <PhaseEditor
+        value={stages}
+        onChange={setStages}
+        statusOptions={statusOptions}
+        errors={errors}
+        disabled={disabled}
+        slots={PHASE_FORM_SLOTS}
+        defaultView="canvas"
+        headingLevel={2}
+      />
+    </div>
   );
 }
 
