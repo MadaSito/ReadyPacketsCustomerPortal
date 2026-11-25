@@ -45,6 +45,13 @@ const DEFAULT_VAR_LABELS: Readonly<Record<string, { label: string; sample: strin
 };
 
 const KNOWN_SYSTEM_SEEDS: Readonly<Record<string, CatalogueSeed>> = {
+  payment_receipt: {
+    name: "Payment receipt",
+    description: "Sent to the verified order owner. Order and project details are added automatically when available.",
+    category: "orders",
+    requiredVars: ["receiptNumber"],
+    textTemplate: "Thank you for your payment. Your ReadyPackets payment receipt number is {{receiptNumber}}.",
+  },
   "auth.verify_email": {
     name: "Registration & e-mail verification",
     description: "Sent when a new account registers and must confirm control of its e-mail address.",

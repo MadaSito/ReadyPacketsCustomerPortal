@@ -93,6 +93,16 @@ function htmlAlternative(text: string): string {
   return `<!doctype html><html lang="en"><body><p>${escapeHtml(text).replace(/\r\n?|\n/g, "<br>")}</p></body></html>`;
 }
 
+const RECEIPT_CONTEXT_FIELDS = [["orderReference", "Order"], ["projectName", "Project"]] as const;
+
+function receiptContextLines(vars: OutboundMail["vars"]): string[] {
+  return RECEIPT_CONTEXT_FIELDS.flatMap(([key, label]) => {
+    const raw = vars[key];
+    const value = typeof raw === "string" ? raw.replace(/\s+/gu, " ").trim() : "";
+    return value ? [`${label}: ${value}`] : [];
+  });
+}
+
 export const ORDER_PHASE_UPDATE_TEMPLATE: MailTemplate = {
   key: "orders.phase_update",
   vars: ["reference", "link"],
@@ -109,10 +119,14 @@ export class MailEngine implements Mailer {
     this.registerTemplate(ORDER_PHASE_UPDATE_TEMPLATE);
     this.registerTemplate({
       key: PAYMENT_RECEIPT_TEMPLATE,
-      vars: ["receiptNumber"],
+      vars: ["receiptNumber", ...RECEIPT_CONTEXT_FIELDS.map(([key]) => key)],
       sensitiveVars: ["receiptNumber"],
       subject: () => "Your ReadyPackets payment receipt",
-      text: ({ receiptNumber }) => `Thank you for your payment. Your ReadyPackets payment receipt number is ${receiptNumber}.`,
+      text: (vars) => {
+        const lines = receiptContextLines(vars);
+        const message = `Thank you for your payment. Your ReadyPackets payment receipt number is ${vars.receiptNumber}.`;
+        return lines.length ? `${lines.join("\n")}\n\n${message}` : message;
+      },
     });
     this.registerTemplate({
       key: POLICY_UPDATE_TEMPLATE,
@@ -206,10 +220,27 @@ export class MailEngine implements Mailer {
       if (published.key !== key || builtin?.sensitiveVars?.some((name) => !published.vars.includes(name))) {
         throw validation("INVALID_MAIL_RENDER", "The message template could not be rendered safely.");
       }
+      const receipt = key === PAYMENT_RECEIPT_TEMPLATE;
       return {
         ...published,
+        ...(receipt ? { vars: [...new Set([...(builtin?.vars ?? []), ...published.vars])] } : {}),
         sensitiveVars: [...new Set([...(builtin?.sensitiveVars ?? []), ...(published.sensitiveVars ?? [])])],
-        render: (vars) => published.render(vars),
+        render: (vars) => {
+          if (!receipt) return published.render(vars);
+          // Legacy published contracts accept only their declared inputs. Receipt context is supplied
+          // by the system even when the customized body predates these variables.
+          const declared = Object.fromEntries(Object.entries(vars).filter(([name]) => published.vars.includes(name)));
+          const rendered = published.render(declared);
+          const lines = receiptContextLines(vars);
+          if (!lines.length) return rendered;
+          const text = `${lines.join("\n")}\n\n${rendered.text}`;
+          if (rendered.html === undefined) return { ...rendered, text };
+          const block = `<p>${lines.map(escapeHtml).join("<br>")}</p>`;
+          const html = /<body\b[^>]*>/iu.test(rendered.html)
+            ? rendered.html.replace(/<body\b[^>]*>/iu, (body) => `${body}${block}`)
+            : `${block}${rendered.html}`;
+          return { ...rendered, text, html };
+        },
       };
     }
     if (!builtin) return null;
@@ -459,6 +490,11 @@ export class MailEngine implements Mailer {
           try {
             const masked = { ...payload.vars };
             for (const key of new Set([...(template.sensitiveVars ?? []), ...(payload.sensitiveVars ?? [])])) masked[key] = REDACTED;
+            if (isReceipt) {
+              for (const [key] of RECEIPT_CONTEXT_FIELDS) {
+                if (Object.hasOwn(masked, key)) masked[key] = REDACTED;
+              }
+            }
             redacted = { ...this.#content(template, masked), to: data.to };
           } catch { redactionFailed = true; }
         }
