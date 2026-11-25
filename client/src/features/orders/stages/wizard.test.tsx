@@ -5,7 +5,7 @@ import { pageA11y } from "@/test/a11y";
 import { expectNoAxeViolations, renderUi } from "@/ui/testing";
 import { OrderListProgress } from "./OrderListProgress";
 import { PhaseWizard, type PhaseWizardProps } from "./PhaseWizard";
-import { STANDARD_ACK_MESSAGE, isWritable, progressStages, wizardErrorMessage, type WizardStage, type WizardWorkspace } from "./wizardModel";
+import { STANDARD_ACK_MESSAGE, describeWorkspaceChange, isWritable, progressStages, wizardErrorMessage, type WizardStage, type WizardWorkspace } from "./wizardModel";
 
 const HASH = "a".repeat(64);
 const noActions = { uploadDocuments: false, answerQuestions: false, recordAudio: false, uploadAudio: false, teamFileReview: false };
@@ -52,6 +52,17 @@ describe("phase wizard model", () => {
       ["done", undefined], ["current", undefined], ["upcoming", "Opens when the previous phase is complete"],
     ]);
   });
+  it("adds no stepper note for NOT_REACHED (it would repeat the state text)", () => {
+    const ws = workspace({}, [stage(0, { state: "open" }), stage(1, { futureReason: "NOT_REACHED" })]);
+    expect(progressStages({ ...ws, currentStageKey: "phase_1" }).map((s) => s.note)).toEqual([undefined, undefined]);
+  });
+  it("describes changes found on a later read", () => {
+    const before = workspace();
+    expect(describeWorkspaceChange(before, before)).toBeNull();
+    const moved = { ...before, version: before.version + 1, currentStageKey: before.stages[2]!.key };
+    expect(describeWorkspaceChange(before, moved)).toBe(`This order was updated. The current phase is now ${before.stages[2]!.customerLabel}.`);
+    expect(describeWorkspaceChange(before, { ...before, version: before.version + 1, currentStageKey: null })).toBe("This order was updated. All phases are complete.");
+  });
   it("only the current open stage is writable; canceled or locked orders are read-only", () => {
     const ws = workspace();
     expect(isWritable(ws, ws.stages[1]!)).toBe(true);
@@ -63,6 +74,22 @@ describe("phase wizard model", () => {
     expect(wizardErrorMessage("STALE_VERSION", "x")).toMatch(/changed in the meantime/);
     expect(wizardErrorMessage("SOMETHING_NEW", "Safe text")).toBe("Safe text");
     expect(wizardErrorMessage(undefined, undefined)).toMatch(/Something went wrong/);
+  });
+});
+
+describe("phase wizard guards (lead QA rulings 5 and 3)", () => {
+  it("keeps the current phase open while files are pending and says why", async () => {
+    setup(workspace(), { pendingUploads: (key) => (key === "phase_2" ? 2 : 0) });
+    await userEvent.setup().click(screen.getByRole("button", { name: /Intake.*review/ }));
+    expect(screen.getByRole("heading", { level: 3, name: /Phase 2 of 3/ })).toBeInTheDocument();
+    expect(screen.getByText("2 files are selected but not uploaded yet. Upload them or clear the selection.")).toBeInTheDocument();
+  });
+  it("a team phase shows the waiting text and no Next", () => {
+    const ws = workspace();
+    ws.stages[1] = { ...ws.stages[1]!, canNext: false, waitingOn: "team" };
+    setup(ws);
+    expect(screen.getByText("Our team is working on this phase. Nothing is needed from you right now.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
   });
 });
 
@@ -191,7 +218,7 @@ describe("OrderListProgress", () => {
   it("names each bar after its order and describes the current phase", async () => {
     renderUi(<ul><li><OrderListProgress name="Smith family" progressPercent={40} phaseLabel="Synthesis" phaseIndex={1} phaseTotal={5} /></li></ul>);
     const bar = screen.getByRole("progressbar", { name: "Progress of Smith family" });
-    expect(bar).toHaveAttribute("aria-valuetext", "40 percent, phase 2 of 5: Synthesis");
+    expect(bar).toHaveAttribute("aria-valuetext", "40 percent, step 2 of 5: Synthesis");
     await expectNoAxeViolations();
   });
   it("shows nothing for rows without a phase model; canceled is said in words", () => {

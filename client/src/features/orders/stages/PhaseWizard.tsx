@@ -8,9 +8,15 @@ import type { StageActionKey } from "@shared/workflowStages";
 import { SafePolicyText } from "@/lib/agreementGate";
 import { Badge, Button, Callout, Card, Checkbox, DateTime, Dialog, OrderProgress, type Tone } from "@/ui";
 import {
-  STATE_LABEL, ackText, currentStage, enabledActions, isWritable, progressStages,
+  STATE_LABEL, WAITING_MESSAGE, ackText, currentStage, enabledActions, isWritable, pendingUploadMessage, progressStages,
   type WizardStage, type WizardWorkspace,
 } from "./wizardModel";
+
+/** A required question the customer has not answered yet (from `orders.questions.customerList`). */
+export interface UnansweredQuestion { questionId: string; prompt: string }
+
+/** Why Next / Submit (or leaving the phase) was refused on the client; the live data decides what is still shown. */
+type Blocker = "pending" | "questions" | null;
 
 const STATE_TONE: Record<WizardStage["state"], Tone> = {
   future: "neutral", open: "brand", submitted: "info", in_review: "info", accepted: "success", reopened: "warning",
@@ -27,11 +33,21 @@ export interface PhaseWizardProps {
   busy: boolean;
   /** Announced error from the last action (already mapped to a customer message). */
   error: string | null;
+  /** Files selected, uploading or with an unknown outcome in a phase (files_engineer's `onPendingChange`). */
+  pendingUploads?: (stageKey: string) => number;
+  /** Required questions without a saved answer in a phase. */
+  unansweredRequired?: (stage: WizardStage) => readonly UnansweredQuestion[];
+  /** Link to pay an outstanding invoice, shown when the phase waits for payment. */
+  paymentAction?: ReactNode;
+  /** Polite announcement of changes found when the workspace was read again. */
+  announcement?: string | null;
 }
 
-export function PhaseWizard({ workspace, renderAction, renderStageExtras, onNext, onSubmit, busy, error }: PhaseWizardProps) {
+export function PhaseWizard({ workspace, renderAction, renderStageExtras, onNext, onSubmit, busy, error, pendingUploads, unansweredRequired, paymentAction, announcement }: PhaseWizardProps) {
   const current = currentStage(workspace);
   const [viewKey, setViewKey] = useState<string | null>(null);
+  /** Set when leaving the current phase would discard selected files (the panels unmount); bumps focus. */
+  const [leaveBlock, setLeaveBlock] = useState(0);
   /** Bumped when the shown phase changes without a route change, so focus moves to the new heading. */
   const [focusToken, setFocusToken] = useState(0);
   const show = (key: string | null) => { setViewKey(key); setFocusToken((n) => n + 1); };
@@ -45,6 +61,7 @@ export function PhaseWizard({ workspace, renderAction, renderStageExtras, onNext
   return (
     <section aria-labelledby={headingId} className="mb-6 flex min-w-0 flex-col gap-4">
       <h2 id={headingId} className="sr-only">Order phases</h2>
+      <p role="status" aria-live="polite" className="sr-only">{announcement ?? ""}</p>
       <Card>
         <div className="p-4 sm:p-6">
           <OrderProgress
@@ -52,7 +69,11 @@ export function PhaseWizard({ workspace, renderAction, renderStageExtras, onNext
             stages={progressStages(workspace)}
             currentIndex={workspace.progress.currentIndex}
             canceled={workspace.progress.canceled}
-            onStageSelect={(key) => show(key === workspace.currentStageKey ? null : key)}
+            onStageSelect={(key) => {
+              const leaving = key !== workspace.currentStageKey && viewKey === null && current;
+              if (leaving && (pendingUploads?.(current.key) ?? 0) > 0) { setLeaveBlock((n) => n + 1); return; }
+              show(key === workspace.currentStageKey ? null : key);
+            }}
           />
         </div>
       </Card>
@@ -74,6 +95,10 @@ export function PhaseWizard({ workspace, renderAction, renderStageExtras, onNext
           onSubmit={(stage, ack) => after(onSubmit(stage, ack))}
           busy={busy}
           error={error}
+          pendingUploads={pendingUploads}
+          unansweredRequired={unansweredRequired}
+          paymentAction={paymentAction}
+          leaveBlock={leaveBlock}
         />
       ) : (
         <div ref={doneRef} tabIndex={-1} className="outline-none">
@@ -84,15 +109,49 @@ export function PhaseWizard({ workspace, renderAction, renderStageExtras, onNext
   );
 }
 
-function StagePanel({ workspace, stage, total, isCurrent, onBackToCurrent, focusToken, renderAction, renderStageExtras, onNext, onSubmit, busy, error }: {
-  workspace: WizardWorkspace; stage: WizardStage; total: number; isCurrent: boolean; onBackToCurrent?: () => void; focusToken: number;
-} & Omit<PhaseWizardProps, "workspace">) {
+function StagePanel({ workspace, stage, total, isCurrent, onBackToCurrent, focusToken, renderAction, renderStageExtras, onNext, onSubmit, busy, error, pendingUploads, unansweredRequired, paymentAction, leaveBlock }: {
+  workspace: WizardWorkspace; stage: WizardStage; total: number; isCurrent: boolean; onBackToCurrent?: () => void; focusToken: number; leaveBlock: number;
+} & Omit<PhaseWizardProps, "workspace" | "announcement">) {
   const headingRef = useRef<HTMLHeadingElement>(null);
   useEffect(() => { if (focusToken) headingRef.current?.focus(); }, [focusToken]);
   const writable = isWritable(workspace, stage);
   const readOnly = !writable;
   const [ackOpen, setAckOpen] = useState(false);
   const actions = enabledActions(stage);
+  const [blocker, setBlocker] = useState<Blocker>(null);
+  const [blockToken, setBlockToken] = useState(0);
+  const blockerRef = useRef<HTMLDivElement>(null);
+  const blockerId = useId();
+  const pending = writable ? (pendingUploads?.(stage.key) ?? 0) : 0;
+  const unanswered = writable && stage.actions.answerQuestions ? (unansweredRequired?.(stage) ?? []) : [];
+  // What is still true is shown; a blocker disappears once the files are uploaded or the questions answered.
+  const shown: Blocker = blocker === "pending" && pending > 0 ? "pending" : blocker === "questions" && unanswered.length > 0 ? "questions" : null;
+  const block = (kind: Exclude<Blocker, null>) => { setBlocker(kind); setBlockToken((n) => n + 1); };
+  const seenLeave = useRef(leaveBlock);
+  useEffect(() => {
+    if (leaveBlock === seenLeave.current) return;
+    seenLeave.current = leaveBlock;
+    setBlocker("pending");
+    setBlockToken((n) => n + 1);
+  }, [leaveBlock]);
+  useEffect(() => {
+    if (!blockToken) return;
+    if (blocker === "questions" && unanswered[0]) {
+      const target = document.querySelector<HTMLElement>(`[data-question-id="${CSS.escape(unanswered[0].questionId)}"]`);
+      if (target) { target.focus(); return; }
+    }
+    blockerRef.current?.focus();
+    // Focus only when a new block is raised.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blockToken]);
+  /** Client-side checks before Next / Submit; the server checks the same rules again. */
+  const proceed = (go: () => void) => {
+    if (pending > 0) return block("pending");
+    if (unanswered.length > 0) return block("questions");
+    setBlocker(null);
+    go();
+  };
+  const waiting = writable && !stage.canNext && !stage.canSubmit && stage.waitingOn ? stage.waitingOn : null;
 
   return (
     <Card>
@@ -147,14 +206,44 @@ function StagePanel({ workspace, stage, total, isCurrent, onBackToCurrent, focus
 
         {renderStageExtras ? renderStageExtras(stage) : null}
 
+        {waiting ? (
+          <Callout tone="info">
+            <p>{WAITING_MESSAGE[waiting]}</p>
+            {waiting === "payment" && paymentAction ? <div className="mt-2">{paymentAction}</div> : null}
+          </Callout>
+        ) : null}
+
         {error ? <Callout tone="danger" live="assertive">{error}</Callout> : null}
+
+        {shown ? (
+          <div ref={blockerRef} id={blockerId} tabIndex={-1} className="outline-none">
+            {shown === "pending" ? (
+              <Callout tone="warning">{pendingUploadMessage(pending)}</Callout>
+            ) : (
+              <Callout tone="warning" title="Answer the required questions first">
+                <ul className="ml-5 list-disc">
+                  {unanswered.map((q) => (
+                    <li key={q.questionId} className="ph-no-capture whitespace-pre-wrap break-words" data-clarity-mask="true">
+                      <Button
+                        variant="link"
+                        onClick={() => document.querySelector<HTMLElement>(`[data-question-id="${CSS.escape(q.questionId)}"]`)?.focus()}
+                      >
+                        {q.prompt}
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              </Callout>
+            )}
+          </div>
+        ) : null}
 
         {writable && (stage.canNext || stage.canSubmit) ? (
           <div className="flex flex-col gap-2 border-t border-line pt-4 sm:flex-row sm:items-center sm:justify-end">
             {stage.progression === "submit_lock" && stage.canSubmit ? (
-              <Button size="lg" onClick={() => setAckOpen(true)} disabled={busy}>Submit and lock</Button>
+              <Button size="lg" aria-describedby={shown ? blockerId : undefined} onClick={() => proceed(() => setAckOpen(true))} disabled={busy}>Submit and lock</Button>
             ) : stage.canNext ? (
-              <Button size="lg" onClick={() => void onNext(stage).catch(() => undefined)} loading={busy}>Next</Button>
+              <Button size="lg" aria-describedby={shown ? blockerId : undefined} onClick={() => proceed(() => void onNext(stage).catch(() => undefined))} loading={busy}>Next</Button>
             ) : null}
           </div>
         ) : null}

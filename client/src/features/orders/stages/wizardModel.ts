@@ -25,6 +25,8 @@ export interface WizardStage {
   review: { outcome: "accepted" | "changes_requested"; note: string | null; at: string } | null;
   canNext: boolean;
   canSubmit: boolean;
+  /** Current phase only: why the customer has no Next / Submit here (server `waitingOn`). Old servers omit it. */
+  waitingOn?: "payment" | "team" | null;
 }
 
 export interface WizardWorkspace {
@@ -51,10 +53,26 @@ export const STATE_LABEL: Record<StageState, string> = {
   reopened: "Reopened",
 };
 
-export const FUTURE_REASON_LABEL: Record<NonNullable<WizardStage["futureReason"]>, string> = {
+/**
+ * Stepper notes for future phases. Only reasons that add something to the item's state text ("Not started")
+ * get a note; NOT_REACHED would only repeat it (lead QA ruling 2).
+ */
+export const FUTURE_REASON_LABEL: Partial<Record<NonNullable<WizardStage["futureReason"]>, string>> = {
   PREVIOUS_PHASE_OPEN: "Opens when the previous phase is complete",
-  NOT_REACHED: "Not reached yet",
 };
+
+/** Panel text when the current phase has nothing for the customer to do (lead QA ruling 3). */
+export const WAITING_MESSAGE: Record<"payment" | "team", string> = {
+  payment: "Waiting for payment confirmation.",
+  team: "Our team is working on this phase. Nothing is needed from you right now.",
+};
+
+/** Inline reason shown when Next / Submit is blocked by files that are selected but not uploaded (ruling 5). */
+export function pendingUploadMessage(count: number): string {
+  return count === 1
+    ? "1 file is selected but not uploaded yet. Upload it or clear the selection."
+    : `${count} files are selected but not uploaded yet. Upload them or clear the selection.`;
+}
 
 /** Order the actions appear in the panel, with the customer's wording. */
 export const ACTION_ORDER: readonly { key: StageActionKey; title: string }[] = [
@@ -77,10 +95,12 @@ export const WIZARD_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   STALE_VERSION: "This order changed in the meantime. The page has been refreshed; please try again.",
   AGREEMENT_REQUIRED: "Please accept the agreement shown at the top of the page first.",
   POLICY_ACCEPTANCE_REQUIRED: "Please accept the required policy shown at the top of the page first.",
+  STAGE_NOT_CUSTOMER_ACTIONABLE: "Nothing is needed from you in this phase. It moves on when our team or your payment completes it.",
+  STAGE_SUBMIT_REQUIRED: "Please submit and lock this phase first.",
 };
 
 /** Codes after which the workspace should be read again (the server state moved on). */
-export const REFRESH_CODES: ReadonlySet<string> = new Set(["STALE_VERSION", "ACK_TEXT_CHANGED", "STAGE_NOT_FOUND", "STAGE_NOT_OPEN", "STAGE_LOCKED"]);
+export const REFRESH_CODES: ReadonlySet<string> = new Set(["STALE_VERSION", "ACK_TEXT_CHANGED", "STAGE_NOT_FOUND", "STAGE_NOT_OPEN", "STAGE_LOCKED", "STAGE_NOT_CUSTOMER_ACTIONABLE"]);
 
 export function wizardErrorMessage(reasonCode: string | undefined, safeMessage: string | undefined): string {
   return (reasonCode && WIZARD_ERROR_MESSAGES[reasonCode]) ?? safeMessage ?? "Something went wrong. Please try again.";
@@ -103,6 +123,19 @@ export function progressStages(ws: WizardWorkspace): OrderProgressStage[] {
 /** May the customer work in this stage now (everything else is read-only)? */
 export function isWritable(ws: WizardWorkspace, stage: WizardStage): boolean {
   return !ws.orderLocked && !ws.progress.canceled && stage.key === ws.currentStageKey && !stage.locked && (stage.state === "open" || stage.state === "reopened");
+}
+
+/** A short, customer-facing description of what changed between two reads of the workspace, or null. */
+export function describeWorkspaceChange(before: WizardWorkspace, after: WizardWorkspace): string | null {
+  if (before.version === after.version) return null;
+  if (before.currentStageKey !== after.currentStageKey) {
+    const now = currentStage(after);
+    return now ? `This order was updated. The current phase is now ${now.customerLabel}.` : "This order was updated. All phases are complete.";
+  }
+  const was = currentStage(before);
+  const now = currentStage(after);
+  if (was && now && was.state !== now.state) return `This order was updated. ${now.customerLabel} is now ${STATE_LABEL[now.state].toLowerCase()}.`;
+  return "This order was updated.";
 }
 
 export function enabledActions(stage: WizardStage): typeof ACTION_ORDER {
