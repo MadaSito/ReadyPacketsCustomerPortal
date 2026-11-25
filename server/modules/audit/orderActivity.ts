@@ -101,6 +101,7 @@ export const ORDER_ACTIVITY_CATALOGUE: readonly CatalogueEntry[] = Object.freeze
   { pattern: "order.stage.reviewed", category: "phases", label: "Phase reviewed", customer: true },
   { pattern: "order.stage.reopened", category: "phases", label: "Phase reopened", customer: true },
   { pattern: "order.stage.status_overridden", category: "status", label: "Status set by an administrator", customer: false },
+  { pattern: "order.stage.passed_by_status", category: "phases", label: "Phase passed by a status change", customer: false },
   { pattern: "order.progress.lowered", category: "status", label: "Progress lowered after a reopen", customer: false },
   { pattern: "order.question.asked", category: "phases", label: "Question added", customer: true },
   { pattern: "order.question.answered", category: "phases", label: "Answer saved", customer: true },
