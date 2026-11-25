@@ -38,7 +38,7 @@ import { createTrpcContext } from "../trpc/context.js";
 import { appRouter } from "../trpc/root.js";
 import { API_PATH, SIGNED_WEBHOOK_PATH, TRPC_PATH, acceptsLocalProbe, clientAddress, isNavigation, providerCallbackRoute, requestHost, routeTemplate } from "./edge.js";
 import { createEdgeAdmission, edgeAdmissionBucket, type RateLimitBucket } from "./edgeAdmission.js";
-import { sendSafeError, trpcRetryAfter } from "./errors.js";
+import { formatHttpError, sendSafeError, trpcRetryAfter } from "./errors.js";
 import { createIsolatedHttpRouter, isolatedRoutePrefix, type IsolatedRouterFactories } from "./isolatedRoutes.js";
 import { createModuleHttpRouter } from "./moduleRoutes.js";
 import { previewProfile } from "./previewProfile.js";
@@ -92,6 +92,15 @@ function hasCanonicalOrigin(req: Request, origin: string, allowMissingOrigin = f
   return sent === origin || (allowMissingOrigin && sent === undefined);
 }
 
+function isSameOriginArchiveNavigation(req: Request): boolean {
+  // `no-referrer` can serialize Origin as "null" on a native POST. These browser-controlled
+  // headers are forbidden to page scripts; this exception never replaces the session or CSRF proof.
+  const dest = req.get("Sec-Fetch-Dest");
+  return isArchiveDownloadForm(req) && req.get("Origin") === "null" &&
+    req.get("Sec-Fetch-Site") === "same-origin" && req.get("Sec-Fetch-Mode") === "navigate" &&
+    (dest === "document" || dest === "empty");
+}
+
 function pathIn(root: string, path: string): boolean {
   return path === root || path.startsWith(`${root}/`);
 }
@@ -142,6 +151,7 @@ export function createApp(services: Services, options: AppOptions = {}): Express
   const anonymousKey = Buffer.from(config.tokenHashKey, "base64");
   const admission = createEdgeAdmission(anonymousKey);
   const limitedRequests = new WeakMap<Request, RateLimitBucket>();
+  const archiveFormDenials = new WeakMap<Request, string>();
   const expandedWorkflowBodies = new WeakSet<Request>();
   const admissionBucket = (req: Request) => options.staticDir ? edgeAdmissionBucket(req.method, req.path) : "edge_requests";
   const currentAddress = () => rateLimitAddress(getRequestContext()?.ipAddress);
@@ -201,8 +211,10 @@ export function createApp(services: Services, options: AppOptions = {}): Express
       res.once("close", () => runWithRequestContext(context, () => {
         const status = res.writableFinished ? res.statusCode : 499;
         const rateLimitBucket = limitedRequests.get(req) ?? (status === 429 ? "unclassified" : undefined);
+        const denialReasonCode = archiveFormDenials.get(req);
         services.logger.info("http request", {
           method, route, status, ...(rateLimitBucket ? { rateLimitBucket } : {}),
+          ...(denialReasonCode ? { denialReasonCode } : {}),
           durationMs: Math.round(performance.now() - started),
           requestId: context.requestId, traceId: context.traceId, spanId: context.spanId,
         });
@@ -305,7 +317,8 @@ export function createApp(services: Services, options: AppOptions = {}): Express
   app.use((req, _res, next) => {
     const bootstrap = req.path === "/api/csrf" && (req.method === "GET" || req.method === "HEAD");
     if (!pathIn(SIGNED_WEBHOOK_PATH, req.path) && !preview?.usesExplicitCredentials &&
-        (bootstrap || !SAFE_METHODS.has(req.method)) && !hasCanonicalOrigin(req, canonical.origin, bootstrap)) {
+        (bootstrap || !SAFE_METHODS.has(req.method)) && !hasCanonicalOrigin(req, canonical.origin, bootstrap) &&
+        !isSameOriginArchiveNavigation(req)) {
       denyBrowserRequest("ORIGIN_NOT_ALLOWED");
     }
     next();
@@ -383,7 +396,7 @@ export function createApp(services: Services, options: AppOptions = {}): Express
     next();
   });
 
-  // 6. Only native ZIP downloads may carry CSRF in a small form, after exact host, Origin and full-session admission.
+  // 6. Only native ZIP downloads may carry CSRF in a small form, after canonical host, browser policy and full-session admission.
   const archiveDownloadForm = express.urlencoded({ extended: false, limit: ARCHIVE_FORM_LIMIT_BYTES, inflate: false, parameterLimit: 2 });
   app.use((req, res, next) => {
     if (!isArchiveDownloadForm(req)) return next();
@@ -512,7 +525,16 @@ export function createApp(services: Services, options: AppOptions = {}): Express
     if (!(error instanceof DomainError) && !(error instanceof Error && "type" in error)) {
       services.logger.error("unhandled http request error");
     }
-    sendSafeError(error, req, res, getRequestContext()?.requestId ?? "unknown", batchSizeForError(req));
+    const requestId = getRequestContext()?.requestId ?? "unknown";
+    if (isArchiveDownloadForm(req)) {
+      // A top-level form navigation must not replace the portal page with an error response.
+      // Keep the safe denial reason in the correlated access record without logging request data.
+      archiveFormDenials.set(req, formatHttpError(error, requestId).safe.reasonCode);
+      res.setHeader("Cache-Control", "no-store");
+      res.status(204).end();
+      return;
+    }
+    sendSafeError(error, req, res, requestId, batchSizeForError(req));
   }) satisfies ErrorRequestHandler);
   return app;
 }

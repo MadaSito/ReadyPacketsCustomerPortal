@@ -16,6 +16,7 @@ import { createApp, type AppOptions } from "../../server/http/app.js";
 import { sendPrivateDownload } from "../../server/http/downloads.js";
 import { EDGE_REQUESTS_PER_WINDOW, EDGE_STATIC_PER_WINDOW, edgeAdmissionBucket } from "../../server/http/edgeAdmission.js";
 import { getHttpState } from "../../server/http/requestState.js";
+import { registerFileArchiveHttpRoutes } from "../../server/modules/files/archivesHttp.js";
 import { compilePolicy, defaultPolicy, type ProtectionPolicy } from "../../server/modules/protection/policy.js";
 import { requestSignals } from "../../server/modules/protection/request.js";
 import { isSignInRequest } from "../../server/modules/protection/signInBans.js";
@@ -521,39 +522,98 @@ describe("HTTP edge: isolated preview controls", () => {
 });
 
 describe("HTTP edge: bounds, errors, static assets and rendering", () => {
-  it("accepts a bounded native ZIP form only with canonical Origin and full-session CSRF", async () => {
+  const archivePath = "/api/files/archives/download";
+  const archiveTicket = "synthetic-download-ticket".padEnd(43, "A");
+  const archiveForm = { ticket: archiveTicket, csrf: csrfA };
+  const archiveNavigation = {
+    "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document",
+  };
+
+  it("accepts a bounded native ZIP form with canonical Origin or same-origin navigation and full-session CSRF", async () => {
     const payload = vi.fn();
     const moduleRouter = Router({ caseSensitive: true, strict: true });
-    const path = "/api/files/archives/download";
     moduleRouter.post("/files/archives/download", (req, res) => { payload(req.body); res.status(204).end(); });
     const h = harness({ moduleRouter }, { aliasHosts: ["portal.readypackets.test"] });
-    const ticket = "synthetic-download-ticket".padEnd(43, "A");
-    const form = { ticket, csrf: csrfA };
-    const post = (url = path, session = TOKEN_A, proof = csrfA) => h.http.post(url).set("Host", HOST)
+    const { ticket } = archiveForm;
+    const post = (url = archivePath, session = TOKEN_A, proof = csrfA) => h.http.post(url).set("Host", HOST)
       .set("Origin", ORIGIN).set("Sec-Fetch-Site", "same-origin").set("Cookie", requestCookies(h.config, session, proof));
+    const refused = async (pending: ReturnType<typeof post>, denialReasonCode: string) => {
+      const response = await pending.expect(204, "");
+      expect(h.access).toHaveBeenCalledWith("http request", expect.objectContaining({
+        status: 204, denialReasonCode, requestId: response.headers["x-request-id"],
+      }));
+    };
 
-    await post().type("form").send(form).expect(204);
+    await post().type("form").send(archiveForm).expect(204);
+    await post().type("form").set("Origin", "null").set(archiveNavigation).send(archiveForm).expect(204);
+    await post().type("form").set("Origin", "null").set({ ...archiveNavigation, "Sec-Fetch-Dest": "empty" })
+      .send(archiveForm).expect(204);
     await post().type("json").set(HEADER_CSRF, csrfA).send({ ticket }).expect(204);
-    expect(payload.mock.calls).toEqual([[{ ticket }], [{ ticket }]]);
-    await post().type("form").set("Origin", "https://external.example.test").send(form).expect(403);
-    await post().type("form").set("Host", "portal.readypackets.test").send(form).expect(404);
-    await post(path, "", csrfA).type("form").send(form).expect(401);
-    await post(path, TOKEN_B).type("form").send(form).expect(403);
-    await post(path, TOKEN_A, csrfB).type("form").send(form).expect(403);
-    await post().type("form").set(HEADER_CSRF, csrfA).send({ ticket }).expect(403);
-    await post().type("json").send(form).expect(403);
-    await post().type("form").send(`ticket=${ticket}&csrf=${csrfA}&csrf=${csrfA}`).expect(413);
-    await post().type("form").send({ csrf: csrfA, ticket: "A".repeat(1024) }).expect(413);
-    await post().type("form").set("Content-Encoding", "gzip").send(gzipSync(`ticket=${ticket}&csrf=${csrfA}`)).expect(415);
-    for (const url of [`${path}/`, `${path}?alternate=1`, "/api/files/Archives/download", "/api/files/download"]) {
-      await post(url).type("form").send(form).expect(403);
+    expect(payload.mock.calls).toEqual(Array.from({ length: 4 }, () => [{ ticket }]));
+    await refused(post().type("form").set("Origin", "https://external.example.test").send(archiveForm), "ORIGIN_NOT_ALLOWED");
+    await refused(post().type("form").set("Host", "portal.readypackets.test").send(archiveForm), "NOT_FOUND");
+    await refused(post(archivePath, "", csrfA).type("form").set("Origin", "null").set(archiveNavigation).send(archiveForm), "NO_SESSION");
+    await refused(post(archivePath, TOKEN_B).type("form").set("Origin", "null").set(archiveNavigation).send(archiveForm), "CSRF_INVALID");
+    await refused(post(archivePath, TOKEN_A, csrfB).type("form").send(archiveForm), "CSRF_INVALID");
+    await refused(post().type("form").set(HEADER_CSRF, csrfA).send({ ticket }), "CSRF_INVALID");
+    await refused(post().type("form").send({ csrf: csrfA, other: ticket }), "DOWNLOAD_TICKET_INVALID");
+    await post().type("json").send(archiveForm).expect(403);
+    await refused(post().type("form").send(`ticket=${ticket}&csrf=${csrfA}&csrf=${csrfA}`), "TOO_MANY_FORM_FIELDS");
+    await refused(post().type("form").send({ csrf: csrfA, ticket: "A".repeat(1024) }), "BODY_TOO_LARGE");
+    await refused(post().type("form").set("Content-Encoding", "gzip")
+      .send(gzipSync(`ticket=${ticket}&csrf=${csrfA}`)), "UNSUPPORTED_ENCODING");
+    for (const url of [`${archivePath}/`, `${archivePath}?alternate=1`, "/api/files/Archives/download", "/api/files/download"]) {
+      await post(url).type("form").send(archiveForm).expect(403);
+      await post(url).type("form").set("Origin", "null").set(archiveNavigation).send(archiveForm).expect(403);
     }
+    await post().type("json").set("Origin", "null").set(archiveNavigation).set(HEADER_CSRF, csrfA).send({ ticket }).expect(403);
     const preview = harness({ moduleRouter }, { deploymentProfile: "preview" });
-    await preview.http.post(path).set("Host", HOST).type("form").send(form).expect(404);
-    expect(payload).toHaveBeenCalledTimes(2);
+    await preview.http.post(archivePath).set("Host", HOST).type("form").send(archiveForm).expect(204, "");
+    expect(payload).toHaveBeenCalledTimes(4);
+    expect(h.audit.notes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ eventName: "http.csrf.denied", reasonCode: "CSRF_INVALID" }),
+    ]));
     const access = JSON.stringify(h.access.mock.calls);
     expect(access).not.toContain(ticket);
     expect(access).not.toContain(csrfA);
+  });
+
+  it.each([
+    ["missing fetch site", { "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document" }],
+    ["cross-site", { ...archiveNavigation, "Sec-Fetch-Site": "cross-site" }],
+    ["same-site", { ...archiveNavigation, "Sec-Fetch-Site": "same-site" }],
+    ["CORS mode", { ...archiveNavigation, "Sec-Fetch-Mode": "cors" }],
+    ["missing mode", { "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Dest": "document" }],
+    ["missing destination", { "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "navigate" }],
+    ["framed navigation", { ...archiveNavigation, "Sec-Fetch-Dest": "iframe" }],
+  ] as const)("audits and silently refuses a null-origin ZIP form with %s", async (_name, metadata) => {
+    const h = harness();
+    const response = await h.http.post(archivePath).set("Host", HOST).set("Origin", "null").set({ ...metadata })
+      .set("Cookie", requestCookies(h.config, TOKEN_A, csrfA)).type("form").send(archiveForm).expect(204, "");
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+    expect(h.audit.notes).toEqual([expect.objectContaining({
+      eventName: "http.origin.denied", reasonCode: "ORIGIN_NOT_ALLOWED", outcome: "denied",
+    })]);
+    expect(h.access).toHaveBeenCalledWith("http request", expect.objectContaining({
+      status: 204, denialReasonCode: "ORIGIN_NOT_ALLOWED", requestId: response.headers["x-request-id"],
+    }));
+  });
+
+  it("preserves the page and Files audit on a malformed native ticket without changing JSON refusals", async () => {
+    const moduleRouter = Router({ caseSensitive: true, strict: true });
+    const files = Router({ caseSensitive: true, strict: true });
+    moduleRouter.use("/files", files);
+    const h = harness({ moduleRouter });
+    const recordDenied = vi.fn(async () => undefined);
+    const redeemDownloadTicket = vi.fn();
+    Object.assign(h.services, { fileArchives: { recordDenied, redeemDownloadTicket } });
+    registerFileArchiveHttpRoutes(files, h.services);
+    const post = () => h.http.post(archivePath).set("Host", HOST).set("Cookie", requestCookies(h.config, TOKEN_A, csrfA));
+    await post().set("Origin", "null").set(archiveNavigation).type("form")
+      .send({ csrf: csrfA, ticket: "invalid" }).expect(204, "");
+    await post().set("Origin", ORIGIN).set(HEADER_CSRF, csrfA).type("json").send({ ticket: "invalid" }).expect(400);
+    expect(recordDenied.mock.calls).toEqual([[a, "DOWNLOAD_TICKET_INVALID"], [a, "DOWNLOAD_TICKET_INVALID"]]);
+    expect(redeemDownloadTicket).not.toHaveBeenCalled();
   });
 
   it("admits only the literal ACS POST without browser credentials and applies the form cap before dispatch", async () => {
