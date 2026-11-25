@@ -125,14 +125,15 @@ export function RecordingPreflight({ orderId, slotKey, stageKey, deviceId, onDev
     }
   }
 
+  const maxSeconds = check.data?.maxSeconds ?? (check.data?.maxMinutes ?? 0) * 60;
   return <Dialog open onOpenChange={(open) => { if (!open) onClose(); }} title="Check your recording setup"
     description="Choose a microphone and record a five-second test. The test stays on this device and is never uploaded."
     footer={<>
       <Button variant="secondary" onClick={onClose}>Close</Button>
       {check.data?.enabled && !check.isError ? <Button variant="secondary" disabled={check.isFetching}
-        onClick={() => onContinue(true, check.data.maxSeconds ?? check.data.maxMinutes * 60)}>Use device recorder</Button> : null}
+        onClick={() => onContinue(true, maxSeconds)}>Use device recorder</Button> : null}
       {check.data?.enabled && micAvailable && !check.isError ? <Button disabled={busy || check.isFetching}
-        onClick={() => onContinue(false, check.data.maxSeconds ?? check.data.maxMinutes * 60)}>Continue to recording</Button> : null}
+        onClick={() => onContinue(false, maxSeconds)}>Continue to recording</Button> : null}
     </>}>
     <div className="grid min-w-0 gap-3">
       <div className="grid gap-1 text-sm text-body" aria-live="polite">
@@ -148,7 +149,7 @@ export function RecordingPreflight({ orderId, slotKey, stageKey, deviceId, onDev
       {check.data ? <div className="grid min-w-0 gap-2 text-sm text-body">
         {!check.data.enabled ? <Callout tone="warning" title="Recording unavailable">This order or task does not currently accept recordings.</Callout> : <>
           <p className="break-words">Pass: order accepts {check.data.acceptedTypes.join(", ").toUpperCase()}. Limit: {stageKey
-            ? `${check.data.maxSeconds} seconds` : `${check.data.maxMinutes} minutes`} and {formatBytes(check.data.maxBytes)}.</p>
+            ? `${maxSeconds} seconds` : `${check.data.maxMinutes} minutes`} and {formatBytes(check.data.maxBytes)}.</p>
           <p>{check.data.conversionAvailable ? "Pass: the server can re-encode supported audio to WebM/Opus. It keeps the original." :
             "Warning: the server cannot re-encode audio right now. It keeps the original; tasks that require a verified duration may be unavailable."}</p>
         </>}

@@ -13,6 +13,7 @@ import {
 } from "@/ui";
 import { formatDuration } from "./AudioRecorder";
 import { categoryLabels, FileUploadPanel, visibilityLabels } from "./FileUploadPanel";
+import { OrderArchiveAction, PhaseArchiveAction } from "./archives/ArchiveAction";
 import { PhaseUploadPanel } from "./PhaseFiles";
 import { formatBytes } from "./format";
 import { saveFileBlob } from "./fileDownload";
@@ -20,6 +21,7 @@ import { audioFileExtensions } from "./recordingDevice";
 
 type Props = { orderId: string; area: "customer" | "console" };
 type FileAction = { file: FileRecord; kind: "remove" | "restore" | "visibility" };
+type LibraryGroup = { category: string; visibility: string; items: FileRecord[] };
 
 const descriptions = {
   remove: "This version will stop being available to order readers. Staff may restore it until the retention window closes.",
@@ -38,18 +40,23 @@ function AudioPlayback({ file, load }: { file: FileRecord; load: (signal: AbortS
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const active = useRef<AbortController | null>(null);
+  const playbackDetails = useRef<HTMLParagraphElement>(null);
   useEffect(() => () => { active.current?.abort(); }, []);
   useEffect(() => () => { if (state?.url.startsWith("blob:")) URL.revokeObjectURL(state.url); }, [state]);
+  useEffect(() => { if (state) playbackDetails.current?.focus(); }, [state]);
 
   async function openAudio() {
     if (active.current) return;
     const controller = new AbortController();
     active.current = controller;
     setBusy(true);
-    setNotice(null);
+    if (!state) setNotice(null);
     try {
       const { url, transcript } = await load(controller.signal);
-      if (!controller.signal.aborted) setState({ url, transcript });
+      if (!controller.signal.aborted) {
+        setState({ url, transcript });
+        setNotice(null);
+      }
       else if (url.startsWith("blob:")) URL.revokeObjectURL(url);
     } catch {
       if (!controller.signal.aborted) setNotice("The recording could not be loaded. Check your access or download the original from the file list.");
@@ -61,15 +68,18 @@ function AudioPlayback({ file, load }: { file: FileRecord; load: (signal: AbortS
 
   return <div className="grid min-w-0 gap-3">
     {!state ? <div><Button loading={busy} onClick={() => { void openAudio(); }}>Load audio and transcript</Button></div> : <>
-      <p className="text-sm text-body">Duration: {duration === null ? "Not available" : formatDuration(duration)}</p>
+      <p ref={playbackDetails} tabIndex={-1} className="text-sm text-body">Duration: {duration === null ? "Not available" : formatDuration(duration)}</p>
       {/* eslint-disable-next-line jsx-a11y/media-has-caption -- Audio-only content exposes the provided transcript alongside the player. */}
       <audio controls preload="metadata" className="w-full min-w-0" aria-label={`Play ${file.displayName}`} src={state.url}
         onLoadedMetadata={(event) => { if (Number.isFinite(event.currentTarget.duration)) setDuration(event.currentTarget.duration); }}
-        onError={() => setNotice("This format could not be played in your browser. You can download the original from the file list.")} />
+        onError={() => setNotice("The browser could not continue playback. Try refreshing access or download the file from the library.")} />
       <p className="font-medium text-ink">Transcript</p>
       <p className="whitespace-pre-wrap break-words text-sm text-body">{state.transcript || "No transcript was supplied."}</p>
     </>}
-    {notice ? <Callout tone="warning" title="Audio playback notice" live="polite">{notice}</Callout> : null}
+    {notice ? <Callout tone="warning" title="Audio playback notice" live="polite">
+      <p>{notice}</p>
+      {state ? <Button variant="secondary" size="sm" loading={busy} onClick={() => { void openAudio(); }}>Refresh playback access</Button> : null}
+    </Callout> : null}
   </div>;
 }
 
@@ -103,13 +113,25 @@ export default function OrderFilesTab({ orderId, area }: Props) {
   const rows = list.data?.pages.flatMap((page) => page.items) ?? [];
   const first = list.data?.pages[0];
   const phases = first?.phases ?? [];
-  const uploadPhase = phases.find((phase) => phase.key === uploadPhaseKey) ?? phases.at(-1);
-  const groups = phases.length && rows.length ? [...phases, { key: "", label: "Other order files" }].flatMap((phase) => {
-    const items = rows.filter((file) => (file.groupStageKey ?? file.stageKey ?? "") === phase.key);
-    return items.length ? [{ ...phase, items: items.sort((a, b) =>
-      categoryLabels[a.category].localeCompare(categoryLabels[b.category]) ||
-      visibilityLabels[a.visibility].localeCompare(visibilityLabels[b.visibility]) ||
-      a.logicalPublicId.localeCompare(b.logicalPublicId) || b.version - a.version) }] : [];
+  const uploadPhase = phases.find((phase) => phase.key === (uploadPhaseKey || first?.currentStageKey)) ?? phases.at(-1);
+  const groupedRows = new Map<string, Map<string, LibraryGroup>>();
+  const knownPhases = new Set(phases.map(({ key }) => key));
+  for (const file of rows) {
+    const phaseKey = file.groupStageKey ?? file.stageKey ?? "";
+    const phase = knownPhases.has(phaseKey) ? phaseKey : "";
+    const groupKey = `${file.category}:${file.visibility}`;
+    const phaseGroups = groupedRows.get(phase) ?? new Map<string, LibraryGroup>();
+    const group = phaseGroups.get(groupKey) ?? {
+      category: categoryLabels[file.category], visibility: visibilityLabels[file.visibility], items: [],
+    };
+    group.items.push(file);
+    phaseGroups.set(groupKey, group);
+    groupedRows.set(phase, phaseGroups);
+  }
+  const groups = phases.length ? [...phases, { key: "", label: "Other order files" }].flatMap((phase) => {
+    const items = [...(groupedRows.get(phase.key)?.entries() ?? [])].sort(([, a], [, b]) =>
+      a.category.localeCompare(b.category) || a.visibility.localeCompare(b.visibility));
+    return items.length ? [{ ...phase, items }] : [];
   }) : [];
   const policy = first?.uploadPolicy;
   const slots = first?.uploadSlots;
@@ -211,7 +233,7 @@ export default function OrderFilesTab({ orderId, area }: Props) {
                   (consoleArea || file.category !== "deliverable") && (!file.slotKey || (!!slots?.slots.some((slot) => slot.key === file.slotKey) && file.statusKey === slots?.statusKey));
                 const staffActions = consoleArea && canChange && !file.derivedFromPublicId;
                 return <div className="flex flex-wrap items-center gap-1">
-                  {!file.deletedAt ? <Button size="sm" variant="secondary" leadingIcon={<Download aria-hidden />} disabled={!!downloading}
+                  {!file.deletedAt ? <Button size="sm" variant="secondary" leadingIcon={<Download aria-hidden />} aria-disabled={!!downloading || undefined}
                     loading={downloading === file.publicId} onClick={() => { void download(file); }} aria-label={`Download ${file.displayName}`}>Download</Button> : null}
                   {!file.deletedAt && !file.supersededAt && file.contentType.startsWith("audio/") ?
                     <Button size="sm" variant="secondary" onClick={() => setPlaying(file)} aria-label={`Listen to ${file.displayName}`}>Listen</Button> : null}
@@ -261,20 +283,29 @@ export default function OrderFilesTab({ orderId, area }: Props) {
               <FileUploadPanel key={`${slots?.statusKey ?? ""}:${chosenSlot?.key ?? ""}:${launchRecording ? "record" : "files"}`}
                 orderId={orderId} staff={consoleArea} policy={policy}
                 slot={chosenSlot && slots ? { ...chosenSlot, statusKey: slots.statusKey } : undefined}
+                phase={first.stageUploadsRequired && chosenSlot && first.currentStageKey ? { key: first.currentStageKey } : undefined}
                 audio={first.audio} launchRecording={launchRecording} onChanged={reload} />}
           </div>
         </Card> : first ? <Callout tone="info" title="File changes unavailable">
           Your access or the order’s current state does not allow file changes.
         </Callout> : null}
-        <Card title="File library" headingLevel={3} description="Current versions appear by default. Include previous versions to see file history.">
+        <Card title="File library" headingLevel={3} description="Current versions appear by default. Include previous versions to see file history."
+          actions={consoleArea && first?.canArchiveOrder ? <OrderArchiveAction orderId={orderId} /> : undefined}>
           <div className="grid min-w-0 gap-3">
             <div className="flex flex-wrap gap-x-6 gap-y-2">
               <Checkbox label="Include previous versions" checked={versions} onCheckedChange={setVersions} />
               {consoleArea ? <Checkbox label="Include trash" checked={trash} onCheckedChange={setTrash} /> : null}
             </div>
             {groups.length && !list.isError ? groups.map((group) => <div key={group.key} className="grid min-w-0 gap-2">
-              <h4 className="break-words text-base font-semibold text-ink">{group.label}</h4>
-              {fileTable(group.items, `Files for ${group.label}`)}
+              <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
+                <h4 className="min-w-0 break-words text-base font-semibold text-ink">{group.label}</h4>
+                {group.key ? <PhaseArchiveAction orderId={orderId} stageKey={group.key} phaseName={group.label} /> : null}
+              </div>
+              {group.items.map(([key, section]) => <div key={key} className="grid min-w-0 gap-2 pb-2">
+                <h5 className="break-words text-sm font-medium text-body">{section.category} · {section.visibility}</h5>
+                {fileTable(section.items.sort((a, b) => a.logicalPublicId.localeCompare(b.logicalPublicId) || b.version - a.version),
+                  `${group.label}: ${section.category}, ${section.visibility}`)}
+              </div>)}
             </div>) : fileTable(rows, "Files for this order")}
             <LoadMore hasMore={list.hasNextPage} loading={list.isFetchingNextPage} onLoadMore={() => { void list.fetchNextPage(); }}
               summary={rows.length ? `Showing ${rows.length} ${rows.length === 1 ? "file" : "files"}` : undefined} />
@@ -286,7 +317,7 @@ export default function OrderFilesTab({ orderId, area }: Props) {
         {replacement && policy ? <FileUploadPanel key={replacement.publicId} orderId={orderId} staff={consoleArea} policy={policy} onChanged={reload}
           audio={first?.audio} slot={replacementSlot && slots ? { ...replacementSlot, statusKey: slots.statusKey } : undefined}
           phase={replacement.stageKey ? { key: replacement.stageKey,
-            intent: replacement.contentType.startsWith("audio/") ? "prerecorded_audio" : "document" } : undefined}
+            intent: replacementSlot ? undefined : replacement.contentType.startsWith("audio/") ? "prerecorded_audio" : "document" } : undefined}
           replace={{ id: replacement.publicId, category: replacement.category, visibility: replacement.visibility }} /> : null}
       </Dialog>
       <Dialog title="Listen to order audio" description={playing?.displayName} open={!!playing} onOpenChange={(open) => { if (!open) setPlaying(null); }}>

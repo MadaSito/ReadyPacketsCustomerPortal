@@ -152,6 +152,7 @@ export interface FilesModule extends ModuleLifecycle {
     canUpload: boolean; uploadPolicy: UploadPolicy | null; uploadSlots: { statusKey: string; slots: FileUploadSlot[] } | null;
     audio: { enabled: boolean; maxMinutes: number } | null;
     phases: FilePhase[];
+    currentStageKey: string | null;
     stageUploadsRequired: boolean;
     canArchiveOrder: boolean;
   }>;
@@ -410,6 +411,9 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       orderPublicId, stageKey: options.stageKey, intent: uploadIntent(options), actor: principal, slotKey: options.slotKey,
     }, tx);
     if (options.stageKey && !stage) throw notFound("STAGE_NOT_OPEN");
+    if (stage?.governance && !options.stageKey && options.source !== "document_edit") {
+      throw validation("STAGE_REQUIRED", "Choose the phase this file belongs to.");
+    }
     return stage ?? null;
   }
 
@@ -444,6 +448,10 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
 
   const listStages = (principal: SessionPrincipal, orderPublicId: string, tx: Tx) =>
     deps.services.orders.stages?.listForOrder({ orderPublicId, actor: principal }, tx);
+
+  function statusStage(stages: Awaited<ReturnType<typeof listStages>>, statusKey: string | null) {
+    return stages && statusKey && Object.hasOwn(stages.statusToStage, statusKey) ? stages.statusToStage[statusKey] ?? null : null;
+  }
 
   function stageStatusKeys(stages: Awaited<ReturnType<typeof listStages>>, key: string) {
     if (!stageKeySchema.safeParse(key).success || !stages?.stages.some((entry) => entry.key === key && entry.viewable)) {
@@ -505,7 +513,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
   }
 
   function deliverableOutput(row: FileRow, stages: Awaited<ReturnType<typeof listStages>>) {
-    return { ...output(row), stageKey: row.stageKey ?? (row.statusKey && stages?.format !== 3 && stages?.statusToStage[row.statusKey] || null) };
+    return { ...output(row), stageKey: row.stageKey ?? (stages?.format !== 3 ? statusStage(stages, row.statusKey) : null) };
   }
 
   async function readFile(principal: SessionPrincipal, publicId: string, orderPublicId?: string, tx?: Tx) {
@@ -557,10 +565,11 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     )).orderBy(orderFiles.publicId).limit(limit + 1).for("update");
     return {
       items: rows.slice(0, limit).map((row) => ({ ...output(row),
-        groupStageKey: row.stageKey ?? (row.statusKey && stages?.format !== 3 && stages?.statusToStage[row.statusKey] || null) })),
+        groupStageKey: row.stageKey ?? (stages?.format !== 3 ? statusStage(stages, row.statusKey) : null) })),
       nextCursor: rows.length > limit ? encodeCursor(rows[limit - 1]!.publicId) : null,
       canUpload,
       phases: stages?.stages.filter((entry) => entry.viewable).map((entry) => ({ key: entry.key, label: staff ? entry.staffLabel : entry.customerLabel })) ?? [],
+      currentStageKey: statusStage(stages, order.statusKey),
       stageUploadsRequired: stages?.format === 3,
       canArchiveOrder: principal.role === "admin" && roleHasCapability(principal.role, "files.archive.order"),
     };
@@ -795,6 +804,12 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     const options: UploadOptions = { stageKey: row.stageKey ?? undefined, slotKey: slot?.key ?? row.slotKey ?? undefined,
       versionOf: row.publicId, category: replyBranch ? "supporting" : row.category, visibility: row.visibility, source: "document_edit" };
     const stage = await resolveUploadStage(principal, order.publicId, options, tx);
+    if (!row.stageKey && stage?.governance && !replyBranch) {
+      throw validation("FILE_VERSION_SCOPE", "A new version must preserve its original phase.");
+    }
+    if (row.stageKey && !stage?.governance) {
+      await deps.services.orders.assertFileStatusWritable(principal, order.publicId, row.statusKey ?? order.statusKey, tx);
+    }
     const documentPolicy = { ...policy, maxFileBytes: maxBytes,
       maxRequestBytes: Math.min(policy.maxRequestBytes, maxBytes + 16 * 1024), maxFiles: 1, extensions: ["docx"] as FileExtension[] };
     const effective = limitsForRequest(documentPolicy, stage, await audioRules(tx), options, slot);
@@ -843,10 +858,12 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       enforceVisibility(row, principal, order.ownerUserId, true);
       if (row.orderPublicId !== order.publicId) throw notFound("FILE_NOT_FOUND");
       if (row.derivedFromPublicId) throw new DomainError("FORBIDDEN", "AUDIO_DERIVATIVE_READ_ONLY", "Change or remove the original recording instead.");
-      const stage = row.stageKey ? await deps.services.orders.stages?.assertStageAccess({
+      const stages = row.stageKey ? await listStages(principal, order.publicId, tx) : undefined;
+      if (row.stageKey) stageStatusKeys(stages, row.stageKey);
+      const stage = row.stageKey && stages?.format === 3 ? await deps.services.orders.stages?.assertStageAccess({
         orderPublicId: order.publicId, actor: principal, stageKey: row.stageKey, mode: "staff_manage",
       }, tx) : undefined;
-      if (row.stageKey && !stage) throw notFound("STAGE_NOT_FOUND");
+      if (row.stageKey && stages?.format === 3 && !stage) throw notFound("STAGE_NOT_FOUND");
       if (!stage && row.statusKey) await deps.services.orders.assertFileStatusWritable(principal, order.publicId, row.statusKey, tx);
       if (row.slotKey && row.statusKey && !row.supersededAt &&
           ((typeof change === "object" && change.visibility === "customer_visible" && row.visibility === "staff_only") ||
@@ -874,7 +891,6 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
         if (!row.deletedAt || !row.purgeAfter || row.purgeAfter <= now) {
           throw conflict("FILE_NOT_RESTORABLE", "The file is not available to restore.");
         }
-        const stages = row.stageKey ? await listStages(principal, order.publicId, tx) : undefined;
         if (row.stageKey && stage && !row.supersededAt && stages?.format === 3) {
           const [policy, audio] = await Promise.all([rules(tx), audioRules(tx)]);
           const limits = limitsForPhase(stage.stage.governance ?? {}, policy.maxFileBytes, audio.maxMinutes * 60);
@@ -1121,9 +1137,10 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
           const order = await deps.services.orders.assertCanWriteOrder(principal, orderPublicId, { kind: "file", tx, forUpdate: true });
           await requireCurrent(principal, tx);
           const stage = await resolveUploadStage(principal, order.publicId, options, tx);
-          if (!stage) await deps.services.orders.assertFileStatusWritable(principal, order.publicId, order.statusKey, tx);
+          if (!stage?.governance) await deps.services.orders.assertFileStatusWritable(principal, order.publicId, order.statusKey, tx);
           if ((options.slotKey === undefined) !== (options.statusKey === undefined) ||
-            (options.statusKey !== undefined && options.statusKey !== order.statusKey)) {
+            (options.statusKey !== undefined && (options.statusKey !== order.statusKey ||
+              (stage && stage.statusKey !== options.statusKey)))) {
             throw conflict("UPLOAD_SLOT_STATUS_CHANGED", "The upload slot no longer matches the current order status.");
           }
           if (principal.role === "customer") await deps.services.orders.gates.assertCustomerMayWork({
@@ -1180,7 +1197,10 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
         await requireCurrent(principal, tx);
         const options: UploadOptions = { stageKey, slotKey, source: "recording", category: "supporting", visibility: "customer_visible" };
         const stage = await resolveUploadStage(principal, order.publicId, options, tx);
-        if (!stage) await deps.services.orders.assertFileStatusWritable(principal, order.publicId, order.statusKey, tx);
+        if (!stage?.governance) await deps.services.orders.assertFileStatusWritable(principal, order.publicId, order.statusKey, tx);
+        if (slotKey && stage && stage.statusKey !== order.statusKey) {
+          throw conflict("UPLOAD_SLOT_STATUS_CHANGED", "The recording slot no longer matches the current phase.");
+        }
         if (principal.role === "customer") await deps.services.orders.gates.assertCustomerMayWork({
           tx, orderId: order.id, actor: principal, action: "record", statusKey: stage?.statusKey ?? (slotKey ? order.statusKey : null),
         });
@@ -1384,7 +1404,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
           if ((stage?.stageKey ?? undefined) !== request.stageKey || stage?.statusKey !== request.targetStatusKey) {
             throw conflict("STAGE_CHANGED", "The phase changed during upload. Please reload and try again.");
           }
-          if (!stage) await deps.services.orders.assertFileStatusWritable(principal, order.publicId, order.statusKey, tx);
+          if (!stage?.governance) await deps.services.orders.assertFileStatusWritable(principal, order.publicId, order.statusKey, tx);
           if (principal.role === "customer" && !editing) await deps.services.orders.gates.assertCustomerMayWork({
             tx, orderId: order.id, actor: principal, action: source === "recording" ? "record" : "upload",
             statusKey: stage?.statusKey ?? (request.slotKey ? order.statusKey : null),
@@ -1401,7 +1421,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
             if (previous.orderId !== order.id || previous.orderPublicId !== order.publicId) throw notFound("FILE_NOT_FOUND");
             enforceVisibility(previous, principal, order.ownerUserId);
             if (previous.supersededAt) throw conflict("FILE_VERSION_CHANGED", "This file already has a newer version.");
-            if (previous.stageKey !== (stage?.stageKey ?? null)) {
+            if (previous.stageKey !== (stage?.stageKey ?? null) && !(edit?.replyBranch && !previous.stageKey)) {
               throw validation("FILE_VERSION_SCOPE", "A new version must preserve its original phase.");
             }
             if ((edit?.replyBranch ? "supporting" : previous.category) !== request.category || previous.visibility !== request.visibility) {

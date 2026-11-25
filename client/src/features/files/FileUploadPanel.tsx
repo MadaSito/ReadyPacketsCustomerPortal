@@ -39,6 +39,8 @@ const uploadRefusals = new Map([
   ["ORDER_ACCEPTANCE_REQUIRED", "Accept the order's required policy before uploading files or saving a recording."],
   ["AGREEMENT_REQUIRED", "Accept the order agreement before uploading files or saving a recording."],
   ["PHASE_LOCKED", "This phase is locked for file changes."],
+  ["STAGE_LOCKED", "This phase is locked for file changes."],
+  ["STAGE_REQUIRED", "Choose the phase this file belongs to."],
   ["UPLOAD_SLOT_STATUS_CHANGED", "The order status changed. Reload to see the current upload slots."],
   ["UPLOAD_SLOT_UNAVAILABLE", "This upload slot is no longer available to you."],
   ["AUDIT_WRITE_FAILED", "A security record could not be saved. Reload the list to confirm which files were saved."],
@@ -68,7 +70,7 @@ export interface FileUploadPanelProps {
   slot?: FileUploadSlot & { statusKey: string };
   audio?: { enabled: boolean; maxMinutes: number } | null;
   launchRecording?: boolean;
-  phase?: { key: string; intent: UploadIntent };
+  phase?: { key: string; intent?: UploadIntent };
   maxSeconds?: number;
   disabled?: boolean;
   onChanged: () => void | Promise<void>;
@@ -103,7 +105,7 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
     return (slot.kind === "audio" ? (audioFileExtensions as readonly string[]) : ["pdf", "png", "jpg", "docx"]).includes(extension);
   }) : policy.extensions;
   const canPick = phase?.intent !== "recording" && slot?.acceptsUpload !== false && slot?.capture !== "record";
-  const canRecord = (!phase || phase.intent === "recording") && audio?.enabled && slot?.acceptsUpload !== false && slot?.capture !== "upload" &&
+  const canRecord = (!phase?.intent || phase.intent === "recording") && audio?.enabled && slot?.acceptsUpload !== false && slot?.capture !== "upload" &&
     slot?.kind !== "document" && audioFileExtensions.some((extension) => extensions.includes(extension));
   const allowsTranscript = selection.length === 1 && (slot?.kind === "audio" ||
     /^(?:audio\/)|\.(?:wav|ogg|webm|m4a|mp4|mp3|aac|caf)$/iu.test(`${selection[0]?.type} ${selection[0]?.name}`));
@@ -120,7 +122,12 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
       setMessage(`Choose at most ${maxFiles} ${maxFiles === 1 ? "file" : "files"} per upload.`);
       return;
     }
-    if (files.some((file) => file.size > policy.maxFileBytes) || files.reduce((total, file) => total + file.size, 0) + 1024 > policy.maxRequestBytes) {
+    if (files.some((file) => file.size > policy.maxFileBytes)) {
+      setSelection([]);
+      setMessage(`Choose files no larger than ${formatBytes(policy.maxFileBytes)} each.`);
+      return;
+    }
+    if (files.reduce((total, file) => total + file.size, 0) + 1024 > policy.maxRequestBytes) {
       setSelection([]);
       setMessage(`Choose files that fit within the ${formatBytes(policy.maxRequestBytes)} request limit.`);
       return;
@@ -156,7 +163,7 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
     const query = new URLSearchParams({ category, visibility: slot ? "customer_visible" : visibility });
     if (phase) {
       query.set("stageKey", phase.key);
-      query.set("intent", phase.intent);
+      query.set("intent", phase.intent ?? (recording ? "recording" : slot?.kind === "audio" ? "prerecorded_audio" : "document"));
     } else if (recording) query.set("source", "recording");
     if (slot) {
       query.set("slotKey", slot.key);

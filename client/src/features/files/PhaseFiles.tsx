@@ -124,7 +124,7 @@ function PhaseFileItems({ files, label, empty, include }: {
           <span className="block break-all font-medium text-ink">{file.displayName}</span>
           <span className="text-sm text-body">{formatBytes(file.size)} · Version {file.version}</span>
         </div>
-        <Button size="sm" variant="secondary" leadingIcon={<Download aria-hidden />} disabled={busy !== null}
+        <Button size="sm" variant="secondary" leadingIcon={<Download aria-hidden />} aria-disabled={busy !== null || undefined}
           loading={busy === file.publicId} aria-label={`Download ${file.displayName}`} onClick={() => { void download(file); }}>Download</Button>
       </li>)}
     </ul> : <p className="text-sm text-body">{files.hasNextPage ? "No matching files on this page." : empty}</p>}

@@ -759,16 +759,17 @@ describe("download ticket custody", () => {
 describe("phase files", () => {
   const stageKey = "intake_phase";
   const documentUpload = { ...upload, stageKey, intent: "document" } as const;
-  function setPhase(governance: StageGovernance, { visible = true, teamReview = true }: { visible?: boolean; teamReview?: boolean } = {}) {
+  function setPhase(governance: StageGovernance, { visible = true, teamReview = true, implicit = false }:
+    { visible?: boolean; teamReview?: boolean; implicit?: boolean } = {}) {
     h.services.orders.stages = {
       async resolveStageForUpload(input: { stageKey?: string; intent: StageUploadIntent; actor: SessionPrincipal }) {
-        if (!input.stageKey) throw new DomainError("CONFLICT", "STAGE_REQUIRED", "Select a phase.");
-        if (input.stageKey !== stageKey) throw notFound("STAGE_NOT_FOUND");
+        if (!input.stageKey && !implicit) throw new DomainError("CONFLICT", "STAGE_REQUIRED", "Select a phase.");
+        if (input.stageKey && input.stageKey !== stageKey) throw notFound("STAGE_NOT_FOUND");
         if (phaseLocked && input.actor.role === "customer") throw new DomainError("FORBIDDEN", "STAGE_LOCKED", "Phase locked.");
         return { stageKey, statusKey: "intake", governance };
       },
       async listForOrder() {
-        return { format: 3, stages: [{ key: stageKey, customerLabel: "Intake", staffLabel: "Intake", viewable: visible, governance }], statusToStage: {} };
+        return { format: 3, stages: [{ key: stageKey, customerLabel: "Intake", staffLabel: "Intake", viewable: visible, governance }], statusToStage: { intake: stageKey } };
       },
       async assertStageAccess() { return { stage: { actions: { teamFileReview: teamReview }, governance } }; },
     } as unknown as TestHarness["services"]["orders"]["stages"];
@@ -828,7 +829,10 @@ describe("phase files", () => {
   });
 
   it("accepts explicit phase document intent over multipart and refuses incomplete bindings", async () => {
-    setPhase({});
+    setPhase({}, { implicit: true });
+    await expect(files.beginUpload(owner, orderPublicId, { ...upload, statusKey: "intake", slotKey: "legacy_slot" }))
+      .rejects.toMatchObject({ reasonCode: "STAGE_REQUIRED" });
+    await expect(files.list(owner, orderPublicId, {})).resolves.toMatchObject({ currentStageKey: stageKey, stageUploadsRequired: true });
     const url = `/api/files/upload/${orderPublicId}`;
     await request(appFor(owner)).post(`${url}?stageKey=${stageKey}`)
       .attach("files", examplePdf(), "phase.pdf").expect(400);
