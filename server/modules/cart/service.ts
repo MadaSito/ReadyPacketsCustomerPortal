@@ -2033,7 +2033,10 @@ export function createCartService(deps: ModuleDeps): CartModule {
             return;
           }
         }
-        const nextStatus = paymentStart.mode === "invoice" ? "checked_out" : "awaiting_payment";
+        const nextStatus =
+          locked.status === "checked_out" || paymentStart.mode === "invoice"
+            ? "checked_out"
+            : "awaiting_payment";
         const nextAttemptPublicId = paymentStart.mode === "redirect" ? paymentStart.attemptPublicId : null;
         const alreadyReconciled =
           locked.status === nextStatus &&
@@ -2292,8 +2295,10 @@ export function createCartService(deps: ModuleDeps): CartModule {
           }
 
           if (
-            (sourceCart.checkedOutTotalMinor === 0 || (sourceCart.checkedOutWaivedMinor ?? 0) > 0) &&
-            sourceCart.status === "checked_out"
+            sourceCart.status === "checked_out" &&
+            (sourceCart.paymentMode !== "invoice" ||
+              sourceCart.checkedOutTotalMinor === 0 ||
+              (sourceCart.checkedOutWaivedMinor ?? 0) > 0)
           ) {
             throw conflict("CHECKOUT_ALREADY_PAID", "Payment has already been confirmed for this order.");
           }
@@ -2674,6 +2679,71 @@ export function createCartService(deps: ModuleDeps): CartModule {
 
     expireAbandonedCarts(options) {
       return executeExpireBatch({ ...(options?.limit !== undefined ? { limit: options.limit } : {}) });
+    },
+
+    async onInvoicePaidInTx(input, tx) {
+      const invoicePublicId = input.invoicePublicId?.trim() ?? "";
+      if (!invoicePublicId) {
+        return { transitioned: false, cartPublicId: null };
+      }
+
+      const [cartRow] = await tx
+        .select()
+        .from(carts)
+        .where(eq(carts.checkoutInvoicePublicId, invoicePublicId))
+        .for("update")
+        .limit(1);
+
+      if (!cartRow) {
+        return { transitioned: false, cartPublicId: null };
+      }
+
+      if (
+        input.orderPublicId &&
+        cartRow.checkoutOrderPublicId &&
+        cartRow.checkoutOrderPublicId !== input.orderPublicId
+      ) {
+        throw conflict("CART_ORDER_MISMATCH", "Invoice cart record does not match order.");
+      }
+
+      if (cartRow.status === "checked_out") {
+        return { transitioned: false, cartPublicId: cartRow.publicId };
+      }
+
+      if (cartRow.status !== "awaiting_payment") {
+        return { transitioned: false, cartPublicId: cartRow.publicId };
+      }
+
+      const now = deps.clock.now();
+      const effectiveCheckedOutAt = cartRow.checkedOutAt ?? input.paidAt ?? now;
+
+      await tx
+        .update(carts)
+        .set({
+          status: "checked_out",
+          checkedOutAt: effectiveCheckedOutAt,
+          version: cartRow.version + 1,
+          updatedAt: now,
+        })
+        .where(eq(carts.id, cartRow.id));
+
+      await deps.audit.record(
+        {
+          category: "business",
+          eventName: "cart.checkout_completed",
+          action: "transition",
+          outcome: "completed",
+          actor: { userId: null, role: "system" },
+          resource: { type: "cart", publicId: cartRow.publicId },
+          attributes: {
+            order_public_id: cartRow.checkoutOrderPublicId ?? input.orderPublicId ?? null,
+            invoice_public_id: invoicePublicId,
+          },
+        },
+        tx,
+      );
+
+      return { transitioned: true, cartPublicId: cartRow.publicId };
     },
   };
 }

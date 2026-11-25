@@ -6,7 +6,7 @@
  * prices, discounts, tax rates, or totals as authoritative values; any extra field is rejected with `BAD_INPUT`.
  */
 import { z } from "zod";
-import type { ModuleLifecycle, SessionPrincipal } from "../../core/types.js";
+import type { ModuleLifecycle, SessionPrincipal, Tx } from "../../core/types.js";
 import type { PublishedPolicyView } from "../compliance/index.js";
 
 const ulidSchema = z.string().regex(/^[0-9A-HJKMNP-TV-Z]{26}$/, "Identifier format is not valid.");
@@ -577,8 +577,21 @@ export interface AdminOpenCartDetail extends AdminOpenCartSummary {
   totals: CartTotalsView;
 }
 
+export interface CartInvoicePaidInput {
+  invoicePublicId: string;
+  orderPublicId?: string;
+  paidAt?: Date;
+}
+
+export interface CartInvoicePaidResult {
+  transitioned: boolean;
+  cartPublicId: string | null;
+}
+
 export interface CartModule extends ModuleLifecycle {
   init(): void;
+  /** Increment 07 (D9): trusted transactional callback invoked by `compliance` when an invoice becomes paid. */
+  onInvoicePaidInTx(input: CartInvoicePaidInput, tx: Tx): Promise<CartInvoicePaidResult>;
   getBadgeCount(principal: SessionPrincipal): Promise<{ enabled: boolean; itemCount: number }>;
   getMyCart(principal: SessionPrincipal): Promise<CartView>;
   addItems(principal: SessionPrincipal, input: z.infer<typeof addItemsInputSchema>): Promise<CartView>;
