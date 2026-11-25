@@ -24,6 +24,7 @@ width; throttled retries always start from a fresh browser context. Both scripts
 Literal native zoom (`QA_LITERAL_ZOOM=1`) always uses a fresh profile and ignores context reuse.
 Unreadable or unreachable cases are retried once at the end of the matrix in a fresh context. If they
 still cannot be measured, they are `NOT CHECKED`, not a product finding or a passing result.
+The matrix runs anonymous, auth-transition and customer cases before staff and admin cases.
 
 ## Shared fixtures and sessions
 
@@ -37,6 +38,11 @@ credentials unless `QA_EXPECT_ORIGIN` equals `QA_BASE_URL`. Credentials come fro
 A route kept only as a redirect alias (for example `/account/sessions` → `/account/security`) needs a case with
 `redirectsTo`, the full document `title` and `heading` for its destination; the check then scans the destination and fails if the alias
 lands anywhere else. Any other redirect still fails the case.
+
+An explicit admin or staff case on a customer route can use `enterViaCustomerPortal: true` to exercise
+the visible Customer portal switch before checking the target path. For form states, a `steps` item may
+use an exact `label` (or `labelPrefix: true`), `key` (default `Enter`), or synthetic `text` input.
+Use `first: true` only when any matching control can advance the fixture, such as the first catalog item.
 
 ## Rate limits
 

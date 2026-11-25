@@ -80,7 +80,7 @@ export function createQaPages(browser, baseUrl, reuse) {
           await context.addInitScript(({ origin, entries }) => {
             if (window.location.origin !== origin) return;
             window.localStorage.clear();
-            window.sessionStorage.clear();
+            // This is a new tab for each measurement. Do not erase choices made by fixture setup during navigation.
             for (const { name, value } of entries) window.localStorage.setItem(name, value);
             window.history.scrollRestoration = "manual";
             window.scrollTo(0, 0);

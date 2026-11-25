@@ -97,6 +97,17 @@ test("route resolution distinguishes missing authenticated/transition states fro
   assert.throws(() => resolveQaScenarios(inventory, { cases: { "/not-a-route": [] } }), /unknown route ID/);
 });
 
+test("an admin customer-portal fixture must be explicitly opted in and does not replace the customer fixture", () => {
+  const routes = [{ id: "/orders/new", path: "/orders/new", access: "customer", title: "New order" }];
+  const sessions = { admin: "admin.state.json", customer: "customer.state.json" };
+  const staffViewer = { role: "admin", enterViaCustomerPortal: true, ready: "[data-testid=staff-order-handoff]" };
+  const config = { sessions, cases: { "/orders/new": [staffViewer] } };
+  const result = resolveQaScenarios(routes, config);
+  assert.equal(result.cases.find(({ role }) => role === "admin").enterViaCustomerPortal, true);
+  assert.equal(result.cases.find(({ role }) => role === "customer").enterViaCustomerPortal, false);
+  assert.throws(() => resolveQaScenarios(routes, { ...config, cases: { "/orders/new": [{ role: "admin" }] } }), /unexpected role/);
+});
+
 test("explicit route fixtures add roles and concrete paths without redirecting to external hosts", () => {
   const result = resolveQaScenarios(inventory, {
     sessions: { customer: "customer.json" },
