@@ -149,7 +149,13 @@ Orders organised into phases guide you through each step; see [Working through y
   - **Sharing** — see [Sharing an order](#sharing-an-order).
   - **Files** — see [Files](#files).
 - **Discount codes and cart suggestions** (when your portal has them switched on): see
-  [Using a discount code](./DISCOUNT_CODES_HELP.md) and [Suggestions in your cart](./CART_SUGGESTIONS_HELP.md).
+  [Using a discount code](./DISCOUNT_CODES_HELP.md) and [Suggestions in your cart](./CART_SUGGESTIONS_HELP.md). The
+  discount code field is in your cart once it has an item, and at checkout.
+- **ReadyPackets staff viewing the portal**: staff and administrators cannot place orders or use a cart as themselves.
+  They place orders for a customer from the console, and the order then appears in that customer's portal. They switch
+  portals with **Admin portal** or **Staff portal**. Customers do not see this switch. See
+  [Admin guide — Placing an order for a customer](./ADMIN_GUIDE.md#placing-an-order-for-a-customer) and
+  [Switching between the admin and customer portals](./ADMIN_GUIDE.md#switching-between-the-admin-and-customer-portals).
 - Orders may be **locked** (for example, on legal hold or after an import). A lock blocks changes but not reading.
 - Whether you can move an order to another status depends on its workflow; the order shows only the actions allowed
   for you.

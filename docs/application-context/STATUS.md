@@ -1,6 +1,6 @@
 # ReadyPackets Portal — Status
 
-Last updated: 2026-11-25 (increment 07 merged to `main` as `c337492` through PR #16). Keep this file current; it is the honest state of the build,
+Last updated: 2026-11-25 (increment 07 merged to `main` as `c337492` through PR #16; fix pack 07.1 on `fix/increment-07-1`, PR and merge commit filled at merge). Keep this file current; it is the honest state of the build,
 not a certification. "Verified" below means the integrator ran the check and saw the result. Anything not
 listed under "Verified" has not been proven and must not be described as working in production.
 
@@ -80,6 +80,7 @@ listed under "Verified" has not been proven and must not be described as working
 | Microsoft 365 file sync (increment 07) | one-way per phase to SharePoint, write check, bounded resync, health and alerts (off until configured); ADR 0061 | `server/modules/{storage,sharepoint}` |
 | SAML with Entra ID (increment 07) | SP-initiated SAML 2.0 with a hardened wrapper, pinned certificates, MFA modes `claim` / `entra` / `portal`, allowed roles, daily metadata check (off until configured); ADR 0062 | `server/modules/identity/sso`, `client/src/features/identity/sso` |
 | Migration (increment 07) | `migrations/0007_increment_07.sql`, additive: 16 tables, 40 columns on 11 tables, one widened enum, 96 statements, no `DROP` | `migrations/` |
+| Staff ordering handoff and portal switch (increment 07.1, client only) | staff and administrators get a handoff panel on `/orders/new`, `/cart`, `/cart/checkout`, `/checkout/return` and `/checkout/cancel` with **New order for a customer** → `/admin/orders?new=1`; visible **Customer portal** / **Admin portal** / **Staff portal** switch; staff landing on `/admin` with a per-tab choice; discount code hints | `client/src/app/portal.tsx`, `client/src/lib/portal.ts`, `client/src/features/{cart,orders}` |
 | Documentation | 62 ADRs, threat model, security reviews, guides for customers / staff / admins, runbooks, requirements register | `docs/` |
 
 ## Verified in session 01 (integrator's own runs)
@@ -379,6 +380,43 @@ Details are in `docs/session-logs/2026-11-22-session-03.md`.
   `bundle_scope_manifest` as a JSON string); a second "Start Phase I" was refused; Phase II was offered and
   not started; the pipeline switch was turned off afterwards. webhook.site is a request inspector, so this
   proves delivery and format, not the production receiver.
+
+## Verification for increment 07.1
+
+Fix pack for the owner's prompts 28 and 29 of 2026-11-25 ([session log](../session-logs/2026-11-25-session-01.md)). Client-side only: no server permission, schema or migration change, and the upgrade commands are unchanged.
+
+### What changed
+
+- **Portal separation rule (unchanged on the server).** Staff and administrator accounts cannot own orders or carts. This is kept as zero-trust separation between the customer and staff roles.
+  - On older builds, an administrator in the customer portal saw "You do not have permission to perform this action" on step 3 of `/orders/new` and on `/cart`.
+  - Now `/orders/new`, `/cart`, `/cart/checkout`, `/checkout/return` and `/checkout/cancel` show staff the panel "Orders are placed for a customer", with **New order for a customer**. That button goes to `/admin/orders?new=1`, which opens the console dialog. Focus moves into the dialog, and closing it removes `?new=1` and returns focus. The dialog accepts a discount code.
+  - No cart requests are made for staff. The customer navigation hides **Create an order** and **Cart** from non-customers.
+- **Portal switch.**
+  - In the console, **Customer portal** is in the top bar (medium screens and up) and the drawer.
+  - In the customer shell, **Admin portal** (administrators) or **Staff portal** (staff) is in the top bar (medium screens and up) and the drawer, and in a staff notice that cannot be dismissed: "You are viewing the customer portal as {role}. Orders, carts and checkout belong to customer accounts."
+  - Staff and administrators opening `/` land on `/admin`, unless this browser tab chose the customer portal (stored in `sessionStorage`). Switching back, signing out or clearing the client caches removes the choice.
+  - Customers never see the switch.
+- **Discount codes.** The field needs two things switched on: **Discount codes** at `/admin/promotions` (`feature.promotions`, off when shipped) and **Cart** at `/admin/settings/features` (`feature.cart`).
+  - With both on, the field is in the cart summary once the cart has an item, and at checkout.
+  - An empty cart shows "Have a discount code? Add an item first to apply it here or at checkout." The order form's Review step shows "Have a discount code? You can enter it in your cart and at checkout."
+  - With the cart off, the code field stays on the order form's Review step (the direct order path).
+- **Navigation rails.** Both rails have a thin themed scrollbar, with a forced-colours fallback.
+- **QA tools.** `scripts/qa` has an opt-in context-reuse mode and deferred retries ([scripts/qa/README.md](../../scripts/qa/README.md)).
+
+### Sweep results (to be filled by lead)
+
+> **PLACEHOLDER — PENDING-LEAD (07.1 sweep).** The lead supplies these results:
+> - widths 240–2560 px, light and dark;
+> - axe checks against WCAG 2.2 AA, with the counts per route;
+> - the manual keyboard and zoom pass;
+> - the findings fixed;
+> - the routes NOT CHECKED;
+> - the gates (vitest, type check, eslint, audit, gitleaks).
+
+### Limits
+
+- **Not done.** No screen-reader pass and no physical-device pass were done. The sweep used automated browsers at set widths.
+- **What is claimed.** The interfaces are designed and tested against WCAG 2.2 AA. This is not a claim of conformance.
 
 ## Verification for increment 07
 

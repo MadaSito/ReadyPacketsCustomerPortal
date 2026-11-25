@@ -5,6 +5,34 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See `docs/engineering/SDLC.md` for the release
 procedure.
 
+## Increment 07.1 (fixes after increment 07)
+
+Requested by the owner on 2026-11-25 (prompts 28 and 29). Client-side only: no server permission, schema or migration change, and the upgrade commands are unchanged. See the [session log](docs/session-logs/2026-11-25-session-01.md).
+
+### Fixed
+
+- **"You do not have permission to perform this action" for staff and administrators.** This appeared on step 3 of `/orders/new` and on `/cart` when an administrator used the customer portal. The server rule stays: staff and administrator accounts cannot own orders or carts.
+  - `/orders/new`, `/cart`, `/cart/checkout`, `/checkout/return` and `/checkout/cancel` now show staff a handoff panel, "Orders are placed for a customer".
+  - The panel's **New order for a customer** button goes to `/admin/orders?new=1`, which opens the console dialog. That dialog accepts a discount code.
+  - No cart requests are made for staff, and the customer navigation hides **Create an order** and **Cart** for them.
+
+### Changed
+
+- **Visible portal switch.** **Customer portal** is in the console top bar (medium screens and up) and drawer. **Admin portal** or **Staff portal** is in the customer shell top bar, drawer and a staff notice that cannot be dismissed.
+  - Staff and administrators opening `/` land on `/admin`, unless this browser tab chose the customer portal. The choice is per tab and is cleared at sign-out.
+  - Customers never see the switch.
+- **Discount code hints.**
+  - The field is in the cart summary once the cart has an item, and at checkout. Both depend on **Discount codes** being switched on at `/admin/promotions` (off when shipped) and the cart being on at `/admin/settings/features`.
+  - An empty cart says "Have a discount code? Add an item first to apply it here or at checkout."
+  - The order form's Review step says "Have a discount code? You can enter it in your cart and at checkout."
+- **QA tools.** `scripts/qa` gained an opt-in context-reuse mode and deferred retries ([scripts/qa/README.md](scripts/qa/README.md)).
+
+### Accessibility and responsive
+
+- **Scrollbars.** Both navigation rails have a thin themed scrollbar, with a forced-colours fallback.
+- **Sweep.** A responsive and accessibility sweep covered widths 240–2560 px, light and dark themes, axe checks against WCAG 2.2 AA, and a manual keyboard and zoom pass. The results are in [STATUS.md](docs/application-context/STATUS.md#verification-for-increment-071). The interfaces are designed and tested against WCAG 2.2 AA.
+- **Limitations.** No screen-reader pass and no physical-device pass were done.
+
 ## Fixes after increment 05
 
 ### Fixed

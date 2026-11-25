@@ -236,6 +236,24 @@ The owner requested this on 2026-11-24 (prompt 26). The contract is [INCREMENT_0
 | Microsoft 365 sync (`storage`, `sharepoint`) | One-way per phase; three targets; write test; resync ([ADR 0061](../adr/0061-microsoft-365-file-sync.md)). | Targets off until configured. |
 | SAML (`identity`) | Entra SAML SP with mandatory checks and MFA modes ([ADR 0062](../adr/0062-saml-entra-id.md)). | Off until configured; `/admin/sso`. Upgraded configs start in `portal` MFA mode; `entra` needs `ENTRA MANAGES MFA`. |
 
+## Increment 07.1: staff ordering handoff, portal switch, discount code hints
+
+This is a client-only fix pack for the owner's prompts 28 and 29 of 2026-11-25 ([session log](../session-logs/2026-11-25-session-01.md)). It makes no server permission, schema or migration change, and the upgrade commands are unchanged. Verification is in [STATUS.md](STATUS.md#verification-for-increment-071).
+
+- **Portal separation rule.** Orders, carts and checkout belong to customer accounts. The server refuses them for staff and administrators, as zero-trust separation.
+  - The client now matches that rule. For staff and administrators, `/orders/new`, `/cart`, `/cart/checkout`, `/checkout/return` and `/checkout/cancel` show a handoff panel instead of calling the server, and `visibleNav` hides **Create an order** and **Cart**.
+  - Staff place orders from the console, at `/admin/orders?new=1`. That opens the **New order for a customer** dialog, which accepts a discount code. The order then appears in that customer's portal.
+  - The components are in `client/src/app/portal.tsx`: `PortalSwitch`, `StaffPortalNotice`, `StaffOrderHandoff`, `NewOrderForCustomerLink` and `useIsStaffViewer`.
+- **Portal switch.**
+  - **Customer portal** is in the console top bar (medium screens and up) and drawer. **Admin portal** or **Staff portal** is in the customer shell top bar, drawer and a staff notice that cannot be dismissed.
+  - Staff and administrators opening `/` land on `/admin`, unless this browser tab chose the customer portal. That choice is kept in `sessionStorage` by `client/src/lib/portal.ts`, and is cleared on switching back, at sign-out and by `clearClientCaches()`.
+  - Customers never see the switch. The choice is a navigation preference only and grants nothing: the server still checks every request.
+- **Discount codes.** They need **Discount codes** on at `/admin/promotions` (`feature.promotions`, off when shipped). With **Cart** on at `/admin/settings/features` (`feature.cart`), the field is in the cart summary once the cart has an item, and at checkout.
+  - Hints appear on the empty cart and on the order form's Review step.
+  - With the cart off, the direct order form keeps the field on its Review step.
+- **Interface.** Both navigation rails have thin themed scrollbars, with a forced-colours fallback. The QA tools (`scripts/qa`) gained an opt-in context-reuse mode and deferred retries.
+- **Limits.** A responsive and accessibility sweep was run (240–2560 px, light and dark, axe against WCAG 2.2 AA, keyboard and zoom). No screen-reader pass and no physical-device pass were done.
+
 ## Deployment profiles
 
 | Profile | Purpose | Session transport | Routing |
