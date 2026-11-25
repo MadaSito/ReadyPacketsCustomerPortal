@@ -399,9 +399,12 @@ Operational alerts collect failures that need a person ([ADR 0058](../adr/0058-o
 Each failure raises one alert, not one per retry.
 
 - **Dashboard.** The `/admin` dashboard counts open alerts by severity (warning, error, critical) and links to them.
-- **Alerts page.** Open **Alerts** (`/admin/alerts`). Staff and administrators can read alerts with `ops.alerts.read` and filter them by severity, source and state. With `ops.alerts.manage` they can **Acknowledge** or **Resolve** an alert.
+- **Alerts page.** Open **Alerts** (`/admin/alerts`). Staff and administrators can read alerts with `ops.alerts.read` and filter them by severity, source and state. Staff and administrators with `ops.alerts.manage` can **Acknowledge** or **Resolve** an alert.
 - **Audit and SIEM.** Alerts go to the audit trail and SIEM with safe codes only.
-- **Attention reminders.** Reminders for orders waiting on staff or the customer are **off** by default. When switched on, a reminder fires after 48 hours by default (`orders.attention_alert_hours`).
+- **Waiting order reminders.** This card on `/admin/alerts` is for administrators only. It is **off** by default.
+  - **Threshold.** The default is 48 hours (`orders.attention_alert_hours`), and you can set 1–8,760. Saving needs step-up.
+  - **How it runs.** A daily sweep raises one staff warning per waiting episode, for orders awaiting staff review or a customer response. No e-mail goes to the customer.
+  - **Switching it off** does not clear existing alerts; resolve those after review.
 
 ## Microsoft 365 file sync
 
