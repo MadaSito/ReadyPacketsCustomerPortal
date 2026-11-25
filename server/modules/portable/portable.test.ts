@@ -33,6 +33,7 @@ const CUSTOMER_EMAIL = "case.owner@example.test";
 const AUTH_MARKER = "source-password-hash-must-not-travel";
 const PDF = examplePdf();
 const PASSPHRASE = randomBytes(26).toString("base64url");
+const ADMIN_PASSWORD = "synthetic portable verifier password";
 const FILE_HASH = createHash("sha256").update(PDF).digest("hex");
 const OFFERING_SNAPSHOT = {
   packetNumber: 2, tier: "Standard" as const, outcome: "Documented findings",
@@ -57,38 +58,29 @@ function distinctKeyConfig() {
 async function environment(t: TestDb, installationId: string) {
   const h = createTestDeps({ db: t.db, config: { ...distinctKeyConfig(), installationId, canonicalOrigin: `https://${installationId}.example.test` } });
   const admins: SessionPrincipal[] = [];
+  h.services.assurance = {
+    getAssuranceState: async () => ({ mfaEnrolled: true, recoveryCodesAcknowledged: true, passkeyCount: 0, totpEnrolled: true }),
+  } as TestHarness["services"]["assurance"];
   const identity = createIdentityModule(h.deps);
-  h.services.identity = {
-    ...identity,
-    sessions: {
-      ...identity.sessions,
-      assertCurrent: async (principal) => ({
-        pendingSteps: [], role: principal.role, stepUpAt: principal.stepUpAt, mfaVerifiedAt: principal.mfaVerifiedAt,
-      }),
-      getState: async (sessionId) => {
-        const value = admins.find((principal) => principal.sessionId === sessionId);
-        return value ? {
-          sessionId, userId: value.userId, userPublicId: value.userPublicId, role: "admin", userStatus: "active", live: true,
-          revokedAt: null, mfaVerifiedAt: value.mfaVerifiedAt, stepUpAt: value.stepUpAt,
-          absoluteExpiresAt: new Date(h.clock.now().getTime() + 24 * 60 * 60_000), authMethod: "local" as const,
-        } : null;
-      },
-    },
-    transitions: { derive: async () => [] },
+  h.services.identity = identity;
+  const signInAdmin = async (email: string): Promise<SessionPrincipal> => {
+    const signed = await identity.auth.signIn({ email, password: ADMIN_PASSWORD }, { userAgent: "vitest" });
+    await identity.sessions.markMfaVerified(signed.sessionId);
+    const issued = await identity.sessions.markStepUp(signed.sessionId);
+    const principal = await identity.sessionResolver.resolve({ token: issued.token, transport: "cookie" });
+    if (!principal || principal.state !== "full" || !principal.stepUpAt) throw new Error("Expected a full stepped-up admin session");
+    return principal;
   };
   h.services.jobAdmin = { isDraining: async () => false } as TestHarness["services"]["jobAdmin"];
   h.services.orders = createOrdersModule(h.deps);
   h.services.files = createFilesModule(h.deps);
   h.services.portable = createPortableModule(h.deps);
   for (const email of ["first.admin@example.test", "second.admin@example.test"]) {
-    const publicId = ulid(h.clock.now().getTime());
-    const [inserted] = await t.db.insert(identitySchema.users).values({
-      publicId, role: "admin", status: "active",
-      emailEnc: h.deps.crypto.encrypt(email, `users.email:${publicId}`),
-      emailIndex: h.deps.crypto.blindIndex(email, "users.email"),
-      nameEnc: h.deps.crypto.encrypt("Synthetic administrator", `users.name:${publicId}`),
-    }).$returningId();
-    admins.push(fakePrincipal({ role: "admin", userId: inserted!.id, userPublicId: publicId, stepUpAt: h.clock.now() }));
+    const user = await t.db.transaction((tx) => identity.auth.insertUser(tx, {
+      email, name: "Synthetic administrator", role: "admin", status: "active", origin: "test", emailVerifiedAt: h.clock.now(),
+    }));
+    await identity.setPassword(user.id, ADMIN_PASSWORD, { mustChange: false });
+    admins.push(await signInAdmin(email));
   }
   return { ...h, admins };
 }
@@ -269,6 +261,49 @@ describe("portable transfer across isolated MySQL installations", () => {
     expect(await targetDb.db.select().from(ordersSchema.orders)).toHaveLength(1);
     expect(await targetDb.db.select().from(filesSchema.orderFiles)).toHaveLength(1);
   });
+
+  it("passes real downstream session revalidation for a live import approver and refuses a revoked approval", async () => {
+    const sessionDb = await createTestDb({ schema: testSchema });
+    try {
+      const env = await environment(sessionDb, "portable-real-sessions");
+      const [revoked, live] = env.admins;
+      if (!revoked || !live) throw new Error("Missing admin fixtures");
+      const data = env.services.portable;
+      const payload = archive ?? await capture();
+      const queue = async (admin: SessionPrincipal) => {
+        const uploaded = await data.upload(admin, Readable.from(payload));
+        const planned = await data.verifyAndPlan(admin, { importId: uploaded.importId, passphrase: PASSPHRASE });
+        await data.approve(admin, { importId: uploaded.importId, planDigest: planned.planDigest! });
+        return uploaded.importId;
+      };
+
+      const revokedImport = await queue(revoked);
+      await env.services.identity.sessions.revoke(revoked.sessionId, "test_revoked");
+      expect(await env.jobs.runAll(PORTABLE_IMPORT_JOB)).toEqual([
+        { outcome: "failed", reasonCode: "PORTABLE_APPLY_REFUSED", retryable: false },
+      ]);
+      expect(await data.getImport(live, revokedImport)).toMatchObject({ phase: "failed", state: "refused", reconciliation: null });
+      expect(await sessionDb.db.select().from(ordersSchema.orders)).toHaveLength(0);
+      expect(await sessionDb.db.select().from(filesSchema.orderFiles)).toHaveLength(0);
+
+      const adopt = env.services.files.adoptVerifiedObject.bind(env.services.files);
+      const recheck = vi.spyOn(env.services.files, "adoptVerifiedObject").mockImplementation(async (input, tx) => {
+        await env.services.identity.sessions.assertCurrent(input.principal, tx);
+        return adopt(input, tx);
+      });
+      try {
+        const liveImport = await queue(live);
+        expect(await env.jobs.runAll(PORTABLE_IMPORT_JOB)).toEqual([expect.objectContaining({ outcome: "completed" })]);
+        expect((await data.getImport(live, liveImport)).phase).toBe("reconciled");
+        expect(recheck).toHaveBeenCalledTimes(1);
+        expect(await sessionDb.db.select().from(filesSchema.orderFiles)).toHaveLength(1);
+      } finally {
+        recheck.mockRestore();
+      }
+    } finally {
+      await sessionDb.cleanup();
+    }
+  }, 20_000);
 
   it("refuses tampering before planning or writing business rows", async () => {
     const admin = target.admins[0]!;
