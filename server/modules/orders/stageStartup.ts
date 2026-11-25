@@ -1,6 +1,6 @@
-import { asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, gt, isNull, sql } from "drizzle-orm";
 import { ulid } from "../../core/ids.js";
-import type { AuditEmitter, Clock, Db, JobResult, Logger, Tx } from "../../core/types.js";
+import type { AuditEmitter, Clock, Db, DbOrTx, JobResult, Logger, Tx } from "../../core/types.js";
 import { deriveStages } from "../../../shared/workflowStages.js";
 import { workflowDefinitionSchema } from "./workflowTypes.js";
 import { orderWorkflowDrafts, orderWorkflowVersions, orderWorkflows, orders } from "./schema.js";
@@ -20,11 +20,62 @@ export interface StageStartupDeps {
   clock: Clock;
   audit: AuditEmitter;
   logger: Logger;
+  /** Compliance's paid-invoice summary (registered at init); absent = no backfill. */
+  paymentSummary?: () => ((orderPublicIds: string[], tx: DbOrTx) => Promise<Map<string, { state: string }>>) | null;
 }
+
+const BACKFILL_BATCH = 200;
 
 export type StageStartupOutcome = "installed_standard" | "upgrade_draft_created" | "nothing_to_do";
 
 export function createStageStartup(deps: StageStartupDeps) {
+  /** Process-local cursor: each start walks the old orders once, in batches. */
+  let backfillAfter = 0;
+  let backfillDone = false;
+
+  /**
+   * D9 backfill: existing orders keep `not_required` unless the invoice summary says they are paid; then only the
+   * payment state is recorded (no status move, no phase completion: nothing fires retroactively).
+   */
+  async function backfillPaid(): Promise<number> {
+    const provider = deps.paymentSummary?.();
+    if (!provider || backfillDone) return 0;
+    return deps.db.transaction(async (tx) => {
+      const rows = await tx
+        .select({ id: orders.id, publicId: orders.publicId })
+        .from(orders)
+        .where(and(gt(orders.id, backfillAfter), eq(orders.paymentState, "not_required"), gt(orders.totalMinor, 0), isNull(orders.paidAt)))
+        .orderBy(asc(orders.id))
+        .limit(BACKFILL_BATCH)
+        .for("update");
+      if (rows.length < BACKFILL_BATCH) backfillDone = true;
+      if (rows.length === 0) return 0;
+      backfillAfter = rows[rows.length - 1]!.id;
+      const summary = await provider(rows.map((row) => row.publicId), tx);
+      let changed = 0;
+      const now = deps.clock.now();
+      for (const row of rows) {
+        if (summary.get(row.publicId)?.state !== "paid") continue;
+        await tx.update(orders).set({ paymentState: "paid", paidAt: now }).where(eq(orders.id, row.id));
+        await deps.audit.record(
+          {
+            category: "business",
+            eventName: "order.payment_state.changed",
+            action: "update",
+            outcome: "completed",
+            actor: { role: "system" },
+            resource: { type: "order", publicId: row.publicId },
+            reasonCode: "PAYMENT_BACKFILL",
+            attributes: { from_state: "not_required", to_state: "paid", ref: "backfill" },
+          },
+          tx,
+        );
+        changed += 1;
+      }
+      return changed;
+    });
+  }
+
   async function installStandardV3(tx: Tx) {
     const now = deps.clock.now();
     const definition = workflowDefinitionSchema.parse(STANDARD_V3_DEFINITION);
@@ -94,6 +145,7 @@ export function createStageStartup(deps: StageStartupDeps) {
   }
 
   return {
+    backfillPaid,
     async run(): Promise<StageStartupOutcome> {
       return deps.db.transaction(async (tx) => {
         const [workflowCount] = await tx.select({ n: sql<number>`count(*)` }).from(orderWorkflows);
@@ -118,7 +170,8 @@ export function createStageStartup(deps: StageStartupDeps) {
     async job(): Promise<JobResult> {
       try {
         const outcome = await this.run();
-        return { outcome: "completed", safeCounts: { installed: outcome === "installed_standard" ? 1 : 0, drafts: outcome === "upgrade_draft_created" ? 1 : 0 } };
+        const paid = await backfillPaid();
+        return { outcome: "completed", safeCounts: { installed: outcome === "installed_standard" ? 1 : 0, drafts: outcome === "upgrade_draft_created" ? 1 : 0, paid } };
       } catch (err) {
         deps.logger.warn("orders increment 07 start-up work deferred", { errorName: err instanceof Error ? err.name : "unknown" });
         throw err;

@@ -9,7 +9,7 @@ import type { SessionPrincipal } from "../../core/types.js";
 import { createCallerFactory } from "../../trpc/trpc.js";
 import { createOrdersModule } from "./index.js";
 import { ordersRouter } from "./router.js";
-import { orders, orderWorkflows, orderWorkflowVersions } from "./schema.js";
+import { orders, orderWorkflowDrafts, orderWorkflows, orderWorkflowVersions } from "./schema.js";
 import { STANDARD_V3_DEFINITION, stageModelOf, workflowFormatOf } from "./stageModel.js";
 import { createStageStartup } from "./stageStartup.js";
 import { fakeIdentity, insertUser, ordersTestSchema } from "./testSupport.js";
@@ -175,6 +175,46 @@ it("start-up work installs the standard phases once on a fresh install and is id
     const rows = await db.db.select().from(orderWorkflows);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ workflowKey: "readypackets_standard", isDefault: true });
+  } finally {
+    await db.cleanup();
+  }
+});
+
+it("start-up work on an existing install creates one phases draft and backfills paid orders without moving them", async () => {
+  const db = await createTestDb({ schema: ordersTestSchema });
+  try {
+    const h = createTestDeps({ db: db.db });
+    const customer = await insertUser(h, db.db);
+    const [workflow] = await db.db.insert(orderWorkflows).values({ publicId: ulid(), workflowKey: "standard", name: "Standard", isDefault: true }).$returningId();
+    const [version] = await db.db.insert(orderWorkflowVersions).values({
+      publicId: ulid(), workflowId: workflow!.id, versionNumber: 1, definition: workflowDefinitionSchema.parse(DEFAULT_WORKFLOW),
+    }).$returningId();
+    await db.db.update(orderWorkflows).set({ currentVersionId: version!.id }).where(eq(orderWorkflows.id, workflow!.id));
+    const initial = DEFAULT_WORKFLOW.states.find((state) => state.kind === "initial")!.key;
+    const paidId = ulid();
+    const openId = ulid();
+    for (const publicId of [paidId, openId])
+      await db.db.insert(orders).values({
+        publicId, reference: publicId, projectName: "Existing order", ownerUserId: customer.id, workflowVersionId: version!.id,
+        statusKey: initial, subtotalMinor: 500, totalMinor: 500, currency: "USD",
+      });
+    const startup = createStageStartup({
+      db: db.db, clock: h.clock, audit: h.deps.audit, logger: h.deps.logger,
+      paymentSummary: () => async (ids) => new Map(ids.map((id) => [id, { state: id === paidId ? "paid" : "unpaid" }])),
+    });
+    expect(await startup.run()).toBe("upgrade_draft_created");
+    expect(await startup.run()).toBe("nothing_to_do");
+    const drafts = await db.db.select().from(orderWorkflowDrafts);
+    expect(drafts).toHaveLength(1);
+    expect(drafts[0]!.workflowId).toBe(workflow!.id);
+    expect((drafts[0]!.definition as { stages?: unknown[] }).stages?.length).toBeGreaterThan(0);
+    expect((await db.db.select().from(orderWorkflowVersions)).length).toBe(1);
+
+    expect(await startup.backfillPaid()).toBe(1);
+    expect(await startup.backfillPaid()).toBe(0);
+    const rows = await db.db.select().from(orders);
+    expect(rows.find((row) => row.publicId === paidId)).toMatchObject({ paymentState: "paid", statusKey: initial, workflowVersionId: version!.id });
+    expect(rows.find((row) => row.publicId === openId)).toMatchObject({ paymentState: "not_required" });
   } finally {
     await db.cleanup();
   }
