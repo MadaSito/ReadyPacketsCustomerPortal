@@ -36,8 +36,13 @@ import type {
   AutomationRunView,
   OrderCompletionJobView,
   OrderPhaseBundleView,
+  OrderStageBundlePreviewView,
   OrderStageRunView,
   OrderStageStepView,
+  RunOrderStageBundleResult,
+  StageBundleSlotKey,
+  StageBundleSlotPreview,
+  StageBundleSlotResult,
 } from "@server/modules/automations/contracts";
 import { useAutomationsApi } from "./api";
 import {
@@ -46,6 +51,139 @@ import {
   StageRunStateBadge,
   StageSlotOutcomeBadge,
 } from "./parts";
+
+const PRODUCTION_WEBHOOKS_PATH = "/admin/integrations/production";
+const OUTBOUND_WEBHOOKS_PATH = "/admin/integrations/webhooks";
+
+const SLOT_FRIENDLY_LABELS: Readonly<Record<StageBundleSlotKey, string>> = {
+  status: "Order status",
+  completion: "Completion percentage",
+  email: "Customer email",
+  webhook: "Workflow webhook",
+  dashboard_alert: "Operational alert",
+};
+
+function slotFriendlyLabel(slot: StageBundleSlotKey): string {
+  return SLOT_FRIENDLY_LABELS[slot] ?? slot.replace(/_/g, " ");
+}
+
+function firstLine(text: string): string {
+  const idx = text.indexOf("\n");
+  return (idx >= 0 ? text.slice(0, idx) : text).trim();
+}
+
+/** Replaces server ASCII path hints with UI wording ("Integrations → Production webhooks"). */
+export function normalizeIntegrationNoticeText(text: string): string {
+  return text
+    .replace(/Integrations\s*(?:->|→)\s*Production(?:\s+webhooks)?\b/g, "Integrations → Production webhooks")
+    .replace(/Integrations\s*(?:->|→)\s*Webhooks\b/g, "Integrations → Webhooks");
+}
+
+function IntegrationLinkedText({
+  text,
+  canLinkProduction,
+  canLinkWebhooks,
+  onNavigate,
+}: {
+  text: string;
+  canLinkProduction: boolean;
+  canLinkWebhooks: boolean;
+  onNavigate?: () => void;
+}) {
+  const normalized = normalizeIntegrationNoticeText(text);
+  const parts = normalized.split(/(Integrations → Production webhooks|Integrations → Webhooks)/g);
+  return (
+    <>
+      {parts.map((part, idx) => {
+        if (!part) return null;
+        if (part === "Integrations → Production webhooks" && canLinkProduction) {
+          return (
+            <Link
+              key={idx}
+              to={PRODUCTION_WEBHOOKS_PATH}
+              onClick={onNavigate}
+              className="font-semibold text-ink underline underline-offset-2 hover:text-action"
+            >
+              {part}
+            </Link>
+          );
+        }
+        if (part === "Integrations → Webhooks" && canLinkWebhooks) {
+          return (
+            <Link
+              key={idx}
+              to={OUTBOUND_WEBHOOKS_PATH}
+              onClick={onNavigate}
+              className="font-semibold text-ink underline underline-offset-2 hover:text-action"
+            >
+              {part}
+            </Link>
+          );
+        }
+        return <span key={idx}>{part}</span>;
+      })}
+    </>
+  );
+}
+
+interface StageRunOutcomeSummary {
+  doneCount: number;
+  skippedCount: number;
+  failedCount: number;
+  hasWarningOrFailure: boolean;
+  /** e.g. "3 done, 1 skipped" */
+  commaCounts: string;
+  /** e.g. "3 done · 1 skipped" */
+  dotCounts: string;
+  /** Failed slots first, then operational skips (e.g. webhooks), then idempotent ALREADY_IN_STATUS skips. */
+  notableResults: StageBundleSlotResult[];
+}
+
+function summarizeStageRun(run: Pick<OrderStageRunView, "state" | "results">): StageRunOutcomeSummary {
+  const doneCount = run.results.filter(
+    (r) => r.outcome === "completed" || r.outcome === "scheduled",
+  ).length;
+  const skippedResults = run.results.filter((r) => r.outcome === "skipped");
+  const failedResults = run.results.filter((r) => r.outcome === "failed");
+  const skippedCount = skippedResults.length;
+  const failedCount = failedResults.length;
+
+  const parts: string[] = [];
+  if (doneCount > 0 || (skippedCount === 0 && failedCount === 0)) {
+    parts.push(`${doneCount} done`);
+  }
+  if (skippedCount > 0) parts.push(`${skippedCount} skipped`);
+  if (failedCount > 0) parts.push(`${failedCount} failed`);
+
+  const notableResults: StageBundleSlotResult[] = [
+    ...failedResults,
+    ...skippedResults.filter((r) => r.reasonCode !== "ALREADY_IN_STATUS"),
+    ...skippedResults.filter((r) => r.reasonCode === "ALREADY_IN_STATUS"),
+  ];
+
+  return {
+    doneCount,
+    skippedCount,
+    failedCount,
+    hasWarningOrFailure: skippedCount > 0 || failedCount > 0 || run.state !== "completed",
+    commaCounts: parts.join(", "),
+    dotCounts: parts.join(" · "),
+    notableResults,
+  };
+}
+
+function slotWillBeSkipped(
+  slot: StageBundleSlotPreview,
+  statusTransition: OrderStageBundlePreviewView["statusTransition"],
+): boolean {
+  if (slot.slot === "status") {
+    return Boolean(statusTransition?.alreadyInTargetStatus) || /\(will skip\)/i.test(slot.summary);
+  }
+  if (slot.slot === "webhook" && slot.warning) {
+    return !/no longer exists/i.test(slot.warning);
+  }
+  return /\(will skip\)/i.test(slot.summary) || /will be skipped/i.test(slot.warning ?? "");
+}
 
 export interface OrderWorkflowStageActionsPanelProps {
   orderId: string;
@@ -90,6 +228,8 @@ function StageActions({
   const [pendingStep, setPendingStep] = useState<{ step: OrderStageStepView; key: string } | null>(null);
   const [pendingBundle, setPendingBundle] = useState<PendingBundleState | null>(null);
   const [pendingCancelJob, setPendingCancelJob] = useState<OrderCompletionJobView | null>(null);
+  const [latestRunResult, setLatestRunResult] = useState<RunOrderStageBundleResult | null>(null);
+  const [latestRunAnnouncement, setLatestRunAnnouncement] = useState("");
 
   if (view.isError && safeError(view.error)?.domainCode === "FORBIDDEN") return null;
 
@@ -106,9 +246,34 @@ function StageActions({
       : data.steps
     : [];
 
+  const stageLabelsByKey = new Map<string, string>();
+  for (const st of data?.steps ?? []) {
+    if (st.phaseKey) stageLabelsByKey.set(st.phaseKey, st.label);
+    stageLabelsByKey.set(st.stepKey, st.label);
+  }
+  for (const st of data?.stages ?? []) {
+    stageLabelsByKey.set(st.stageKey, st.staffLabel);
+  }
+
   const stageBundlesEnabled = data?.stageBundlesEnabled ?? false;
   const canRunBundles = data?.canRunStageBundles ?? roleHasCapability(role, "orders.stage.run");
   const canCancelJobs = data?.canCancelCompletionJobs ?? role === "admin";
+  const canLinkProduction = roleHasCapability(role, "integrations.manage");
+  const canLinkWebhooks = roleHasCapability(role, "webhooks.manage");
+
+  const visibleRunResult =
+    latestRunResult && (!stageKey || latestRunResult.stageRun.stageKey === stageKey)
+      ? latestRunResult
+      : null;
+  const visibleRunSummary = visibleRunResult
+    ? summarizeStageRun(visibleRunResult.stageRun)
+    : null;
+  const visibleRunTitle =
+    visibleRunResult && visibleRunSummary
+      ? visibleRunResult.deduplicated
+        ? `Phase actions already run: ${visibleRunSummary.commaCounts}`
+        : `Phase actions run: ${visibleRunSummary.commaCounts}`
+      : null;
 
   return (
     <Section
@@ -119,6 +284,10 @@ function StageActions({
           : "Administrator-run phase bundles and workflow step automations pinned to this order's workflow version."
       }
     >
+      <p role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+        {latestRunAnnouncement}
+      </p>
+
       {view.isPending ? (
         <Skeleton className="h-40" />
       ) : view.isError ? (
@@ -129,6 +298,60 @@ function StageActions({
         />
       ) : !data ? null : (
         <div className="min-w-0 space-y-6">
+          {visibleRunResult && visibleRunSummary && visibleRunTitle ? (
+            <Callout
+              tone={visibleRunSummary.hasWarningOrFailure ? "warning" : "success"}
+              title={`${visibleRunTitle} (${visibleRunResult.stageRun.stageLabel})`}
+              actions={
+                <Button size="sm" variant="ghost" onClick={() => setLatestRunResult(null)}>
+                  Dismiss
+                </Button>
+              }
+            >
+              {visibleRunResult.deduplicated ? (
+                <p>This confirmation was already processed and was not repeated.</p>
+              ) : visibleRunSummary.notableResults.length > 0 ? (
+                <ul className="space-y-1 text-xs">
+                  {visibleRunSummary.notableResults.map((slotResult) => {
+                    const isFailed = slotResult.outcome === "failed";
+                    const summaryLine = firstLine(slotResult.safeSummary);
+                    const needsProdLink =
+                      slotResult.slot === "webhook" &&
+                      /production webhook/i.test(summaryLine) &&
+                      !/Integrations/i.test(summaryLine);
+                    return (
+                      <li key={slotResult.slot} className="break-words">
+                        <span className="font-semibold">
+                          {isFailed ? "Failed" : "Skipped"} ({slotFriendlyLabel(slotResult.slot)}):
+                        </span>{" "}
+                        <IntegrationLinkedText
+                          text={summaryLine}
+                          canLinkProduction={canLinkProduction}
+                          canLinkWebhooks={canLinkWebhooks}
+                        />
+                        {needsProdLink ? (
+                          <>
+                            {" ("}
+                            <IntegrationLinkedText
+                              text="Integrations → Production webhooks"
+                              canLinkProduction={canLinkProduction}
+                              canLinkWebhooks={canLinkWebhooks}
+                            />
+                            {")"}
+                          </>
+                        ) : null}
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : visibleRunResult.completionJob ? (
+                <p>Scheduled {visibleRunResult.completionJob.resolvedPercent}% completion update.</p>
+              ) : (
+                <p>All configured actions for this phase completed.</p>
+              )}
+            </Callout>
+          ) : null}
+
           {!data.engineEnabled ? (
             <Callout tone="warning" title="The automation engine is turned off">
               Stage actions cannot run until it is turned on.{" "}
@@ -167,6 +390,8 @@ function StageActions({
               workflowFormat={data.workflowFormat}
               stageBundlesEnabled={stageBundlesEnabled}
               canRunBundles={canRunBundles}
+              canLinkProduction={canLinkProduction}
+              canLinkWebhooks={canLinkWebhooks}
               scopedStageKey={stageKey}
               onPreviewBundle={(stage) =>
                 setPendingBundle({
@@ -244,6 +469,7 @@ function StageActions({
               <CompletionJobsSection
                 orderId={orderId}
                 stageKey={stageKey}
+                stageLabelsByKey={stageLabelsByKey}
                 initialJobs={data.recentCompletionJobs ?? []}
                 canCancel={canCancelJobs}
                 onRequestCancel={(job) => setPendingCancelJob(job)}
@@ -264,6 +490,12 @@ function StageActions({
       <PhaseBundlePreviewDialog
         orderId={orderId}
         pending={pendingBundle}
+        canLinkProduction={canLinkProduction}
+        canLinkWebhooks={canLinkWebhooks}
+        onRunCompleted={(result, announcement) => {
+          setLatestRunResult(result);
+          setLatestRunAnnouncement(announcement);
+        }}
         onClose={() => setPendingBundle(null)}
       />
       <CancelCompletionJobDialog
@@ -282,6 +514,8 @@ function PhaseBundlesList({
   workflowFormat,
   stageBundlesEnabled,
   canRunBundles,
+  canLinkProduction,
+  canLinkWebhooks,
   scopedStageKey,
   onPreviewBundle,
 }: {
@@ -290,6 +524,8 @@ function PhaseBundlesList({
   workflowFormat?: 1 | 2 | 3;
   stageBundlesEnabled: boolean;
   canRunBundles: boolean;
+  canLinkProduction: boolean;
+  canLinkWebhooks: boolean;
   scopedStageKey?: string;
   onPreviewBundle: (stage: OrderPhaseBundleView) => void;
 }) {
@@ -319,74 +555,148 @@ function PhaseBundlesList({
         </p>
       </div>
       <ol className="divide-y divide-line rounded-lg border border-line" aria-label="Pinned workflow phases">
-        {stages.map((stage) => (
-          <li
-            key={stage.stageKey}
-            className="flex min-w-0 flex-col gap-3 p-3.5 sm:flex-row sm:items-start sm:justify-between"
-            aria-current={stage.isCurrentStage ? "step" : undefined}
-          >
-            <div className="min-w-0 space-y-1.5">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-sm font-semibold text-ink break-words">{stage.staffLabel}</span>
-                {stage.customerLabel !== stage.staffLabel ? (
-                  <span className="text-xs text-muted">(Customer sees &ldquo;{stage.customerLabel}&rdquo;)</span>
-                ) : null}
-                {stage.isCurrentStage ? (
-                  <Badge tone="info" icon={<CheckCircle2 aria-hidden="true" className="size-3.5" />}>
-                    Current phase
+        {stages.map((stage) => {
+          const lastRunSummary = stage.lastStageRun ? summarizeStageRun(stage.lastStageRun) : null;
+          return (
+            <li
+              key={stage.stageKey}
+              className="flex min-w-0 flex-col gap-3 p-3.5 sm:flex-row sm:items-start sm:justify-between"
+              aria-current={stage.isCurrentStage ? "step" : undefined}
+            >
+              <div className="min-w-0 space-y-1.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-semibold text-ink break-words">{stage.staffLabel}</span>
+                  {stage.customerLabel !== stage.staffLabel ? (
+                    <span className="text-xs text-muted">(Customer sees &ldquo;{stage.customerLabel}&rdquo;)</span>
+                  ) : null}
+                  {stage.isCurrentStage ? (
+                    <Badge tone="info" icon={<CheckCircle2 aria-hidden="true" className="size-3.5" />}>
+                      Current phase
+                    </Badge>
+                  ) : null}
+                  <Badge tone={stage.configuredSlotCount > 0 ? "info" : "neutral"}>
+                    {stage.configuredSlotCount} configured
                   </Badge>
+                </div>
+
+                {stage.slots.length > 0 ? (
+                  <ul className="list-disc space-y-1 pl-5 text-xs text-ink">
+                    {stage.slots.map((slot) => (
+                      <li key={slot.slot} className="break-words">
+                        <span className="font-medium">{slot.label}:</span> {slot.summary}
+                        {slot.warning ? (
+                          <span className="mt-0.5 flex items-start gap-1 text-ink">
+                            <AlertTriangle aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-warning" />
+                            <span>
+                              <span className="font-semibold">Warning:</span>{" "}
+                              <IntegrationLinkedText
+                                text={slot.warning}
+                                canLinkProduction={canLinkProduction}
+                                canLinkWebhooks={canLinkWebhooks}
+                              />
+                            </span>
+                          </span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-xs text-muted">Nothing runs for this phase.</p>
+                )}
+
+                {stage.activeCompletionJob ? (
+                  <p className="flex flex-wrap items-center gap-1.5 text-xs text-muted">
+                    <Clock aria-hidden="true" className="size-3.5 text-info" />
+                    <span>
+                      Scheduled completion: <strong className="text-ink">{stage.activeCompletionJob.resolvedPercent}%</strong>{" "}
+                      due <DateTime value={stage.activeCompletionJob.dueAt} />
+                    </span>
+                  </p>
                 ) : null}
-                <Badge tone={stage.configuredSlotCount > 0 ? "info" : "neutral"}>
-                  {stage.configuredSlotCount} configured
-                </Badge>
+
+                {stage.lastStageRun && lastRunSummary ? (
+                  <div className="space-y-1 pt-0.5">
+                    <p className="flex flex-wrap items-center gap-2 text-xs text-muted">
+                      <span>Last phase run:</span>
+                      <StageRunStateBadge state={stage.lastStageRun.state} />
+                      <Badge
+                        tone={
+                          lastRunSummary.failedCount > 0
+                            ? "danger"
+                            : lastRunSummary.skippedCount > 0
+                              ? "warning"
+                              : "neutral"
+                        }
+                      >
+                        {lastRunSummary.dotCounts}
+                      </Badge>
+                      <DateTime value={stage.lastStageRun.finishedAt} format="relative" />
+                    </p>
+                    {lastRunSummary.notableResults.length > 0 ? (
+                      <ul
+                        className="space-y-1 text-xs"
+                        aria-label="Skipped or failed actions in last phase run"
+                      >
+                        {lastRunSummary.notableResults.map((slotResult) => {
+                          const isFailed = slotResult.outcome === "failed";
+                          const summaryLine = firstLine(slotResult.safeSummary);
+                          const needsProdLink =
+                            slotResult.slot === "webhook" &&
+                            /production webhook/i.test(summaryLine) &&
+                            !/Integrations/i.test(summaryLine);
+                          return (
+                            <li key={slotResult.slot} className="flex items-start gap-1.5 text-ink">
+                              {isFailed ? (
+                                <XCircle aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-danger" />
+                              ) : (
+                                <AlertTriangle
+                                  aria-hidden="true"
+                                  className="mt-0.5 size-3.5 shrink-0 text-warning"
+                                />
+                              )}
+                              <span className="break-words">
+                                <span className="font-semibold">
+                                  {isFailed ? "Failed" : "Skipped"} ({slotFriendlyLabel(slotResult.slot)}):
+                                </span>{" "}
+                                <IntegrationLinkedText
+                                  text={summaryLine}
+                                  canLinkProduction={canLinkProduction}
+                                  canLinkWebhooks={canLinkWebhooks}
+                                />
+                                {needsProdLink ? (
+                                  <>
+                                    {" ("}
+                                    <IntegrationLinkedText
+                                      text="Integrations → Production webhooks"
+                                      canLinkProduction={canLinkProduction}
+                                      canLinkWebhooks={canLinkWebhooks}
+                                    />
+                                    {")"}
+                                  </>
+                                ) : null}
+                              </span>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    ) : null}
+                  </div>
+                ) : null}
               </div>
 
-              {stage.slots.length > 0 ? (
-                <ul className="list-disc space-y-1 pl-5 text-xs text-ink">
-                  {stage.slots.map((slot) => (
-                    <li key={slot.slot} className="break-words">
-                      <span className="font-medium">{slot.label}:</span> {slot.summary}
-                      {slot.warning ? (
-                        <span className="ml-1.5 font-medium text-warning">({slot.warning})</span>
-                      ) : null}
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p className="text-xs text-muted">Nothing runs for this phase.</p>
-              )}
-
-              {stage.activeCompletionJob ? (
-                <p className="flex flex-wrap items-center gap-1.5 text-xs text-muted">
-                  <Clock aria-hidden="true" className="size-3.5 text-info" />
-                  <span>
-                    Scheduled completion: <strong className="text-ink">{stage.activeCompletionJob.resolvedPercent}%</strong>{" "}
-                    due <DateTime value={stage.activeCompletionJob.dueAt} />
-                  </span>
-                </p>
-              ) : null}
-
-              {stage.lastStageRun ? (
-                <p className="flex flex-wrap items-center gap-2 text-xs text-muted">
-                  <span>Last phase run:</span>
-                  <StageRunStateBadge state={stage.lastStageRun.state} />
-                  <DateTime value={stage.lastStageRun.finishedAt} format="relative" />
-                </p>
-              ) : null}
-            </div>
-
-            <Button
-              variant="secondary"
-              leadingIcon={<Eye aria-hidden="true" className="size-4" />}
-              className="shrink-0"
-              disabled={!stageBundlesEnabled || !canRunBundles || !stage.hasConfiguredBundle}
-              aria-label={`Preview and run ${stage.staffLabel}`}
-              onClick={() => onPreviewBundle(stage)}
-            >
-              Preview and run
-            </Button>
-          </li>
-        ))}
+              <Button
+                variant="secondary"
+                leadingIcon={<Eye aria-hidden="true" className="size-4" />}
+                className="shrink-0"
+                disabled={!stageBundlesEnabled || !canRunBundles || !stage.hasConfiguredBundle}
+                aria-label={`Preview and run ${stage.staffLabel}`}
+                onClick={() => onPreviewBundle(stage)}
+              >
+                Preview and run
+              </Button>
+            </li>
+          );
+        })}
       </ol>
     </section>
   );
@@ -397,10 +707,16 @@ function PhaseBundlesList({
 function PhaseBundlePreviewDialog({
   orderId,
   pending,
+  canLinkProduction,
+  canLinkWebhooks,
+  onRunCompleted,
   onClose,
 }: {
   orderId: string;
   pending: PendingBundleState | null;
+  canLinkProduction: boolean;
+  canLinkWebhooks: boolean;
+  onRunCompleted: (result: RunOrderStageBundleResult, announcement: string) => void;
   onClose: () => void;
 }) {
   const api = useAutomationsApi();
@@ -430,6 +746,10 @@ function PhaseBundlePreviewDialog({
     overrideValid &&
     !runBundle.isPending;
 
+  const willSkipCount = preview
+    ? preview.slots.filter((slot) => slotWillBeSkipped(slot, preview.statusTransition)).length
+    : 0;
+
   const handleClose = () => {
     setOverrideReason("");
     setSubmitError(null);
@@ -451,19 +771,38 @@ function PhaseBundlePreviewDialog({
           }),
         { reason: `Running phase actions for "${pending.stageLabel}" requires a fresh confirmation.` },
       );
-      toast.show({
-        tone: result.stageRun.state === "completed" ? "success" : "warning",
-        title:
-          result.stageRun.state === "completed"
-            ? `Phase actions completed for ${pending.stageLabel}`
-            : `Phase actions finished (${result.stageRun.state.replace(/_/g, " ")})`,
-        description: result.deduplicated
-          ? "This confirmation was already processed and was not repeated."
+
+      const summary = summarizeStageRun(result.stageRun);
+      const tone = summary.hasWarningOrFailure ? "warning" : "success";
+      const title = result.deduplicated
+        ? `Phase actions already run: ${summary.commaCounts}`
+        : `Phase actions run: ${summary.commaCounts}`;
+      const firstReason = summary.notableResults[0]
+        ? normalizeIntegrationNoticeText(firstLine(summary.notableResults[0].safeSummary))
+        : null;
+      const description = result.deduplicated
+        ? "This confirmation was already processed and was not repeated."
+        : firstReason
+          ? summary.notableResults.length > 1
+            ? `${firstReason} (+${summary.notableResults.length - 1} more)`
+            : firstReason
           : result.completionJob
             ? `Scheduled ${result.completionJob.resolvedPercent}% completion update.`
-            : undefined,
+            : pending.stageLabel;
+
+      toast.show({
+        tone,
+        title,
+        description,
+        duration: summary.hasWarningOrFailure ? 8000 : 5000,
       });
-      await queryClient.invalidateQueries(api.orderStageActions.pathFilter());
+      onRunCompleted(result, `${title} (${pending.stageLabel}). ${description}`);
+      await Promise.all([
+        queryClient.invalidateQueries(api.orderStageActions.pathFilter()),
+        queryClient.invalidateQueries({
+          predicate: (query) => Array.isArray(query.queryKey[0]) && query.queryKey[0][0] === "orders",
+        }),
+      ]);
       handleClose();
     } catch (error) {
       if (error instanceof StepUpCancelledError) return;
@@ -488,18 +827,30 @@ function PhaseBundlePreviewDialog({
       title={pending ? `Preview phase actions: ${pending.stageLabel}` : "Preview phase actions"}
       description="Review each configured action against the order's live state before confirming execution."
       footer={
-        <div className="flex flex-wrap justify-end gap-2">
-          <Button variant="ghost" onClick={handleClose} disabled={runBundle.isPending}>
-            Cancel
-          </Button>
-          <Button
-            variant="primary"
-            loading={runBundle.isPending}
-            disabled={!canConfirm}
-            onClick={() => void handleConfirm()}
-          >
-            Confirm and run phase
-          </Button>
+        <div className="flex w-full flex-wrap items-center justify-between gap-3">
+          {willSkipCount > 0 ? (
+            <p className="flex items-center gap-1.5 text-xs font-medium text-ink">
+              <AlertTriangle aria-hidden="true" className="size-4 shrink-0 text-warning" />
+              <span>
+                {willSkipCount} {willSkipCount === 1 ? "action" : "actions"} will be skipped
+              </span>
+            </p>
+          ) : (
+            <span />
+          )}
+          <div className="ml-auto flex flex-wrap justify-end gap-2">
+            <Button variant="ghost" onClick={handleClose} disabled={runBundle.isPending}>
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              loading={runBundle.isPending}
+              disabled={!canConfirm}
+              onClick={() => void handleConfirm()}
+            >
+              Confirm and run phase
+            </Button>
+          </div>
         </div>
       }
     >
@@ -541,22 +892,52 @@ function PhaseBundlePreviewDialog({
 
           <div className="space-y-2">
             <h3 className="text-sm font-semibold text-ink">Actions in this bundle</h3>
-            <ul className="divide-y divide-line rounded-[var(--radius-card)] border border-line text-sm">
-              {preview.slots.map((slot) => (
-                <li key={slot.slot} className="space-y-1 p-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="font-medium text-ink">{slot.label}</span>
-                    <Badge tone="neutral">{slot.slot.replace(/_/g, " ")}</Badge>
-                  </div>
-                  <p className="text-sm text-muted break-words">{slot.summary}</p>
-                  {slot.warning ? (
-                    <p className="flex items-start gap-1.5 text-xs font-medium text-warning">
-                      <AlertTriangle aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" />
-                      <span>{slot.warning}</span>
+            <ul className="divide-y divide-line overflow-hidden rounded-[var(--radius-card)] border border-line text-sm">
+              {preview.slots.map((slot) => {
+                const hasWarning = Boolean(slot.warning);
+                return (
+                  <li
+                    key={slot.slot}
+                    className={
+                      hasWarning
+                        ? "space-y-1.5 bg-warning-soft p-3 text-ink rp-forced-border"
+                        : "space-y-1 p-3"
+                    }
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-medium text-ink">{slot.label}</span>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {hasWarning ? (
+                          <Badge
+                            tone="warning"
+                            icon={<AlertTriangle aria-hidden="true" className="size-3.5" />}
+                          >
+                            Warning
+                          </Badge>
+                        ) : null}
+                        <Badge tone="neutral">{slot.slot.replace(/_/g, " ")}</Badge>
+                      </div>
+                    </div>
+                    <p className={hasWarning ? "text-sm text-ink break-words" : "text-sm text-muted break-words"}>
+                      {slot.summary}
                     </p>
-                  ) : null}
-                </li>
-              ))}
+                    {slot.warning ? (
+                      <p className="flex items-start gap-1.5 text-xs font-medium text-ink">
+                        <AlertTriangle aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-warning" />
+                        <span>
+                          <span className="font-semibold">Warning:</span>{" "}
+                          <IntegrationLinkedText
+                            text={slot.warning}
+                            canLinkProduction={canLinkProduction}
+                            canLinkWebhooks={canLinkWebhooks}
+                            onNavigate={handleClose}
+                          />
+                        </span>
+                      </p>
+                    ) : null}
+                  </li>
+                );
+              })}
             </ul>
           </div>
 
@@ -585,12 +966,14 @@ function PhaseBundlePreviewDialog({
 function CompletionJobsSection({
   orderId,
   stageKey,
+  stageLabelsByKey,
   initialJobs,
   canCancel,
   onRequestCancel,
 }: {
   orderId: string;
   stageKey?: string;
+  stageLabelsByKey: ReadonlyMap<string, string>;
   initialJobs: readonly OrderCompletionJobView[];
   canCancel: boolean;
   onRequestCancel: (job: OrderCompletionJobView) => void;
@@ -655,7 +1038,11 @@ function CompletionJobsSection({
                         ? `Range ${job.minPercent}%–${job.maxPercent}%`
                         : "Fixed"}
                     </Badge>
-                    {job.stageKey ? <Badge tone="neutral">Phase: {job.stageKey}</Badge> : null}
+                    {job.stageKey ? (
+                      <Badge tone="neutral">
+                        Phase: {stageLabelsByKey.get(job.stageKey) ?? job.stageKey}
+                      </Badge>
+                    ) : null}
                   </div>
                   <p className="text-xs text-muted">
                     {job.state === "scheduled" ? (

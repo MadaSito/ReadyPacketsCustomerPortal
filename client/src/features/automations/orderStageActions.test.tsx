@@ -34,7 +34,8 @@ vi.mock("@/lib/trpc", async (original) => {
           });
         }
         if (prop === "mutationOptions") return () => ({ mutationFn: (input: Record<string, unknown>) => call(key, input) });
-        if (prop === "pathFilter" || prop === "queryFilter") return () => ({ queryKey: [key] });
+        if (prop === "pathFilter") return () => ({ predicate: (q: { queryKey: readonly unknown[] }) => typeof q.queryKey[0] === "string" && (q.queryKey[0] === key || q.queryKey[0].startsWith(`${key}.`)) });
+        if (prop === "queryFilter") return () => ({ queryKey: [key] });
         if (prop === "queryKey" || prop === "pathKey") return () => [key];
         return node([...path, prop]);
       },
@@ -422,11 +423,14 @@ describe("OrderWorkflowStageActionsPanel (Increment 07 D5)", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 
-  it("displays scheduled completion updates, cancels with administrator confirmation, and supports scoped stageKey mode", async () => {
+  it("displays scheduled completion updates with staff phase labels, cancels with administrator confirmation, and supports scoped stageKey mode", async () => {
     const user = userEvent.setup();
     const { unmount } = page();
 
     expect(await screen.findByText("65% completion")).toBeInTheDocument();
+    expect(screen.getByText("Phase: Discovery & intake")).toBeInTheDocument();
+    expect(screen.queryByText("Phase: discovery")).toBeNull();
+    expect(screen.getByText("2 done")).toBeInTheDocument();
     expect(screen.getByText("Moved order to approved")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Cancel 65% completion update" }));
@@ -456,12 +460,191 @@ describe("OrderWorkflowStageActionsPanel (Increment 07 D5)", () => {
     expect(screen.queryByText("Discovery & intake")).toBeNull();
   });
 
-  pageA11y("order phase bundles panel", async () => {
+  it("renders warning rows with production webhook link + skip count in preview, announces warning summary toast/status on run, and surfaces skipped reasons under Last phase run", async () => {
+    const user = userEvent.setup();
+
+    const runWithSkippedWebhook = {
+      publicId: "01JSTGRUN00000000000000099",
+      orderPublicId: ORDER,
+      stageKey: "discovery",
+      stageLabel: "Discovery & intake",
+      workflowVersionId: 12,
+      state: "completed",
+      triggeredBy: { publicId: "usr_admin", displayName: "Synthetic Admin", role: "admin" },
+      correlationId: "stage:01JSTGRUN00000000000000099",
+      statusOverrideReason: null,
+      results: [
+        {
+          slot: "status",
+          outcome: "completed",
+          reasonCode: null,
+          safeSummary: "Moved order to Approved.",
+          externalRef: null,
+        },
+        {
+          slot: "completion",
+          outcome: "scheduled",
+          reasonCode: null,
+          safeSummary: "Scheduled 72% completion update.",
+          externalRef: "01JCOMPJOB0000000000000001",
+        },
+        {
+          slot: "email",
+          outcome: "completed",
+          reasonCode: null,
+          safeSummary: "Queued customer phase email.",
+          externalRef: null,
+        },
+        {
+          slot: "webhook",
+          outcome: "skipped",
+          reasonCode: "PRODUCTION_WEBHOOKS_NOT_ENABLED",
+          safeSummary: "Production webhook P201 is disabled or not configured.\nSecondary diagnostic line",
+          externalRef: null,
+        },
+      ],
+      startedAt: "2026-11-24T14:00:00.000Z",
+      finishedAt: "2026-11-24T14:00:01.000Z",
+      createdAt: "2026-11-24T14:00:00.000Z",
+    };
+
+    let hasRun = false;
+    handlers["automations.orderStageActions.get"] = () => {
+      const base = phaseBundleView();
+      if (!hasRun) return base;
+      const updatedStages = (base.stages as Record<string, unknown>[]).map((st) =>
+        st.stageKey === "discovery" ? { ...st, lastStageRun: runWithSkippedWebhook } : st,
+      );
+      return {
+        ...base,
+        stages: updatedStages,
+        recentStageRuns: [runWithSkippedWebhook],
+      };
+    };
+
+    handlers["automations.orderStageActions.previewBundle"] = () =>
+      previewPayload({
+        slots: [
+          {
+            slot: "status",
+            label: "Order status",
+            summary: "Move order from review to Approved (approved)",
+            warning: null,
+          },
+          {
+            slot: "completion",
+            label: "Completion",
+            summary: "Schedule 70%–80% completion in 1 minute",
+            warning: null,
+          },
+          {
+            slot: "email",
+            label: "Customer email",
+            summary: "Queue phase review notification",
+            warning: null,
+          },
+          {
+            slot: "webhook",
+            label: "Workflow webhook",
+            summary: "Send Production P201 webhook",
+            warning: "Production webhooks are currently disabled in Integrations -> Production.",
+          },
+        ],
+      });
+
+    handlers["automations.orderStageActions.runBundle"] = () => {
+      hasRun = true;
+      return {
+        deduplicated: false,
+        stageRun: runWithSkippedWebhook,
+        completionJob: (phaseBundleView().recentCompletionJobs as unknown[])[0],
+      };
+    };
+
+    page();
+    await user.click(await screen.findByRole("button", { name: "Preview and run Discovery & intake" }));
+    const dialog = await screen.findByRole("dialog", { name: /Preview phase actions: Discovery & intake/ });
+
+    /* 4. Warning row with Warning badge, normalized wording + link, and confirm-area skip count */
+    expect(within(dialog).getByText("Warning")).toBeInTheDocument();
+    const prodLink = within(dialog).getByRole("link", { name: "Integrations → Production webhooks" });
+    expect(prodLink).toHaveAttribute("href", "/admin/integrations/production");
+    expect(within(dialog).getByText("1 action will be skipped")).toBeInTheDocument();
+
+    /* 1. Confirm and run -> warning toast + polite status announcement summarising the run */
+    await user.click(within(dialog).getByRole("button", { name: "Confirm and run phase" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    const statusRegions = screen.getAllByRole("status");
+    expect(
+      statusRegions.some((el) => el.textContent?.includes("Phase actions run: 3 done, 1 skipped")),
+    ).toBe(true);
+    expect(
+      statusRegions.some((el) => el.textContent?.includes("Warning:")),
+    ).toBe(true);
+    expect(
+      screen.getByText("Phase actions run: 3 done, 1 skipped (Discovery & intake)"),
+    ).toBeInTheDocument();
+
+    /* 2. "Last phase run" displays "3 done · 1 skipped" and first reason line without opening history */
+    expect(await screen.findByText("3 done · 1 skipped")).toBeInTheDocument();
+    const lastRunReasons = screen.getByRole("list", {
+      name: "Skipped or failed actions in last phase run",
+    });
+    expect(lastRunReasons.textContent).toContain("Skipped (Workflow webhook):");
+    expect(lastRunReasons.textContent).toContain(
+      "Production webhook P201 is disabled or not configured.",
+    );
+    expect(lastRunReasons.textContent).not.toContain("Secondary diagnostic line");
+    expect(
+      within(lastRunReasons).getByRole("link", { name: "Integrations → Production webhooks" }),
+    ).toHaveAttribute("href", "/admin/integrations/production");
+  });
+
+  pageA11y("order phase bundles panel with skipped webhook notice", async () => {
+    const base = phaseBundleView();
+    const stages = (base.stages as Record<string, unknown>[]).map((st) =>
+      st.stageKey === "discovery"
+        ? {
+            ...st,
+            slots: [
+              ...(st.slots as unknown[]),
+              {
+                slot: "webhook",
+                label: "Workflow webhook",
+                summary: "Send Production P201 webhook",
+                warning: "Production webhooks are currently disabled in Integrations -> Production.",
+              },
+            ],
+            lastStageRun: {
+              ...(st.lastStageRun as Record<string, unknown>),
+              results: [
+                { slot: "status", outcome: "skipped", reasonCode: "ALREADY_IN_STATUS", safeSummary: "Order is already in status \"Approved\".", externalRef: null },
+                { slot: "completion", outcome: "scheduled", reasonCode: null, safeSummary: "Scheduled 65% completion", externalRef: "01JCOMPJOB0000000000000001" },
+                { slot: "webhook", outcome: "skipped", reasonCode: "PRODUCTION_WEBHOOKS_NOT_ENABLED", safeSummary: "Production webhook P201 is disabled or not configured.", externalRef: null },
+              ],
+            },
+          }
+        : st,
+    );
+    handlers["automations.orderStageActions.get"] = () => ({ ...base, stages });
     page();
     await screen.findByRole("list", { name: "Pinned workflow phases" });
   });
 
-  pageA11y("order phase bundle preview dialog", async () => {
+  pageA11y("order phase bundle preview dialog with warning row and skip count", async () => {
+    handlers["automations.orderStageActions.previewBundle"] = () =>
+      previewPayload({
+        slots: [
+          { slot: "status", label: "Order status", summary: "Move order from review to Approved (approved)", warning: null },
+          {
+            slot: "webhook",
+            label: "Workflow webhook",
+            summary: "Send Production P201 webhook",
+            warning: "Production webhooks are currently disabled in Integrations -> Production.",
+          },
+        ],
+      });
     const user = userEvent.setup();
     page();
     await user.click(await screen.findByRole("button", { name: "Preview and run Discovery & intake" }));
