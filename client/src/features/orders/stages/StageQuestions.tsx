@@ -93,7 +93,8 @@ function CustomerQuestion({ scope, question, canAnswer, Heading }: {
   return (
     <li className="min-w-0 space-y-3 rounded-[var(--radius-control)] border border-line bg-surface px-4 py-3">
       <div className="flex flex-wrap items-start gap-x-2 gap-y-1">
-        <Heading ref={heading} id={id} tabIndex={-1} className="min-w-0 flex-1 whitespace-pre-wrap break-words font-medium text-ink">{question.prompt}</Heading>
+        <Heading ref={heading} id={id} data-question-id={question.questionId} tabIndex={-1}
+          className="min-w-0 flex-1 whitespace-pre-wrap break-words font-medium text-ink">{question.prompt}</Heading>
         <Badge tone={question.required && !question.latestAnswer ? "warning" : "neutral"}>{question.required ? "Required" : "Optional"}</Badge>
       </div>
       {question.latestAnswer ? (
