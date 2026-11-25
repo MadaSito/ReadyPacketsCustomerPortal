@@ -12,9 +12,10 @@ WCAG/ADA conformance claim.
 ## Features
 
 - **Customer portal**: orders, workflow checklists and acknowledgements, private uploads, optional audio recording, invoices and support. A sidebar, a smaller-screen drawer, phone shortcuts and System/Light/Dark themes support different devices.
+- **Phases-first order workflows**: named phases the customer works through in a guided wizard, with Next or Submit and lock, acknowledgements, staff questions and review, an animated progress bar, a status catalogue, attention filters, human-confirmed phase actions, operational alerts, phase-bound uploads, audio playback and phase ZIP downloads.
 - **Staff and administrator console**: order creation and reassignment, delegated order access, session and sign-in tools, customer maintenance, an audit centre, and secure SIEM/syslog forwarding.
 - **Optional customer tools**: searchable Help Centre, moderated community, referral rewards, and a server-priced cart with invoice payment or hosted Stripe/Square checkout. The portal does not collect card details.
-- **Optional integrations**: Microsoft Entra OIDC, outbound mail, scoped API v1, signed webhooks, consent-gated PostHog and Clarity, and cloud copies for files, backups and SharePoint order data. The Copy log distinguishes accepted writes from verified copies.
+- **Optional integrations**: Microsoft Entra OIDC or SAML 2.0 (with a choice of MFA mode), Stripe completion with a guided setup page, one-way Microsoft 365 / SharePoint file sync per phase, outbound mail, scoped API v1, signed webhooks, consent-gated PostHog and Clarity, and cloud copies for files, backups and SharePoint order data. The Copy log distinguishes accepted writes from verified copies.
 - **Self-hosted operations**: encrypted backups and restore drills, forward-only native upgrades, and application-level IP, country and rate-limit controls. Browser interfaces are designed and tested against WCAG 2.2 AA; see the [accessibility evidence](docs/verification/ACCESSIBILITY.md) for coverage and gaps.
 
 ## Quick start

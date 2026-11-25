@@ -60,7 +60,7 @@ Workflows today are status graphs. Definition formats 1 and 2 group statuses int
   - **Canceled orders.** A canceled order shows its last value, frozen, with the word "Canceled".
   - **Storage.** The value is stored in `orders.progress_percent` and recalculated in the same transaction as a transition, submit, review, reopen, waive or completion. Rows with no stored value are filled on read.
 - **`OrderProgress` component.** It is used on the customer order page, the order list, the dashboard and the console.
-  - It is a `role="progressbar"` with `aria-valuenow`, `aria-valuemin` and `aria-valuemax`, and an `aria-valuetext` such as "40 percent, phase 2 of 5: Intake".
+  - It is a `role="progressbar"` with `aria-valuenow`, `aria-valuemin` and `aria-valuemax`, and an `aria-valuetext` such as "40 percent, step 2 of 5: Intake".
   - It shows the number as text and a phase stepper with customer labels.
   - The fill is smooth with a count-up, and there is no animation under reduced motion.
   - It never relies on colour alone, works in both themes and reflows at 320 px.

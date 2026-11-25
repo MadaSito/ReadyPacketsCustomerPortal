@@ -140,14 +140,14 @@ Migration `0005_increment_05` is additive. It adds eight tables: one workflow im
 
 ## Increment 07 and migration `0007`
 
-<!-- platform_engineer with http_security_engineer. D11 proxy and upgrade testing: PENDING-LEAD (not yet run as of this draft). Counts from /root at f4fa798. -->
+<!-- platform_engineer with http_security_engineer. Counts from /root at f4fa798; lead QA 2026-11-25. A reverse proxy with TLS on a VPS and the Docker image build were not verifiable in the QA environment. -->
 
 `0007_increment_07` is additive: new tables, nullable columns or columns with defaults, new indexes and enum widening. It drops and renames nothing. Seeding and backfill run in code at start-up and are idempotent; the migration contains no data SQL. It has 16 new tables, 40 new columns on 11 existing tables and one widened enum (`payment_webhook_events.status`) in 96 statements, with no `DROP`. Reported by /root at `f4fa798`: it applied cleanly on a copy of an increment 06 database (189 → 205 tables, 8 migrations), and existing orders got `payment_state = not_required` and `attention = none`. The schema is frozen for increment 07; any further change would need `0008`.
 
 - **New tables:** `order_stage_progress`, `order_status_catalog`, `order_questions`, `order_question_answers`, `order_admin_tasks`, `order_stage_runs`, `order_completion_jobs`, `operational_alerts`, `file_playback_grants`, `file_archives`, `file_archive_tickets`, `storage_managed_order_roots`, `storage_managed_file_copies`, `payment_webhook_rejections`, `sso_saml_certificates` and `sso_role_mappings`.
 - **New columns:** `orders` (7: progress, completion, attention and payment state), `sso_configuration` (8, SAML), `integration_webhook_deliveries` (7), `integration_production_dispatches` (6), `sso_auth_requests` (3), `file_access_log` (2), `storage_connections` (2), `payment_webhook_events` (2), and one each on `order_files` (`stage_key`), `integration_webhook_subscriptions` (`signing_enabled`) and `automations` (`sort_order`).
 
-Existing orders keep their pinned workflow version. The upgrade prepares a phases (format 3) **draft** of the standard workflow for review and publishes nothing.
+Existing orders keep their pinned workflow version. The start-up job `orders.increment07.startup` runs once at every boot and then every 10 minutes. When no published version or draft has phases, it gives the default workflow one draft with phases derived from its statuses, for you to review and publish. It publishes nothing and re-pins no order. It also recalculates the stored progress of orders on phases (format 3) versions. In the lead's QA, the boot run finished about 200 ms after the server started listening.
 
 - **Native upgrade.** Follow sections 2–5 without `--yes`, with the same backup, fence and `BACKUP-VERIFIED` steps as for increment 06.
   - Release validation requires the SQL file and journal entry `0007_increment_07`.
@@ -164,15 +164,17 @@ Existing orders keep their pinned workflow version. The upgrade prepares a phase
   - **Audio playback** (`GET` / `HEAD /api/files/playback/:grantPublicId`):
     - `Range` and `If-Range` are forwarded to the portal unchanged;
     - the proxy must not buffer or build its own 206 answer.
-    - The POSTs that create playback grants and ZIP archives keep the existing Origin and CSRF checks.
+    - The POST that creates playback grants keeps the existing Origin and CSRF checks.
+    - **ZIP download** (`POST /api/files/archives/download`) is a native form POST. Because the portal sends `Referrer-Policy: no-referrer`, browsers send `Origin: null` on it. The portal accepts that value only for this exact form, and only with `Sec-Fetch-Site: same-origin`, `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest` of `document` or `empty`. The session, the form CSRF token and a single-use, account-bound ticket are still required. Do not strip or rewrite the `Origin` or `Sec-Fetch-*` headers.
   - **Stripe webhook** (`POST /api/payments/webhooks/stripe`, canonical host):
     - it skips only the built-in country allow-list;
     - the IP deny list, rate limits, the 256 KiB cap and signature (HMAC) verification all stay.
 - **After the upgrade:**
   - confirm readiness, local administrator MFA, and that a pre-existing order still shows its status and now shows a progress bar;
   - **Stripe:** check `/admin/payments/setup` (webhook URL, events, egress switch, self-test) before relying on Stripe completion;
-  - **SAML:** keep at least one local administrator with MFA before switching it on;
-  - **Off until configured:** SAML, file sync targets, receipts to Microsoft 365, P101 / P201 auto-queue, phase action bundles and attention reminders. Test each with synthetic data before using it with customers.
+  - **SAML:** keep at least one local administrator with MFA before switching it on. An upgraded existing SSO configuration starts in `portal` MFA mode; `claim` is recommended for new setups, and `entra` needs the typed words `ENTRA MANAGES MFA`. Switching protocol disables SSO until you enable it again;
+  - **Off until configured:** SAML, file sync targets, receipts to Microsoft 365, the P101 / P201 auto-queue (per workflow), production pipeline payload signing (generate a secret first) and attention reminders. Phase actions are empty until you configure them. New webhook subscriptions are signed by default and start paused. Test each with synthetic data before using it with customers.
+  - **Not tested against real services** in the lead's QA: a real Stripe account, an Entra tenant, a SharePoint site, the production P101 / P201 receiver, SMTP, the Docker image build, and a reverse proxy with TLS on a VPS.
 
 ---
 

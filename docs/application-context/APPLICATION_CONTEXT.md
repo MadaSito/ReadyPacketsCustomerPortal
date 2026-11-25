@@ -216,7 +216,11 @@ The owner requested this on 2026-11-24 (prompt 26). The contract is [INCREMENT_0
 
 **Defaults.** Safe features are on after upgrade. Anything that sends something outside, or changes orders by itself, is off until configured.
 
-_Verification status: PENDING-LEAD — /root supplies the verified / not verified facts._
+**Verification (lead QA, 2026-11-25).** Details are in [STATUS.md](STATUS.md#verification-for-increment-07), in three groups:
+- **Checked by the lead** in a real Chromium against a production build on MySQL: phases, progress, bundles, alerts, statuses, the Stripe setup and a signed webhook, phase files and ZIPs, webhook retry, the P101 auto-queue transport, and SAML against a local fake IdP.
+- **Peer-reported automated tests:** SharePoint sync against mocked Graph, redelivery, stop controls and long delays.
+- **Not verifiable here:** a real Stripe account, an Entra tenant, a SharePoint site, the production P101 / P201 receiver, the Docker image build, a reverse proxy with TLS on a VPS, and SMTP.
+- **Gates:** full vitest at `7c6bb71`, 229 files: 2,894 tests passed, 1 flaky client test (being fixed) and 4 todo. Final gates, PR and merge: **PENDING-LEAD (final gates)**.
 
 **Migration `0007_increment_07`.** 16 new tables, 40 new columns on 11 existing tables and one widened enum (`payment_webhook_events.status`) in 96 statements, with no `DROP`. Reported by /root at `f4fa798`: it applied cleanly on a copy of an increment 06 database (189 → 205 tables, 8 migrations), and existing orders got `payment_state = not_required` and `attention = none`. The schema is frozen; a further change needs `0008`.
 
@@ -224,13 +228,13 @@ _Verification status: PENDING-LEAD — /root supplies the verified / not verifie
 | --- | --- | --- |
 | Phases (`orders`) | Definition format 3 `stages[]` on the existing slots, locks and gates; `order_stage_progress`; customer wizard; questions and admin tasks ([ADR 0055](../adr/0055-phases-first-order-workflow.md)). | On. Uses `orders.stage.review`, `orders.stage.reopen` (step-up) and `orders.questions.manage`. |
 | Statuses and attention (`orders`) | `order_status_catalog`; `orders.attention`; filter chips ([ADR 0056](../adr/0056-status-catalogue-and-attention.md)). | On. `orders.statuses.manage` (step-up). |
-| Progress (`orders`, UI) | `orders.progress_percent` is the higher of the derived and explicit values; `OrderProgress` progressbar. | On. |
+| Progress (`orders`, UI) | Every phase counts by weight (1–100, default 1). Derived = floor(done weight × 100 ÷ total weight), capped at 99 until a `done` status. Shown = max(derived, explicit), stored in `orders.progress_percent`, and lowered only by an audited reopen. `orders.increment07.startup` runs at every boot and every 10 minutes. `OrderProgress` progressbar. | On. |
 | Phase actions and rules (`automations`) | `order_stage_runs`, `order_completion_jobs`, new rule triggers and actions; no unattended status change ([ADR 0057](../adr/0057-phase-actions-completion-rules.md)). | Bundles empty = nothing runs; `orders.stage.run` (step-up). |
-| Alerts and webhooks (`opsAlerts`, `integrations`) | `operational_alerts`; P101 / P201 auto-queue; signing; delivery controls ([ADR 0058](../adr/0058-outbound-webhooks-and-operational-alerts.md)). | `ops.alerts.read` / `ops.alerts.manage`; auto-queue and reminders off. |
-| Phase files (`files`) | `stage_key` on files, governance, playback grants, `file_archives` ([ADR 0059](../adr/0059-phase-bound-files.md)). | Phase ZIP on; whole-order ZIP `files.archive.order` (step-up). |
-| Stripe completion (`payments`, `compliance`) | `orders.payment_state`, `paid_at`; `/admin/payments/setup`; `payment_webhook_rejections` ([ADR 0060](../adr/0060-stripe-completion-and-payment-state.md)). | Provider configuration as before. |
+| Alerts and webhooks (`opsAlerts`, `integrations`) | `operational_alerts`; P101 / P201 auto-queue; signing; delivery controls ([ADR 0058](../adr/0058-outbound-webhooks-and-operational-alerts.md)). | `ops.alerts.read` / `ops.alerts.manage`. Off: auto-queue (P101 on a real payment record, P201 on intake submit), reminders and pipeline signing. New subscriptions are signed and start paused. |
+| Phase files (`files`) | `stage_key` on files (format-3 customer uploads must name the current phase: `STAGE_REQUIRED`), governance, playback grants, `file_archives`; ZIP by native form POST with the narrow `Origin: null` rule ([ADR 0059](../adr/0059-phase-bound-files.md)). | Phase ZIP on; whole-order ZIP `files.archive.order` (step-up). |
+| Stripe completion (`payments`, `compliance`) | `orders.payment_state`, `paid_at`; `/admin/payments/setup`; `payment_webhook_rejections` ([ADR 0060](../adr/0060-stripe-completion-and-payment-state.md)). | Activation gated on egress, API check and self-test for the current key; live needs `ACTIVATE LIVE PAYMENTS`. |
 | Microsoft 365 sync (`storage`, `sharepoint`) | One-way per phase; three targets; write test; resync ([ADR 0061](../adr/0061-microsoft-365-file-sync.md)). | Targets off until configured. |
-| SAML (`identity`) | Entra SAML SP with mandatory checks and MFA modes ([ADR 0062](../adr/0062-saml-entra-id.md)). | Off until configured; `/admin/settings/sso`. |
+| SAML (`identity`) | Entra SAML SP with mandatory checks and MFA modes ([ADR 0062](../adr/0062-saml-entra-id.md)). | Off until configured; `/admin/sso`. Upgraded configs start in `portal` MFA mode; `entra` needs `ENTRA MANAGES MFA`. |
 
 ## Deployment profiles
 
