@@ -95,8 +95,11 @@ ids only across the wire, no secrets or personal data in logs). This file adds o
 
 ### D3. Progress — orders_engineer (calculation), ui_foundation_engineer (bar)
 
-- Derived: weight of completed actionable stages ÷ weight of all actionable stages; a status of category
-  `done` gives 100. Explicit: `orders.completion_percent` set by a stage action or a rule (D5).
+- Derived (lead ruling after live QA; replaces "actionable stages"): **every** phase counts by its weight
+  (1–100, default 1, editable per phase). A phase is complete when it is accepted or the order has passed
+  it. Derived = floor(weight done × 100 ÷ total weight), capped at 99 until a status of category `done`,
+  which gives 100. Reason: with only two customer-actionable phases the bar jumped 0 → 50 → 100 and sat
+  at 0 after payment. Explicit: `orders.completion_percent` set by a stage action or a rule (D5).
 - Shown = max(derived, explicit). It only goes down on an audited administrator reopen. A canceled order
   shows the last value, frozen, with the word "Canceled".
 - Stored in `orders.progress_percent` and recalculated in the same transaction as transition, submit,
