@@ -15,6 +15,9 @@ Owner: portable_contract_engineer. These files live in `server/modules/files` by
 - **Expiry:** archives expire 30 minutes after they are requested. The object is deleted on expiry, revocation or failure.
 - **Entry names:** NFC, with control characters, `/`, `\`, `:` and leading dots replaced. Names are never absolute and never contain `..`, are at most 120 characters (extension kept), and get ` (2)`-style suffixes when names collide case-insensitively. Phase ZIPs are flat. Order ZIPs use one folder per phase plus `Order files/` for files that have no phase.
 - **Download:** a single-use, account- and session-bound ticket that lasts 60 seconds (hashed at rest), then `POST /api/files/archives/download` with `{ ticket }` in the body. The response is streamed with `Content-Type: application/zip`, never through a bearer URL.
+  - Ticket semantics: only a ticket bound to the caller's account and current session is consumed (atomically, committed before admission), so a refused admission still burns it; a ticket presented by anyone else is refused and left untouched. Admission (live session, archive row, order fence via the Files selector, fixed-manifest comparison, audit row, object open) runs in one transaction; only the byte stream continues after commit. A manifest mismatch revokes the archive (`ARCHIVE_STALE`).
+  - `status` / `latest` re-check current order access under the order fence; a requester who lost access gets `NOT_FOUND` / `null` (no metadata or counts).
+  - Foreign requester (another user's archive id): `NOT_FOUND`, reason `ARCHIVE_NOT_FOUND`, plus a `file.archive.denied` audit row.
 - **Audit (file category):**
   - `file.archive.requested`, `file.archive.built`, `file.archive.failed`, `file.archive.ticket_issued`, `file.archive.downloaded` (attempted then completed or failed), `file.archive.denied` and `file.archive.expired`.
   - Recorded facts: `order_public_id`, `stage_key`, `scope`, file count and bytes.
