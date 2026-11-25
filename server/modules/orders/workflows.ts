@@ -57,6 +57,8 @@ export interface BoundWorkflow {
 
 const DEFAULT_KEY = "standard";
 
+export type ConvertDefaultResult = { draftId: string; created: boolean; draftName: string; outcome: "created" | "opened" | "needs_confirm" | "converted" };
+
 export function createWorkflowService(deps: WorkflowDeps) {
   /** Versions are immutable, so caching by id is safe. */
   const versionCache = new Map<number, BoundWorkflow>();
@@ -393,21 +395,52 @@ export function createWorkflowService(deps: WorkflowDeps) {
 
     /**
      * Increment 07 QA: "Convert <default> to phases". A draft of the default workflow with phases derived from its
-     * statuses (classic groups removed). When the workflow already has a draft, that draft is returned instead
-     * (`created: false`) so the designer opens it on the Phases tab. Nothing is published.
+     * statuses (classic groups removed). Nothing is published. When the workflow already has an open draft:
+     * - the draft has phases → `outcome: "opened"` (unchanged);
+     * - the draft has no phases → `outcome: "needs_confirm"` (unchanged) naming the draft; calling again with
+     *   `convertDraftId` set to that draft converts it in place (same toPhasesDraft) → `outcome: "converted"`.
      */
-    async convertDefaultToPhases(principal: SessionPrincipal): Promise<{ draftId: string; created: boolean }> {
+    async convertDefaultToPhases(principal: SessionPrincipal, input: { convertDraftId?: string } = {}): Promise<ConvertDefaultResult> {
       return deps.db.transaction(async (tx) => {
         await assertDesigner(principal, tx, false);
         const [workflow] = await tx.select().from(orderWorkflows).where(eq(orderWorkflows.isDefault, true)).orderBy(asc(orderWorkflows.id)).limit(1).for("update");
         if (!workflow?.currentVersionId) throw notFound("WORKFLOW_NOT_FOUND");
         const [open] = await tx
-          .select({ publicId: orderWorkflowDrafts.publicId })
+          .select()
           .from(orderWorkflowDrafts)
           .where(eq(orderWorkflowDrafts.workflowId, workflow.id))
           .orderBy(desc(orderWorkflowDrafts.updatedAt), desc(orderWorkflowDrafts.id))
-          .limit(1);
-        if (open) return { draftId: open.publicId, created: false };
+          .limit(1)
+          .for("update");
+        if (open) {
+          const base = { draftId: open.publicId, created: false, draftName: open.name };
+          if (open.definition.stages?.length) return { ...base, outcome: "opened" as const };
+          if (input.convertDraftId !== open.publicId) return { ...base, outcome: "needs_confirm" as const };
+          const parsed = workflowDefinitionSchema.safeParse(open.definition);
+          if (!parsed.success)
+            throw conflict("DRAFT_NOT_CONVERTIBLE", "This draft has problems to fix first. Open it, fix them, then add phases on the Phases tab.");
+          const definition = toPhasesDraft(parsed.data);
+          const now = deps.clock.now();
+          await tx
+            .update(orderWorkflowDrafts)
+            .set({ definition, updatedByUserId: principal.userId, updatedAt: now, version: open.version + 1 })
+            .where(eq(orderWorkflowDrafts.id, open.id));
+          await deps.audit.record(
+            {
+              category: "admin",
+              eventName: "workflow.draft.changed",
+              action: "update",
+              outcome: "completed",
+              actor: { userId: principal.userId, role: principal.role },
+              resource: { type: "order_workflow_draft", publicId: open.publicId },
+              reasonCode: "PHASES_CONVERT_DRAFT",
+              attributes: { source: "draft", existing_workflow: true, in_place: true },
+              safeCounts: { states: definition.states.length, transitions: definition.transitions.length, stages: definition.stages?.length ?? 0 },
+            },
+            tx,
+          );
+          return { ...base, outcome: "converted" as const };
+        }
         const [version] = await tx.select().from(orderWorkflowVersions).where(eq(orderWorkflowVersions.id, workflow.currentVersionId)).limit(1);
         if (!version) throw notFound("WORKFLOW_VERSION_NOT_FOUND");
         const current = workflowDefinitionSchema.parse(version.definition);
@@ -444,7 +477,7 @@ export function createWorkflowService(deps: WorkflowDeps) {
           },
           tx,
         );
-        return { draftId: publicId, created: true };
+        return { draftId: publicId, created: true, draftName: workflow.name, outcome: "created" as const };
       });
     },
 

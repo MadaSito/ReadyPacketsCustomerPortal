@@ -305,7 +305,8 @@ it("phases notice actions: add the standard phases workflow and convert the defa
 
     const converted = await owner.admin.workflows.phases.convertDefault();
     expect(converted.created).toBe(true);
-    expect(await owner.admin.workflows.phases.convertDefault()).toEqual({ draftId: converted.draftId, created: false });
+    expect(converted.outcome).toBe("created");
+    expect(await owner.admin.workflows.phases.convertDefault()).toMatchObject({ draftId: converted.draftId, created: false, outcome: "opened" });
     const [convertedRow] = await db.db.select().from(orderWorkflowDrafts).where(eq(orderWorkflowDrafts.publicId, converted.draftId));
     expect(convertedRow).toMatchObject({ workflowId: workflow!.id, baseVersionId: version!.id });
     const definition = convertedRow!.definition as Parameters<typeof validateDraft>[0];
@@ -313,6 +314,19 @@ it("phases notice actions: add the standard phases workflow and convert the defa
     expect(definition.phases ?? []).toHaveLength(0);
     expect(validateDraft(definition).filter((issue) => issue.severity === "error")).toEqual([]);
     expect(h.audit.named("workflow.draft.changed").at(-1)).toMatchObject({ reasonCode: "PHASES_CONVERT_DRAFT" });
+
+    // An open draft without phases: first call only asks (unchanged, named); with its id it is converted in place.
+    const [classicVersion] = await db.db.select().from(orderWorkflowVersions).where(eq(orderWorkflowVersions.id, version!.id));
+    await db.db.update(orderWorkflowDrafts).set({ definition: classicVersion!.definition as never }).where(eq(orderWorkflowDrafts.publicId, converted.draftId));
+    const ask = await owner.admin.workflows.phases.convertDefault();
+    expect(ask).toMatchObject({ draftId: converted.draftId, created: false, outcome: "needs_confirm" });
+    expect(ask.draftName.length).toBeGreaterThan(0);
+    expect(((await db.db.select().from(orderWorkflowDrafts).where(eq(orderWorkflowDrafts.publicId, converted.draftId)))[0]!.definition as { stages?: unknown[] }).stages ?? []).toHaveLength(0);
+    expect(await owner.admin.workflows.phases.convertDefault({ convertDraftId: converted.draftId })).toMatchObject({ draftId: converted.draftId, outcome: "converted" });
+    const [inPlace] = await db.db.select().from(orderWorkflowDrafts).where(eq(orderWorkflowDrafts.publicId, converted.draftId));
+    expect((inPlace!.definition as { stages?: unknown[] }).stages?.length).toBeGreaterThan(0);
+    expect(h.audit.named("workflow.draft.changed").at(-1)).toMatchObject({ reasonCode: "PHASES_CONVERT_DRAFT", attributes: { in_place: true } });
+    expect(h.audit.recordedInTx.at(-1)).toBe(true);
 
     // New workflow dialog: "phases" starts from the standard phases definition (stored source "standard").
     const created = await owner.admin.workflows.drafts.create({ from: "phases", workflowKey: "phases_two", name: "Phases two" });

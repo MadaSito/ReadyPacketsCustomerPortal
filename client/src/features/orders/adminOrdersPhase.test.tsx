@@ -47,22 +47,29 @@ const base = {
   attention: null,
   progressCanceled: false,
 };
-const phased = { ...base, publicId: "01JTESTORDER0000000000000A", reference: "RP-2026-000001", progressPercent: 40, phaseLabel: "Intake review", phaseIndex: 2, phaseTotal: 7 };
+const phased = { ...base, publicId: "01JTESTORDER0000000000000A", reference: "RP-2026-000001", progressPercent: 40, phaseLabel: "Phase 1 intake", phaseIndex: 2, phaseTotal: 7 };
+const uncached = { ...base, publicId: "01JTESTORDER0000000000000C", reference: "RP-2026-000003", progressPercent: null, phaseLabel: "Phase 2 synthesis", phaseIndex: 3, phaseTotal: 7 };
 const classic = { ...base, publicId: "01JTESTORDER0000000000000B", reference: "RP-2026-000002", progressPercent: 0, phaseLabel: null, phaseIndex: null, phaseTotal: 0 };
 
 beforeEach(() => {
   handlers.clear();
-  handlers.set("orders.admin.list", () => ({ items: [phased, classic], nextCursor: null }));
+  handlers.set("orders.admin.list", () => ({ items: [phased, classic, uncached], nextCursor: null }));
   handlers.set("orders.statusCatalog.list", () => []);
   handlers.set("orders.statusCatalog.attentionCounts", () => ({}));
 });
 
 describe("console order list Phase column", () => {
-  it("shows the current phase, n of m and a compact progress bar; a row without phases shows a dash", async () => {
+  it("shows the compact progress bar once per row (text when no value yet), a nowrap reference; a row without phases shows a dash", async () => {
     const { container } = renderUi(<AdminOrdersPage />, { path: "/admin/orders" });
     const table = await screen.findByRole("table");
     expect(within(table).getByRole("columnheader", { name: "Phase" })).toBeInTheDocument();
-    expect(within(table).getByText("Phase 3 of 7")).toBeInTheDocument();
+    // One line per row (QA #2): the compact bar's own line, no second copy of the phase name.
+    expect(within(table).getAllByText(/Phase 1 intake/)).toHaveLength(1);
+    expect(within(table).getByText(/3 of 7: Phase 1 intake/)).toBeInTheDocument();
+    // No progress value yet: plain text instead of a bar.
+    expect(within(table).getByText("Step 4 of 7: Phase 2 synthesis")).toBeInTheDocument();
+    expect(within(table).queryByRole("progressbar", { name: "Progress of RP-2026-000003" })).not.toBeInTheDocument();
+    expect(within(table).getByRole("link", { name: "RP-2026-000001" })).toHaveClass("whitespace-nowrap");
     expect(within(table).getByRole("progressbar", { name: "Progress of RP-2026-000001" })).toHaveAttribute("aria-valuenow", "40");
     expect(within(table).queryByRole("progressbar", { name: "Progress of RP-2026-000002" })).not.toBeInTheDocument();
     await expectNoAxeViolations(container);

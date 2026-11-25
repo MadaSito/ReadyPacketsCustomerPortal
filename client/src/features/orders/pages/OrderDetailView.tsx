@@ -12,7 +12,7 @@ import { AgreementDialog, parseAgreementRequiredDetails, type AgreementRequiredD
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import {
   Badge, Breadcrumbs, Button, Callout, Card, DataTable, DateTime, Dialog, ErrorState, Field, KeyValueList, Money, PageHeader, Select,
-  RouteTabPanel, RouteTabs, Skeleton, Spinner, Textarea, formatDateTime, useToast, type Tone,
+  OrderProgress, RouteTabPanel, RouteTabs, Skeleton, Spinner, Textarea, formatDateTime, useToast, type Tone,
 } from "@/ui";
 import { ConsoleActions, ReferenceHistory } from "../ConsoleActions";
 import { SharingPanel } from "../SharingPanel";
@@ -87,6 +87,7 @@ export function OrderDetailView({ area }: { area: Area }) {
       />
       {consoleArea ? (
         <div className="mb-6 flex flex-col gap-2">
+          <ConsoleOrderProgress orderId={order.publicId} />
           <ConsoleActions orderId={order.publicId} version={order.version} lockState={lockState} reference={order.reference} name={order.projectName} />
           <TransitionControl order={order} />
         </div>
@@ -404,6 +405,30 @@ function Activity({ order, area }: { order: OrderDetail; area: Area }) {
         </ol>
       </Card>
     </div>
+  );
+}
+
+/**
+ * Increment 07 lead QA (7): dense progress (bar, percent, current phase) under the console order header on every
+ * tab. Staff labels; nothing when the order has no phase model or the workspace cannot be read (fails quietly).
+ */
+function ConsoleOrderProgress({ orderId }: { orderId: string }) {
+  const trpc = useTRPC();
+  const workspace = useQuery(trpc.orders.stages.workspace.queryOptions({ orderId }));
+  const data = workspace.data;
+  if (!data || data.stages.length === 0) return null;
+  return (
+    <Card>
+      <OrderProgress
+        variant="compact"
+        caption={null}
+        label="Order progress"
+        percent={data.progress.percent}
+        stages={data.stages.map((stage) => ({ key: stage.key, label: stage.staffLabel?.trim() || stage.customerLabel }))}
+        currentIndex={data.progress.currentIndex}
+        canceled={data.progress.canceled}
+      />
+    </Card>
   );
 }
 

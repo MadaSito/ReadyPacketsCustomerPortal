@@ -149,7 +149,7 @@ export default function AdminOrdersPage() {
               header: "Reference",
               primary: true,
               cell: (order) => (
-                <Link href={`/admin/orders/${order.publicId}`} className="font-semibold break-all text-action underline-offset-2 hover:underline">
+                <Link href={`/admin/orders/${order.publicId}`} className="font-semibold whitespace-nowrap text-action underline-offset-2 hover:underline">
                   {order.reference}
                 </Link>
               ),
@@ -170,20 +170,23 @@ export default function AdminOrdersPage() {
               key: "phase",
               header: "Phase",
               hideOnMobile: true,
-              // Increment 07 QA: current phase (label, n of m) and a compact progress bar; "—" without a phase model.
+              // Increment 07 QA: the compact bar alone (its visible line already names the position and the phase);
+              // the plain text only when there is no progress value yet. "—" without a phase model.
               cell: (order) =>
                 order.phaseLabel && order.phaseIndex !== null && order.phaseTotal ? (
-                  <div className="grid min-w-[9rem] gap-1">
-                    <span className="text-sm break-words text-ink">{order.phaseLabel}</span>
-                    <span className="text-xs text-muted">{`Phase ${order.phaseIndex + 1} of ${order.phaseTotal}`}</span>
-                    <OrderListProgress
-                      name={order.reference}
-                      progressPercent={order.progressPercent}
-                      phaseLabel={order.phaseLabel}
-                      phaseIndex={order.phaseIndex}
-                      phaseTotal={order.phaseTotal}
-                      canceled={order.progressCanceled}
-                    />
+                  <div className="min-w-[9rem]">
+                    {order.progressPercent === null || order.progressPercent === undefined ? (
+                      <span className="text-sm break-words text-ink">{`Step ${order.phaseIndex + 1} of ${order.phaseTotal}: ${order.phaseLabel}`}</span>
+                    ) : (
+                      <OrderListProgress
+                        name={order.reference}
+                        progressPercent={order.progressPercent}
+                        phaseLabel={order.phaseLabel}
+                        phaseIndex={order.phaseIndex}
+                        phaseTotal={order.phaseTotal}
+                        canceled={order.progressCanceled}
+                      />
+                    )}
                   </div>
                 ) : (
                   <span className="text-muted">—</span>

@@ -1,7 +1,8 @@
 /**
  * Console workflows (/admin/workflows). Owner: orders_engineer.
  * Lists workflows and open drafts; starts drafts (ReadyPackets phases, standard, blank, copy) that the designer edits.
- * Increment 07 QA: while no published workflow has phases, a dismissible notice offers "add" and "convert" drafts. Publishing happens
+ * Increment 07 QA: while the DEFAULT workflow's current version has no phases, a dismissible notice offers "add" and
+ * "convert" drafts (an open phase-less draft of the default is converted in place only after a confirm naming it). Publishing happens
  * in the designer and always creates a new version; orders stay bound to the version they started on.
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -30,6 +31,7 @@ export default function AdminWorkflowsPage() {
   const [noticeDismissed, setNoticeDismissed] = useState(() => phasesNoticeDismissed);
   const addPhases = useMutation(trpc.orders.admin.workflows.phases.addStandard.mutationOptions());
   const convertDefault = useMutation(trpc.orders.admin.workflows.phases.convertDefault.mutationOptions());
+  const [convertAsk, setConvertAsk] = useState<{ draftId: string; draftName: string } | null>(null);
 
   const refresh = () =>
     Promise.all([
@@ -68,13 +70,30 @@ export default function AdminWorkflowsPage() {
   const startPhases = async (kind: "add" | "convert") => {
     setProblem(null);
     try {
-      const result = kind === "add" ? await addPhases.mutateAsync() : await convertDefault.mutateAsync();
-      if (!result.created) toast.show({ tone: "info", title: "Opening the existing draft" });
+      if (kind === "add") {
+        const result = await addPhases.mutateAsync();
+        toast.show({ tone: result.created ? "success" : "info", title: result.created ? "Phases draft started" : "Opening the existing phases draft" });
+        await refresh();
+        return openPhases(result.draftId);
+      }
+      const result = await convertDefault.mutateAsync({});
+      // An open draft of the default without phases is only converted after an explicit confirm naming it.
+      if (result.outcome === "needs_confirm") return setConvertAsk({ draftId: result.draftId, draftName: result.draftName });
+      toast.show({
+        tone: result.outcome === "created" ? "success" : "info",
+        title: result.outcome === "created" ? `Started a phases draft of ${result.draftName}` : `Opened the draft “${result.draftName}”: it already has phases`,
+      });
       await refresh();
       openPhases(result.draftId);
     } catch (err) {
       setProblem(errorMessage(err));
     }
+  };
+  const convertInPlace = async (draftId: string) => {
+    const result = await convertDefault.mutateAsync({ convertDraftId: draftId });
+    toast.show({ tone: "success", title: `Converted the draft “${result.draftName}” to phases` });
+    await refresh();
+    openPhases(result.draftId);
   };
   const dismissNotice = () => {
     phasesNoticeDismissed = true;
@@ -115,7 +134,8 @@ export default function AdminWorkflowsPage() {
   const rows = workflows.data;
   const draftRows = drafts.data ?? [];
   const defaultWorkflow = rows.find((wf) => wf.isDefault && wf.currentVersionPublicId) ?? null;
-  const showPhasesNotice = rows.length > 0 && !noticeDismissed && !rows.some((wf) => (wf.definition?.stages?.length ?? 0) > 0);
+  // Lead QA (8): keyed on the default workflow, so new orders can't silently keep using a phase-less default.
+  const showPhasesNotice = !noticeDismissed && defaultWorkflow !== null && (defaultWorkflow.definition?.stages?.length ?? 0) === 0;
   return (
     <>
       {header}
@@ -130,7 +150,7 @@ export default function AdminWorkflowsPage() {
           <section aria-labelledby="phases-notice-title" className="flex flex-col gap-3 rounded-[var(--radius-card)] border border-line bg-surface p-4 sm:p-5">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <h2 id="phases-notice-title" className="text-lg font-semibold text-ink">
-                Your workflows do not use phases yet
+                Your default workflow does not use phases yet
               </h2>
               <Button size="sm" variant="ghost" aria-label="Dismiss the phases notice" onClick={dismissNotice}>
                 Dismiss
@@ -242,6 +262,24 @@ export default function AdminWorkflowsPage() {
         />
       </div>
       {creating ? <NewWorkflowDialog workflows={rows} onClose={() => setCreating(false)} onCreated={(id) => void refresh().then(() => navigate(`/admin/workflows/drafts/${id}`))} /> : null}
+      {convertAsk ? (
+        <ConfirmDialog
+          open
+          onOpenChange={(open) => (open ? undefined : setConvertAsk(null))}
+          title={`Convert the draft “${convertAsk.draftName}” to phases?`}
+          description="This draft has no phases yet. Converting it groups its statuses into phases and removes the older status groups. The draft stays unpublished and orders are not affected."
+          confirmLabel="Convert draft"
+          onConfirm={async () => {
+            try {
+              await convertInPlace(convertAsk.draftId);
+              setConvertAsk(null);
+            } catch (err) {
+              setProblem(errorMessage(err));
+              setConvertAsk(null);
+            }
+          }}
+        />
+      ) : null}
       {discarding ? <DiscardDialog draft={discarding} onClose={() => setDiscarding(null)} onDone={() => void refresh()} /> : null}
       {transfer.dialog}
     </>

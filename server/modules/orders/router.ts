@@ -180,7 +180,8 @@ const workflowsAdmin = router({
       .mutation(({ ctx }) => ctx.services.orders.workflows.addPhasesWorkflow(ctx.session)),
     convertDefault: adminProcedure
       .use(requireCapability("workflows.manage"))
-      .mutation(({ ctx }) => ctx.services.orders.workflows.convertDefaultToPhases(ctx.session)),
+      .input(z.strictObject({ convertDraftId: id.optional() }).optional())
+      .mutation(({ ctx, input }) => ctx.services.orders.workflows.convertDefaultToPhases(ctx.session, input ?? {})),
   }),
   drafts: router({
     list: adminProcedure.use(requireCapability("workflows.manage")).query(({ ctx }) => ctx.services.orders.workflows.listDrafts()),

@@ -674,6 +674,15 @@ describe("console", () => {
     session.role = "admin";
     handlers.set("orders.admin.get", () => ({ ...detail, accessRole: "admin", transitions: [] }));
     handlers.set("orders.admin.referenceHistory", () => [{ reference: "RP-2026-000001", status: "active", reasonCode: "CREATED", assignedAt: now, retiredAt: null }]);
+    handlers.set("orders.stages.workspace", () => ({
+      workflowFormat: 3, derived: false, currentStageKey: "intake",
+      progress: { percent: 33, canceled: false, currentIndex: 1, total: 3, currentLabel: "Intake (staff)" },
+      stages: [
+        { key: "payment", customerLabel: "Payment", staffLabel: "Payment check" },
+        { key: "intake", customerLabel: "Intake", staffLabel: "Intake (staff)" },
+        { key: "delivery", customerLabel: "Delivery", staffLabel: "Delivery" },
+      ],
+    }));
     handlers.set("orders.admin.customerLookup", () => [{ publicId: "01JTESTUSER00000000000000B", name: "Synthetic Customer B", customerRef: null, emailMasked: "s***@example.test" }]);
     const user = userEvent.setup();
     const { container } = renderUi(
@@ -684,6 +693,9 @@ describe("console", () => {
     );
     await screen.findByRole("heading", { level: 1, name: "Synthetic project" });
     expect(within(screen.getByRole("tablist")).getByRole("tab", { name: "Billing (staff)" })).toBeInTheDocument();
+    // Lead QA (7): dense progress under the console header, staff labels.
+    expect(await screen.findByRole("progressbar", { name: "Order progress" })).toHaveAttribute("aria-valuenow", "33");
+    expect(screen.getByText(/2 of 3: Intake \(staff\)/)).toBeInTheDocument();
     await expectNoAxeViolations(container);
     await user.click(screen.getByRole("button", { name: "Reassign customer" }));
     const dialog = await screen.findByRole("dialog");

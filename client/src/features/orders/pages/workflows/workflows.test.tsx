@@ -177,30 +177,51 @@ describe("workflows page", () => {
     expect(calls.find((c) => c.path === "orders.admin.workflows.drafts.create")?.input).toEqual({ from: "phases", workflowKey: "packets", name: "Packets" });
   });
 
-  it("phases notice: shown while no published workflow has phases; add, convert (opens the existing draft) and dismiss", async () => {
-    handlers.set("orders.admin.workflows.list", () => [workflowRow]);
+  it("phases notice: keyed on the default workflow; add, convert (confirm before converting a phase-less draft in place) and dismiss", async () => {
+    const title = "Your default workflow does not use phases yet";
+    // Another (non-default) workflow with phases does not hide the notice.
+    const other = { ...workflowRow, publicId: "01JTESTWF0000000000000000Z", workflowKey: "other", name: "Other", isDefault: false, definition: { ...workflowRow.definition, stages: [{ key: "intake" }] } };
+    handlers.set("orders.admin.workflows.list", () => [workflowRow, other]);
     handlers.set("orders.admin.workflows.drafts.list", () => []);
     handlers.set("orders.admin.workflows.phases.addStandard", () => ({ draftId: "01JTESTWFD000000000000000C", created: true }));
-    handlers.set("orders.admin.workflows.phases.convertDefault", () => ({ draftId: DRAFT, created: false }));
+    const convertCalls: unknown[] = [];
+    handlers.set("orders.admin.workflows.phases.convertDefault", (input: unknown) => {
+      convertCalls.push(input);
+      const converting = Boolean((input as { convertDraftId?: string } | undefined)?.convertDraftId);
+      return { draftId: DRAFT, created: false, draftName: "Standard draft", outcome: converting ? "converted" : "needs_confirm" };
+    });
     const user = userEvent.setup();
     const { container, location, unmount } = renderUi(<AdminWorkflowsPage />, { path: "/admin/workflows" });
-    const notice = await screen.findByRole("region", { name: "Your workflows do not use phases yet" });
+    const notice = await screen.findByRole("region", { name: title });
     await expectNoAxeViolations(container);
     await user.click(within(notice).getByRole("button", { name: "Add the ReadyPackets phases workflow" }));
     await waitFor(() => expect(location.history.at(-1)).toBe("/admin/workflows/drafts/01JTESTWFD000000000000000C"));
     await user.click(within(notice).getByRole("button", { name: "Convert Standard to phases" }));
+    const confirm = await screen.findByRole("alertdialog", { name: "Convert the draft “Standard draft” to phases?" });
+    expect(location.history.at(-1)).toBe("/admin/workflows/drafts/01JTESTWFD000000000000000C");
+    await user.click(within(confirm).getByRole("button", { name: "Convert draft" }));
     await waitFor(() => expect(location.history.at(-1)).toBe(`/admin/workflows/drafts/${DRAFT}`));
-    expect(await screen.findByText("Opening the existing draft")).toBeInTheDocument();
+    expect(convertCalls.at(-1)).toEqual({ convertDraftId: DRAFT });
+    expect(await screen.findByText("Converted the draft “Standard draft” to phases")).toBeInTheDocument();
     await user.click(within(notice).getByRole("button", { name: "Dismiss the phases notice" }));
-    expect(screen.queryByRole("region", { name: "Your workflows do not use phases yet" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: title })).not.toBeInTheDocument();
     unmount();
 
-    // A published workflow with phases: no notice.
+    // The default's draft already has phases: opened unchanged, and the toast says so.
+    resetPhasesNoticeForTests();
+    handlers.set("orders.admin.workflows.phases.convertDefault", () => ({ draftId: DRAFT, created: false, draftName: "Standard draft", outcome: "opened" }));
+    const second = renderUi(<AdminWorkflowsPage />, { path: "/admin/workflows" });
+    await user.click(within(await screen.findByRole("region", { name: title })).getByRole("button", { name: "Convert Standard to phases" }));
+    await waitFor(() => expect(second.location.history.at(-1)).toBe(`/admin/workflows/drafts/${DRAFT}`));
+    expect(await screen.findByText("Opened the draft “Standard draft”: it already has phases")).toBeInTheDocument();
+    second.unmount();
+
+    // The default workflow has phases: no notice.
     resetPhasesNoticeForTests();
     handlers.set("orders.admin.workflows.list", () => [{ ...workflowRow, definition: { ...workflowRow.definition, stages: [{ key: "intake" }] } }]);
     renderUi(<AdminWorkflowsPage />, { path: "/admin/workflows" });
     expect(await screen.findByRole("heading", { name: "Standard" })).toBeInTheDocument();
-    expect(screen.queryByRole("region", { name: "Your workflows do not use phases yet" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: title })).not.toBeInTheDocument();
   });
 });
 
