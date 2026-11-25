@@ -55,6 +55,7 @@ Use these chapters alongside the existing console guide. Installing a dependency
 - [Native upgrade and migration `0003`](../operations/UPGRADE.md#increment-04-and-migration-0003): the pre-upgrade backup, traffic fence, and recovery after a partially applied migration.
 - [Files and media](../../server/modules/files/ADMIN_GUIDE.md): configure uploads and review file and media behavior.
 - [Upgrade to increment 06 and migration `0006`](../operations/UPGRADE.md#increment-06-and-migration-0006): new headers for the installable app, and larger upload limits for recordings.
+- [Work with customer phases](../../server/modules/orders/questions/ADMIN_GUIDE.md) (increment 07): console phase selection, required questions, answer history, review and reopen, and the administrator checklist.
 - [Customer tasks and the order agreement (MNDA)](./WORKFLOW_CUSTOMER_TASKS.md) (increment 06): tasks per status, designer findings, the export/import switch and the agreement gate.
 - [Security incidents help](./SECURITY_INCIDENTS_HELP.md) (increment 06).
 - [Cart suggestions](#cart-suggestions), [Discount codes](#discount-codes) and [Policy acceptances](#policy-acceptances) (increment 05): see the sections below.
@@ -426,7 +427,8 @@ File sync copies order files from the portal to SharePoint, one way, phase by ph
 
 ### What goes to each target
 
-- **Intake delivery** receives only customer-visible phase files that have cleared scanning (admitted), plus verified audio derivatives, and only when they are published. Nothing is sent when a phase is submitted.
+- **Intake delivery** receives only customer-visible phase files that the portal has admitted, plus verified audio derivatives, and only when they are published. Nothing is sent when a phase is submitted.
+  Admitted means the file passed the portal's byte and file-type checks, and the configured scanner if one is set up. The default production setup does not configure an external antivirus scanner.
 - **Originals** receives staff-only files and originals that are still pending or not yet converted. These never go to intake delivery.
 
 Files land under `CustomerName-CustomerID/OrderNumber/<phase folder>`. The first two segments are fixed when an order is first exported.
