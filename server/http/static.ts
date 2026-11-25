@@ -7,6 +7,28 @@ import { isNavigation } from "./edge.js";
 
 const HASHED_ASSET = /^(?:.+\/)?assets\/[^/]+-[A-Za-z0-9_-]{8,}\.[a-z0-9]+$/i;
 const NEVER_SPA = /^\/(?:api|assets|brand|fonts|healthz|readyz|\.well-known)(?:\/|$)/i;
+const MAIL_TEMPLATE_EDITOR = "/admin/email-templates/";
+const DOTTED_MAIL_KEY = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/u;
+const CUSTOM_MAIL_KEY = /^custom\.[a-z][a-z0-9_]{1,63}$/u;
+
+function permitsSpaPath(path: string, isBuiltinMailKey: (key: string) => boolean): boolean {
+  if (path === "/index.html") return true;
+  let decoded: string;
+  try {
+    // Decode for classification only. Express's static file resolution continues to use the original request.
+    decoded = decodeURIComponent(path);
+  } catch {
+    return false;
+  }
+  if (decoded.split("/").some((segment) => segment.startsWith("."))) return false;
+  if (!extname(path) && !extname(decoded)) return true;
+
+  // The exact editor route is the only SPA route with a dotted identifier. Use the mail
+  // registry rather than accepting arbitrary template-shaped filenames like auth.png.
+  if (!path.startsWith(MAIL_TEMPLATE_EDITOR)) return false;
+  const key = decoded.slice(MAIL_TEMPLATE_EDITOR.length);
+  return key.length <= 100 && DOTTED_MAIL_KEY.test(key) && (CUSTOM_MAIL_KEY.test(key) || isBuiltinMailKey(key));
+}
 
 function realOrFuturePath(path: string): string {
   const absolute = resolve(path);
@@ -30,7 +52,10 @@ export function assertSeparateStorage(staticDir: string, storageDir: string): vo
   }
 }
 
-export function registerStatic(app: Express, staticDir: string, publicPaths: ReadonlySet<string>): void {
+export function registerStatic(
+  app: Express, staticDir: string, publicPaths: ReadonlySet<string>,
+  isBuiltinMailKey: (key: string) => boolean = () => false,
+): void {
   const root = resolve(staticDir);
   const serve = express.static(root, {
     cacheControl: false,
@@ -64,7 +89,7 @@ export function registerStatic(app: Express, staticDir: string, publicPaths: Rea
   });
 
   app.use(async (req, res, next) => {
-    if (NEVER_SPA.test(req.path) || !isNavigation(req) || (req.path !== "/index.html" && extname(req.path))) {
+    if (NEVER_SPA.test(req.path) || !isNavigation(req) || !permitsSpaPath(req.path, isBuiltinMailKey)) {
       return next();
     }
     let html: string;
