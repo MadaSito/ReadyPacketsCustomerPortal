@@ -244,13 +244,18 @@ export function DataTable<Row>({ caption, showCaption, columns, rows, rowKey, lo
                 {primary ? <div className="min-w-0 flex-1 text-[0.9375rem] font-semibold break-words text-ink">{primary.cell(row)}</div> : null}
               </div>
             ) : null}
-            <dl className="grid grid-cols-[minmax(6rem,auto)_1fr] gap-x-3 gap-y-1.5 text-sm">
+            {/*
+              Phone card. The label column sizes to its content (at least 6rem, as before) but is capped at 40% so a long
+              label can never starve the value column; values may shrink to 0 and wrap long tokens. Below 320 CSS px the
+              pairs stack in one column (07.1: four pages overflowed at 240 px through this grid).
+            */}
+            <dl className="grid grid-cols-[fit-content(40%)_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-sm max-[320px]:grid-cols-1 max-[320px]:gap-y-0.5" data-card-fields="">
               {columns
                 .filter((col) => col !== primary && !col.hideOnMobile)
                 .map((col) => (
                   <div key={col.key} className="contents">
-                    <dt className="text-muted">{col.header}</dt>
-                    <dd className="min-w-0 break-words text-ink">{col.cell(row)}</dd>
+                    <dt className="min-w-24 break-words text-muted max-[320px]:min-w-0 max-[320px]:pt-1">{col.header}</dt>
+                    <dd className="min-w-0 break-words text-ink [overflow-wrap:anywhere]">{col.cell(row)}</dd>
                   </div>
                 ))}
             </dl>

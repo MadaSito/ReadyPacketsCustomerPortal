@@ -136,6 +136,23 @@ describe("DataTable", () => {
     expect(onSort).toHaveBeenCalledWith({ key: "name", direction: "desc" });
     await expectNoAxeViolations();
   });
+  it("phone cards: label column capped, values can shrink and wrap, single column below 320 px (07.1)", () => {
+    renderUi(<DataTable caption="Orders" columns={columns} rows={rows} rowKey={(r) => r.id} />);
+    const cards = screen.getByRole("list", { name: "Orders" });
+    const dl = cards.querySelector("dl[data-card-fields]")!;
+    expect(dl).not.toBeNull();
+    expect(dl.className).toContain("grid-cols-[fit-content(40%)_minmax(0,1fr)]");
+    expect(dl.className).toContain("max-[320px]:grid-cols-1");
+    expect(dl.className).not.toMatch(/minmax\(6rem,auto\)/);
+    for (const dt of dl.querySelectorAll("dt")) expect(dt.className).toMatch(/\bbreak-words\b/);
+    for (const dd of dl.querySelectorAll("dd")) {
+      expect(dd.className).toMatch(/\bmin-w-0\b/);
+      expect(dd.className).toContain("[overflow-wrap:anywhere]");
+    }
+    // md+ table markup untouched.
+    expect(screen.getByRole("table", { name: "Orders" }).querySelector("dl")).toBeNull();
+  });
+
   it("shows empty, loading and error states", () => {
     const { rerender } = renderUi(<DataTable caption="Orders" columns={columns} rows={[]} rowKey={(r) => r.id} />);
     expect(screen.getByText("Nothing here yet")).toBeInTheDocument();
