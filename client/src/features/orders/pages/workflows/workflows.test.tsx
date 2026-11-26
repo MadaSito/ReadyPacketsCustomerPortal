@@ -548,14 +548,14 @@ describe("workflow designer — acceptance gates and storage folders (part B)", 
     await user.click(within(gates).getByRole("checkbox", { name: "Ask again when the policy has a new version" }));
 
     const storage = screen.getByRole("group", { name: "Storage folder" });
-    expect(within(storage).getByText("customers/RPCUS-A1B2C3D4E/orders/RP-2026-000123/Intake")).toBeInTheDocument();
+    expect(within(storage).getByText("customers/RPCUS-A1B2C3D4E/orders/RP-JJG5-ZEUGRE-ICEQUE-001/Intake")).toBeInTheDocument();
     const folder = within(storage).getByLabelText(/Default storage folder/);
     await user.type(folder, "../secret");
     expect(within(storage).getByText("No example yet: the folder path is not valid.")).toBeInTheDocument();
     await user.clear(folder);
     await user.click(folder);
     await user.paste("clients/{customer_ref}/{order_ref}");
-    expect(within(storage).getByText("clients/RPCUS-A1B2C3D4E/RP-2026-000123")).toBeInTheDocument();
+    expect(within(storage).getByText("clients/RPCUS-A1B2C3D4E/RP-JJG5-ZEUGRE-ICEQUE-001")).toBeInTheDocument();
 
     // Per-slot folder overrides the workflow default in the example.
     await user.click(screen.getAllByRole("button", { name: /^Add upload to / })[0]!);
@@ -702,7 +702,7 @@ describe("workflow designer — review summary", () => {
     expect(await within(summary).findByText("Synthetic order terms")).toBeInTheDocument();
     expect(summary).toHaveTextContent("before submitting from “Submitted”; type their full name; asked again for a new policy version");
     expect(summary).toHaveTextContent("Orders/{order_ref}; 1 upload slot uses its own folder");
-    expect(summary).toHaveTextContent("Example: Orders/RP-2026-000123");
+    expect(summary).toHaveTextContent("Example: Orders/RP-JJG5-ZEUGRE-ICEQUE-001");
     // 07.2: where the default lives (a new version of an existing workflow).
     expect(screen.getByText(/A draft must be published before it can be the default\./)).toHaveTextContent("You can change the default workflow any time with “Set as default” on the Workflows list.");
     // Increment 08 (D7): the default choice moved into the publish dialog.
