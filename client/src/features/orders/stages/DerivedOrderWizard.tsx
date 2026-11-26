@@ -55,6 +55,8 @@ export function DerivedOrderWizard({ orderId, waitingKind, waitingAction }: {
   const rules = useQuery(trpc.orders.requirements.forOrder.queryOptions({ orderId }));
   const files = useQuery(trpc.files.list.queryOptions({ orderId, limit: 1 }));
   const intake = useQuery(trpc.compliance.intake.listForOrder.queryOptions({ orderPublicId: orderId }));
+  // The order-level agreement gate (same cache as the gate card above the wizard).
+  const gate = useQuery(trpc.compliance.acceptance.forOrder.queryOptions({ orderId }));
   const transition = useMutation(trpc.orders.transition.mutationOptions());
   const [ack, setAck] = useState<Ack | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -62,12 +64,21 @@ export function DerivedOrderWizard({ orderId, waitingKind, waitingAction }: {
   const pendingFor = (key: string) => (count: number) => setPending((prev) => (prev[key] === count ? prev : { ...prev, [key]: count }));
   const pendingOf = (kind: "document" | "audio") => Object.entries(pending).reduce((n, [k, c]) => (k.startsWith(`${kind}:`) ? n + c : n), 0);
 
-  if (order.isPending || rules.isPending || files.isPending || intake.isPending) {
+  if (order.isPending || rules.isPending || files.isPending || intake.isPending || gate.isPending) {
     return <div role="status" aria-label="Loading your order steps" className="mb-6"><Skeleton lines={4} /></div>;
   }
   if (!order.data) return null;
 
   const terminal = order.data.statusKind === "terminal";
+  // One accept prompt at a time: while the agreement gate above is pending, the wizard waits for it.
+  const gatePending = (gate.data?.gates ?? []).some((g) => g.required && g.applies && !g.met);
+  if (!terminal && gatePending) {
+    return (
+      <Card>
+        <p className="p-4 text-body sm:px-6" data-wizard-waiting="agreement">Accept the agreement above to continue.</p>
+      </Card>
+    );
+  }
   const r = rules.data;
   const page = files.data;
   const policy = page?.canUpload ? page.uploadPolicy : null;

@@ -78,9 +78,11 @@ const safeError = (reasonCode: string) => Object.assign(new Error(reasonCode), {
 beforeEach(() => {
   for (const key of Object.keys(handlers)) delete handlers[key];
   uploadPending.clear();
-  // What the steps read before choosing where to resume: no uploads yet, no questions.
+  // What the steps read before choosing where to resume: no uploads yet, one optional question.
   handlers["files.list"] = () => ({ items: [], nextCursor: null });
-  handlers["orders.questions.customerList"] = () => ({ canAnswer: true, questions: [] });
+  handlers["orders.questions.customerList"] = () => ({ canAnswer: true, questions: [
+    { questionId: "q2", prompt: "Anything else?", required: false, askedAt: new Date(), latestAnswer: null },
+  ] });
 });
 
 describe("CustomerPhaseWizard", () => {
@@ -177,6 +179,40 @@ describe("CustomerPhaseWizard", () => {
     await waitFor(() => expect(seen).toEqual([{ orderId: ORDER, expectedVersion: 3, toStatus: "in_review" }]));
   });
 
+  it("leaves out the Questions step when the phase has no questions; keeps it with one", async () => {
+    handlers["orders.stages.workspace"] = () => ws();
+    handlers["orders.questions.customerList"] = () => ({ canAnswer: true, questions: [] });
+    const view = renderUi(<CustomerPhaseWizard orderId={ORDER} />);
+    expect(await screen.findByRole("heading", { name: "Step 1 of 2: Upload documents" })).toBeInTheDocument();
+    expect(screen.queryByText(/^questions intake/)).toBeNull();
+    view.unmount();
+    handlers["orders.questions.customerList"] = () => ({ canAnswer: true, questions: [
+      { questionId: "q2", prompt: "Anything else?", required: false, askedAt: new Date(), latestAnswer: null },
+    ] });
+    renderUi(<CustomerPhaseWizard orderId={ORDER} />);
+    expect(await screen.findByRole("heading", { name: "Step 2 of 3: Upload documents" })).toBeInTheDocument();
+    expect(screen.getByText("questions intake ro=false h4")).toBeInTheDocument();
+  });
+
+  it("a derived order with a pending agreement gate shows one line, not a second accept step", async () => {
+    handlers["orders.stages.workspace"] = () => ws({ derived: true, workflowFormat: 2, stages: [stage({ canNext: false, actions: { ...actions, answerQuestions: false, uploadDocuments: false } })] });
+    handlers["orders.get"] = () => ({ statusKind: "active", version: 3, transitions: [] });
+    handlers["orders.requirements.forOrder"] = () => ({ status: { key: "submitted" }, uploads: [],
+      acknowledgements: [{ key: "terms", acceptedBy: "customer", canAccept: true, met: false }] });
+    handlers["files.list"] = () => ({ items: [], nextCursor: null, canUpload: false, uploadSlots: null, audio: null, uploadPolicy: null });
+    handlers["compliance.intake.listForOrder"] = () => ({ items: [], lockState: "none" });
+    handlers["compliance.acceptance.forOrder"] = () => ({ gates: [{ key: "tos", required: true, applies: true, met: false, acceptance: null }] });
+    const view = renderUi(<CustomerPhaseWizard orderId={ORDER} />);
+    expect(await screen.findByText("Accept the agreement above to continue.")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: /Review and accept/ })).toBeNull();
+    view.unmount();
+    // Once the gate is met, the wizard's own steps come back.
+    handlers["compliance.acceptance.forOrder"] = () => ({ gates: [{ key: "tos", required: true, applies: true, met: true, acceptance: { at: new Date() } }] });
+    renderUi(<CustomerPhaseWizard orderId={ORDER} />);
+    expect(await screen.findByRole("heading", { name: "Step 1 of 2: Review and accept" })).toBeInTheDocument();
+    expect(screen.queryByText("Accept the agreement above to continue.")).toBeNull();
+  });
+
   it("a derived order with nothing to do shows one waiting screen, never a dead end", async () => {
     handlers["orders.stages.workspace"] = () => ws({ derived: true, workflowFormat: 1, stages: [stage({ canNext: false, actions: { ...actions, answerQuestions: false, uploadDocuments: false } })] });
     handlers["orders.get"] = () => ({ statusKind: "active", version: 3, transitions: [] });
@@ -196,7 +232,11 @@ describe("CustomerPhaseWizard", () => {
     ] });
     const view = renderUi(<CustomerPhaseWizard orderId={ORDER} />);
     expect(await screen.findByText("This step completes when your payment is confirmed.")).toBeInTheDocument();
-    expect(await screen.findByRole("link", { name: "Pay now (invoice INV-2)" })).toHaveAttribute("href", "/invoices/inv_open");
+    const pay = await screen.findByRole("link", { name: "Pay now, invoice INV-2" });
+    expect(pay).toHaveAttribute("href", "/invoices/inv_open");
+    // The primary button of the screen; the invoice number is separate text beside it, not glued to the label.
+    expect(pay).toHaveTextContent(/^Pay now$/);
+    expect(screen.getByText("Invoice INV-2")).not.toBe(pay);
     expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
     view.unmount();
     handlers["compliance.invoices.listForOrder"] = () => ({ items: [] });

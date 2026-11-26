@@ -11,7 +11,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import type { StageActionKey } from "@shared/workflowStages";
 import { safeError, useTRPC } from "@/lib/trpc";
 import { Link } from "wouter";
-import { Skeleton } from "@/ui";
+import { Skeleton, buttonClasses } from "@/ui";
 import { PhaseArchiveAction } from "../../files/archives/ArchiveAction";
 import { PhaseTeamFiles, PhaseUploadPanel, PhaseUploadedFiles } from "../../files/PhaseFiles";
 import { DerivedOrderWizard } from "./DerivedOrderWizard";
@@ -104,6 +104,9 @@ export function CustomerPhaseWizard({ orderId, fallback, waitingAction, completi
     questionsOn && stage.key === current?.key && questions.data
       ? questions.data.questions.filter((q) => q.required && !q.latestAnswer).map((q) => ({ questionId: q.questionId, prompt: q.prompt }))
       : [];
+  // Questions configured or assigned to the current phase; null while unknown (the step stays until it is known).
+  const questionCount = (stage: WizardStage): number | null =>
+    questionsOn && stage.key === current?.key && questions.data ? questions.data.questions.length : null;
 
   // Files already uploaded in the current writable phase (same queries as "Uploaded in this phase").
   const writableCurrent = Boolean(data && current && isWritable(data, current));
@@ -190,9 +193,17 @@ export function CustomerPhaseWizard({ orderId, fallback, waitingAction, completi
   };
 
   const paymentAction = payable ? (
-    <Link href={`/invoices/${encodeURIComponent(payable.invoicePublicId)}`} className="inline-flex min-h-11 items-center font-semibold text-action underline underline-offset-2">
-      Pay now{payable.invoiceNumber ? <>{" "}<span className="font-normal">(invoice {payable.invoiceNumber})</span></> : null}
-    </Link>
+    // The primary action of the payment waiting screen; the invoice number sits beside it (and is in the name).
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+      <Link
+        href={`/invoices/${encodeURIComponent(payable.invoicePublicId)}`}
+        className={buttonClasses("primary")}
+        aria-label={payable.invoiceNumber ? `Pay now, invoice ${payable.invoiceNumber}` : undefined}
+      >
+        Pay now
+      </Link>
+      {payable.invoiceNumber ? <span aria-hidden="true" className="min-w-0 break-words text-sm text-muted">Invoice {payable.invoiceNumber}</span> : null}
+    </div>
   ) : invoices.isSuccess && waitsForPayment ? <p>{INVOICE_PREPARING_MESSAGE}</p> : null;
   // Derived workflows (formats 1/2) have no phase actions: the order-level wizard offers what the server allows.
   const derivedKind = derivedWaitingKind(workspace);
@@ -219,6 +230,7 @@ export function CustomerPhaseWizard({ orderId, fallback, waitingAction, completi
       error={error}
       pendingUploads={pendingUploads}
       unansweredRequired={unansweredRequired}
+      questionCount={questionCount}
       uploadCounts={uploadCounts}
       factsReady={factsReady}
       waitingAction={waitingAction}

@@ -47,6 +47,8 @@ export interface PhaseWizardProps {
   completion?: ReactNode;
   /** Required questions without a saved answer in a phase. */
   unansweredRequired?: (stage: WizardStage) => readonly UnansweredQuestion[];
+  /** Questions configured or assigned to a phase (null when unknown). With 0 the Questions step is left out. */
+  questionCount?: (stage: WizardStage) => number | null;
   /** Shown when the phase waits for payment: the pay-invoice link, or that the invoice is being prepared. */
   paymentAction?: ReactNode;
   /** Replaces the current phase's panel (derived workflows: the order-level wizard); earlier phases still open read-only. */
@@ -55,7 +57,7 @@ export interface PhaseWizardProps {
   announcement?: string | null;
 }
 
-export function PhaseWizard({ workspace, renderAction, renderStageExtras, onNext, onSubmit, busy, error, pendingUploads, unansweredRequired, uploadCounts, factsReady, paymentAction, waitingAction, completion, currentBody, announcement }: PhaseWizardProps) {
+export function PhaseWizard({ workspace, renderAction, renderStageExtras, onNext, onSubmit, busy, error, pendingUploads, unansweredRequired, questionCount, uploadCounts, factsReady, paymentAction, waitingAction, completion, currentBody, announcement }: PhaseWizardProps) {
   const current = currentStage(workspace);
   const [viewKey, setViewKey] = useState<string | null>(null);
   /** Set when leaving the current phase would discard selected files (the panels unmount); bumps focus. */
@@ -109,6 +111,7 @@ export function PhaseWizard({ workspace, renderAction, renderStageExtras, onNext
           error={error}
           pendingUploads={pendingUploads}
           unansweredRequired={unansweredRequired}
+          questionCount={questionCount}
           uploadCounts={uploadCounts}
           factsReady={factsReady}
           paymentAction={paymentAction}
@@ -124,7 +127,7 @@ export function PhaseWizard({ workspace, renderAction, renderStageExtras, onNext
   );
 }
 
-function StagePanel({ workspace, stage, isCurrent, onBackToCurrent, focusToken, renderAction, renderStageExtras, onNext, onSubmit, busy, error, pendingUploads, unansweredRequired, uploadCounts, factsReady, paymentAction, waitingAction, leaveBlock }: {
+function StagePanel({ workspace, stage, isCurrent, onBackToCurrent, focusToken, renderAction, renderStageExtras, onNext, onSubmit, busy, error, pendingUploads, unansweredRequired, questionCount, uploadCounts, factsReady, paymentAction, waitingAction, leaveBlock }: {
   workspace: WizardWorkspace; stage: WizardStage; isCurrent: boolean; onBackToCurrent?: () => void; focusToken: number; leaveBlock: number;
 } & Omit<PhaseWizardProps, "workspace" | "announcement" | "completion">) {
   const headingRef = useRef<HTMLHeadingElement>(null);
@@ -200,6 +203,7 @@ function StagePanel({ workspace, stage, isCurrent, onBackToCurrent, focusToken, 
               error={error}
               pendingUploads={pendingUploads}
               unansweredRequired={unansweredRequired}
+              questionCount={questionCount}
               uploadCounts={uploadCounts}
             />
           )
@@ -256,9 +260,9 @@ function readFlag(key: string): boolean { return ticks.has(key); }
 function writeFlag(key: string, on: boolean): void { if (on) ticks.add(key); else ticks.delete(key); }
 
 /** The steps of the current, writable phase: accept → questions → documents → audio → review and submit. */
-function CurrentPhaseSteps({ workspace, stage, renderAction, renderStageExtras, onNext, onSubmit, busy, error, pendingUploads, unansweredRequired, uploadCounts }: {
+function CurrentPhaseSteps({ workspace, stage, renderAction, renderStageExtras, onNext, onSubmit, busy, error, pendingUploads, unansweredRequired, questionCount, uploadCounts }: {
   workspace: WizardWorkspace; stage: WizardStage;
-} & Pick<PhaseWizardProps, "renderAction" | "renderStageExtras" | "onNext" | "onSubmit" | "busy" | "error" | "pendingUploads" | "unansweredRequired" | "uploadCounts">) {
+} & Pick<PhaseWizardProps, "renderAction" | "renderStageExtras" | "onNext" | "onSubmit" | "busy" | "error" | "pendingUploads" | "unansweredRequired" | "questionCount" | "uploadCounts">) {
   const policy = stage.acknowledgement.policy;
   const hash = stage.acknowledgement.textSha256;
   const storageKey = ackStorageKey(workspace.orderId, stage.key, hash);
@@ -270,7 +274,7 @@ function CurrentPhaseSteps({ workspace, stage, renderAction, renderStageExtras, 
   const counts = uploadCounts?.(stage.key) ?? { documents: 0, audio: 0 };
   const steps = buildSteps({
     accept: { present: Boolean(stage.contentMarkdown) || policy !== "none" || stage.actions.teamFileReview, required: policy === "required" ? 1 : 0, provided: ticked ? 1 : 0 },
-    questions: { present: stage.actions.answerQuestions, required: unanswered.length, provided: 0 },
+    questions: { present: stage.actions.answerQuestions && (questionCount?.(stage) ?? 1) > 0, required: unanswered.length, provided: 0 },
     documents: { present: stage.actions.uploadDocuments, required: 0, provided: counts.documents, pending: pendingUploads?.(stage.key, "document") ?? 0 },
     audio: { present: stage.actions.recordAudio || stage.actions.uploadAudio, required: 0, provided: counts.audio, pending: pendingUploads?.(stage.key, "audio") ?? 0 },
   });
