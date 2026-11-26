@@ -86,6 +86,7 @@ function normalizeRuleType(raw: string | null | undefined): CartUpsellRuleType {
 function buildBundleCompletionCandidate(params: {
   availableLines: readonly CartLineView[];
   lineByPacket: ReadonlyMap<number, CartLineView>;
+  excludedPacketNumbers?: ReadonlySet<number>;
   catalogGroups: readonly CatalogGroupView[];
   bundleRule: BundleRule;
   currency: string;
@@ -105,6 +106,7 @@ function buildBundleCompletionCandidate(params: {
   const {
     availableLines,
     lineByPacket,
+    excludedPacketNumbers,
     catalogGroups,
     bundleRule,
     currency,
@@ -124,6 +126,10 @@ function buildBundleCompletionCandidate(params: {
   const presentRequiredCount = required.filter((n) => lineByPacket.has(n)).length;
   const missingPacketNumbers = required.filter((n) => !lineByPacket.has(n));
   if (missingPacketNumbers.length < 1) return null;
+  // Never suggest completing a bundle with packets already in the cart's target project (D3).
+  if (excludedPacketNumbers && missingPacketNumbers.some((n) => excludedPacketNumbers.has(n))) {
+    return null;
+  }
 
   if (requireMultiplePacketsForLargeBundle && required.length >= 4) {
     // D3(b): complete-the-bundle when several packets (>= 2) are in the cart.
@@ -225,6 +231,7 @@ export function computeEligibleUpsells(input: {
   dismissedOfferKeys: ReadonlySet<string>;
   now: Date;
   hasConfiguredBundleOffer?: boolean;
+  excludedPacketNumbers?: ReadonlySet<number>;
 }): CartUpsellSuggestionView[] {
   const {
     availableLines,
@@ -235,6 +242,7 @@ export function computeEligibleUpsells(input: {
     dismissedOfferKeys,
     now,
     hasConfiguredBundleOffer = false,
+    excludedPacketNumbers,
   } = input;
   if (availableLines.length === 0) return [];
 
@@ -279,6 +287,7 @@ export function computeEligibleUpsells(input: {
       const bundleCand = buildBundleCompletionCandidate({
         availableLines,
         lineByPacket,
+        ...(excludedPacketNumbers ? { excludedPacketNumbers } : {}),
         catalogGroups,
         bundleRule,
         currency,
@@ -312,8 +321,13 @@ export function computeEligibleUpsells(input: {
     };
 
     if (offer.kind === "add_on") {
-      // Never suggest a packet product whose packet number is already in the cart (would break 1-tier-per-packet).
-      if (target.packetNumber !== null && lineByPacket.has(target.packetNumber)) continue;
+      // Never suggest a packet product whose packet number is already in the cart or in the target project (D3).
+      if (
+        target.packetNumber !== null &&
+        (lineByPacket.has(target.packetNumber) || excludedPacketNumbers?.has(target.packetNumber))
+      ) {
+        continue;
+      }
 
       candidates.push({
         priority: offer.priority,
@@ -373,6 +387,7 @@ export function computeEligibleUpsells(input: {
     const fallbackCand = buildBundleCompletionCandidate({
       availableLines,
       lineByPacket,
+      ...(excludedPacketNumbers ? { excludedPacketNumbers } : {}),
       catalogGroups,
       bundleRule,
       currency,
@@ -737,8 +752,18 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
       bundleRule: BundleRule;
       dbOrTx: DbOrTx;
       recordImpressions: boolean;
+      excludedPacketNumbers?: ReadonlySet<number>;
     }): Promise<CartUpsellSuggestionView[]> {
-      const { openCart, availableLines, catalogGroups, catalogMap, bundleRule, dbOrTx, recordImpressions } = input;
+      const {
+        openCart,
+        availableLines,
+        catalogGroups,
+        catalogMap,
+        bundleRule,
+        dbOrTx,
+        recordImpressions,
+        excludedPacketNumbers,
+      } = input;
       if (!openCart || availableLines.length === 0) return [];
 
       const enabled = await isUpsellEnabled(dbOrTx);
@@ -776,6 +801,7 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
         dismissedOfferKeys,
         now,
         hasConfiguredBundleOffer: configuredBundleRows.length > 0,
+        ...(excludedPacketNumbers ? { excludedPacketNumbers } : {}),
       });
 
       if (recordImpressions && suggestions.length > 0) {
@@ -950,10 +976,18 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
           stateRows.filter((s) => s.dismissedAt !== null).map((s) => s.offerKey),
         );
 
-        // 5. Read live catalog + bundle rule INSIDE the transaction under `tx` (`forShare: true`) so deactivated
-        //    or repriced products and updated bundle rules are evaluated atomically without taking a 2nd pool connection.
-        const catalogGroups = await ordersSvc.listActiveCatalog(tx, { forShare: true });
-        const bundleRule = await ordersSvc.getBundleRule(tx);
+        // 5. Read live catalog + bundle rule + optional D3 add-on target INSIDE the transaction under `tx`.
+        const [catalogGroups, bundleRule, addOnTarget] = await Promise.all([
+          ordersSvc.listActiveCatalog(tx, { forShare: true }),
+          ordersSvc.getBundleRule(tx),
+          cart.addToOrderPublicId
+            ? ordersSvc.addOnTargetInTx(tx, principal.userId, cart.addToOrderPublicId)
+            : Promise.resolve(null),
+        ]);
+        if (cart.addToOrderPublicId && !addOnTarget) {
+          throw conflict("ADD_ON_TARGET_UNAVAILABLE", "Packets can no longer be added to this project.");
+        }
+        const excludedPacketNumbers = addOnTarget ? new Set(addOnTarget.packetNumbers) : undefined;
         const catalogMap = indexCatalog(catalogGroups);
         const liveLines = await computeLiveLines(cart.id, catalogMap, tx);
         const availableLines = liveLines.filter((l) => l.available);
@@ -969,11 +1003,25 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
           dismissedOfferKeys,
           now,
           hasConfiguredBundleOffer: configuredBundleRows.length > 0,
+          ...(excludedPacketNumbers ? { excludedPacketNumbers } : {}),
         });
 
         const matched = eligibleSuggestions.find((s) => s.offerPublicId === input.offerPublicId);
         if (!matched) {
           throw validation("UPSELL_NOT_AVAILABLE", "This suggestion is no longer available for your cart.");
+        }
+        if (addOnTarget) {
+          for (const target of matched.targetProducts) {
+            if (target.currency !== addOnTarget.currency) {
+              throw conflict("ADD_ON_TARGET_UNAVAILABLE", "Packets can no longer be added to this project.");
+            }
+            if (target.packetNumber !== null && excludedPacketNumbers?.has(target.packetNumber)) {
+              throw conflict(
+                "PACKET_ALREADY_IN_PROJECT",
+                "A selected packet is already part of this project. Remove it and try again.",
+              );
+            }
+          }
         }
 
         let nextPosition = existingItems.reduce((maxPos, r) => Math.max(maxPos, r.position + 1), 0);

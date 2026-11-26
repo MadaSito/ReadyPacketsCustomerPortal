@@ -16,7 +16,7 @@ export {
   CART_UPSELL_SEEDED_KEYS,
   parseCartUpsellSeededKeysSetting,
 } from "./settings.js";
-export { BUNDLE_COMPLETION_OFFER_KEY } from "./types.js";
+export { BUNDLE_COMPLETION_OFFER_KEY, billingDetailsSchema } from "./types.js";
 export type * from "./types.js";
 
 export function createCartModule(deps: ModuleDeps): CartModule {
