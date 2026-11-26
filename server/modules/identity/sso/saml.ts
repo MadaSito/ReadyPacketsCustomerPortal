@@ -45,6 +45,8 @@ export const SAML_CLAIMS = {
   displayName: "http://schemas.microsoft.com/identity/claims/displayname",
   email: "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
   name: "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name",
+  givenName: "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname",
+  surname: "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/surname",
   role: "http://schemas.microsoft.com/ws/2008/06/identity/claims/role",
 } as const;
 /** The value Entra puts in authnmethodsreferences when the sign-in satisfied MFA. */
@@ -249,6 +251,9 @@ export interface VerifiedSamlAssertion {
   roles: string[];
   email: string | null;
   name: string | null;
+  /** D1: givenname / surname claims (name hints only). */
+  givenName: string | null;
+  familyName: string | null;
   /** Attribute names present (never values) — for "Test sign-in". */
   attributeNames: string[];
 }
@@ -399,6 +404,8 @@ export async function verifySamlResponse(samlResponse: unknown, ctx: SamlValidat
     roles: (attributes.get(SAML_CLAIMS.role) ?? []).filter((r) => /^[A-Za-z0-9._-]{1,120}$/.test(r)).slice(0, 50),
     email,
     name: name || null,
+    givenName: one(SAML_CLAIMS.givenName)?.replace(/[\p{Cc}<>]/gu, "").slice(0, 120) || null,
+    familyName: one(SAML_CLAIMS.surname)?.replace(/[\p{Cc}<>]/gu, "").slice(0, 120) || null,
     attributeNames: [...attributes.keys()].slice(0, 50),
   };
 }

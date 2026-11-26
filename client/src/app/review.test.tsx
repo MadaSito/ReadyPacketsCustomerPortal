@@ -49,7 +49,8 @@ describe("register is uniform (C-04)", () => {
   it("never renders a preview verification link, whether or not the server returned one", async () => {
     for (const result of [{ accepted: true as const, previewLink: "/verify-email?token=leak" }, { accepted: true as const }]) {
       const { unmount, container } = renderUi(<RegisterPage />, { path: "/register", api: fakeAuthApi({ register: async () => result, presentation: async () => presentation(true) }) });
-      fireEvent.change(screen.getByLabelText(/full name/i), { target: { value: "Avery" } });
+      fireEvent.change(screen.getByLabelText(/^first name/i), { target: { value: "Avery" } });
+      fireEvent.change(screen.getByLabelText(/^last name/i), { target: { value: "Example" } });
       fireEvent.change(screen.getByLabelText(/^email/i), { target: { value: "a@example.test" } });
       fireEvent.change(screen.getByLabelText(/^password/i), { target: { value: "correct horse battery staple" } });
       fireEvent.click(screen.getByRole("checkbox"));

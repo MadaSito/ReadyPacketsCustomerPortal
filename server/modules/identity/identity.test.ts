@@ -17,9 +17,13 @@ import { newRequestContext } from "../../core/requestContext.js";
 import { createCallerFactory } from "../../trpc/trpc.js";
 import { PASSWORD_RESET_JOB } from "./auth.js";
 import { identityRouter } from "./router.js";
+import { deriveNameParts } from "./normalize.js";
 import { createIdentityModule, type IdentityModule } from "./index.js";
 import { createPasswordHasher } from "./password/hasher.js";
 import { customerRefHistory, customerRefReservations, identityTokens, sessionRestrictions, signInEvents, users, userSessions } from "./schema.js";
+
+/** D1: tests written with one display name use the same lazy split as legacy accounts. */
+const partsOf = (name: string) => deriveNameParts(name);
 
 const PW = "copper lantern drifts beyond quiet harbor";
 const PW2 = "violet glacier hums under amber skies";
@@ -106,7 +110,7 @@ describe("identity module (MySQL)", () => {
   describe("registration", () => {
     it("creates an account, sends verification, audits in tx; preview returns only its own link", async () => {
       build({ deploymentProfile: "preview" });
-      const result = await identity.auth.register({ email: `new${Date.now()}@example.test`, name: "Nova Tester", password: PW }, {});
+      const result = await identity.auth.register({ email: `new${Date.now()}@example.test`, nameParts: partsOf("Nova Tester"), password: PW }, {});
       expect(result.previewLink).toMatch(/^\/verify-email\?token=[A-Za-z0-9_-]{43}$/);
       expect(h.mailer.last("auth.verify_email")).toBeDefined();
       expect(h.audit.named("auth.register.requested")[0]?.outcome).toBe("completed");
@@ -116,7 +120,7 @@ describe("identity module (MySQL)", () => {
     it("existing address: same response shape, no link, notification mail, audited in tx (no enumeration)", async () => {
       build({ deploymentProfile: "preview" });
       const existing = await makeUser();
-      const result = await identity.auth.register({ email: existing.email.toUpperCase(), name: "Other", password: PW2 }, {});
+      const result = await identity.auth.register({ email: existing.email.toUpperCase(), nameParts: partsOf("Other"), password: PW2 }, {});
       expect(result).toEqual({ accepted: true });
       expect(h.mailer.last("auth.account_exists")).toBeDefined();
       expect(h.audit.named("auth.register.requested")[0]).toMatchObject({ outcome: "refused", reasonCode: "EXISTING_ACCOUNT" });
@@ -124,19 +128,19 @@ describe("identity module (MySQL)", () => {
     });
 
     it("rejects weak passwords before any lookup, and closed registration", async () => {
-      await rejects(identity.auth.register({ email: "weak@example.test", name: "W", password: "short" }, {}), "PASSWORD_TOO_SHORT");
+      await rejects(identity.auth.register({ email: "weak@example.test", nameParts: partsOf("W"), password: "short" }, {}), "PASSWORD_TOO_SHORT");
       h.settings.values.set("identity.registration.enabled", false);
-      await rejects(identity.auth.register({ email: "closed@example.test", name: "C", password: PW }, {}), "REGISTRATION_DISABLED");
+      await rejects(identity.auth.register({ email: "closed@example.test", nameParts: partsOf("C"), password: PW }, {}), "REGISTRATION_DISABLED");
     });
 
     it("throttles by account blind index (never the raw address)", async () => {
-      await identity.auth.register({ email: `thr${Date.now()}@example.test`, name: "T", password: PW }, {});
+      await identity.auth.register({ email: `thr${Date.now()}@example.test`, nameParts: partsOf("T"), password: PW }, {});
       const call = h.rateLimiter.calls.find((c) => c.category === "auth_high_risk")!;
       expect(call.key).toMatch(/^register:[0-9a-f]{64}$/);
       h.rateLimiter.blocked.add("auth_high_risk");
-      await rejects(identity.auth.register({ email: "x@example.test", name: "T", password: PW }, {}), "RATE_LIMITED");
+      await rejects(identity.auth.register({ email: "x@example.test", nameParts: partsOf("T"), password: PW }, {}), "RATE_LIMITED");
       // I-3: one sampled note per subject per minute; the subject key never appears.
-      await rejects(identity.auth.register({ email: "x@example.test", name: "T", password: PW }, {}), "RATE_LIMITED");
+      await rejects(identity.auth.register({ email: "x@example.test", nameParts: partsOf("T"), password: PW }, {}), "RATE_LIMITED");
       const notes = h.audit.notes.filter((n) => n.eventName === "auth.rate_limited");
       expect(notes).toHaveLength(1);
       expect(notes[0]).toMatchObject({ outcome: "denied", attributes: { category: "auth_high_risk", subject: "register" } });
@@ -146,9 +150,143 @@ describe("identity module (MySQL)", () => {
     it("audit failure ⇒ no account row", async () => {
       const email = `af${Date.now()}@example.test`;
       h.audit.failRecords = true;
-      await expect(identity.auth.register({ email, name: "A", password: PW }, {})).rejects.toThrow();
+      await expect(identity.auth.register({ email, nameParts: partsOf("A"), password: PW }, {})).rejects.toThrow();
       h.audit.failRecords = false;
       expect(await identity.findUserIdByEmail(email)).toBeNull();
+    });
+
+    /* ---- increment 08: D1 names + D4 optional billing at registration ---- */
+
+    const BILLING = {
+      fullName: "Zeus Greene", company: "", email: "billing@example.test", country: "US", region: "",
+      addressLine1: "1 Synthetic Way", addressLine2: "", city: "Testville", postalCode: "00001", taxId: "",
+    };
+    function fakeBillingPort() {
+      const calls: { userId: number; actor: unknown; inTx: boolean }[] = [];
+      (h.services as unknown as { billingProfile?: unknown }).billingProfile = {
+        saveForUserInTx: async (tx: unknown, userId: number, _details: unknown, actor: unknown) => {
+          calls.push({ userId, actor, inTx: Boolean(tx) });
+          return { details: BILLING, version: 1, updatedAt: h.clock.now() };
+        },
+      };
+      return calls;
+    }
+
+    it("D1: stores the name parts; display name is \"<First> <Last>\"; greeting uses preferred, else first", async () => {
+      build({ deploymentProfile: "preview" });
+      const email = `parts${Date.now()}@example.test`;
+      await identity.auth.register({ email, nameParts: { firstName: "Zeus", lastName: "Greene", preferredName: "Zed" }, password: PW }, {});
+      const found = (await identity.findUserIdByEmail(email))!;
+      const row = await userRow(found.userId);
+      expect(row.firstNameEnc).not.toBeNull();
+      expect(row.lastNameEnc).not.toBeNull();
+      const view = (await identity.getUser(found.userId))!;
+      expect(view).toMatchObject({ name: "Zeus Greene", firstName: "Zeus", lastName: "Greene", preferredName: "Zed", greetingName: "Zed", namePartsStored: true });
+      expect(h.mailer.last("auth.verify_email")?.vars).toMatchObject({ name: "Zed" });
+      expect(JSON.stringify(h.audit.events)).not.toMatch(/Zeus|Greene|Zed/);
+    });
+
+    it("D4: billing is saved in the registration tx only for a NEW account; existing address gets the same response", async () => {
+      build({ deploymentProfile: "production" });
+      const calls = fakeBillingPort();
+      const fresh = await identity.auth.register({ email: `bill${Date.now()}@example.test`, nameParts: partsOf("Zeus Greene"), password: PW, billing: BILLING }, {});
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatchObject({ actor: { role: "customer", via: "registration" }, inTx: true });
+      expect(h.audit.named("auth.register.requested").at(-1)?.attributes).toMatchObject({ billing: "saved" });
+
+      const existing = await makeUser();
+      const again = await identity.auth.register({ email: existing.email, nameParts: partsOf("Zeus Greene"), password: PW2, billing: BILLING }, {});
+      expect(calls).toHaveLength(1);
+      expect(again).toEqual(fresh);
+      expect(JSON.stringify(h.audit.events)).not.toMatch(/Synthetic Way|billing@example/);
+    });
+
+    it("D4: a missing billing module means 'skip saving' (account still created, audited as skipped)", async () => {
+      (h.services as unknown as { billingProfile?: unknown }).billingProfile = undefined;
+      const email = `skip${Date.now()}@example.test`;
+      await identity.auth.register({ email, nameParts: partsOf("Zeus Greene"), password: PW, billing: BILLING }, {});
+      expect(await identity.findUserIdByEmail(email)).not.toBeNull();
+      expect(h.audit.named("auth.register.requested").at(-1)?.attributes).toMatchObject({ billing: "skipped" });
+    });
+
+    it("D4: a billing save failure rolls the whole registration back (atomic)", async () => {
+      (h.services as unknown as { billingProfile?: unknown }).billingProfile = {
+        saveForUserInTx: async () => { throw new DomainError("VALIDATION", "BILLING_INVALID", "Check the billing details."); },
+      };
+      const email = `roll${Date.now()}@example.test`;
+      await rejects(identity.auth.register({ email, nameParts: partsOf("Zeus Greene"), password: PW, billing: BILLING }, {}), "BILLING_INVALID");
+      expect(await identity.findUserIdByEmail(email)).toBeNull();
+    });
+
+    it("D1 router: names are validated (required first/last, ≤50, no markup) and billing is validated before any lookup", async () => {
+      const caller = createCallerFactory(identityRouter)({ services: h.services, session: null, request: newRequestContext("test"), transport: { issue() {}, clear() {} } } as never);
+      const base = { email: `r${Date.now()}@example.test`, password: PW };
+      await expect(caller.register({ ...base, firstName: "", lastName: "Greene" })).rejects.toMatchObject({ code: "BAD_REQUEST" });
+      await expect(caller.register({ ...base, firstName: "Z".repeat(51), lastName: "Greene" })).rejects.toMatchObject({ code: "BAD_REQUEST" });
+      await expect(caller.register({ ...base, firstName: "<b>", lastName: "Greene" })).rejects.toMatchObject({ code: "BAD_REQUEST" });
+      await expect(caller.register({ ...base, firstName: "Zeus", lastName: "Greene", billing: { ...BILLING, city: "" } })).rejects.toMatchObject({ code: "BAD_REQUEST" });
+      expect(h.audit.named("auth.register.requested")).toHaveLength(0);
+      expect(h.mailer.sent).toHaveLength(0);
+    });
+  });
+
+  describe("D1 backward compatibility (pre-08 clients send `name`)", () => {
+    const anon = () => createCallerFactory(identityRouter)({ services: h.services, session: null, request: newRequestContext("test"), transport: { issue() {}, clear() {} } } as never);
+    it("register still accepts the legacy single name; parts are derived lazily; mixing both forms is refused", async () => {
+      const email = `legacy${Date.now()}@example.test`;
+      expect(await anon().register({ email, name: "Zeus Greene", password: PW })).toEqual({ accepted: true });
+      const found = (await identity.findUserIdByEmail(email))!;
+      expect((await userRow(found.userId)).firstNameEnc).toBeNull();
+      expect(await identity.getUser(found.userId)).toMatchObject({ name: "Zeus Greene", firstName: "Zeus", lastName: "Greene", namePartsStored: false });
+      await expect(anon().register({ email: `mix${Date.now()}@example.test`, name: "Zeus Greene", firstName: "Zeus", lastName: "Greene", password: PW })).rejects.toMatchObject({ code: "BAD_REQUEST" });
+      await expect(anon().register({ email: `none${Date.now()}@example.test`, password: PW })).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    });
+
+    it("a legacy profile save replaces the display name and clears stored parts", async () => {
+      const u = await makeUser();
+      const { principal } = await session(u.email);
+      await identity.admin.updateOwnProfile(principal, { nameParts: { firstName: "Zeus", lastName: "Greene", preferredName: "Zed" } });
+      await identity.admin.updateOwnProfile(principal, { name: "Ice Queen" });
+      expect(await identity.getUser(u.id)).toMatchObject({ name: "Ice Queen", firstName: "Ice", lastName: "Queen", preferredName: null, namePartsStored: false });
+    });
+  });
+
+  describe("D1 name parts (legacy + ports)", () => {
+    it("legacy accounts derive parts lazily (first/last token; one token → last \"\"), stored at the next profile save", async () => {
+      const u = await makeUser();
+      await db.db.update(users).set({ firstNameEnc: null, lastNameEnc: null, preferredNameEnc: null }).where(eq(users.id, u.id));
+      const view = (await identity.getUser(u.id))!;
+      expect(view).toMatchObject({ firstName: "Synthetic", lastName: view.name.split(" ").at(-1), namePartsStored: false, greetingName: "Synthetic" });
+      expect(await identity.users.namePartsInTx(db.db, u.id)).toMatchObject({ firstName: "Synthetic", preferredName: null });
+      const { principal } = await session(u.email);
+      await identity.admin.updateOwnProfile(principal, { nameParts: { firstName: "Zeus", lastName: "Greene", preferredName: null } });
+      const after = (await identity.getUser(u.id))!;
+      expect(after).toMatchObject({ name: "Zeus Greene", namePartsStored: true, greetingName: "Zeus" });
+      expect(h.audit.named("identity.profile.updated").at(-1)?.attributes).toMatchObject({ name_changed: true });
+    });
+
+    it("namePartsInTx: parts + customerRef; unknown user → NOT_FOUND USER_NOT_FOUND; no audit", async () => {
+      const u = await makeUser();
+      const parts = await identity.users.namePartsInTx(db.db, u.id);
+      expect(parts.customerRef).toBe(u.customerRef);
+      expect(h.audit.events).toHaveLength(0);
+      await rejects(identity.users.namePartsInTx(db.db, 99_999_999), "USER_NOT_FOUND");
+    });
+
+    it("admin updateCustomerName: capability-gated, optimistic version, audited without the name", async () => {
+      const admin = await makeUser({ role: "admin" });
+      const cust = await makeUser();
+      const { principal } = await session(admin.email, { stepUp: true });
+      const version = (await userRow(cust.id)).version;
+      const out = await identity.admin.updateCustomerName(principal, cust.publicId, { nameParts: { firstName: "Zeus", lastName: "Greene", preferredName: "Zed" }, expectedVersion: version });
+      expect(out.version).toBe(version + 1);
+      expect((await identity.getUser(cust.id))!).toMatchObject({ name: "Zeus Greene", preferredName: "Zed" });
+      const [event] = h.audit.named("admin.customer.name_updated");
+      expect(event).toMatchObject({ resource: { type: "user", publicId: cust.publicId } });
+      expect(JSON.stringify(h.audit.events)).not.toMatch(/Zeus|Greene|Zed/);
+      await rejects(identity.admin.updateCustomerName(principal, cust.publicId, { nameParts: partsOf("Other Name"), expectedVersion: version }), "STALE_VERSION");
+      const { principal: custPrincipal } = await session(cust.email);
+      await rejects(identity.admin.updateCustomerName(custPrincipal, cust.publicId, { nameParts: partsOf("Other Name"), expectedVersion: out.version }), "CAPABILITY_NOT_GRANTED");
     });
   });
 
@@ -306,14 +444,14 @@ describe("identity module (MySQL)", () => {
   describe("e-mail verification", () => {
     it("is single-use and expires", async () => {
       build({ deploymentProfile: "preview" });
-      const r = await identity.auth.register({ email: `v${Date.now()}@example.test`, name: "V", password: PW }, {});
+      const r = await identity.auth.register({ email: `v${Date.now()}@example.test`, nameParts: partsOf("V"), password: PW }, {});
       const token = tokenOf(r.previewLink);
       await identity.auth.verifyEmail(token, null);
       await rejects(identity.auth.verifyEmail(token, null), "LINK_INVALID");
       expect(h.audit.named("auth.token.rejected").at(-1)).toMatchObject({ reasonCode: "LINK_INVALID", attributes: { purpose: "verify_email" } });
       expect(JSON.stringify(h.audit.events)).not.toContain(token);
 
-      const r2 = await identity.auth.register({ email: `v2${Date.now()}@example.test`, name: "V", password: PW }, {});
+      const r2 = await identity.auth.register({ email: `v2${Date.now()}@example.test`, nameParts: partsOf("V"), password: PW }, {});
       h.clock.advance(24 * 3_600_000 + 1);
       await rejects(identity.auth.verifyEmail(tokenOf(r2.previewLink), null), "LINK_INVALID");
     });
@@ -338,7 +476,7 @@ describe("identity module (MySQL)", () => {
     it("test/production profiles never return previewLink (registration, resend)", async () => {
       for (const profile of ["test", "production"] as const) {
         build({ deploymentProfile: profile });
-        const r = await identity.auth.register({ email: `p${profile}${Date.now()}@example.test`, name: "P", password: PW }, {});
+        const r = await identity.auth.register({ email: `p${profile}${Date.now()}@example.test`, nameParts: partsOf("P"), password: PW }, {});
         expect(r).toEqual({ accepted: true });
         expect("previewLink" in r).toBe(false);
       }
@@ -447,11 +585,11 @@ describe("identity module (MySQL)", () => {
       const staff = await makeUser({ role: "staff" });
       const c = await session(customer.email, { stepUp: true });
       await rejects(identity.admin.searchCustomers(c.principal, {}), "CAPABILITY_NOT_GRANTED");
-      await rejects(identity.admin.createCustomer(c.principal, { email: "n@example.test", name: "N" }), "CAPABILITY_NOT_GRANTED");
+      await rejects(identity.admin.createCustomer(c.principal, { email: "n@example.test", nameParts: partsOf("N") }), "CAPABILITY_NOT_GRANTED");
       const s = await session(staff.email, { stepUp: true });
-      await rejects(identity.admin.createStaff(s.principal, { email: "n@example.test", name: "N", role: "admin" }), "CAPABILITY_NOT_GRANTED");
+      await rejects(identity.admin.createStaff(s.principal, { email: "n@example.test", nameParts: partsOf("N"), role: "admin" }), "CAPABILITY_NOT_GRANTED");
       const remediation = { ...(await session(admin.email, { stepUp: true })).principal, state: "remediation" as const, pendingSteps: ["change_password" as const] };
-      await rejects(identity.admin.createCustomer(remediation, { email: "n@example.test", name: "N" }), "CAPABILITY_NOT_GRANTED");
+      await rejects(identity.admin.createCustomer(remediation, { email: "n@example.test", nameParts: partsOf("N") }), "CAPABILITY_NOT_GRANTED");
       const noStepUp = await session(admin.email);
       await rejects(identity.admin.changeReference(noStepUp.principal, customer.publicId, "ACME-1", (await userRow(customer.id)).version, "CORRECTION"), "STEP_UP_REQUIRED");
     });
@@ -577,7 +715,7 @@ describe("identity module (MySQL)", () => {
       build({ deploymentProfile: "preview" });
       const admin = await makeUser({ role: "admin" });
       const { principal } = await session(admin.email, { stepUp: true });
-      const created = await identity.admin.createCustomer(principal, { email: `cust${Date.now()}@example.test`, name: "Cara Customer" });
+      const created = await identity.admin.createCustomer(principal, { email: `cust${Date.now()}@example.test`, nameParts: partsOf("Cara Customer") });
       expect(created.customerRef).toMatch(/^RPCUS-[0-9A-Z]{9}$/);
       expect(created.previewLink).toMatch(/^\/activate\?token=/);
       await identity.auth.activateAccount({ token: tokenOf(created.previewLink), password: PW2 });
@@ -589,7 +727,7 @@ describe("identity module (MySQL)", () => {
         build({ deploymentProfile: profile });
         const admin2 = await makeUser({ role: "admin" });
         const s = await session(admin2.email, { stepUp: true });
-        const c = await identity.admin.createCustomer(s.principal, { email: `c${profile}${Date.now()}@example.test`, name: "Cara" });
+        const c = await identity.admin.createCustomer(s.principal, { email: `c${profile}${Date.now()}@example.test`, nameParts: partsOf("Cara") });
         expect("previewLink" in c).toBe(false);
       }
     });
@@ -909,11 +1047,11 @@ describe("identity module (MySQL)", () => {
       const user = await makeUser();
       const { principal } = await session(user.email);
       h.audit.clear();
-      await identity.admin.updateOwnProfile(principal, { name: "Renamed Synthetic Person" });
+      await identity.admin.updateOwnProfile(principal, { nameParts: partsOf("Renamed Synthetic Person") });
       const [event] = h.audit.named("identity.profile.updated");
       expect(event?.attributes).toEqual({ name_changed: true });
       expect(JSON.stringify(event)).not.toContain("Renamed");
-      expect((await identity.getUser(user.id))?.name).toBe("Renamed Synthetic Person");
+      expect((await identity.getUser(user.id))?.name).toBe("Renamed Person");
     });
   });
 
@@ -960,7 +1098,7 @@ describe("identity module (MySQL)", () => {
       expect(held?.pendingSteps).toEqual(["accept_policy"]);
       const callerFor = (p: SessionPrincipal) =>
         createCallerFactory(identityRouter)({ services: h.services, session: p, request: newRequestContext("test"), transport: { issue() {}, clear() {} } } as never);
-      await expect(callerFor(held!).profile.update({ name: "Blocked Change" })).rejects.toMatchObject({ code: "FORBIDDEN" });
+      await expect(callerFor(held!).profile.update({ firstName: "Blocked", lastName: "Change" })).rejects.toMatchObject({ code: "FORBIDDEN" });
       await expect(callerFor(held!).sessions.list()).rejects.toThrow();
       accepted = true; // compliance records the acceptance
       const restored = await identity.sessionResolver.resolve({ token, transport: "cookie" });

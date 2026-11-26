@@ -9,6 +9,7 @@ import {
   Badge, Breadcrumbs, Button, Callout, Card, ConfirmDialog, DataTable, DateTime, Dialog, DropdownMenu, ErrorState, Field,
   Input, KeyValueList, PageHeader, Select, Skeleton, StepUpCancelledError, Tabs, useStepUp, useToast,
 } from "@/ui";
+import { NameFields, validateNameParts, type NameErrors, type NameValues } from "../NameFields";
 import { PreviewLinkNotice, REFERENCE_REASONS, UserStatusBadge } from "../shared";
 import { StatusDialog, type StatusTarget } from "./StatusActions";
 
@@ -32,6 +33,7 @@ export default function CustomerDetailPage() {
   const [statusTarget, setStatusTarget] = useState<StatusTarget | null>(null);
   const [revokeOpen, setRevokeOpen] = useState(false);
   const [referenceOpen, setReferenceOpen] = useState(false);
+  const [nameOpen, setNameOpen] = useState(false);
   const [previewLink, setPreviewLink] = useState<string>();
 
   const crumbs = (label: string) => <Breadcrumbs items={[{ label: "Customers", href: "/admin/customers" }, { label }]} />;
@@ -65,6 +67,7 @@ export default function CustomerDetailPage() {
     ...(customer.status === "pending_activation"
       ? [{ label: "Resend invitation", onSelect: () => void run(() => resend.mutateAsync({ customerId }), "Invitation sent").then((r) => setPreviewLink(r?.previewLink)).catch(() => undefined) }]
       : []),
+    { label: "Edit name", onSelect: () => setNameOpen(true) },
     { label: "Change reference", onSelect: () => setReferenceOpen(true) },
     { label: "Sign out all sessions", onSelect: () => setRevokeOpen(true), disabled: activeSessions === 0 },
     "separator" as const,
@@ -92,6 +95,9 @@ export default function CustomerDetailPage() {
             <KeyValueList
               columns={2}
               items={[
+                { label: "First name", value: customer.firstName || "—" },
+                { label: "Last name", value: customer.lastName || "—" },
+                { label: "Preferred name", value: customer.preferredName ?? "—" },
                 { label: "E-mail address", value: <span className="break-all">{customer.email}</span> },
                 { label: "E-mail verified", value: customer.emailVerified ? "Yes" : "Not yet" },
                 { label: "Customer reference", value: customer.customerRef ?? "—" },
@@ -141,6 +147,15 @@ export default function CustomerDetailPage() {
         destructive
         onConfirm={async () => { await run(() => revokeSessions.mutateAsync({ userId: customerId }), "Sessions signed out"); }}
       />
+      {nameOpen ? (
+        <NameDialog
+          onClose={() => setNameOpen(false)}
+          customerId={customerId}
+          initial={{ firstName: customer.firstName, lastName: customer.lastName, preferredName: customer.preferredName ?? "" }}
+          version={customer.version}
+          onChanged={() => void detail.refetch()}
+        />
+      ) : null}
       <ReferenceDialog
         open={referenceOpen}
         onOpenChange={setReferenceOpen}
@@ -192,6 +207,47 @@ function ReferenceDialog({ open, onOpenChange, customerId, current, version, onC
         <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
           <Button variant="secondary" onClick={close}>Cancel</Button>
           <Button type="submit" loading={change.isPending}>Change reference</Button>
+        </div>
+      </form>
+    </Dialog>
+  );
+}
+
+/** D1: administrator edits a customer's first / last / preferred name (optimistic version; audited without values). */
+function NameDialog({ onClose, customerId, initial, version, onChanged }: {
+  onClose: () => void; customerId: string; initial: NameValues; version: number; onChanged: () => void;
+}) {
+  const trpc = useTRPC();
+  const toast = useToast();
+  const stepUp = useStepUp();
+  const update = useMutation(trpc.identity.admin.customers.updateName.mutationOptions());
+  const [names, setNames] = useState<NameValues>(initial);
+  const [errors, setErrors] = useState<NameErrors>({});
+  const [error, setError] = useState<string>();
+  const onSubmit = async (event: FormEvent) => {
+    event.preventDefault();
+    const check = validateNameParts(names, "their");
+    setErrors(check.ok ? {} : check.errors);
+    if (!check.ok) return;
+    try {
+      await stepUp.run(() => update.mutateAsync({ customerId, ...check.data, expectedVersion: version }), { reason: "Changing a customer's name needs verification." });
+      toast.show({ tone: "success", title: "Name updated" });
+      onChanged();
+      onClose();
+    } catch (err) {
+      if (err instanceof StepUpCancelledError) return;
+      setError(errorMessage(err));
+    }
+  };
+  return (
+    <Dialog open onOpenChange={(next) => { if (!next) onClose(); }} title="Edit customer name"
+      description="Invoices and billing documents use the first and last name. Greetings use the preferred name when there is one.">
+      <form onSubmit={onSubmit} noValidate className="flex flex-col gap-4">
+        {error ? <Callout tone="danger" live="assertive">{error}</Callout> : null}
+        <NameFields value={names} onChange={setNames} errors={errors} subject="their" />
+        <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+          <Button variant="secondary" onClick={onClose}>Cancel</Button>
+          <Button type="submit" loading={update.isPending}>Save name</Button>
         </div>
       </form>
     </Dialog>

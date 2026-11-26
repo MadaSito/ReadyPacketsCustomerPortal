@@ -96,6 +96,9 @@ export interface SignedResponseOptions {
   objectId?: string | null;
   email?: string | null;
   displayName?: string | null;
+  /** D1: givenname / surname claims (omitted when undefined or null). */
+  givenName?: string | null;
+  surname?: string | null;
   roles?: string[];
   /** authnmethodsreferences values; default password + multipleauthn. */
   methods?: string[];
@@ -150,6 +153,8 @@ export function buildSignedResponse(o: SignedResponseOptions): string {
   if (objectId !== null) attrs.push(attribute(SAML_CLAIMS.objectId, [objectId]));
   if (o.email !== null) attrs.push(attribute(SAML_CLAIMS.email, [o.email ?? "person@example.test"]));
   if (o.displayName !== null) attrs.push(attribute(SAML_CLAIMS.displayName, [o.displayName ?? "Test Person"]));
+  if (o.givenName) attrs.push(attribute(SAML_CLAIMS.givenName, [o.givenName]));
+  if (o.surname) attrs.push(attribute(SAML_CLAIMS.surname, [o.surname]));
   if (o.roles?.length) attrs.push(attribute(SAML_CLAIMS.role, o.roles));
   attrs.push(attribute(SAML_CLAIMS.methods, o.methods ?? ["http://schemas.microsoft.com/ws/2008/06/identity/authenticationmethod/password", ENTRA_MULTIPLE_AUTHN]));
 

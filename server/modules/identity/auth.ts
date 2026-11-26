@@ -9,7 +9,8 @@ import { ulid } from "../../core/ids.js";
 import type { AuditEventInput, SessionPrincipal, Tx } from "../../core/types.js";
 import type { TransitionStep, UserRole } from "../../../shared/domain.js";
 import { readSetting } from "../platform/settingsRegistry.js";
-import { normalizeEmail } from "./normalize.js";
+import { deriveNameParts, fullNameOf, greetingNameOf, normalizeEmail, normalizeName, type NameInput, type NameParts } from "./normalize.js";
+import type { BillingDetails } from "../../../shared/billingDetails.js";
 import type { PasswordHasher } from "./password/hasher.js";
 import { checkPassword, PASSWORD_MESSAGES } from "./password/policy.js";
 import { users, type UserRow } from "./schema.js";
@@ -20,7 +21,12 @@ import type { TransitionService } from "./transitions.js";
 import type { Gates } from "./gates.js";
 import type { SignInLog } from "./sessionPolicy.js";
 import { createSignInSignals, type SignInSignalKind } from "./signals.js";
-import { emailColumns, emailIndexOf, generateCustomerRef, isDuplicate, nameColumns, toView, type UserRepo } from "./users.js";
+import { emailColumns, emailIndexOf, generateCustomerRef, isDuplicate, nameColumns, namePartColumns, toView, type UserRepo } from "./users.js";
+
+/** D4 port (billingProfile module, compliance_engineer). Uses the caller's transaction; no mail. */
+export interface RegistrationBillingPort {
+  saveForUserInTx(tx: Tx, userId: number, details: BillingDetails, actor: { userId: number; role: "customer"; via: "registration" }): Promise<unknown>;
+}
 
 export const PASSWORD_RESET_JOB = "identity.password_reset.dispatch";
 export interface PasswordResetJob {
@@ -185,7 +191,10 @@ export function createAuthService(i: AuthInternals) {
     tx: Tx,
     input: {
       email: string;
-      name: string;
+      /** Legacy single display name (portable import, seeds, older callers): parts are derived lazily. */
+      name?: string;
+      /** Increment 08 (D1): stored encrypted; name_enc becomes "<First> <Last>". Wins over `name`. */
+      nameParts?: NameParts;
       role: UserRow["role"];
       status: UserRow["status"];
       origin: string;
@@ -207,7 +216,7 @@ export function createAuthService(i: AuthInternals) {
           role: input.role,
           status: input.status,
           ...emailColumns(deps.crypto, publicId, input.email),
-          ...nameColumns(deps.crypto, publicId, input.name),
+          ...(input.nameParts ? namePartColumns(deps.crypto, publicId, input.nameParts) : nameColumns(deps.crypto, publicId, input.name ?? "")),
           emailVerifiedAt: input.emailVerifiedAt ?? null,
           passwordHash: input.passwordHash ?? null,
           passwordChangedAt: input.passwordHash ? now : null,
@@ -303,12 +312,23 @@ export function createAuthService(i: AuthInternals) {
     }
   }
 
+  /** D4: the billingProfile port, read at call time (the module may be absent, e.g. in tests). */
+  async function saveRegistrationBilling(tx: Tx, userId: number, details: BillingDetails): Promise<boolean> {
+    const port = (deps.services as { billingProfile?: RegistrationBillingPort }).billingProfile;
+    if (!port?.saveForUserInTx) return false;
+    await port.saveForUserInTx(tx, userId, details, { userId, role: "customer", via: "registration" });
+    return true;
+  }
+
   return {
     insertUser,
     claimNewRef,
     provisionLocalAccount,
 
-    async register(input: { email: string; name: string; password: string; referralCode?: string }, meta: CallMeta): Promise<{ accepted: true; previewLink?: string }> {
+    async register(
+      input: NameInput & { email: string; password: string; referralCode?: string; billing?: BillingDetails | null },
+      meta: CallMeta,
+    ): Promise<{ accepted: true; previewLink?: string }> {
       if (!(await readSetting(deps.settings, REGISTRATION_ENABLED))) {
         throw new DomainError("FORBIDDEN", "REGISTRATION_DISABLED", "New account registration is currently closed.");
       }
@@ -317,7 +337,10 @@ export function createAuthService(i: AuthInternals) {
       const email = normalizeEmail(input.email);
       await throttle("auth_high_risk", `register:${emailIndexOf(deps.crypto, email)}`);
       // Policy is checked before any existence lookup, so its outcome reveals nothing about accounts.
-      assertPasswordAcceptable(input.password, { email, name: input.name });
+      // Legacy `name` callers (pre-08 clients): the display name is stored as given and parts are derived lazily.
+      const name = input.nameParts ? fullNameOf(input.nameParts) : normalizeName(input.name);
+      const greetingParts = input.nameParts ?? deriveNameParts(name);
+      assertPasswordAcceptable(input.password, { email, name });
       const passwordHash = await hasher.hash(input.password); // always hash: uniform timing
       const existing = await repo.byEmail(email);
       if (existing) {
@@ -352,11 +375,14 @@ export function createAuthService(i: AuthInternals) {
       try {
         return await deps.db.transaction(async (tx) => {
           await gates.assertCustomerAccess(tx);
-          const created = await insertUser(tx, { email, name: input.name, role: "customer", status: "active", origin: "register", passwordHash });
+          const created = await insertUser(tx, { email, ...(input.nameParts ? { nameParts: input.nameParts } : { name }), role: "customer", status: "active", origin: "register", passwordHash });
+          // D4 (increment 08): optional billing information, stored ONLY for a new account, in this transaction. It was
+          // validated in full before any lookup, so neither branch can fail differently on it. Missing module → skipped.
+          const billingSaved = input.billing ? await saveRegistrationBilling(tx, created.id, input.billing) : false;
           const referral = await gates.attributeReferral(input.referralCode, created.id, tx);
           const link = await tokens.issue(tx, created.id, "verify_email");
           await deps.mailer.enqueue(
-            { template: "auth.verify_email", to: { userId: created.id }, vars: { name: input.name, link: link.url }, idempotencyKey: link.mailKey, expiresAt: link.expiresAt },
+            { template: "auth.verify_email", to: { userId: created.id }, vars: { name: greetingNameOf(greetingParts, name), link: link.url }, idempotencyKey: link.mailKey, expiresAt: link.expiresAt },
             tx,
           );
           await deps.audit.record(
@@ -367,7 +393,7 @@ export function createAuthService(i: AuthInternals) {
               outcome: "completed",
               actor: { userId: created.id, role: "customer" },
               resource: { type: "user", publicId: created.publicId },
-              attributes: { referral: input.referralCode ? (referral.attributed ? "attributed" : "not_attributed") : "none" },
+              attributes: { referral: input.referralCode ? (referral.attributed ? "attributed" : "not_attributed") : "none", billing: input.billing ? (billingSaved ? "saved" : "skipped") : "none" },
             },
             tx,
           );
@@ -498,7 +524,7 @@ export function createAuthService(i: AuthInternals) {
         const view = toView(deps.crypto, user);
         const link = await tokens.issue(tx, user.id, "verify_email");
         await deps.mailer.enqueue(
-          { template: "auth.verify_email", to: { userId: user.id }, vars: { name: view.name, link: link.url }, idempotencyKey: link.mailKey, expiresAt: link.expiresAt },
+          { template: "auth.verify_email", to: { userId: user.id }, vars: { name: view.greetingName ?? view.name, link: link.url }, idempotencyKey: link.mailKey, expiresAt: link.expiresAt },
           tx,
         );
         await deps.audit.record(

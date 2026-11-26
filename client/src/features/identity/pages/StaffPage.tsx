@@ -9,6 +9,7 @@ import {
   PageHeader, RadioGroup, Select, StepUpCancelledError, useStepUp, useToast,
 } from "@/ui";
 import { MoreHorizontal } from "lucide-react";
+import { EMPTY_NAME, NameFields, validateNameParts, type NameErrors, type NameValues } from "../NameFields";
 import { PreviewLinkNotice, ROLE_LABELS, STATUS_FILTER_OPTIONS, UserStatusBadge, SignInMethodBadges, type UserStatus } from "../shared";
 import { StatusDialog, type StatusTarget } from "./StatusActions";
 
@@ -123,19 +124,21 @@ function InviteStaffDialog({ open, onOpenChange, onCreated }: { open: boolean; o
   const stepUp = useStepUp();
   const create = useMutation(trpc.identity.admin.staff.create.mutationOptions());
   const [email, setEmail] = useState("");
-  const [name, setName] = useState("");
+  const [names, setNames] = useState<NameValues>(EMPTY_NAME);
+  const [nameErrors, setNameErrors] = useState<NameErrors>({});
   const [role, setRole] = useState<"staff" | "admin">("staff");
-  const [errors, setErrors] = useState<{ email?: string; name?: string; form?: string }>({});
-  const close = () => { setEmail(""); setName(""); setRole("staff"); setErrors({}); onOpenChange(false); };
+  const [errors, setErrors] = useState<{ email?: string; form?: string }>({});
+  const close = () => { setEmail(""); setNames(EMPTY_NAME); setNameErrors({}); setRole("staff"); setErrors({}); onOpenChange(false); };
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault();
     const found: typeof errors = {};
     if (!email.includes("@")) found.email = "Enter their e-mail address.";
-    if (!name.trim()) found.name = "Enter their name.";
+    const nameCheck = validateNameParts(names, "their");
+    setNameErrors(nameCheck.ok ? {} : nameCheck.errors);
     setErrors(found);
-    if (Object.keys(found).length) return;
+    if (Object.keys(found).length || !nameCheck.ok) return;
     try {
-      const result = await stepUp.run(() => create.mutateAsync({ email, name, role }), { reason: "Adding staff needs verification." });
+      const result = await stepUp.run(() => create.mutateAsync({ email, ...nameCheck.data, role }), { reason: "Adding staff needs verification." });
       toast.show({ tone: "success", title: "Invitation sent" });
       onCreated(result.previewLink);
       close();
@@ -154,9 +157,7 @@ function InviteStaffDialog({ open, onOpenChange, onCreated }: { open: boolean; o
         <Field label="E-mail address" required error={errors.email}>
           <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="off" inputMode="email" maxLength={254} />
         </Field>
-        <Field label="Full name" required error={errors.name}>
-          <Input value={name} onChange={(e) => setName(e.target.value)} autoComplete="off" maxLength={120} />
-        </Field>
+        <NameFields value={names} onChange={setNames} errors={nameErrors} subject="their" />
         <RadioGroup
           legend="Role"
           variant="cards"

@@ -9,12 +9,19 @@
  */
 import { createContext, createElement, useContext, useMemo, type ReactNode } from "react";
 import type { TransitionStep, UserRole } from "@shared/domain";
+import type { BillingDetailsInput } from "@shared/billingDetails";
 import { useTRPCClient } from "./trpc";
 
 export interface MeUser {
   publicId: string;
   role: UserRole;
   name: string;
+  /** Increment 08 (D1). Derived for accounts from before 08 until the profile is saved. */
+  firstName?: string;
+  lastName?: string;
+  preferredName?: string | null;
+  /** Preferred name, else first name — use for greetings; legal/billing contexts keep `name`. */
+  greetingName?: string;
   email: string;
   customerRef?: string | null;
   status: string;
@@ -75,7 +82,17 @@ export interface AuthApi {
   passwordPolicy(): Promise<{ minLength: number; maxLength: number }>;
   signIn(input: { email: string; password: string }): Promise<{ nextStep: TransitionStep | null }>;
   signOut(): Promise<unknown>;
-  register(input: { email: string; name: string; password: string; acceptedPolicies?: string[]; referralCode?: string }): Promise<Accepted>;
+  register(input: {
+    email: string;
+    firstName: string;
+    lastName: string;
+    preferredName?: string | null;
+    password: string;
+    acceptedPolicies?: string[];
+    referralCode?: string;
+    /** D4: optional billing information, saved only when a new account is created. */
+    billing?: BillingDetailsInput | null;
+  }): Promise<Accepted>;
   verifyEmail(input: { token: string }): Promise<unknown>;
   resendVerification(): Promise<Accepted>;
   requestPasswordReset(input: { email: string }): Promise<Accepted>;

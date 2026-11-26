@@ -8,6 +8,7 @@ import {
   Button, Callout, DataTable, DateTime, Dialog, EmptyState, Field, FilterBar, Input, LoadMore, PageHeader, Select,
   StepUpCancelledError, useStepUp, useToast,
 } from "@/ui";
+import { EMPTY_NAME, NameFields, validateNameParts, type NameErrors, type NameValues } from "../NameFields";
 import { PreviewLinkNotice, STATUS_FILTER_OPTIONS, UserStatusBadge, SignInMethodBadges, type UserStatus } from "../shared";
 
 type Page = Awaited<ReturnType<ReturnType<typeof useTRPCClient>["identity"]["admin"]["customers"]["list"]["query"]>>;
@@ -93,22 +94,24 @@ function CreateCustomerDialog({ open, onOpenChange, onCreated }: { open: boolean
   const stepUp = useStepUp();
   const create = useMutation(trpc.identity.admin.customers.create.mutationOptions());
   const [email, setEmail] = useState("");
-  const [name, setName] = useState("");
+  const [names, setNames] = useState<NameValues>(EMPTY_NAME);
+  const [nameErrors, setNameErrors] = useState<NameErrors>({});
   const [reference, setReference] = useState("");
-  const [errors, setErrors] = useState<{ email?: string; name?: string; customerRef?: string; form?: string }>({});
+  const [errors, setErrors] = useState<{ email?: string; customerRef?: string; form?: string }>({});
   const [result, setResult] = useState<{ customerId: string; customerRef: string | null; previewLink?: string } | null>(null);
 
-  const reset = () => { setEmail(""); setName(""); setReference(""); setErrors({}); setResult(null); };
+  const reset = () => { setEmail(""); setNames(EMPTY_NAME); setNameErrors({}); setReference(""); setErrors({}); setResult(null); };
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault();
     const found: typeof errors = {};
     if (!email.includes("@")) found.email = "Enter the customer's e-mail address.";
-    if (!name.trim()) found.name = "Enter the customer's name.";
+    const nameCheck = validateNameParts(names, "their");
+    setNameErrors(nameCheck.ok ? {} : nameCheck.errors);
     setErrors(found);
-    if (Object.keys(found).length) return;
+    if (Object.keys(found).length || !nameCheck.ok) return;
     try {
       const created = await stepUp.run(() =>
-        create.mutateAsync({ email, name, ...(reference.trim() ? { customerRef: reference.trim() } : {}) }),
+        create.mutateAsync({ email, ...nameCheck.data, ...(reference.trim() ? { customerRef: reference.trim() } : {}) }),
       );
       setResult(created);
       onCreated();
@@ -119,7 +122,10 @@ function CreateCustomerDialog({ open, onOpenChange, onCreated }: { open: boolean
       const fields = safe?.fieldErrors ?? {};
       if (safe?.reasonCode === "EMAIL_IN_USE") setErrors({ email: safe.safeMessage });
       else if (safe?.reasonCode === "REFERENCE_IN_USE") setErrors({ customerRef: safe.safeMessage });
-      else if (Object.keys(fields).length) setErrors({ email: fields.email?.[0], name: fields.name?.[0], customerRef: fields.customerRef?.[0] });
+      else if (Object.keys(fields).length) {
+        setErrors({ email: fields.email?.[0], customerRef: fields.customerRef?.[0] });
+        setNameErrors({ firstName: fields.firstName?.[0], lastName: fields.lastName?.[0], preferredName: fields.preferredName?.[0] });
+      }
       else setErrors({ form: errorMessage(err) });
     }
   };
@@ -148,9 +154,7 @@ function CreateCustomerDialog({ open, onOpenChange, onCreated }: { open: boolean
           <Field label="E-mail address" required error={errors.email}>
             <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="off" inputMode="email" maxLength={254} />
           </Field>
-          <Field label="Full name" required error={errors.name}>
-            <Input value={name} onChange={(e) => setName(e.target.value)} autoComplete="off" maxLength={120} />
-          </Field>
+          <NameFields value={names} onChange={setNames} errors={nameErrors} subject="their" />
           <Field label="Customer reference" hint="Optional. Leave blank to generate one (format RPCUS- followed by 9 letters or digits). Letters, digits and single hyphens." error={errors.customerRef}>
             <Input value={reference} onChange={(e) => setReference(e.target.value.toUpperCase())} autoComplete="off" maxLength={32} />
           </Field>

@@ -2,7 +2,7 @@
  * Auth/transition layout. Desktop (≥ lg): restrained brand slideshow on the LEFT, controls on the RIGHT.
  * Mobile: form first; a compact brand header above it, no slideshow.
  */
-import type { ReactNode } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 import { Link } from "wouter";
 import { BrandLogo, ThemeControl } from "@/ui";
 import { cn } from "@/ui/cn";
@@ -19,9 +19,15 @@ export interface AuthLayoutProps {
   showcase?: boolean;
   /** Wider card for content-heavy screens (MFA enrolment, recovery codes). */
   wide?: boolean;
+  /** Move focus to the page heading on mount (e.g. a success screen that replaced a submitted form). */
+  focusTitle?: boolean;
 }
 
-export function AuthLayout({ title, description, children, below, showcase = false, wide = false }: AuthLayoutProps) {
+export function AuthLayout({ title, description, children, below, showcase = false, wide = false, focusTitle = false }: AuthLayoutProps) {
+  const titleRef = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    if (focusTitle) titleRef.current?.focus();
+  }, [focusTitle]);
   return (
     <div className={cn("flex flex-1", showcase && "lg:grid lg:grid-cols-[minmax(0,5fr)_minmax(0,6fr)]")}>
       {showcase ? (
@@ -40,7 +46,7 @@ export function AuthLayout({ title, description, children, below, showcase = fal
         <div className="flex flex-1 items-start justify-center px-4 py-8 sm:items-center sm:px-8 sm:py-12">
           <div className={cn("w-full", wide ? "max-w-2xl" : "max-w-md")}>
             <div className="rounded-2xl border border-line bg-surface p-6 shadow-[var(--shadow-raised)] sm:p-8 rp-forced-border">
-              <h1 className="text-2xl font-semibold tracking-tight text-ink">{title}</h1>
+              <h1 ref={titleRef} tabIndex={focusTitle ? -1 : undefined} className="text-2xl font-semibold tracking-tight text-ink outline-none">{title}</h1>
               {description ? <div className="mt-2 text-[0.9375rem] text-body">{description}</div> : null}
               <div className="mt-6">{children}</div>
             </div>

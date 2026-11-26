@@ -21,7 +21,18 @@ export default function PrivacyPage() {
 
       <LegalSection id="collect" title="What the portal collects">
         <ul>
-          <li>Account details you give us: your name, email address and any profile information you add.</li>
+          <li>
+            Account details you give us: your first name, last name and, if you choose, a preferred name (used to greet you), your email address and
+            any profile information you add.
+          </li>
+          <li>
+            An optional saved billing profile (billing contact name, company, billing email, address and tax ID), if you add one when you register or
+            later. You can change it or clear it at any time in the portal.
+          </li>
+          <li>
+            Order numbers: each order number includes a few letters of your name and of the project name, so it can appear wherever the order number
+            does, such as emails, invoices and files.
+          </li>
           <li>
             Sign-in security data: your password is stored only as a one-way hash, and two-step verification secrets are stored encrypted. Recovery
             codes are shown to you once and are not displayed again.

@@ -10,11 +10,11 @@ import { roleHasCapability, STEP_UP_CAPABILITIES, type Capability } from "../../
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
 import type { UserRole } from "../../../shared/domain.js";
 import type { AuthInternals, AuthService } from "./auth.js";
-import { namePrefixes, normalizeEmail, normalizeName } from "./normalize.js";
+import { namePrefixes, normalizeEmail, normalizeName, type NameInput, type NameParts } from "./normalize.js";
 import type { ApiCaller, ApiListQuery, ApiPage, CustomerDto } from "../publicApi/ports.js";
 import { customerRefHistory, USER_STATUSES, users, type UserRow, type UserStatus } from "./schema.js";
 import { RESEND_MIN_INTERVAL_MS } from "./settings.js";
-import { emailIndexOf, nameAad, nameColumns, namePrefixIndex, toView } from "./users.js";
+import { emailIndexOf, nameAad, nameColumns, namePartColumns, namePartsOf, namePrefixIndex, toView } from "./users.js";
 
 export interface CustomerListItem {
   publicId: string;
@@ -186,7 +186,7 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
     const view = toView(deps.crypto, row);
     const link = await tokens.issue(tx, row.id, "invitation");
     await deps.mailer.enqueue(
-      { template: "auth.invitation", to: { userId: row.id }, vars: { name: view.name, link: link.url }, idempotencyKey: link.mailKey, expiresAt: link.expiresAt },
+      { template: "auth.invitation", to: { userId: row.id }, vars: { name: view.greetingName ?? view.name, link: link.url }, idempotencyKey: link.mailKey, expiresAt: link.expiresAt },
       tx,
     );
     return preview(link.path);
@@ -346,19 +346,19 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
       const activeSessions = await sessions.countLive(row.id);
       await deps.audit.record({ category: "admin", eventName: "admin.customer.viewed", action: "read", outcome: "completed", resource: { type: "user", publicId } });
       return {
-        customer: { ...listItem(row), mustChangePassword: view.mustChangePassword, hasPassword: view.hasPassword, version: row.version, statusReasonCode: row.statusReasonCode, statusChangedAt: row.statusChangedAt },
+        customer: { ...listItem(row), firstName: view.firstName ?? "", lastName: view.lastName ?? "", preferredName: view.preferredName ?? null, namePartsStored: view.namePartsStored === true, mustChangePassword: view.mustChangePassword, hasPassword: view.hasPassword, version: row.version, statusReasonCode: row.statusReasonCode, statusChangedAt: row.statusChangedAt },
         activeSessions,
         referenceHistory: history.map((h) => ({ previousReference: h.previousReference, newReference: h.newReference, reasonCode: h.reasonCode, changedAt: h.changedAt })),
       };
     },
 
-    async createCustomer(principal: SessionPrincipal, input: { email: string; name: string; customerRef?: string }) {
+    async createCustomer(principal: SessionPrincipal, input: NameInput & { email: string; customerRef?: string }) {
       await require(principal, "customers.manage", "identity.admin.customers.create");
       return deps.db.transaction(async (tx) => {
         await authorizeInTx(tx, principal, "customers.manage");
         const created = await auth.insertUser(tx, {
           email: input.email,
-          name: input.name,
+          ...(input.nameParts ? { nameParts: input.nameParts } : { name: input.name }),
           role: "customer",
           status: "pending_activation",
           origin: "admin",
@@ -445,11 +445,31 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
       return listUsers(["staff", "admin"], input);
     },
 
-    async createStaff(principal: SessionPrincipal, input: { email: string; name: string; role: "staff" | "admin" }) {
+    /** D1: administrator edits a customer's name parts (optimistic version). The audit says THAT it changed, never the name. */
+    async updateCustomerName(principal: SessionPrincipal, publicId: string, input: { nameParts: NameParts; expectedVersion: number }): Promise<{ version: number }> {
+      await require(principal, "customers.manage", "identity.admin.customers.updateName");
+      return deps.db.transaction(async (tx) => {
+        await authorizeInTx(tx, principal, "customers.manage");
+        const row = await repo.byPublicId(publicId, { tx, forUpdate: true });
+        if (!row || row.role !== "customer") throw notFound("USER_NOT_FOUND");
+        if (row.version !== input.expectedVersion) throw conflict("STALE_VERSION", "This customer was changed by someone else. Reload and try again.");
+        const before = namePartsOf(deps.crypto, row);
+        const changed = !before.stored || before.firstName !== input.nameParts.firstName || before.lastName !== input.nameParts.lastName || before.preferredName !== input.nameParts.preferredName;
+        if (!changed) return { version: row.version };
+        await tx.update(users).set({ ...namePartColumns(deps.crypto, row.publicId, input.nameParts), version: row.version + 1 }).where(eq(users.id, row.id));
+        await deps.audit.record(
+          { category: "admin", eventName: "admin.customer.name_updated", action: "update", outcome: "completed", resource: { type: "user", publicId: row.publicId }, attributes: { name_changed: true, parts_were_stored: before.stored } },
+          tx,
+        );
+        return { version: row.version + 1 };
+      });
+    },
+
+    async createStaff(principal: SessionPrincipal, input: NameInput & { email: string; role: "staff" | "admin" }) {
       await require(principal, "staff.manage", "identity.admin.staff.create");
       return deps.db.transaction(async (tx) => {
         await authorizeInTx(tx, principal, "staff.manage");
-        const created = await auth.insertUser(tx, { email: input.email, name: input.name, role: input.role, status: "pending_activation", origin: "admin" });
+        const created = await auth.insertUser(tx, { email: input.email, ...(input.nameParts ? { nameParts: input.nameParts } : { name: input.name }), role: input.role, status: "pending_activation", origin: "admin" });
         const row = (await repo.byId(created.id, { tx, forUpdate: true }))!;
         const invitation = await sendInvitation(tx, row);
         await deps.audit.record(
@@ -495,11 +515,16 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
 
     /* ----------------------------------------------------------- self-service (full session) */
 
-    async updateOwnProfile(principal: SessionPrincipal, input: { name: string }): Promise<void> {
+    async updateOwnProfile(principal: SessionPrincipal, input: NameInput): Promise<void> {
       await deps.db.transaction(async (tx) => {
         const row = await repo.byId(principal.userId, { tx, forUpdate: true });
         if (!row) throw notFound("USER_NOT_FOUND");
-        await tx.update(users).set({ ...nameColumns(deps.crypto, row.publicId, input.name), version: row.version + 1 }).where(eq(users.id, row.id));
+        // D1: saving the profile stores the parts (accounts from before 08 stop deriving them lazily from here on).
+        // A legacy `name` (pre-08 client) replaces the display name and clears stored parts (derived lazily again).
+        const columns = input.nameParts
+          ? namePartColumns(deps.crypto, row.publicId, input.nameParts)
+          : { ...nameColumns(deps.crypto, row.publicId, input.name), firstNameEnc: null, lastNameEnc: null, preferredNameEnc: null };
+        await tx.update(users).set({ ...columns, version: row.version + 1 }).where(eq(users.id, row.id));
         // D11 (increment 06): signature-name checks link here; the audit says THAT the name changed, never the name.
         await deps.audit.record(
           {
@@ -535,13 +560,14 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
     /* ----------------------------------------------------------- portable import/export hooks */
 
     async createPendingCustomer(
-      input: { email: string; name: string; customerRef?: string | null; publicId?: string; createdAt?: Date },
+      input: { email: string; name: string; nameParts?: NameParts; customerRef?: string | null; publicId?: string; createdAt?: Date },
       opts: { tx: Tx },
     ): Promise<{ userId: number; publicId: string; customerRef: string }> {
       const tx = opts.tx;
       const created = await auth.insertUser(tx, {
         email: input.email,
         name: input.name,
+        ...(input.nameParts ? { nameParts: input.nameParts } : {}),
         role: "customer", // never staff/admin from an archive
         status: "pending_activation", // never an automatically active account
         origin: "import",
@@ -574,7 +600,12 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
       const rows = await tx.select().from(users).where(and(...conditions)).orderBy(asc(users.publicId)).limit(bounded);
       return rows.map((row) => {
         const view = toView(deps.crypto, row);
-        return { publicId: view.publicId, email: view.email, name: view.name, customerRef: view.customerRef, createdAt: view.createdAt };
+        // D1: stored parts only (null while not stored; derived parts are never exported).
+        const stored = view.namePartsStored === true;
+        return {
+          publicId: view.publicId, email: view.email, name: view.name, customerRef: view.customerRef, createdAt: view.createdAt,
+          firstName: stored ? (view.firstName ?? null) : null, lastName: stored ? (view.lastName ?? null) : null, preferredName: stored ? (view.preferredName ?? null) : null,
+        };
       });
     },
   };

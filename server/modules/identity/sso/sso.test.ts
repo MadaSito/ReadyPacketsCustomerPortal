@@ -355,6 +355,20 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
       expect(row?.passwordHash).toBeNull();
     });
 
+    it("D1: maps given_name/family_name when present, else splits the display name", async () => {
+      await configure({ jitMode: "customers", jitDailyLimit: 5 });
+      const partsOfDone = async (done: Awaited<ReturnType<Awaited<ReturnType<typeof signIn>>["finish"]>>) => {
+        if (done.purpose !== "sign_in") throw new Error("unreachable");
+        const principal = await identity.sessionResolver.resolve({ token: done.issued.token, transport: "cookie" });
+        return identity.getUser(principal!.userId);
+      };
+      const withClaims = await partsOfDone(await (await signIn({ oid: oid(), name: "Display Only", claims: { given_name: "Zeus", family_name: "Greene" } })).finish());
+      expect(withClaims).toMatchObject({ firstName: "Zeus", lastName: "Greene", name: "Zeus Greene", namePartsStored: true });
+      const fromDisplay = await partsOfDone(await (await signIn({ oid: oid(), name: "Zeus Middle Greene" })).finish());
+      expect(fromDisplay).toMatchObject({ firstName: "Zeus", lastName: "Greene", name: "Zeus Greene" });
+      expect(JSON.stringify(h.audit.events)).not.toMatch(/Zeus|Greene/);
+    });
+
     it("stops at the daily limit", async () => {
       await configure({ jitMode: "customers", jitDailyLimit: 1 });
       await (await signIn({ oid: oid() })).finish();
@@ -651,6 +665,14 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
       const principal = await identity.sessionResolver.resolve({ token: staff.issued.token, transport: "cookie" });
       expect(principal?.role).toBe("staff");
       await rejects((await samlSignIn(oid(), { email: `none.${randomUUID().slice(0, 6)}@contoso.test`, roles: ["Unmapped"] })).finish(), "SSO_ROLE_NOT_ASSIGNED");
+    });
+
+    it("D1: SAML givenname/surname claims become the name parts", async () => {
+      await configureSaml({ jitMode: "customers", allowedRoles: ["admin", "staff", "customer"] });
+      const done = await (await samlSignIn(oid(), { email: `gn.${randomUUID().slice(0, 6)}@contoso.test`, roles: ["Portal.Customer"], givenName: "Zeus", surname: "Greene", displayName: "Other Display" })).finish();
+      if (done.purpose !== "sign_in") throw new Error("unreachable");
+      const principal = await identity.sessionResolver.resolve({ token: done.issued.token, transport: "cookie" });
+      expect(await identity.getUser(principal!.userId)).toMatchObject({ firstName: "Zeus", lastName: "Greene", greetingName: "Zeus" });
     });
 
     it("an older row (no MFA mode, no allowed roles) keeps its previous behaviour", async () => {
