@@ -765,6 +765,8 @@ Defects found in lead QA and fixed before merge:
 
 ## Outstanding and known limits
 
+- **Increment 08 known gaps:**
+  - ReadyPackets has no self-service account data export or account erasure yet; an administrator handles privacy requests, and a customer can clear their own saved billing information under Account settings → Billing information.
 - Increment 07 decisions the owner should confirm (ADRs 0055–0062):
   - the progress formula: weighted, capped at 99 until a `done` status, and the higher of derived and explicit;
   - publishing the prepared phases draft of the default workflow; running orders keep their version;

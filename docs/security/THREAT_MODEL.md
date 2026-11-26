@@ -280,7 +280,7 @@ file handle, COMP-01–03, IPv6 transition classification. Client C-01–C-05 an
   - P101 / P201 payloads;
   - SharePoint folder names.
 
-  The trade-off was accepted by /root on the owner's explicit requirement. It is documented in the [Admin guide](../guides/ADMIN_GUIDE.md#order-numbers-increment-08). <!-- PENDING-OWNER orders_engineer / portable_contract_engineer: what account erasure does to existing references -->
+  The trade-off was accepted by /root on the owner's explicit requirement. It is documented in the [Admin guide](../guides/ADMIN_GUIDE.md#order-numbers-increment-08). There is no self-service account erasure yet. An administrator handles privacy requests, and existing references are business records on orders and invoices. <!-- PENDING-OWNER orders_engineer: confirm whether an administrator's handling changes references -->
 
 ## 10. Increment 03 trust boundaries and validation gates
 
