@@ -8,7 +8,7 @@
  * disabled only with its reason written next to it (`aria-describedby`); errors are summarised at the top.
  */
 import { Check, Circle } from "lucide-react";
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
 import { Button, Callout } from "@/ui";
 import { stepTitle, type WizardStep, type WizardStepKey } from "./wizardModel";
 
@@ -32,15 +32,18 @@ export interface StepWizardProps {
   /** Errors to summarise at the top (customer wording); `step` makes the line a button that opens that step. */
   errors?: readonly WizardError[];
   headingLevel?: 3 | 4;
+  /** Ref to the error summary, so a dialog that failed can hand focus back to it on close. */
+  summaryRef?: RefObject<HTMLDivElement | null>;
 }
 
 export interface WizardError { message: string; step?: WizardStepKey }
 
-export function StepWizard({ label, steps, initialIndex, renderStep, final, errors = [], headingLevel = 4 }: StepWizardProps) {
+export function StepWizard({ label, steps, initialIndex, renderStep, final, errors = [], headingLevel = 4, summaryRef }: StepWizardProps) {
   const [index, setIndex] = useState(() => Math.min(Math.max(initialIndex, 0), steps.length - 1));
   const [moved, setMoved] = useState(0);
   const headingRef = useRef<HTMLHeadingElement>(null);
-  const errorsRef = useRef<HTMLDivElement>(null);
+  const ownSummaryRef = useRef<HTMLDivElement>(null);
+  const errorsRef = summaryRef ?? ownSummaryRef;
   const reasonId = useId();
   const summaryId = useId();
   const safeIndex = Math.min(index, steps.length - 1);
@@ -51,7 +54,7 @@ export function StepWizard({ label, steps, initialIndex, renderStep, final, erro
   useEffect(() => { if (moved) headingRef.current?.focus(); }, [moved]);
   // A new error list is announced by moving focus to its summary.
   const errorKey = errors.map((e) => e.message).join("\n");
-  useEffect(() => { if (errorKey) errorsRef.current?.focus(); }, [errorKey]);
+  useEffect(() => { if (errorKey) errorsRef.current?.focus(); }, [errorKey, errorsRef]);
   const Heading = headingLevel === 3 ? "h3" : "h4";
   const reason = last ? (final.disabledReason ?? null) : step.blockedReason;
 

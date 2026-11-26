@@ -3,7 +3,7 @@
  * (`CustomerPhaseWizard`) supplies the workspace, the mutations and the action panels of other owners
  * (questions: assurance; files: files_engineer). The server enforces every rule; the client only shows them.
  */
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
 import type { StageActionKey } from "@shared/workflowStages";
 import { SafePolicyText } from "@/lib/agreementGate";
 import { Badge, Button, Callout, Card, Checkbox, DateTime, Dialog, OrderProgress, Skeleton, type Tone } from "@/ui";
@@ -264,6 +264,7 @@ function CurrentPhaseSteps({ workspace, stage, renderAction, renderStageExtras, 
   const storageKey = ackStorageKey(workspace.orderId, stage.key, hash);
   const [ticked, setTicked] = useState(() => policy !== "none" && readFlag(storageKey));
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const summaryRef = useRef<HTMLDivElement>(null);
   const checkboxId = `ack-${useId().replace(/:/g, "")}`;
   const unanswered = stage.actions.answerQuestions ? (unansweredRequired?.(stage) ?? []) : [];
   const counts = uploadCounts?.(stage.key) ?? { documents: 0, audio: 0 };
@@ -359,6 +360,7 @@ function CurrentPhaseSteps({ workspace, stage, renderAction, renderStageExtras, 
         steps={steps}
         initialIndex={initialIndex}
         renderStep={renderStep}
+        summaryRef={summaryRef}
         errors={error ? [{ message: error }, ...open.map((s) => ({ message: `${s.title}: ${s.blockedReason ?? ""}`, step: s.key }))] : []}
         final={{
           label: submitLock ? "Submit" : "Finish this phase",
@@ -371,6 +373,7 @@ function CurrentPhaseSteps({ workspace, stage, renderAction, renderStageExtras, 
         open={confirmOpen}
         stage={stage}
         busy={busy}
+        returnFocusRef={summaryRef}
         onCancel={() => setConfirmOpen(false)}
         onConfirm={async () => {
           await onSubmit(stage, ack).then(() => { writeFlag(storageKey, false); setConfirmOpen(false); }).catch(() => setConfirmOpen(false));
@@ -392,12 +395,15 @@ function summaryLine(key: WizardStepKey, complete: boolean, f: { policy: WizardS
 }
 
 /** Last step: confirm that Submit locks the phase. The acknowledgement itself was given in "Review and accept". */
-export function SubmitConfirmDialog({ open, stage, busy, onCancel, onConfirm }: {
+export function SubmitConfirmDialog({ open, stage, busy, onCancel, onConfirm, returnFocusRef }: {
   open: boolean; stage: WizardStage; busy: boolean; onCancel: () => void; onConfirm: () => Promise<void>;
+  /** On close, focus this (the error summary after a failed submit) before the Submit opener. */
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }) {
   return (
     <Dialog
       open={open}
+      returnFocusRef={returnFocusRef}
       onOpenChange={(next) => { if (!next && !busy) onCancel(); }}
       dismissible={!busy}
       title={`Submit and lock “${stage.customerLabel}”?`}

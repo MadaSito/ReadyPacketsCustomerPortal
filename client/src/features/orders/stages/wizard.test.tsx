@@ -1,4 +1,5 @@
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
+import { useState } from "react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { pageA11y } from "@/test/a11y";
@@ -335,6 +336,32 @@ describe("PhaseWizard", () => {
     const dialog = await screen.findByRole("dialog");
     await user.click(within(dialog).getByRole("button", { name: "Submit" }));
     expect(props.onSubmit).toHaveBeenCalledWith(expect.anything(), undefined);
+  });
+
+  it("a rejected Submit closes the dialog and puts focus on the error summary, not the Submit opener", async () => {
+    const ws = workspace({ currentStageKey: "phase_1" }, [stage(0, { state: "open", viewable: true, progression: "submit_lock", canSubmit: true })]);
+    function Harness() {
+      const [error, setError] = useState<string | null>(null);
+      return (
+        <PhaseWizard
+          workspace={ws}
+          renderAction={() => null}
+          onNext={async () => undefined}
+          onSubmit={async () => { setError("Someone else changed this order. Please try again."); throw new Error("conflict"); }}
+          busy={false}
+          error={error}
+        />
+      );
+    }
+    renderUi(<Harness />);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Submit" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "Submit" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    const summary = screen.getByRole("region", { name: "Please check the following" });
+    await waitFor(() => expect(summary).toHaveFocus());
+    expect(within(summary).getByText("Someone else changed this order. Please try again.")).toBeInTheDocument();
   });
 
   it("a submitted (locked) current phase is read-only and explains why; changes requested shows the note", () => {
