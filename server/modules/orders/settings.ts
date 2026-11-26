@@ -7,7 +7,7 @@ export const ORDER_REFERENCE_PREFIX = defineSetting({
   owner: "orders",
   group: "orders",
   label: "Order reference prefix",
-  description: "Uppercase prefix for generated order references, e.g. RP-2026-000123.",
+  description: "Uppercase prefix for generated order references, e.g. RP-JJG5-ZEUGRE-ICEQUE-001.",
   schema: z.string().regex(/^[A-Z]{2,6}$/),
   default: "RP",
   sensitivity: "internal",

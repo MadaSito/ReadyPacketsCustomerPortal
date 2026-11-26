@@ -21,7 +21,7 @@ type OrderLockState = "none" | "review" | "finalized" | "legal_hold" | "imported
 interface OrderAccessView {
   id: number;                 // internal numeric id — server-side only, never send to clients
   publicId: string;           // ULID
-  reference: string;          // current human-facing order reference (e.g. RP-2026-000123)
+  reference: string;          // current human-facing order reference (e.g. RP-JJG5-ZEUGRE-ICEQUE-001; older orders keep RP-2026-000123)
   ownerUserId: number;
   ownerPublicId: string;
   statusKey: string;
@@ -527,3 +527,18 @@ Attention = stage state first (`submitted` / `in_review` ⇒ `staff_review`; ope
 ### Phase questions and checklist
 
 See [D4 phase work API](./questions/API.md) for the `orders.questions` and `orders.adminTasks` procedures, version and ownership rules, customer wizard and console slots, and encrypted storage.
+
+## Increment 08 — order numbers (D2) and add-on orders (D3)
+
+**References.** New orders get `RP-<C4>-<F3><L3>-<P6>-<NNN>`, for example `RP-JJG5-ZEUGRE-ICEQUE-001`. Pure `buildReferenceStem({ prefix, customerRef, firstName, lastName, projectName })` folds each part (NFKD, accents stripped, upper case, A–Z0–9). C4 is the last 4 characters of the customer ID, padded left with `0` (or `0000` when there is none). F3, L3 and P6 are padded right with `X`. `NNN` is a per-stem counter (`order_reference_counters.scope` is now varchar(32)) that skips reserved values and never reuses one; if allocation fails you get `CONFLICT:REFERENCE_ALLOCATION_FAILED`. The stem is frozen on `orders.reference_stem`. Existing orders keep their references. References contain name fragments, so URLs and new log fields use public ids only (see the admin guide).
+
+**Groups.** Column `orders.group_root_order_id` (nullable, index `orders_group_root_idx`). The root's value is null, and each add-on order points at the root. An add-on order reuses the root's stem and project name.
+
+| Surface | Change |
+| --- | --- |
+| `orders.create`, `admin.createForCustomer` | optional `addToOrderPublicId` (any order in the group; resolved to the root). Errors: `CONFLICT:ADD_ON_TARGET_UNAVAILABLE` (not found, other owner, cancelled root, other currency), `CONFLICT:PACKET_ALREADY_IN_PROJECT` (a packet number already in a non-cancelled group order). |
+| `orders.addOnTarget({ orderId })` | customer + `orders.create`: `{ rootPublicId, rootReference, projectName, currency, packetNumbers, available, reason }`. |
+| `orders.get` | adds `group: { rootPublicId, orders: [{ publicId, reference, createdAt, statusLabel, packetNumbers, current }] }` (owner, staff and admin see the whole group; grantees see only the current order), `canAddPackets`, and `transitions[].kind: "forward" \| "cancel"`. |
+| `orders.list`, admin list | items add `group: { rootPublicId, rootReference } \| null`. |
+| Ports (`OrdersModule`) | `addOnTargetInTx(tx, ownerUserId, publicId)`, `lockAddOnRootInTx(tx, ownerUserId, publicId) → { rootPublicId } \| null` (cart checkout locks the root before its actor check). `createOrderFromCheckoutInTx` accepts `addToOrderPublicId`. |
+| Portable | order records carry `groupRootOrderId` (and `groupRootPublicId` on export). On import the root must already be imported and be its own root, with the same owner and currency (`VALIDATION:IMPORT_GROUP_ROOT_INVALID`). A kept reference records its stem and bumps the counter. |

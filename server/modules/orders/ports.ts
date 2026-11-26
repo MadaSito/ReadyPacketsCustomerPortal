@@ -49,6 +49,28 @@ export function identityPort(services: Services): IdentityPort {
   return { getUser, getUserByPublicId };
 }
 
+/** Increment 08 (D2): identity's name parts for the reference stem (identity_engineer's D1 port). */
+export interface NameParts {
+  firstName: string;
+  lastName: string;
+  preferredName: string | null;
+  customerRef: string | null;
+}
+
+/**
+ * Reads `identity.users.namePartsInTx` inside the caller's tx. While that port is absent (older identity module), the
+ * parts are derived from the display name the same way identity does: first token / last token. Never logged.
+ */
+export async function namePartsInTx(services: Services, tx: DbOrTx, userId: number): Promise<NameParts> {
+  const users = ((services as Partial<Services>).identity as { users?: unknown } | undefined)?.users;
+  const fn = method<(tx: DbOrTx, userId: number) => Promise<NameParts>>(users, "namePartsInTx");
+  if (fn) return fn(tx, userId);
+  const user = await identityPort(services).getUser(userId, { tx });
+  if (!user) throw unavailable("IDENTITY_UNAVAILABLE");
+  const tokens = user.name.normalize("NFC").trim().split(/\s+/).filter(Boolean);
+  return { firstName: tokens[0] ?? "", lastName: tokens.length > 1 ? tokens[tokens.length - 1]! : "", preferredName: null, customerRef: user.customerRef };
+}
+
 export function filesPort(services: Services): FilesPort {
   const fn = method<FilesPort["reassignOrderFiles"]>((services as Partial<Services>).files, "reassignOrderFiles");
   if (!fn) throw unavailable("FILES_UNAVAILABLE");

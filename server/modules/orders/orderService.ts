@@ -14,9 +14,10 @@ import { readSetting } from "../platform/index.js";
 import type { CatalogService } from "./catalog.js";
 import { orderGrants, orderLineItems, orderLockHistory, orderNotes, orderReassignments, orderNameHistory, orderReferences, orders, orderStageProgress, orderStatusHistory } from "./schema.js";
 import { ORDER_NOT_FOUND, orderLocked, type OrderPolicy } from "./policy.js";
-import { compliancePort, engagementPort, filesPort, identityPort, paymentExposurePort, promoNotApplicable, promotionsPort, releaseIsSafe, requirePromotions, withPromoAttemptGuard, type PromotionContext, type PromotionOutcome } from "./ports.js";
+import { compliancePort, engagementPort, filesPort, identityPort, namePartsInTx, paymentExposurePort, promoNotApplicable, promotionsPort, releaseIsSafe, requirePromotions, withPromoAttemptGuard, type PromotionContext, type PromotionOutcome } from "./ports.js";
 import { getRequestContext } from "../../core/requestContext.js";
-import { allocateReference, normalizeReference, reserveReference } from "./references.js";
+import { allocateStemReference, buildReferenceStem, normalizeReference, reserveReference } from "./references.js";
+import { addOnTarget, assertAddOnAllowed, groupMembers, isGroupOrderCancelled, lockGroupRoot, packetNumbersByOrder, prelockGroupRoot } from "./orderGroups.js";
 import { ORDER_NOTIFY_MAIL, ORDER_REFERENCE_PREFIX } from "./settings.js";
 import type { OrderAccessRole, OrderAccessView, OrderLockState, OrderProductionScope, OrderQuote, OrderSummary, NoteVisibility } from "./types.js";
 import type { PacketTier } from "./schema.js";
@@ -132,6 +133,8 @@ export interface OrderListItem {
   /** Increment 07 (D9 / D2). */
   paymentState: OrderPaymentStateV7;
   attention: OrderAttention;
+  /** Increment 08 (D3): set on an addition — the project's first order (null for a root or when not shown). */
+  group: { rootPublicId: string; rootReference: string } | null;
 }
 
 export function createOrderService(deps: OrderServiceDeps) {
@@ -342,7 +345,7 @@ export function createOrderService(deps: OrderServiceDeps) {
   async function createInTx(
     tx: Tx,
     principal: SessionPrincipal | null,
-    input: { projectName: string; items: { productPublicId: string; quantity: number }[]; note?: string; idempotencyKey: string; promoCode?: string },
+    input: { projectName: string; items: { productPublicId: string; quantity: number }[]; note?: string; idempotencyKey: string; promoCode?: string; addToOrderPublicId?: string },
     ownerUserId: number,
     prefix: string,
     system?: { correlationId: string; channel: string },
@@ -351,6 +354,11 @@ export function createOrderService(deps: OrderServiceDeps) {
     const workflow = await workflows.ensureDefault(tx);
     const lineItems = await deps.catalog.resolveForOrder(tx, input.items);
     const currency = lineItems[0]!.currency;
+    // Increment 08 (D3): an addition is checked under the group root's row lock before anything is redeemed or written.
+    const groupRoot = input.addToOrderPublicId
+      ? await assertAddOnAllowed(tx, workflows, { orderPublicId: input.addToOrderPublicId, ownerUserId, currency, packetNumbers: lineItems.map((item) => item.packetNumber) })
+      : null;
+    const projectName = groupRoot ? groupRoot.projectName : input.projectName;
     const basePricing = priceOrder(lineItems, await deps.catalog.getBundleRule(tx));
     const publicId = ulid(now.getTime());
     // Increment 05 (C3): redeem inside this transaction BEFORE the order row; any refusal rolls everything back.
@@ -367,13 +375,17 @@ export function createOrderService(deps: OrderServiceDeps) {
       pricing = applyOutcome(basePricing, outcome);
     }
     const totalMinor = pricing.totalMinor;
-    const reference = await allocateReference(tx, prefix, now);
+    // Increment 08 (D2): `PREFIX-C4-F3L3-P6-NNN`; an addition reuses the root's frozen stem when it has one.
+    const referenceStem = groupRoot?.referenceStem ?? (await stemFor(tx, prefix, ownerUserId, projectName));
+    const reference = await allocateStemReference(tx, referenceStem);
     const initial = initialState(workflow.definition);
     await tx.insert(orders).values({
       publicId,
       reference,
+      referenceStem,
+      groupRootOrderId: groupRoot?.id ?? null,
       ownerUserId,
-      projectName: input.projectName,
+      projectName,
       workflowVersionId: workflow.versionId,
       statusKey: initial.key,
       subtotalMinor: pricing.subtotalMinor,
@@ -451,6 +463,7 @@ export function createOrderService(deps: OrderServiceDeps) {
           ...(system ? { channel: system.channel } : {}),
           workflow_version: workflow.versionNumber,
           inherited_grants: inherited,
+          ...(groupRoot ? { group_root_public_id: groupRoot.publicId } : {}),
         },
         safeCounts: { line_items: lineItems.length, packet_items: lineItems.filter((item) => item.packetNumber !== null).length },
       },
@@ -458,6 +471,62 @@ export function createOrderService(deps: OrderServiceDeps) {
     );
     await emitChange(tx, { orderId, orderPublicId: publicId, kind: "created" });
     return { orderId, publicId, reference, currency, pricing, lineItems };
+  }
+
+  /**
+   * Increment 08 (D3): `group` (owner-scoped: owner and staff see every order of the project; a shared-access viewer
+   * sees only this order) and `canAddPackets` (the owning customer, root not cancelled).
+   */
+  async function groupReadModel(
+    tx: DbOrTx,
+    principal: SessionPrincipal,
+    accessRole: OrderAccessRole,
+    order: typeof orders.$inferSelect,
+    consoleView: boolean,
+  ): Promise<{
+    group: { rootPublicId: string; orders: { publicId: string; reference: string; createdAt: Date; statusLabel: string; packetNumbers: number[]; current: boolean }[] };
+    canAddPackets: boolean;
+  }> {
+    const rootId = order.groupRootOrderId ?? order.id;
+    const seesGroup = accessRole === "owner" || accessRole === "staff" || accessRole === "admin";
+    const members = seesGroup
+      ? await groupMembers(tx, { id: rootId, ownerUserId: order.ownerUserId })
+      : [{ id: order.id, publicId: order.publicId, reference: order.reference, createdAt: order.createdAt, statusKey: order.statusKey, workflowVersionId: order.workflowVersionId, groupRootOrderId: order.groupRootOrderId }];
+    const root = members.find((m) => m.id === rootId) ?? null;
+    const packets = await packetNumbersByOrder(tx, members.map((m) => m.id));
+    const bounds = new Map<number, BoundWorkflow>();
+    const boundOf = async (versionId: number) => {
+      let bound = bounds.get(versionId);
+      if (!bound) {
+        bound = await workflows.byVersionId(tx, versionId);
+        bounds.set(versionId, bound);
+      }
+      return bound;
+    };
+    const items = [];
+    for (const member of members) {
+      const state = findState((await boundOf(member.workflowVersionId)).definition, member.statusKey);
+      items.push({
+        publicId: member.publicId,
+        reference: member.reference,
+        createdAt: member.createdAt,
+        statusLabel: state ? (consoleView ? state.label : state.customerLabel) : member.statusKey,
+        packetNumbers: packets.get(member.id) ?? [],
+        current: member.id === order.id,
+      });
+    }
+    const canAddPackets =
+      accessRole === "owner" &&
+      principal.role === "customer" &&
+      root !== null &&
+      !(await isGroupOrderCancelled(tx, workflows, root));
+    return { group: { rootPublicId: root?.publicId ?? order.publicId, orders: items }, canAddPackets };
+  }
+
+  /** Increment 08 (D2): the stem from identity's name parts (never logged) and the project name. */
+  async function stemFor(tx: DbOrTx, prefix: string, ownerUserId: number, projectName: string): Promise<string> {
+    const parts = await namePartsInTx(deps.services, tx, ownerUserId);
+    return buildReferenceStem({ prefix, customerRef: parts.customerRef, firstName: parts.firstName, lastName: parts.lastName, projectName });
   }
 
   async function ownerUser(publicId: string, tx?: DbOrTx) {
@@ -483,9 +552,20 @@ export function createOrderService(deps: OrderServiceDeps) {
     // Increment 07 (D3): old orders get their progress cache filled on first read.
     const unfilled = rows.filter((row) => row.progressPercent === null).map((row) => row.id);
     const filled = unfilled.length && deps.stageRuntime ? await deps.stageRuntime.fillForRead(unfilled) : new Map<number, number>();
+    // Increment 08 (D3): additions name their project's first order (owner and staff only; a shared viewer sees none).
+    const rootIds = [...new Set(rows.map((row) => row.groupRootOrderId).filter((id): id is number => id !== null))];
+    const roots = new Map(
+      rootIds.length
+        ? (await deps.db.select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, ownerUserId: orders.ownerUserId }).from(orders).where(inArray(orders.id, rootIds))).map(
+            (root) => [root.id, root] as const,
+          )
+        : [],
+    );
     for (const row of rows) {
       const status = await statusPresentation(row.workflowVersionId, row.statusKey);
       const staffSide = principal.role !== "customer";
+      const root = row.groupRootOrderId !== null ? roots.get(row.groupRootOrderId) : undefined;
+      const showsGroup = root !== undefined && root.ownerUserId === row.ownerUserId && (staffSide || row.ownerUserId === principal.userId);
       const model = stageModelOf((await workflows.byVersionId(deps.db, row.workflowVersionId)).definition);
       const phaseIndex = stageIndexOfStatus(model, row.statusKey);
       const phase = phaseIndex >= 0 ? model.stages[phaseIndex]! : null;
@@ -510,6 +590,7 @@ export function createOrderService(deps: OrderServiceDeps) {
         phaseTotal: model.stages.length,
         paymentState: row.paymentState,
         attention: row.attention,
+        group: showsGroup ? { rootPublicId: root.publicId, rootReference: root.reference } : null,
       });
     }
     return items;
@@ -535,6 +616,8 @@ export function createOrderService(deps: OrderServiceDeps) {
         idempotencyKey: string;
         onBehalfOfCustomerPublicId?: string;
         promoCode?: string;
+        /** Increment 08 (D3): add to this order's project (any group member's public id). */
+        addToOrderPublicId?: string;
       },
     ): Promise<{ publicId: string; reference: string; created: boolean }> {
       if (principal.state !== "full") throw ORDER_NOT_FOUND();
@@ -559,9 +642,18 @@ export function createOrderService(deps: OrderServiceDeps) {
         // C1: with a code, the promotions attempt guard wraps the whole tx (refusals are recorded after rollback).
         return await withPromoAttemptGuard(deps.services, input.promoCode, principal.userId, () =>
           deps.db.transaction(async (tx) => {
-            // No existing order row is locked here, so the actor check is the first statement.
+            // Increment 08 (D3): an addition locks the group root FIRST — the same order as every existing-order write
+            // (order row → actor users row, actor.ts) — so an add-on and a concurrent root mutation cannot deadlock.
+            // Lock only; ownership and eligibility are decided after the actor check, inside createInTx.
+            if (input.addToOrderPublicId) await prelockGroupRoot(tx, input.addToOrderPublicId);
+            // Otherwise no existing order row is locked here, so the actor check is the first statement.
             const actor = await assertActorCurrent(principal, tx, "orders.create");
             if (input.onBehalfOfCustomerPublicId && !roleHasCapability(actor.role, "orders.manage")) throw forbidden("ACTOR_NOT_AUTHORIZED");
+            if (input.onBehalfOfCustomerPublicId) {
+              // Re-validate the target customer inside the transaction (the pre-check above ran outside it).
+              const owner = await ownerUser(input.onBehalfOfCustomerPublicId, tx);
+              if (!owner || owner.id !== ownerUserId) throw validation("CUSTOMER_NOT_ELIGIBLE", "Choose an active customer account.");
+            }
             // D14: a customer placing an order accepts the order agreement first (staff creating for a customer are
             // not gated; that customer is checked when they work on the order).
             await deps.gates.assertCustomerMayPlaceOrder({ tx, actor: principal });
@@ -589,7 +681,7 @@ export function createOrderService(deps: OrderServiceDeps) {
      */
     async createOrderFromCheckoutInTx(
       principal: SessionPrincipal,
-      input: { projectName: string; items: { productPublicId: string; quantity: number }[]; note?: string; idempotencyKey: string; promoCode?: string },
+      input: { projectName: string; items: { productPublicId: string; quantity: number }[]; note?: string; idempotencyKey: string; promoCode?: string; addToOrderPublicId?: string | null },
       tx: Tx,
     ) {
       if (principal.state !== "full" || principal.pendingSteps.length > 0) throw ORDER_NOT_FOUND();
@@ -613,7 +705,8 @@ export function createOrderService(deps: OrderServiceDeps) {
         };
       }
       const prefix = await readSetting(deps.settings, ORDER_REFERENCE_PREFIX, tx);
-      const result = await createInTx(tx, principal, input, principal.userId, prefix);
+      const { addToOrderPublicId, ...rest } = input;
+      const result = await createInTx(tx, principal, { ...rest, ...(addToOrderPublicId ? { addToOrderPublicId } : {}) }, principal.userId, prefix);
       return {
         id: result.orderId,
         publicId: result.publicId,
@@ -629,6 +722,31 @@ export function createOrderService(deps: OrderServiceDeps) {
         lineItems: result.lineItems.map((line) => ({ productPublicId: line.productPublicId, name: line.name, quantity: line.quantity, unitPriceMinor: line.unitPriceMinor, lineTotalMinor: line.lineTotalMinor, currency: line.currency })),
         afterCommit,
       };
+    },
+
+    /**
+     * Increment 08 (D3) read port, trusted (cart / checkout summary / new-order page): may `ownerUserId` add packets to
+     * the project of `orderPublicId`? Null when not (missing, foreign or cancelled root). No lock, no audit.
+     */
+    async addOnTargetInTx(tx: DbOrTx, ownerUserId: number, orderPublicId: string) {
+      return addOnTarget(tx, workflows, ownerUserId, orderPublicId);
+    },
+
+    /**
+     * Increment 08 (D3) lock-order port for checkout: call FIRST in the checkout transaction, before the actor check,
+     * when the cart has an add-on target. Locks the group root row (FOR UPDATE); null when the order is missing or not
+     * this owner's (eligibility is re-checked under the same lock by createOrderFromCheckoutInTx). No audit.
+     */
+    async lockAddOnRootInTx(tx: Tx, ownerUserId: number, orderPublicId: string): Promise<{ rootPublicId: string } | null> {
+      const root = await lockGroupRoot(tx, orderPublicId, ownerUserId);
+      return root ? { rootPublicId: root.publicId } : null;
+    },
+
+    /** Increment 08 (D3): `orders.addOnTarget` for the signed-in customer (NewOrderPage `?addTo=`). */
+    async addOnTarget(principal: SessionPrincipal, input: { orderId: string }) {
+      if (principal.state !== "full" || principal.pendingSteps.length > 0) throw ORDER_NOT_FOUND();
+      if (principal.role !== "customer") return null;
+      return snapshot((tx) => addOnTarget(tx, workflows, principal.userId, input.orderId));
     },
 
     /* ------------------------------------------------------------------ list */
@@ -819,9 +937,12 @@ export function createOrderService(deps: OrderServiceDeps) {
             label: targetLabel,
             actionLabel: transitionActionLabel(t, target, targetLabel),
             destructive: target ? isCancelState(target) : false,
+            /** Increment 08 (D6 wizard): "cancel" = moves to a cancel state; anything else moves the order forward. */
+            kind: (target && isCancelState(target) ? "cancel" : "forward") as "forward" | "cancel",
             requiresNote: t.requiresNote,
           };
         }),
+        ...(await groupReadModel(tx, principal, view.accessRole, order, consoleView)),
         /** Part B (B1): console header only — customer name and payment badge (null when unknown or hidden). */
         console: consoleView ? await consoleHeader(tx, order.publicId, order.ownerUserId) : null,
       };

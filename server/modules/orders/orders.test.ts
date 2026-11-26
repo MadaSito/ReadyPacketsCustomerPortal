@@ -146,7 +146,7 @@ describe("order creation", () => {
     const input = { projectName: "Idempotent", items: [{ productPublicId: productB, quantity: 3 }], idempotencyKey: key, note: "Please hurry" };
     const created = await mod.orders.create(alice.principal, input);
     expect(created.created).toBe(true);
-    expect(created.reference).toMatch(/^RP-2026-\d{6}$/);
+    expect(created.reference).toMatch(/^RP-[A-Z0-9]{4}-[A-Z0-9]{6}-IDEMPO-\d{3}$/);
     const replay = await mod.orders.create(alice.principal, input);
     expect(replay).toEqual({ ...created, created: false });
     const detail = await mod.orders.get(alice.principal, created.publicId);
@@ -350,7 +350,7 @@ describe("workflow transitions", () => {
     const order = await newOrder(alice);
     let view = await mod.assertCanReadOrder(alice.principal, order.publicId);
     expect((await mod.orders.get(alice.principal, order.publicId)).transitions).toEqual([
-      { to: "canceled", label: "Canceled", actionLabel: "Cancel order", destructive: true, requiresNote: false },
+      { to: "canceled", kind: "cancel", label: "Canceled", actionLabel: "Cancel order", destructive: true, requiresNote: false },
     ]);
     expect((await mod.orders.get(staff.principal, order.publicId, "console")).transitions.map((t) => t.actionLabel)).toEqual(["Move to In review", "Cancel order"]);
     await expectError(mod.orders.transition(alice.principal, { orderId: order.publicId, expectedVersion: view.version, toStatus: "in_review" }), "FORBIDDEN:TRANSITION_NOT_ALLOWED");
@@ -705,7 +705,7 @@ describe("portable hooks", () => {
     expect(mod.preflightImportOrder({ ...input, projectName: "" })).toMatchObject({ ok: false, reasonCode: "IMPORT_ORDER_INVALID" });
     // reference collision ⇒ fresh target reference
     const collide = await t.db.transaction((tx) => mod.importOrder({ ...input, sourceOrderPublicId: "SRC-4" }, tx));
-    expect(collide.reference).toMatch(/^RP-2026-/);
+    expect(collide.reference).toMatch(/^RP-[A-Z0-9]{4}-[A-Z0-9]{6}-[A-Z0-9]{6}-\d{3}$/);
     expect(await mod.findImportedOrder("src-install", "SRC-ORDER-1")).toMatchObject({ publicId: result.publicId, importId: "imp_test_1" });
 
     const exported = await mod.portableOrders(t.db, { limit: 10, orderIds: [view.id] });

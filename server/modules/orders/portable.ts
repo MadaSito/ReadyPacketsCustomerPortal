@@ -3,7 +3,7 @@
  * Import NEVER trusts archive-supplied identity: the target owner comes from the portable mapping and is
  * re-validated here; target public ids are freshly generated; no workflow, notification or mail is replayed.
  */
-import { and, asc, eq, gt, inArray } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, or } from "drizzle-orm";
 import { z } from "zod";
 import { conflict, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
@@ -11,8 +11,8 @@ import type { AuditEmitter, Clock, Db, DbOrTx, FieldCrypto, Logger, SettingsStor
 import type { Services } from "../../container.js";
 import { readSetting } from "../platform/index.js";
 import { assertCurrency } from "./catalog.js";
-import { identityPort } from "./ports.js";
-import { allocateReference, isReferenceReserved, normalizeReference, reserveReference } from "./references.js";
+import { identityPort, namePartsInTx } from "./ports.js";
+import { allocateStemReference, buildReferenceStem, isReferenceReserved, normalizeReference, noteStemReferenceUsed, reserveReference, stemOfReference } from "./references.js";
 import {
   orderImportProvenance,
   orderLineItems,
@@ -54,6 +54,8 @@ export const importOrderInputSchema = z.strictObject({
   sourceOrderPublicId: z.string().min(1).max(64),
   sourceReference: z.string().min(1).max(64).optional(),
   targetOwnerUserId: z.number().int().positive(),
+  /** Increment 08 (D3): local id of the already-imported group root (absent/null = standalone, as in older packages). */
+  groupRootOrderId: z.number().int().positive().nullable().optional(),
   projectName: text(160, 1),
   statusKey: z.string().min(1).max(64),
   /** Optional (v3): absent = totalMinor, i.e. no discount. totalMinor must equal subtotalMinor - discountMinor. */
@@ -190,6 +192,7 @@ export function createPortableHooks(deps: PortableDeps) {
         submittedAt: orders.submittedAt,
         totalMinor: orders.totalMinor,
         currency: orders.currency,
+        groupRootOrderId: orders.groupRootOrderId,
         importId: orderImportProvenance.importId,
       })
       .from(orderImportProvenance)
@@ -219,7 +222,7 @@ export function createPortableHooks(deps: PortableDeps) {
     /** Bounded export projection (internal notes and grants are excluded — grants are authority, not data). */
     async portableOrders(tx: DbOrTx, selection: PortableSelection): Promise<{ items: PortableOrder[]; nextAfter: number | null }> {
       const limit = Math.min(Math.max(selection.limit, 1), 200);
-      if (selection.customerIds?.length === 0 || selection.orderIds?.length === 0) return { items: [], nextAfter: null };
+      if (selection.customerIds?.length === 0 || selection.orderIds?.length === 0 || selection.groupRootIds?.length === 0) return { items: [], nextAfter: null };
       const rows = await tx
         .select({ order: orders, workflowKey: orderWorkflows.workflowKey })
         .from(orders)
@@ -230,6 +233,10 @@ export function createPortableHooks(deps: PortableDeps) {
             selection.after !== undefined ? gt(orders.id, selection.after) : undefined,
             selection.customerIds ? inArray(orders.ownerUserId, selection.customerIds.slice(0, 1000)) : undefined,
             selection.orderIds ? inArray(orders.id, selection.orderIds.slice(0, 1000)) : undefined,
+            // Increment 08 (D3): whole groups — the roots themselves and every addition pointing at them.
+            selection.groupRootIds
+              ? or(inArray(orders.id, selection.groupRootIds.slice(0, 1000)), inArray(orders.groupRootOrderId, selection.groupRootIds.slice(0, 1000)))
+              : undefined,
           ),
         )
         .orderBy(asc(orders.id))
@@ -237,6 +244,10 @@ export function createPortableHooks(deps: PortableDeps) {
       const page = rows.slice(0, limit);
       const ids = page.map((r) => r.order.id);
       if (ids.length === 0) return { items: [], nextAfter: null };
+      const rootIds = [...new Set(page.map((r) => r.order.groupRootOrderId).filter((v): v is number => v !== null))];
+      const rootPublicIds = new Map(
+        rootIds.length ? (await tx.select({ id: orders.id, publicId: orders.publicId }).from(orders).where(inArray(orders.id, rootIds))).map((r) => [r.id, r.publicId] as const) : [],
+      );
       const [items, history, notes, refs] = await Promise.all([
         tx.select().from(orderLineItems).where(inArray(orderLineItems.orderId, ids)).orderBy(asc(orderLineItems.orderId), asc(orderLineItems.sortOrder)),
         tx.select().from(orderStatusHistory).where(inArray(orderStatusHistory.orderId, ids)).orderBy(asc(orderStatusHistory.id)),
@@ -256,6 +267,8 @@ export function createPortableHooks(deps: PortableDeps) {
           publicId: order.publicId,
           reference: order.reference,
           retiredReferences: refs.filter((r) => r.orderId === order.id).map((r) => r.reference),
+          groupRootOrderId: order.groupRootOrderId,
+          groupRootPublicId: order.groupRootOrderId === null ? null : (rootPublicIds.get(order.groupRootOrderId) ?? null),
           ownerUserId: order.ownerUserId,
           projectName: order.projectName,
           statusKey: order.statusKey,
@@ -338,14 +351,41 @@ export function createPortableHooks(deps: PortableDeps) {
           reference = null;
         }
       }
+      // Increment 08 (D3): an addition joins an already-imported root of the same owner and currency.
+      let groupRoot: typeof orders.$inferSelect | null = null;
+      if (input.groupRootOrderId !== undefined && input.groupRootOrderId !== null) {
+        const [root] = await tx.select().from(orders).where(eq(orders.id, input.groupRootOrderId)).for("update").limit(1);
+        if (!root || root.groupRootOrderId !== null || root.ownerUserId !== owner.id || root.currency !== input.currency || root.origin !== "import")
+          throw validation("IMPORT_GROUP_ROOT_INVALID", "The imported order's project root is not available.");
+        groupRoot = root;
+      }
       const referenceReason = reference ? "IMPORTED_SOURCE" : "IMPORTED_GENERATED";
-      reference ??= await allocateReference(tx, await readSetting(deps.settings, ORDER_REFERENCE_PREFIX, tx), now);
+      // Increment 08 (D2): imports keep their reference; only a missing or taken one falls back to the stem generator.
+      let referenceStem: string | null;
+      if (reference) {
+        referenceStem = stemOfReference(reference);
+        await noteStemReferenceUsed(tx, reference);
+      } else {
+        const parts = groupRoot?.referenceStem ? null : await namePartsInTx(deps.services, tx, owner.id);
+        referenceStem =
+          groupRoot?.referenceStem ??
+          buildReferenceStem({
+            prefix: await readSetting(deps.settings, ORDER_REFERENCE_PREFIX, tx),
+            customerRef: parts!.customerRef,
+            firstName: parts!.firstName,
+            lastName: parts!.lastName,
+            projectName: groupRoot?.projectName ?? input.projectName,
+          });
+        reference = await allocateStemReference(tx, referenceStem);
+      }
 
       const publicId = ulid(now.getTime());
       const lockState = input.editable ? "none" : "imported_read_only";
       await tx.insert(orders).values({
         publicId,
         reference,
+        referenceStem,
+        groupRootOrderId: groupRoot?.id ?? null,
         ownerUserId: owner.id,
         projectName: input.projectName,
         workflowVersionId: workflow.versionId,

@@ -295,9 +295,15 @@ export const ordersRouter = router({
         note: nfc(1, 5000).optional(),
         idempotencyKey: z.string().regex(/^[A-Za-z0-9_-]{16,80}$/),
         promoCode: promoCode.optional(),
+        addToOrderPublicId: id.optional(),
       }),
     )
     .mutation(({ ctx, input }) => ctx.services.orders.orders.create(ctx.session, input)),
+  /** Increment 08 (D3): the caller's add-on target (project name, root reference, packets already in it); null = not addable. */
+  addOnTarget: protectedProcedure
+    .use(requireCapability("orders.create"))
+    .input(z.strictObject({ orderId: id }))
+    .query(({ ctx, input }) => ctx.services.orders.orders.addOnTarget(ctx.session, input)),
   update: protectedProcedure
     .input(z.strictObject({ orderId: id, expectedVersion: version, projectName: nfc(1, 160) }))
     .mutation(({ ctx, input }) => ctx.services.orders.orders.update(ctx.session, input)),
@@ -370,6 +376,7 @@ export const ordersRouter = router({
           note: nfc(1, 5000).optional(),
           idempotencyKey: z.string().regex(/^[A-Za-z0-9_-]{16,80}$/),
           promoCode: promoCode.optional(),
+          addToOrderPublicId: id.optional(),
         }),
       )
       .mutation(({ ctx, input }) => {

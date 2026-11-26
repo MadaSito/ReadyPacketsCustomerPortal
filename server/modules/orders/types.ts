@@ -116,6 +116,9 @@ export interface PortableOrder {
   publicId: string;
   reference: string;
   retiredReferences: string[];
+  /** Increment 08 (D3): null = the order is its own group root. */
+  groupRootOrderId: number | null;
+  groupRootPublicId: string | null;
   ownerUserId: number;
   projectName: string;
   statusKey: string;
@@ -142,6 +145,8 @@ export interface PortableSelection {
   limit: number;
   customerIds?: number[];
   orderIds?: number[];
+  /** Increment 08 (D3): orders whose id OR group_root_order_id is in the list (whole groups). */
+  groupRootIds?: number[];
 }
 
 export type ImportOrderInput = ZodInput<typeof importOrderInputSchema>;
