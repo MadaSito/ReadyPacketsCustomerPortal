@@ -13,6 +13,11 @@ const billingSettings = (state, summary) => ({
   route: "/account/billing", role: "customer",
   ready: `main [data-testid="billing-profile-page"][data-profile-state="${state}"] [data-testid="${summary}"]`,
 });
+const orderWizard = (ready) => ({ route: "/orders/:orderId", role: "customer", publicIdAtEnd: true, ready });
+const wizard = 'main section:has(> h2:text-is("Order phases"))';
+const wizardWaiting = (state, heading) => orderWizard(
+  `${wizard} [data-wizard-waiting="${state}"]:has(${heading})${state === "payment" ? ':has(a:has-text("Pay now"))' : ""}`,
+);
 const publishDialog = '[role="dialog"]:has([data-testid="publish-draft-confirm"])';
 
 // Data-dependent states need a concrete URL and a readiness locator that proves the intended state loaded.
@@ -24,8 +29,15 @@ export const increment08States = Object.freeze({
   "billing-settings-saved": billingSettings("saved", "billing-profile-summary"),
   "packet-tier-expanded": { route: "/orders/new", role: "customer", interactive: true, ready: 'main [data-packet-card="1"] [data-tier-disclosure="Basic"] button[aria-expanded="true"]' },
   "add-to-order": { route: "/orders/new", role: "customer", query: "addTo", ready: 'main [data-testid="packet-1-owned"]' },
-  "order-wizard": { route: "/orders/:orderId", role: "customer", publicIdAtEnd: true, ready: 'main ol li[aria-current="step"]' },
-  "order-wizard-waiting": { route: "/orders/:orderId", role: "customer", publicIdAtEnd: true, ready: 'main [data-wizard-waiting="team"]' },
+  "order-wizard-configured-active": orderWizard(`${wizard} ol[aria-label^="Steps in "] li[aria-current="step"]`),
+  "order-wizard-configured-payment": wizardWaiting("payment", "h4"),
+  "order-wizard-configured-team": wizardWaiting("team", "h4"),
+  // Configured completion renders its download action directly rather than through WaitingScreen.
+  "order-wizard-configured-delivered": orderWizard(`${wizard} > div[tabindex="-1"] a:text-is("Download your deliverables")`),
+  "order-wizard-derived-active": orderWizard(`${wizard} section[aria-label="Your order steps"] ol[aria-label="Steps for this order"] li[aria-current="step"]`),
+  "order-wizard-derived-payment": wizardWaiting("payment", "h3"),
+  "order-wizard-derived-team": wizardWaiting("team", "h3"),
+  "order-wizard-derived-delivered": orderWizard(`${wizard} [data-wizard-waiting="delivered"]:has(h3) a:text-is("Download your deliverables")`),
   "cart-add-to-order": { route: "/cart", role: "customer", ready: 'main [data-testid="cart-adding-to-project"]' },
   "checkout-add-to-order": { route: "/cart/checkout", role: "customer", ready: 'main form[aria-label="Checkout details"]:has([data-testid="checkout-adding-to-project"]):has([data-testid="checkout-target-project-lock"])' },
   "checkout-saved-billing": { route: "/cart/checkout", role: "customer", ready: billingChoice(true, "saved", "checkout-saved-billing-summary") },

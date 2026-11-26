@@ -67,8 +67,10 @@ Only supply non-submitting fixture steps. Do not buy, publish, save billing deta
 - **Registration and billing:** `/register` checks the name fields and the open optional billing section. `/account/billing` checks
   customers with and without saved data; use separate customer sessions.
 - **Orders:** `/orders/new` covers tier expansion; `/orders/new?addTo=<publicId>` must show an already-purchased packet on an
-  active order owned by the fixture customer. `/orders/:orderId` covers a purchase with a currently available wizard and a separate
-  waiting order with no customer action. Do not advance past steps that save or submit data.
+  active order owned by the fixture customer. `/orders/:orderId` checks active, awaiting payment, awaiting team, and delivered
+  for both configured phase workflows and legacy derived workflows. Seed eight customer-owned orders, one per state, with an actionable
+  step for active cases, an issued invoice with a positive balance for payment cases, and the completion action for delivered cases.
+  Do not advance past steps that save or submit data.
 - **Checkout:** `/cart` and `/cart/checkout` cover the locked add-to-project flow; `/cart/checkout` also covers saved billing
   and custom entry with and without a saved profile. Use synthetic non-empty carts.
   `/checkout/return` covers paid, processing, terminal unpaid, invalid and missing-target states. Use separate seeded attempt IDs

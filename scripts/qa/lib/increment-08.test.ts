@@ -35,12 +35,12 @@ describe("Increment 08 focused browser evidence", () => {
     expect(result.cases).toEqual(expect.arrayContaining([expect.objectContaining({ name: expect.stringContaining("checkout-return-missing-target") })]));
     expect(result.missing).toEqual(expect.arrayContaining([
       expect.stringContaining("billing-settings-empty]: route is not registered"),
-      expect.stringContaining("order-wizard]: supply a concrete same-origin fixture path"),
+      expect.stringContaining("order-wizard-configured-active]: supply a concrete same-origin fixture path"),
     ]));
     expect(() => resolveIncrement08Scenarios(inventory, { increment08: { unknown: {} } })).toThrow(/unknown state ID/);
     expect(Object.keys(fixtureExample.increment08)).toEqual(Object.keys(increment08States));
     expect(fixtureExample.checkoutSandbox).toBe(false);
-    const placeholder = resolveIncrement08Scenarios(inventory, fixtureExample, "/qa", "order-wizard");
+    const placeholder = resolveIncrement08Scenarios(inventory, fixtureExample, "/qa", "order-wizard-configured-active");
     expect(placeholder.cases).toEqual([]);
     expect(placeholder.missing[0]).toMatch(/seeded public ID/);
   });
@@ -94,6 +94,25 @@ describe("Increment 08 focused browser evidence", () => {
     expect(result.cases).toEqual([
       expect.objectContaining({ ready: expect.stringContaining('data-profile-state="empty"'), storageState: "/qa/customer-no-billing.state.json" }),
       expect.objectContaining({ ready: expect.stringContaining('data-profile-state="saved"'), storageState: "/qa/customer-with-billing.state.json" }),
+    ]);
+  });
+
+  it("resolves four distinct wizard states for each workflow format", () => {
+    const paths = Object.fromEntries(Object.keys(fixtureExample.increment08).filter((key) => key.startsWith("order-wizard-"))
+      .map((key, index) => [key, { path: `/orders/${orderId.slice(0, -1)}${index + 1}` }]));
+    const result = resolveIncrement08Scenarios(inventory, { sessions, increment08: paths }, "/qa", "order-wizard");
+    expect(result.missing).toEqual([]);
+    expect(result.cases).toHaveLength(8);
+    expect(new Set(result.cases.map((scenario: { ready: string }) => scenario.ready)).size).toBe(8);
+    expect(result.cases.map((scenario: { ready: string }) => scenario.ready)).toEqual([
+      expect.stringContaining('aria-label^="Steps in "'),
+      expect.stringContaining('[data-wizard-waiting="payment"]:has(h4)'),
+      expect.stringContaining('[data-wizard-waiting="team"]:has(h4)'),
+      expect.stringContaining('> div[tabindex="-1"] a:text-is("Download your deliverables")'),
+      expect.stringContaining('aria-label="Steps for this order"'),
+      expect.stringContaining('[data-wizard-waiting="payment"]:has(h3)'),
+      expect.stringContaining('[data-wizard-waiting="team"]:has(h3)'),
+      expect.stringContaining('[data-wizard-waiting="delivered"]:has(h3)'),
     ]);
   });
 });
