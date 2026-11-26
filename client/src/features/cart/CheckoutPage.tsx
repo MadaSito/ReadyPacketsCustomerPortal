@@ -761,7 +761,7 @@ function CheckoutForm({
                 role="radiogroup"
                 aria-label="Billing information choice"
                 data-testid="checkout-billing-choice"
-                className="grid gap-3"
+                className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3"
               >
                 <div className="rounded-lg border border-line p-3 sm:p-4">
                   <label className="flex min-h-11 cursor-pointer items-center gap-3 text-sm font-medium text-ink">
@@ -782,7 +782,7 @@ function CheckoutForm({
                   </label>
                   <div
                     data-testid="checkout-saved-billing-summary"
-                    className="mt-1 grid gap-0.5 pl-7 text-sm text-muted break-words"
+                    className="mt-1 grid min-w-0 grid-cols-[minmax(0,1fr)] gap-0.5 pl-7 text-sm text-muted [overflow-wrap:anywhere]"
                   >
                     {formatBillingSummaryLines(savedProfile.details).map((line, idx) => (
                       <p key={idx}>{line}</p>

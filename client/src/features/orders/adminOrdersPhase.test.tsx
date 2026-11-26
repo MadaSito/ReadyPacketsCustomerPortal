@@ -60,7 +60,7 @@ beforeEach(() => {
 });
 
 describe("console order list Phase column", () => {
-  it("shows the compact progress bar once per row (text when no value yet), a nowrap reference; a row without phases shows a dash", async () => {
+  it("shows the compact progress bar once per row (text when no value yet), a wrapping reference; a row without phases shows a dash", async () => {
     const { container } = renderUi(<AdminOrdersPage />, { path: "/admin/orders" });
     const table = await screen.findByRole("table");
     expect(within(table).getByRole("columnheader", { name: "Phase" })).toBeInTheDocument();
@@ -70,7 +70,8 @@ describe("console order list Phase column", () => {
     // No progress value yet: plain text instead of a bar.
     expect(within(table).getByText("Step 4 of 7: Phase 2 synthesis")).toBeInTheDocument();
     expect(within(table).queryByRole("progressbar", { name: "Progress of RP-2026-000003" })).not.toBeInTheDocument();
-    expect(within(table).getByRole("link", { name: "RP-2026-000001" })).toHaveClass("whitespace-nowrap");
+    // Increment 08 D2: references grew to RP-<C4>-<F3><L3>-<P6>-<NNN>, so the link may wrap instead of forcing overflow.
+    expect(within(table).getByRole("link", { name: "RP-2026-000001" })).toHaveClass("break-words");
     expect(within(table).getByRole("progressbar", { name: "Progress of RP-2026-000001" })).toHaveAttribute("aria-valuenow", "40");
     expect(within(table).queryByRole("progressbar", { name: "Progress of RP-2026-000002" })).not.toBeInTheDocument();
     await expectNoAxeViolations(container);

@@ -33,6 +33,9 @@ let admin: ReadyAdmin;
 let a: ReadyCustomer;
 let b: ReadyCustomer;
 let bOrderId = "";
+let bCartVersion = 0;
+let aBillingProfile = { publicId: "", version: 0 };
+let bBillingProfile = { publicId: "", version: 0 };
 let aOrderVersion = 0;
 let phaseOrderVersion = 0;
 const intake = "isolation_intake";
@@ -91,7 +94,7 @@ const RESOURCE_KEY = /(Id|PublicId|Ids)$/;
 const NOT_A_FOREIGN_RESOURCE = new Set(["recoverySetId", "challengeId", "upToMessageId", "productPublicId", "offerPublicId"]);
 
 /** Every probe customer B runs, keyed by procedure path. Inputs are otherwise valid so only ownership decides. */
-type Probe = { kind: "query" | "mutation"; input: () => unknown; denial?: { code: "FORBIDDEN"; reason: string } | { code: "FILTERED" | "EMPTY" }; alternateInputs?: () => unknown[] };
+type Probe = { kind: "query" | "mutation"; input: () => unknown; denial?: { code: "FORBIDDEN"; reason: string } | { code: "CONFLICT"; reason: string } | { code: "FILTERED" | "EMPTY" }; alternateInputs?: () => unknown[] };
 
 const documentLocator = (orderPublicId = owned.orderId) => ({ orderPublicId, filePublicId: owned.documentFileId });
 const phaseRef = () => ({ orderId: owned.phaseOrderId, stageKey: intake });
@@ -112,6 +115,27 @@ function probes(): Record<string, Probe> {
   const enforcementTarget = () => ({ userPublicId: o.customerPublicId, versionPublicId: o.enforcementVersionId });
   return {
     "orders.get": { kind: "query", input: () => ({ orderId: o.orderId }) },
+    // Increment 08 D3: B cannot attach an add-on order, or its cart, to A's project (and learns nothing about it).
+    "orders.addOnTarget": { kind: "query", input: () => ({ orderId: o.orderId }), denial: { code: "EMPTY" } },
+    "orders.create": {
+      kind: "mutation",
+      input: () => ({ projectName: "Not my project", items: [{ productPublicId: o.productId, quantity: 1 }], idempotencyKey: key("addon-create"), addToOrderPublicId: o.orderId }),
+    },
+    "cart.addItems": { kind: "mutation", input: () => ({ items: [{ productPublicId: o.productId, quantity: 1 }], addToOrderPublicId: o.orderId }) },
+    "cart.setTarget": { kind: "mutation", input: () => ({ expectedVersion: bCartVersion, addToOrderPublicId: o.orderId }) },
+    "cart.saveDraftDetails": { kind: "mutation", input: () => ({ expectedVersion: bCartVersion, projectName: "Not my project", addToOrderPublicId: o.orderId }) },
+    // Increment 08 D4: the generation token only ever compares against the caller's own profile. B presenting
+    // A's token and version is refused as a conflict on B's own profile; A's row is never read or written.
+    "billingProfile.save": {
+      kind: "mutation", input: () => ({ details: { ...billing, fullName: "Hijacked Billing" }, expectedVersion: aBillingProfile.version, expectedPublicId: aBillingProfile.publicId }),
+      denial: { code: "CONFLICT", reason: "BILLING_PROFILE_VERSION_CONFLICT" },
+    },
+    "billingProfile.clear": {
+      kind: "mutation", input: () => ({ expectedVersion: aBillingProfile.version, expectedPublicId: aBillingProfile.publicId }),
+      denial: { code: "CONFLICT", reason: "BILLING_PROFILE_VERSION_CONFLICT" },
+    },
+    // Increment 08 D5: B cannot trigger a provider lookup, or learn the outcome, for A's payment attempt.
+    "payments.confirmCheckoutPayment": { kind: "mutation", input: () => ({ attemptPublicId: o.attemptId }) },
     // Pricing "for a customer" is a console action: a customer naming another customer is refused before any lookup.
     "orders.quote": {
       kind: "query", input: () => ({ items: [{ productPublicId: o.productId, quantity: 1 }], forCustomerPublicId: o.customerPublicId }),
@@ -555,6 +579,15 @@ beforeAll(async () => {
   bOrderId = Browser.ok(await b.browser.mutate<{ publicId: string }>("orders.create", {
     projectName: "Isolation project bravo", items: [{ productPublicId: productId, quantity: 1 }], idempotencyKey: "isolation-order-b-0001",
   })).publicId;
+  // B has its own open cart, so only ownership of the add-on target decides the cart probes.
+  bCartVersion = Browser.ok(await b.browser.mutate<CartView>("cart.addItems", { items: [{ productPublicId: productId, quantity: 1 }] })).version;
+  const existingProfile = Browser.ok(await a.browser.query<{ publicId: string; version: number } | null>("billingProfile.get"));
+  const savedProfile = existingProfile ?? Browser.ok(await a.browser.mutate<{ publicId: string; version: number }>("billingProfile.save", { details: billing, expectedVersion: 0 }));
+  aBillingProfile = { publicId: savedProfile.publicId, version: savedProfile.version };
+  const bProfile = Browser.ok(await b.browser.mutate<{ publicId: string; version: number }>("billingProfile.save", {
+    details: { ...billing, fullName: "Bravo Isolation", email: "bravo.isolation@example.test" }, expectedVersion: 0,
+  }));
+  bBillingProfile = { publicId: bProfile.publicId, version: bProfile.version };
 
   const upload = await a.browser.raw("post", `/api/files/upload/${owned.orderId}?statusKey=submitted&slotKey=voice_evidence`)
     .field("transcript", transcript).attach("files", exampleWav(8000), "private.wav");
@@ -615,6 +648,8 @@ afterAll(async () => sys?.close());
 describe("cross-customer isolation (assembled system)", () => {
   it("customer A can read every one of its own resources (the probes below are meaningful)", async () => {
     Browser.ok(await a.browser.query("orders.get", { orderId: owned.orderId }));
+    Browser.ok(await a.browser.query("orders.addOnTarget", { orderId: owned.orderId }));
+    expect(Browser.ok(await a.browser.query("billingProfile.get"))).toMatchObject(aBillingProfile);
     expect(Browser.ok(await a.browser.query("orders.stages.workspace", { orderId: owned.phaseOrderId })))
       .toMatchObject({ orderId: owned.phaseOrderId, workflowFormat: 3, currentStageKey: intake, derived: false, version: phaseOrderVersion });
     expect(Browser.ok(await a.browser.query("orders.questions.customerList", phaseRef())))
@@ -689,6 +724,8 @@ describe("cross-customer isolation (assembled system)", () => {
           if (!visible.includes(owned.sharedTopicId)) failures.push(`${label}: did not return the shared topic`);
         } else if (probe.denial?.code === "EMPTY") {
           if (result.status !== 200 || result.data !== null) failures.push(`${label}: expected empty result`);
+        } else if (probe.denial?.code === "CONFLICT") {
+          if (result.status !== 409 || code !== "CONFLICT" || reason !== probe.denial.reason) failures.push(`${label}: ${result.status} ${code ?? ""} ${reason ?? ""}`);
         } else if (probe.denial?.code === "FORBIDDEN") {
           if (result.status !== 403 || code !== "FORBIDDEN" || reason !== probe.denial.reason) failures.push(`${label}: ${result.status} ${code ?? ""} ${reason ?? ""}`);
         } else if (result.status !== 404 || code !== "NOT_FOUND") {
@@ -773,6 +810,16 @@ describe("cross-customer isolation (assembled system)", () => {
     expect(messages).not.toContain("Intrusion.");
     const cart = Browser.ok(await a.browser.query<CartView>("cart.get"));
     expect(cart).toMatchObject({ cartPublicId: owned.cartId, version: cartVersion, items: [{ itemPublicId: owned.cartItemId, quantity: 1 }] });
+    // Increment 08: A's billing profile and order group are untouched, and B's cart never gained A's project as a target.
+    expect(Browser.ok(await a.browser.query("billingProfile.get")))
+      .toMatchObject({ ...aBillingProfile, details: expect.objectContaining({ fullName: billing.fullName }) });
+    expect(Browser.ok(await b.browser.query("billingProfile.get")))
+      .toMatchObject({ ...bBillingProfile, details: expect.objectContaining({ fullName: "Bravo Isolation" }) });
+    expect(detail).not.toContain("Not my project");
+    const bCart = Browser.ok(await b.browser.query<CartView>("cart.get"));
+    expect(bCart.version).toBe(bCartVersion);
+    expect(JSON.stringify(bCart)).not.toContain(owned.orderId);
+    expect(await sys.t.db.select({ publicId: orders.publicId }).from(orders).where(eq(orders.projectName, "Not my project"))).toEqual([]);
     const [attempt] = await sys.t.db.select().from(paymentAttempts).where(eq(paymentAttempts.publicId, owned.attemptId));
     expect(attempt).toMatchObject({ status: "created", cancelledAt: null });
     const [attachment] = await sys.t.db.select().from(knowledgeArticleAttachments).where(eq(knowledgeArticleAttachments.publicId, owned.staffAttachmentId));

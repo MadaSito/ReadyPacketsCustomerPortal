@@ -89,3 +89,4 @@ d049499ffec3e9e519ba24b5aa28c241e8b9023d:server/modules/payments/stripeCompletio
 14bc58a30e3872774031e6b095a945c05bbf04bc:tests/integration/isolation.test.ts:generic-api-key:369
 77cdfc3ba04327926381f1c41a8bbc4e378d3ebc:server/modules/orders/stageModel.ts:generic-api-key:181
 4fb93be4aa0a8584cac0048c187ba95e13f189e1:server/modules/orders/workflowDefault.test.ts:generic-api-key:71
+b7ae06403167c16c14bb08efe57ac66b5a326f1c:server/modules/compliance/receiptsAndSmallTotals.test.ts:generic-api-key:1614
