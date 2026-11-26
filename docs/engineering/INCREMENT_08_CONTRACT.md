@@ -51,7 +51,8 @@ across the wire, no secrets or personal data in logs, WCAG 2.2 AA in both themes
 - `users` gains nullable encrypted `first_name_enc`, `last_name_enc`, `preferred_name_enc`. The existing
   encrypted display name stays and is always `"<First> <Last>"`, so every existing consumer keeps working.
 - Registration, profile, administrator customer creation/edit and invitations ask for **First name** (required,
-  1–80), **Last name** (required, 1–80), **Preferred name** (optional, 0–80). Autocomplete tokens `given-name`,
+  1–50), **Last name** (required, 1–50), **Preferred name** (optional, 0–50); lengths in UTF-16 units so the
+  composed name (≤ 101) fits every downstream cap (typed signature 120, billing 160, P101 200). Autocomplete tokens `given-name`,
   `family-name`, `nickname`.
 - Accounts created before 08 (and single-name SSO subjects): parts are derived lazily — first whitespace token =
   first name, last token = last name (one token → last name empty) — and stored the next time the profile is
