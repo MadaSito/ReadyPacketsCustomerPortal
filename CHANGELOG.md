@@ -9,7 +9,7 @@ procedure.
 
 Requested by the owner on 2026-11-26 (prompt 34). See the [session log](docs/session-logs/2026-11-26-session-02.md) and the [contract](docs/engineering/INCREMENT_08_CONTRACT.md).
 - **Database migration** `0008_increment_08`, additive only. Details are in [UPGRADE.md](docs/operations/UPGRADE.md#increment-08-and-migration-0008).
-- **PR and merge commit:** (filled at merge).
+- **PR and merge commit:** #23, merge commit `1587d11` on `main`, 2026-11-26. All four workflows (ci, security, container, native-install) passed on `85a8184`.
 
 ### Fixed
 

@@ -399,7 +399,7 @@ Owner's prompt 34 of 2026-11-26 ([session log](../session-logs/2026-11-26-sessio
 
 ### Verification for increment 08
 
-Branch HEAD `76e767f`. PR and merge commit: (filled at merge).
+Branch HEAD `76e767f`. PR #23, merge commit `1587d11` on `main`, 2026-11-26; the four workflows (ci, security, container, native-install) passed on `85a8184`, including the full test suite.
 
 **Verified by the lead** on a running QA build of the branch, in Chromium, with synthetic data in pay-by-invoice mode. Migration 0008 was applied to a copy of the QA database, which then reported 9 migrations.
 - **Registration and home page (D1, D4).** Registration shows **First name**, **Last name**, **Preferred name (optional)** and a collapsed optional billing section. Submitting it empty shows an error summary and moves focus to it. The home page greets the customer by preferred name, or by first name.
