@@ -17,6 +17,6 @@ Depending on how your administrator has configured the portal, one of two checko
 
 - Returning to the portal from Stripe or Square displays your live checkout confirmation status while we verify payment confirmation directly with the payment provider.
 - In most cases confirmation completes within a few seconds. If network delivery of the provider confirmation is briefly delayed, your invoice temporarily shows **Processing confirmation** and updates to **Paid** automatically once verification completes — you do not need to submit payment a second time.
-- If you cancel on the hosted payment page or your checkout session expires, your invoice remains open under **Invoices** so you can start a fresh payment session whenever you are ready.
+- If you cancel on the hosted payment page, if your checkout session expires, or if online payment could not start right after placing your order, your order and itemized invoice remain safely saved under **Orders** and **Invoices**. You can select **Pay now** whenever online card checkout is available, or follow the invoice remittance instructions to pay by invoice without placing a duplicate order.
 
 All checkout, return, and invoice views are designed and tested against WCAG 2.2 AA for keyboard, screen-reader, and responsive mobile/desktop use.

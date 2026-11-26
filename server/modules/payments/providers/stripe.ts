@@ -16,6 +16,7 @@ import type { ModuleDeps } from "../../../container.js";
 import { DomainError, validation } from "../../../core/errors.js";
 import { ulid } from "../../../core/ids.js";
 import type { EgressPolicy } from "../../integrations/egress.js";
+import { resolveProviderMinimumMinor, sanitizeStripeDiagnosticToken } from "../settings.js";
 import type {
   CreateProviderRefundInput,
   LookupProviderRefundInput,
@@ -32,6 +33,8 @@ import type {
   ProviderRefundLookupResult,
   ProviderTestConnectionInput,
   ProviderTestConnectionResult,
+  ProviderVerifyCheckoutSessionInput,
+  ProviderVerifyCheckoutSessionResult,
   ProviderVerifyWebhookInput,
   ProviderVerifyWebhookOutput,
 } from "./types.js";
@@ -147,6 +150,95 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+export interface SafeStripeErrorDiagnostics {
+  readonly stripeErrorType: string | null;
+  readonly stripeErrorCode: string | null;
+  readonly stripeErrorParam: string | null;
+}
+
+/**
+ * Extracts bounded, secret-safe Stripe error tokens (`error.type`, `error.code`, `error.param`).
+ * NEVER inspects or returns `error.message` because Stripe 401/400 messages can echo rejected keys.
+ */
+export function extractSafeStripeErrorDiagnostics(
+  rawBody: Buffer | string | null | undefined,
+): SafeStripeErrorDiagnostics {
+  if (!rawBody) {
+    return { stripeErrorType: null, stripeErrorCode: null, stripeErrorParam: null };
+  }
+  try {
+    const text = typeof rawBody === "string" ? rawBody : rawBody.toString("utf8");
+    const parsed = asRecord(JSON.parse(text));
+    const errObj = asRecord(parsed?.error);
+    if (!errObj) {
+      return { stripeErrorType: null, stripeErrorCode: null, stripeErrorParam: null };
+    }
+    return {
+      stripeErrorType: sanitizeStripeDiagnosticToken(errObj.type),
+      stripeErrorCode: sanitizeStripeDiagnosticToken(errObj.code),
+      stripeErrorParam: sanitizeStripeDiagnosticToken(errObj.param, { allowBrackets: true }),
+    };
+  } catch {
+    return { stripeErrorType: null, stripeErrorCode: null, stripeErrorParam: null };
+  }
+}
+
+function classifyStripeNon2xxStatus(status: number): string {
+  if (status === 401) return "STRIPE_AUTH_INVALID_KEY";
+  if (status === 403) return "STRIPE_KEY_MISSING_PERMISSION";
+  if (status === 429) return "STRIPE_RATE_LIMITED";
+  if (status === 400) return "STRIPE_INVALID_REQUEST";
+  if (status > 400 && status < 500) return "STRIPE_HTTP_4XX";
+  return "STRIPE_UPSTREAM_5XX";
+}
+
+function mapStripeCheckoutTransportError(err: unknown): never {
+  if (err instanceof DomainError) {
+    if (err.reasonCode === "EGRESS_TIMEOUT" || err.reasonCode === "EGRESS_DNS_TIMEOUT") {
+      throw new DomainError(
+        "UNAVAILABLE",
+        "STRIPE_NETWORK_TIMEOUT",
+        "Connecting to Stripe timed out.",
+        { egressReasonCode: err.reasonCode },
+      );
+    }
+    if (
+      err.reasonCode === "EGRESS_CONNECT_REFUSED" ||
+      err.reasonCode === "EGRESS_CONNECTION_FAILED" ||
+      err.reasonCode === "EGRESS_DNS_RESOLUTION_FAILED" ||
+      err.reasonCode === "EGRESS_NETWORK_ERROR" ||
+      err.reasonCode === "EGRESS_ABORTED"
+    ) {
+      throw new DomainError(
+        "UNAVAILABLE",
+        "STRIPE_TRANSPORT_FAILED",
+        "Connecting to Stripe failed before receiving an HTTP response.",
+        { egressReasonCode: err.reasonCode },
+      );
+    }
+    throw err;
+  }
+  const msg = err instanceof Error ? `${err.name} ${err.message}` : "";
+  if (/timeout|timed out|etimedout|aborterror/iu.test(msg)) {
+    throw new DomainError("UNAVAILABLE", "STRIPE_NETWORK_TIMEOUT", "Connecting to Stripe timed out.");
+  }
+  throw new DomainError(
+    "UNAVAILABLE",
+    "STRIPE_TRANSPORT_FAILED",
+    "Connecting to Stripe failed before receiving an HTTP response.",
+  );
+}
+
+function isSuspectedCustomDomainRedirect(rawUrl: string): boolean {
+  if (!rawUrl || rawUrl.length > 2048 || /[\s"'<>\\]/u.test(rawUrl)) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    return parsed.protocol === "https:" && Boolean(parsed.hostname) && parsed.hostname !== "checkout.stripe.com";
+  } catch {
+    return false;
+  }
+}
+
 export function createStripeProvider(
   getEgress: () => Pick<EgressPolicy, "fetchPinned">,
 ): PaymentProviderAdapter {
@@ -155,7 +247,6 @@ export function createStripeProvider(
 
     async createCheckout(input: ProviderCreateCheckoutInput): Promise<ProviderCreateCheckoutOutput> {
       assertStripeKeyMatchesMode(input.credentials.secretKey, input.credentials.mode);
-      const egress = getEgress();
 
       const params = new URLSearchParams();
       params.set("mode", "payment");
@@ -175,35 +266,48 @@ export function createStripeProvider(
         `Invoice ${input.invoiceNumber} (${input.orderReference})`.slice(0, 120),
       );
 
-      const response = await egress.fetchPinned(
-        new URL("/v1/checkout/sessions", STRIPE_API_ORIGIN),
-        "stripe",
-        {
-          method: "POST",
-          headers: {
-            authorization: `Bearer ${input.credentials.secretKey}`,
-            "content-type": "application/x-www-form-urlencoded",
-            "stripe-version": STRIPE_API_VERSION,
-            "idempotency-key": `rp-checkout:${input.attemptPublicId}:${input.idempotencyKey}`.slice(0, 200),
+      let response;
+      try {
+        const egress = getEgress();
+        response = await egress.fetchPinned(
+          new URL("/v1/checkout/sessions", STRIPE_API_ORIGIN),
+          "stripe",
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${input.credentials.secretKey}`,
+              "content-type": "application/x-www-form-urlencoded",
+              "stripe-version": STRIPE_API_VERSION,
+              "idempotency-key": `rp-checkout:${input.attemptPublicId}:${input.idempotencyKey}`.slice(0, 200),
+            },
+            body: params.toString(),
+            timeoutMs: STRIPE_TIMEOUT_MS,
+            maxRequestBytes: 16 * 1024,
+            maxResponseBytes: MAX_STRIPE_RESPONSE_BYTES,
+            requireAllowlistRule: true,
+            publicAddressesOnly: true,
+            expectedHostSuffixes: [STRIPE_API_HOST],
+            ...(input.signal ? { signal: input.signal } : {}),
+            ...(input.beforeSend ? { beforeSend: input.beforeSend } : {}),
           },
-          body: params.toString(),
-          timeoutMs: STRIPE_TIMEOUT_MS,
-          maxRequestBytes: 16 * 1024,
-          maxResponseBytes: MAX_STRIPE_RESPONSE_BYTES,
-          requireAllowlistRule: true,
-          publicAddressesOnly: true,
-          expectedHostSuffixes: [STRIPE_API_HOST],
-          ...(input.signal ? { signal: input.signal } : {}),
-          ...(input.beforeSend ? { beforeSend: input.beforeSend } : {}),
-        },
-      );
+        );
+      } catch (err) {
+        mapStripeCheckoutTransportError(err);
+      }
 
       if (response.status < 200 || response.status >= 300) {
+        const diag = extractSafeStripeErrorDiagnostics(response.body);
+        const reasonCode = classifyStripeNon2xxStatus(response.status);
         throw new DomainError(
           "UNAVAILABLE",
-          "STRIPE_CHECKOUT_CREATE_FAILED",
+          reasonCode,
           "Stripe Checkout session could not be created.",
-          { upstreamStatus: response.status },
+          {
+            upstreamStatus: response.status,
+            ...(diag.stripeErrorType ? { stripeErrorType: diag.stripeErrorType } : {}),
+            ...(diag.stripeErrorCode ? { stripeErrorCode: diag.stripeErrorCode } : {}),
+            ...(diag.stripeErrorParam ? { stripeErrorParam: diag.stripeErrorParam } : {}),
+          },
         );
       }
 
@@ -211,7 +315,9 @@ export function createStripeProvider(
       try {
         parsed = asRecord(JSON.parse(response.body.toString("utf8")));
       } catch {
-        throw new DomainError("UNAVAILABLE", "STRIPE_INVALID_JSON", "Invalid JSON returned by Stripe.");
+        throw new DomainError("UNAVAILABLE", "STRIPE_INVALID_JSON", "Invalid JSON returned by Stripe.", {
+          upstreamStatus: response.status,
+        });
       }
 
       const sessionId = typeof parsed?.id === "string" ? parsed.id.trim() : "";
@@ -220,16 +326,30 @@ export function createStripeProvider(
       const expectedLivemode = input.credentials.mode === "live";
 
       if (!/^cs_[A-Za-z0-9_]{8,120}$/u.test(sessionId)) {
-        throw new DomainError("UNAVAILABLE", "STRIPE_INVALID_SESSION_ID", "Stripe returned an invalid session id.");
+        throw new DomainError(
+          "UNAVAILABLE",
+          "STRIPE_INVALID_SESSION_ID",
+          "Stripe returned an invalid session id.",
+          { upstreamStatus: response.status },
+        );
       }
       if (livemode !== expectedLivemode) {
-        throw new DomainError("CONFLICT", "STRIPE_MODE_MISMATCH", "Stripe session livemode did not match portal mode.");
+        throw new DomainError(
+          "CONFLICT",
+          "STRIPE_MODE_MISMATCH",
+          "Stripe session livemode did not match portal mode.",
+          { upstreamStatus: response.status },
+        );
       }
       if (!isAllowedStripeHostedUrl(redirectUrl)) {
         throw new DomainError(
           "UNAVAILABLE",
           "STRIPE_UNTRUSTED_REDIRECT_URL",
           "Stripe returned an untrusted hosted checkout URL.",
+          {
+            upstreamStatus: response.status,
+            customDomainSuspected: isSuspectedCustomDomainRedirect(redirectUrl),
+          },
         );
       }
 
@@ -638,21 +758,29 @@ export function createStripeProvider(
 
       const latencyMs = Math.max(0, Date.now() - startedMs);
       if (response.status === 401 || response.status === 403) {
+        const diag = extractSafeStripeErrorDiagnostics(response.body);
         return {
           ok: false,
           mode: input.credentials.mode,
           latencyMs,
           verifiedAt: null,
           reasonCode: response.status === 401 ? "STRIPE_AUTH_INVALID_KEY" : "STRIPE_KEY_MISSING_PERMISSION",
+          upstreamStatus: response.status,
+          stripeErrorType: diag.stripeErrorType,
+          stripeErrorCode: diag.stripeErrorCode,
         };
       }
       if (response.status < 200 || response.status >= 300) {
+        const diag = extractSafeStripeErrorDiagnostics(response.body);
         return {
           ok: false,
           mode: input.credentials.mode,
           latencyMs,
           verifiedAt: null,
           reasonCode: "STRIPE_UPSTREAM_HTTP_ERROR",
+          upstreamStatus: response.status,
+          stripeErrorType: diag.stripeErrorType,
+          stripeErrorCode: diag.stripeErrorCode,
         };
       }
 
@@ -665,6 +793,7 @@ export function createStripeProvider(
             latencyMs,
             verifiedAt: null,
             reasonCode: "STRIPE_UNEXPECTED_PAYLOAD",
+            upstreamStatus: response.status,
           };
         }
       } catch {
@@ -674,6 +803,7 @@ export function createStripeProvider(
           latencyMs,
           verifiedAt: null,
           reasonCode: "STRIPE_INVALID_JSON",
+          upstreamStatus: response.status,
         };
       }
 
@@ -683,6 +813,217 @@ export function createStripeProvider(
         latencyMs,
         verifiedAt: input.now,
         reasonCode: null,
+        upstreamStatus: response.status,
+      };
+    },
+
+    async verifyCheckoutSession(
+      input: ProviderVerifyCheckoutSessionInput,
+    ): Promise<ProviderVerifyCheckoutSessionResult> {
+      const startedMs = Date.now();
+      try {
+        assertStripeKeyMatchesMode(input.credentials.secretKey, input.credentials.mode);
+      } catch {
+        return {
+          ok: false,
+          mode: input.credentials.mode,
+          latencyMs: Math.max(0, Date.now() - startedMs),
+          verifiedAt: null,
+          sessionId: null,
+          expiredImmediately: false,
+          reasonCode: "STRIPE_KEY_MODE_MISMATCH",
+        };
+      }
+
+      const probeToken = ulid(input.now.getTime());
+      const currency = /^[A-Z]{3}$/u.test(input.currency) ? input.currency : "USD";
+      const minMinor = Math.max(
+        resolveProviderMinimumMinor("stripe", currency, { belowProviderMinimum: "waive" }),
+        100,
+      );
+      const origin = input.canonicalOrigin.replace(/\/+$/u, "");
+
+      const params = new URLSearchParams();
+      params.set("mode", "payment");
+      params.set("success_url", `${origin}/admin/payments/setup?probe=ok`);
+      params.set("cancel_url", `${origin}/admin/payments/setup?probe=cancel`);
+      params.set("client_reference_id", `rp_probe_${probeToken}`);
+      params.set("metadata[rp_setup_probe]", "1");
+      params.set("line_items[0][quantity]", "1");
+      params.set("line_items[0][price_data][currency]", currency.toLowerCase());
+      params.set("line_items[0][price_data][unit_amount]", String(minMinor));
+      params.set(
+        "line_items[0][price_data][product_data][name]",
+        "ReadyPackets Checkout setup verification (auto-expired)",
+      );
+
+      let createResp;
+      try {
+        const egress = getEgress();
+        createResp = await egress.fetchPinned(
+          new URL("/v1/checkout/sessions", STRIPE_API_ORIGIN),
+          "stripe",
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${input.credentials.secretKey}`,
+              "content-type": "application/x-www-form-urlencoded",
+              "stripe-version": STRIPE_API_VERSION,
+              "idempotency-key": `rp-probe-create:${probeToken}`,
+            },
+            body: params.toString(),
+            timeoutMs: STRIPE_TIMEOUT_MS,
+            maxRequestBytes: 8 * 1024,
+            maxResponseBytes: MAX_STRIPE_RESPONSE_BYTES,
+            requireAllowlistRule: true,
+            publicAddressesOnly: true,
+            expectedHostSuffixes: [STRIPE_API_HOST],
+            ...(input.signal ? { signal: input.signal } : {}),
+          },
+        );
+      } catch (err) {
+        let reasonCode = "STRIPE_TRANSPORT_FAILED";
+        if (err instanceof DomainError && /^[A-Z0-9_]{2,64}$/u.test(err.reasonCode)) {
+          if (err.reasonCode === "EGRESS_TIMEOUT" || err.reasonCode === "EGRESS_DNS_TIMEOUT") {
+            reasonCode = "STRIPE_NETWORK_TIMEOUT";
+          } else if (
+            err.reasonCode === "EGRESS_CONNECT_REFUSED" ||
+            err.reasonCode === "EGRESS_CONNECTION_FAILED" ||
+            err.reasonCode === "EGRESS_DNS_RESOLUTION_FAILED" ||
+            err.reasonCode === "EGRESS_NETWORK_ERROR" ||
+            err.reasonCode === "EGRESS_ABORTED"
+          ) {
+            reasonCode = "STRIPE_TRANSPORT_FAILED";
+          } else {
+            reasonCode = err.reasonCode;
+          }
+        }
+        return {
+          ok: false,
+          mode: input.credentials.mode,
+          latencyMs: Math.max(0, Date.now() - startedMs),
+          verifiedAt: null,
+          sessionId: null,
+          expiredImmediately: false,
+          reasonCode,
+        };
+      }
+
+      if (createResp.status < 200 || createResp.status >= 300) {
+        const diag = extractSafeStripeErrorDiagnostics(createResp.body);
+        return {
+          ok: false,
+          mode: input.credentials.mode,
+          latencyMs: Math.max(0, Date.now() - startedMs),
+          verifiedAt: null,
+          sessionId: null,
+          expiredImmediately: false,
+          reasonCode: classifyStripeNon2xxStatus(createResp.status),
+          upstreamStatus: createResp.status,
+          stripeErrorType: diag.stripeErrorType,
+          stripeErrorCode: diag.stripeErrorCode,
+          stripeErrorParam: diag.stripeErrorParam,
+        };
+      }
+
+      let parsed: Record<string, unknown> | null;
+      try {
+        parsed = asRecord(JSON.parse(createResp.body.toString("utf8")));
+      } catch {
+        return {
+          ok: false,
+          mode: input.credentials.mode,
+          latencyMs: Math.max(0, Date.now() - startedMs),
+          verifiedAt: null,
+          sessionId: null,
+          expiredImmediately: false,
+          reasonCode: "STRIPE_INVALID_JSON",
+          upstreamStatus: createResp.status,
+        };
+      }
+
+      const sessionId = typeof parsed?.id === "string" ? parsed.id.trim() : "";
+      const redirectUrl = typeof parsed?.url === "string" ? parsed.url.trim() : "";
+      const livemode = parsed?.livemode === true;
+      const expectedLivemode = input.credentials.mode === "live";
+
+      if (!/^cs_[A-Za-z0-9_]{8,120}$/u.test(sessionId)) {
+        return {
+          ok: false,
+          mode: input.credentials.mode,
+          latencyMs: Math.max(0, Date.now() - startedMs),
+          verifiedAt: null,
+          sessionId: null,
+          expiredImmediately: false,
+          reasonCode: "STRIPE_INVALID_SESSION_ID",
+          upstreamStatus: createResp.status,
+        };
+      }
+
+      let expiredImmediately: boolean;
+      try {
+        const egress = getEgress();
+        const expireResp = await egress.fetchPinned(
+          new URL(`/v1/checkout/sessions/${encodeURIComponent(sessionId)}/expire`, STRIPE_API_ORIGIN),
+          "stripe",
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${input.credentials.secretKey}`,
+              "content-type": "application/x-www-form-urlencoded",
+              "stripe-version": STRIPE_API_VERSION,
+              "idempotency-key": `rp-probe-expire:${probeToken}`,
+            },
+            body: "",
+            timeoutMs: STRIPE_TIMEOUT_MS,
+            maxRequestBytes: 1024,
+            maxResponseBytes: MAX_STRIPE_RESPONSE_BYTES,
+            requireAllowlistRule: true,
+            publicAddressesOnly: true,
+            expectedHostSuffixes: [STRIPE_API_HOST],
+            ...(input.signal ? { signal: input.signal } : {}),
+          },
+        );
+        expiredImmediately = expireResp.status >= 200 && expireResp.status < 300;
+      } catch {
+        expiredImmediately = false;
+      }
+
+      const latencyMs = Math.max(0, Date.now() - startedMs);
+      if (livemode !== expectedLivemode) {
+        return {
+          ok: false,
+          mode: input.credentials.mode,
+          latencyMs,
+          verifiedAt: null,
+          sessionId,
+          expiredImmediately,
+          reasonCode: "STRIPE_MODE_MISMATCH",
+          upstreamStatus: createResp.status,
+        };
+      }
+      if (!isAllowedStripeHostedUrl(redirectUrl)) {
+        return {
+          ok: false,
+          mode: input.credentials.mode,
+          latencyMs,
+          verifiedAt: null,
+          sessionId,
+          expiredImmediately,
+          reasonCode: "STRIPE_UNTRUSTED_REDIRECT_URL",
+          upstreamStatus: createResp.status,
+        };
+      }
+
+      return {
+        ok: true,
+        mode: input.credentials.mode,
+        latencyMs,
+        verifiedAt: input.now,
+        sessionId,
+        expiredImmediately,
+        reasonCode: null,
+        upstreamStatus: createResp.status,
       };
     },
   };

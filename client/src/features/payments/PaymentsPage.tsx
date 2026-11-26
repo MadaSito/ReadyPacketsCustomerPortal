@@ -38,7 +38,25 @@ const publicId = /^[0-9A-HJKMNP-TV-Z]{26}$/u;
 const smallId = (id: string) => <span className="break-all font-mono text-xs">{id}</span>;
 
 function StripeReadinessBanner({ settings }: { settings: PaymentSettingsView }) {
-  if (settings.provider !== "stripe" || settings.onlineEnabled) return null;
+  if (settings.provider !== "stripe") return null;
+  if (settings.onlineEnabled) {
+    if (!settings.stripe.lastCheckoutFailure) return null;
+    return (
+      <div className="mb-5">
+        <Callout tone="danger" title="Recent Stripe Checkout session creation failed">
+          <p className="mb-2">
+            A customer could not be redirected to Stripe Checkout ({settings.stripe.lastCheckoutFailure.reasonCode}
+            {settings.stripe.lastCheckoutFailure.upstreamStatus !== null
+              ? `, HTTP ${settings.stripe.lastCheckoutFailure.upstreamStatus}`
+              : ""}). Inspect diagnostics and verify Checkout session creation.
+          </p>
+          <Link href="/admin/payments/setup" className="font-semibold text-action underline underline-offset-2">
+            Open Stripe setup checklist
+          </Link>
+        </Callout>
+      </div>
+    );
+  }
   const missing: string[] = [];
   if (!settings.stripe.egressAllowlisted) missing.push("outbound HTTPS allowlist for api.stripe.com:443");
   if (!settings.stripe.secretKeyConfigured) missing.push("Stripe API secret key");
@@ -49,8 +67,11 @@ function StripeReadinessBanner({ settings }: { settings: PaymentSettingsView }) 
     <div className="mb-5">
       <Callout tone="warning" title="Stripe checkout is selected, but readiness checks are incomplete">
         <p className="mb-2">
-          Hosted checkout stays inactive until every prerequisite is in place
+          Hosted checkout stays inactive (customers currently receive pay-by-invoice) until every prerequisite is in place
           {missing.length > 0 ? `: ${missing.join(", ")}.` : "."}
+          {settings.stripe.reverificationNeeded
+            ? " Credentials or outbound allowlist settings changed after the previous verification."
+            : ""}
         </p>
         <Link href="/admin/payments/setup" className="font-semibold text-action underline underline-offset-2">
           Open Stripe setup checklist

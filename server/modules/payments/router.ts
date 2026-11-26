@@ -79,18 +79,18 @@ export const updatePaymentsSettingsInputSchema = z.strictObject({
   successPath: safeReturnPathSchema.optional(),
   cancelPath: safeReturnPathSchema.optional(),
   webhookToleranceSeconds: z.number().int().min(30).max(300).optional(),
-  stripeSecretKey: z.string().trim().min(1).max(256).optional(),
+  stripeSecretKey: z.string().max(1024).optional(),
   clearStripeSecretKey: z.boolean().optional(),
-  stripeWebhookSecret: z.string().trim().min(1).max(256).optional(),
+  stripeWebhookSecret: z.string().max(1024).optional(),
   clearStripeWebhookSecret: z.boolean().optional(),
-  stripeWebhookSecretSecondary: z.string().trim().min(1).max(256).optional(),
+  stripeWebhookSecretSecondary: z.string().max(1024).optional(),
   clearStripeWebhookSecretSecondary: z.boolean().optional(),
   squareLocationId: z
     .union([z.string().trim().regex(/^[A-Za-z0-9_-]{4,64}$/u), z.literal(""), z.null()])
     .optional(),
-  squareAccessToken: z.string().trim().min(1).max(256).optional(),
+  squareAccessToken: z.string().max(1024).optional(),
   clearSquareAccessToken: z.boolean().optional(),
-  squareWebhookSignatureKey: z.string().trim().min(1).max(256).optional(),
+  squareWebhookSignatureKey: z.string().max(1024).optional(),
   clearSquareWebhookSignatureKey: z.boolean().optional(),
   smallTotals: paymentsSmallTotalsSchema.optional(),
   receipts: paymentsReceiptsSchema.optional(),
@@ -102,19 +102,20 @@ export const paymentsRouter = router({
     .meta({ rateLimit: "standard_browsing" })
     .query(({ ctx }) => requirePaymentsModule(ctx.services).getPublicCheckoutConfig()),
 
-  /** Starts hosted checkout for an issued unpaid customer invoice (or returns `{ mode: "invoice" }`). */
+  /** Starts hosted checkout for an issued unpaid customer invoice (throws customer-safe error when online payment cannot start). */
   startInvoiceCheckout: protectedProcedure
     .meta({ rateLimit: "form_submission" })
     .input(
       z.strictObject({
         invoicePublicId: publicIdSchema,
+        cartPublicId: publicIdSchema.optional(),
         successPath: safeReturnPathSchema.optional(),
         cancelPath: safeReturnPathSchema.optional(),
         idempotencyKey: z.string().trim().min(4).max(128).optional(),
       }),
     )
     .mutation(({ ctx, input }) =>
-      requirePaymentsModule(ctx.services).startCheckout(
+      requirePaymentsModule(ctx.services).startInvoiceCheckout(
         input.invoicePublicId,
         {
           ...(input.successPath ? { successPath: input.successPath } : {}),
@@ -122,6 +123,7 @@ export const paymentsRouter = router({
         },
         {
           principal: ctx.session,
+          ...(input.cartPublicId ? { cartPublicId: input.cartPublicId } : {}),
           ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
         },
       ),
@@ -179,6 +181,19 @@ export const paymentsRouter = router({
           .optional(),
       )
       .mutation(({ ctx }) => requirePaymentsModule(ctx.services).admin.testConnection(ctx.session)),
+
+    verifyCheckoutSession: paymentsManageProc
+      .meta({ rateLimit: "auth_high_risk" })
+      .input(
+        z
+          .strictObject({
+            provider: z.literal("stripe").optional(),
+          })
+          .optional(),
+      )
+      .mutation(({ ctx }) =>
+        requirePaymentsModule(ctx.services).admin.verifyCheckoutSession(ctx.session),
+      ),
 
     sendSelfTestWebhook: paymentsManageProc
       .meta({ rateLimit: "auth_high_risk" })

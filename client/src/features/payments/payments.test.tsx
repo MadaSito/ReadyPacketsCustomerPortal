@@ -95,6 +95,7 @@ const mocks = vi.hoisted(() => ({
   getSettings: vi.fn(),
   updateSettings: vi.fn(),
   testConnection: vi.fn(),
+  verifyCheckoutSession: vi.fn(),
   sendSelfTest: vi.fn(),
   listRejections: vi.fn(),
   egressPresets: vi.fn(),
@@ -112,6 +113,21 @@ beforeEach(() => {
     secretConfigured: true,
     httpStatus: 200,
     message: "Connected to Stripe test API over api.stripe.com:443.",
+    checkedAt: date,
+  });
+  mocks.verifyCheckoutSession.mockReset().mockResolvedValue({
+    provider: "stripe",
+    mode: "test",
+    ok: true,
+    egressAllowlisted: true,
+    secretConfigured: true,
+    httpStatus: 200,
+    reasonCode: "CHECKOUT_SESSION_VERIFIED",
+    stripeErrorType: null,
+    stripeErrorCode: null,
+    stripeErrorParam: null,
+    expiredImmediately: true,
+    message: "Created an unpaid test Stripe Checkout Session over api.stripe.com:443 and expired it immediately.",
     checkedAt: date,
   });
   mocks.sendSelfTest.mockReset().mockResolvedValue({
@@ -175,6 +191,11 @@ vi.mock("@/lib/trpc", async (original) => ({
           testConnection: {
             mutationOptions: () => ({
               mutationFn: (input: unknown) => mocks.testConnection(input),
+            }),
+          },
+          verifyCheckoutSession: {
+            mutationOptions: () => ({
+              mutationFn: (input: unknown) => mocks.verifyCheckoutSession(input),
             }),
           },
           sendSelfTestWebhook: {
@@ -508,3 +529,328 @@ it("keeps Activate Stripe Checkout disabled when API check fails (HTTP 401), req
     expect.objectContaining({ provider: "none", mode: "test" }),
   );
 });
+
+it("Fix Pack 07.2 Problem A — renders ACTIVE/NOT ACTIVE customer banner, stale verification warning, last checkout failure diagnostics, and Verify Checkout session creation probe", async () => {
+  const user = userEvent.setup();
+  mocks.egressPresets.mockResolvedValue([
+    { key: "stripe", label: "Stripe API", enabled: true, parameterized: false },
+  ]);
+
+  // 1. Paused / stale verification + lastCheckoutFailure diagnostics + failed probe blocks activation
+  mocks.getSettings.mockResolvedValue({
+    ...defaultConfig,
+    provider: "stripe",
+    mode: "live",
+    onlineEnabled: false,
+    stripe: {
+      ...defaultConfig.stripe,
+      egressAllowlisted: true,
+      secretKeyConfigured: true,
+      secretKeyLast4: "4242",
+      webhookSecretConfigured: true,
+      webhookSecretLast4: "9876",
+      lastApiVerifiedAt: "2026-11-21T12:05:00.000Z",
+      lastSelfTestWebhookAt: "2026-11-21T12:06:00.000Z",
+      reverificationNeeded: true,
+      reverificationReasons: [
+        "Primary signing secret changed after the last self-test; re-run Send self-test webhook.",
+      ],
+      missingGates: ["api_verified", "checkout_session_verified", "webhook_verified"],
+      lastCheckoutProbe: {
+        checkedAt: "2026-11-21T12:10:00.000Z",
+        mode: "live",
+        ok: false,
+        reasonCode: "STRIPE_KEY_MISSING_PERMISSION",
+        httpStatus: 403,
+        stripeErrorType: "invalid_request_error",
+        stripeErrorCode: "permission_denied",
+        stripeErrorParam: "line_items",
+        expiredImmediately: false,
+      },
+      lastCheckoutFailure: {
+        occurredAt: "2026-11-21T12:15:00.000Z",
+        provider: "stripe",
+        mode: "live",
+        reasonCode: "STRIPE_KEY_MISSING_PERMISSION",
+        failureClass: "provider_permission",
+        upstreamStatus: 403,
+        stripeErrorType: "invalid_request_error",
+        stripeErrorCode: "permission_denied",
+        stripeErrorParam: "line_items",
+        invoicePublicId: invoiceId,
+        attemptPublicId: id,
+      },
+    },
+  });
+
+  const pausedView = renderSetupPage();
+  expect(
+    await screen.findByText(/Online card checkout: NOT ACTIVE — Stripe Checkout \(live\) is paused pending verification/u),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText(/Credentials or outbound allowlist changed after verification/u),
+  ).toBeInTheDocument();
+  expect(screen.getByText("Last checkout-session failure")).toBeInTheDocument();
+  expect(screen.getByText("Restricted key missing permission (HTTP 403)")).toBeInTheDocument();
+  expect(screen.getAllByText("STRIPE_KEY_MISSING_PERMISSION").length).toBeGreaterThan(0);
+  expect(screen.getAllByText(/permission_denied/u).length).toBeGreaterThan(0);
+  expect(screen.queryByText("Optional")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Switch to Pay by invoice" })).toBeEnabled();
+
+  await user.click(screen.getByRole("button", { name: "Verify Checkout session creation" }));
+  expect(mocks.verifyCheckoutSession).toHaveBeenCalledWith({ provider: "stripe" });
+  pausedView.unmount();
+
+  // 2. Pay-by-invoice mode banner states plainly: Customers get pay-by-invoice; no card payment is collected; failed probe keeps Activate disabled
+  mocks.getSettings.mockResolvedValue({
+    ...defaultConfig,
+    provider: "none",
+    mode: "live",
+    onlineEnabled: false,
+    stripe: {
+      ...defaultConfig.stripe,
+      egressAllowlisted: true,
+      secretKeyConfigured: true,
+      secretKeyLast4: "4242",
+      webhookSecretConfigured: true,
+      webhookSecretLast4: "9876",
+      lastApiVerifiedAt: "2026-11-21T12:05:00.000Z",
+      lastSelfTestWebhookAt: "2026-11-21T12:06:00.000Z",
+      lastCheckoutProbe: {
+        checkedAt: "2026-11-21T12:10:00.000Z",
+        mode: "live",
+        ok: false,
+        reasonCode: "STRIPE_KEY_MISSING_PERMISSION",
+        httpStatus: 403,
+        stripeErrorType: "invalid_request_error",
+        stripeErrorCode: "permission_denied",
+        stripeErrorParam: "line_items",
+        expiredImmediately: false,
+      },
+      missingGates: ["checkout_session_verified"],
+    },
+  });
+  const invoiceOnlyView = renderSetupPage();
+  expect(
+    await screen.findByText(
+      /Online card checkout: NOT ACTIVE — Customers get pay-by-invoice; no card payment is collected/u,
+    ),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Activate Stripe Checkout" })).toBeDisabled();
+  invoiceOnlyView.unmount();
+
+  // 3. Active live mode banner states plainly that customers are sent to Stripe Checkout (live)
+  mocks.getSettings.mockResolvedValue({
+    ...defaultConfig,
+    provider: "stripe",
+    mode: "live",
+    onlineEnabled: true,
+    stripe: {
+      ...defaultConfig.stripe,
+      egressAllowlisted: true,
+      secretKeyConfigured: true,
+      secretKeyLast4: "4242",
+      webhookSecretConfigured: true,
+      webhookSecretLast4: "9876",
+      ready: true,
+      lastApiVerifiedAt: "2026-11-21T12:05:00.000Z",
+      lastSelfTestWebhookAt: "2026-11-21T12:06:00.000Z",
+      missingGates: [],
+    },
+  });
+
+  const activeView = renderSetupPage();
+  expect(
+    await screen.findByText(/Online card checkout: ACTIVE — Customers are sent to Stripe Checkout \(live\)/u),
+  ).toBeInTheDocument();
+  activeView.unmount();
+});
+
+it("Fix Pack 07.2 Problem B — validates shapes per field with focus management without echoing secrets, normalizes pasted whitespace/quotes, toggles Show/Hide, and warns on Secondary vs Primary", async () => {
+  const user = userEvent.setup();
+  mocks.egressPresets.mockResolvedValue([
+    { key: "stripe", label: "Stripe API", enabled: true, parameterized: false },
+  ]);
+  mocks.getSettings.mockResolvedValue({
+    ...defaultConfig,
+    provider: "none",
+    mode: "live",
+    onlineEnabled: false,
+    stripe: {
+      ...defaultConfig.stripe,
+      egressAllowlisted: true,
+      secretKeyConfigured: true,
+      secretKeyLast4: "4242",
+      webhookSecretConfigured: true,
+      webhookSecretLast4: "9876",
+    },
+  });
+
+  const { container } = renderSetupPage();
+  const apiKeyInput = await screen.findByLabelText("Stripe API secret key");
+  const primaryWhInput = screen.getByLabelText("Primary Stripe webhook signing secret");
+  const secondaryWhInput = screen.getByLabelText("Secondary Stripe webhook signing secret (optional rollover)");
+
+  // Anti-autofill attributes + password type + Show/Hide toggles + zero character counters
+  for (const input of [apiKeyInput, primaryWhInput, secondaryWhInput]) {
+    expect(input).toHaveAttribute("autocomplete", "off");
+    expect(input).toHaveAttribute("data-1p-ignore", "true");
+    expect(input).toHaveAttribute("data-lpignore", "true");
+    expect(input).toHaveAttribute("data-bwignore", "true");
+    expect(input).toHaveAttribute("data-form-type", "other");
+    expect(input).toHaveAttribute("type", "password");
+  }
+  expect(container.textContent).not.toMatch(/\b\d+\s*\/\s*256\b/u);
+
+  const showPrimaryBtn = screen.getByRole("button", { name: "Show Primary Stripe webhook signing secret" });
+  expect(showPrimaryBtn).toHaveAttribute("aria-pressed", "false");
+  await user.click(showPrimaryBtn);
+  expect(primaryWhInput).toHaveAttribute("type", "text");
+  const hidePrimaryBtn = screen.getByRole("button", { name: "Hide Primary Stripe webhook signing secret" });
+  expect(hidePrimaryBtn).toHaveAttribute("aria-pressed", "true");
+  await user.click(hidePrimaryBtn);
+  expect(primaryWhInput).toHaveAttribute("type", "password");
+
+  // Wrong-key shapes: publishable key in API field + API key in webhook field -> per-field inline errors, focus moves to first invalid field, secret content never echoed
+  const fakePubFragment = "PublishableNeverEcho9911";
+  const fakeSkFragment = "SecretNeverEcho8822";
+  await user.type(apiKeyInput, `pk_live_fake_${fakePubFragment}`);
+  await user.type(primaryWhInput, `sk_live_fake_${fakeSkFragment}`);
+  await user.click(screen.getByRole("button", { name: "Stage Stripe credentials" }));
+
+  expect(mocks.updateSettings).not.toHaveBeenCalled();
+  expect(apiKeyInput).toHaveAttribute("aria-invalid", "true");
+  expect(primaryWhInput).toHaveAttribute("aria-invalid", "true");
+  expect(document.activeElement).toBe(apiKeyInput);
+  expect(screen.getAllByText(/publishable key \(pk_…\)/u).length).toBeGreaterThan(0);
+  expect(screen.getAllByText(/This looks like a Stripe API key \(sk_… \/ rk_…\)/u).length).toBeGreaterThan(0);
+  expect(container.textContent).not.toContain(fakePubFragment);
+  expect(container.textContent).not.toContain(fakeSkFragment);
+
+  // Endpoint ID in Primary webhook field
+  await user.clear(apiKeyInput);
+  await user.clear(primaryWhInput);
+  await user.type(primaryWhInput, "we_1FakeEndpointIdentifier7733");
+  await user.click(screen.getByRole("button", { name: "Stage Stripe credentials" }));
+  expect(document.activeElement).toBe(primaryWhInput);
+  expect(screen.getAllByText(/webhook endpoint ID \(we_…\)/u).length).toBeGreaterThan(0);
+  expect(container.textContent).not.toContain("Identifier7733");
+
+  // Secondary-only rollover pre-save explanation callout when Primary is blank and already saved
+  await user.clear(primaryWhInput);
+  await user.type(secondaryWhInput, "whsec_fake_rollover_candidate_secret_5566");
+  expect(
+    await screen.findByText(/Saving Secondary keeps your existing Primary signing secret/u),
+  ).toBeInTheDocument();
+
+  // Quoted + wrapped Primary signing secret normalizes cleanly on save and shows post-save self-test + Stripe test-event reminder
+  await user.clear(secondaryWhInput);
+  await user.type(primaryWhInput, '  "whsec_live_fake_normalized_secret_4455"  ');
+  await user.click(screen.getByRole("button", { name: "Stage Stripe credentials" }));
+  expect(mocks.updateSettings).toHaveBeenCalledWith(
+    expect.objectContaining({
+      stripeWebhookSecret: "whsec_live_fake_normalized_secret_4455",
+    }),
+  );
+  expect(
+    await screen.findByText(/Re-run webhook verification after changing a signing secret/u),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText(/portal self-test only proves ReadyPackets' local signature check/u),
+  ).toBeInTheDocument();
+});
+
+it("Fix Pack 07.2 Problem B (PaymentSettings) — validates inline per field, focuses first invalid input, and displays post-save webhook reminder", async () => {
+  const user = userEvent.setup();
+  const onSave = vi.fn().mockResolvedValue(undefined);
+  const { container } = renderUi(
+    <PaymentSettings
+      settings={{
+        ...defaultConfig,
+        provider: "stripe",
+        mode: "live",
+        stripe: {
+          ...defaultConfig.stripe,
+          egressAllowlisted: true,
+          secretKeyConfigured: true,
+          secretKeyLast4: "4242",
+          webhookSecretConfigured: true,
+          webhookSecretLast4: "9876",
+          ready: true,
+        },
+      }}
+      saving={false}
+      onSave={onSave}
+    />,
+  );
+
+  const primaryWh = screen.getByLabelText(/^Primary Stripe webhook signing secret/u);
+  await user.type(primaryWh, "sk_live_fake_wrong_slot_secret_31415");
+  await user.click(screen.getByRole("button", { name: "Save payment settings" }));
+
+  expect(onSave).not.toHaveBeenCalled();
+  expect(primaryWh).toHaveAttribute("aria-invalid", "true");
+  expect(document.activeElement).toBe(primaryWh);
+  expect(container.textContent).not.toContain("31415");
+
+  await user.clear(primaryWh);
+  await user.type(primaryWh, " `whsec_live_fake_updated_primary_secret_27182` ");
+  await user.click(screen.getByRole("button", { name: "Save payment settings" }));
+
+  // Live Stripe confirmation dialog requires ACTIVATE LIVE PAYMENTS when provider=stripe & mode=live
+  const liveDialogInput = screen.queryByLabelText(/Type ACTIVATE LIVE PAYMENTS/i);
+  if (liveDialogInput) {
+    await user.type(liveDialogInput, "ACTIVATE LIVE PAYMENTS");
+    await user.click(screen.getByRole("button", { name: /Save live payment settings|Activate/i }));
+  }
+
+  expect(onSave).toHaveBeenCalledWith(
+    expect.objectContaining({
+      stripeWebhookSecret: "whsec_live_fake_updated_primary_secret_27182",
+    }),
+  );
+  expect(
+    await screen.findByText(/Re-verify your Stripe webhook signing secret/u),
+  ).toBeInTheDocument();
+});
+
+pageA11y("/admin/payments/setup Fix Pack 07.2 diagnostics, banners, and secret toggles", async () => {
+  mocks.egressPresets.mockResolvedValue([
+    { key: "stripe", label: "Stripe API", enabled: true, parameterized: false },
+  ]);
+  mocks.getSettings.mockResolvedValue({
+    ...defaultConfig,
+    provider: "stripe",
+    mode: "live",
+    onlineEnabled: false,
+    stripe: {
+      ...defaultConfig.stripe,
+      egressAllowlisted: true,
+      secretKeyConfigured: true,
+      secretKeyLast4: "4242",
+      webhookSecretConfigured: true,
+      webhookSecretLast4: "9876",
+      reverificationNeeded: true,
+      reverificationReasons: [
+        "Primary signing secret changed after the last self-test; re-run Send self-test webhook.",
+      ],
+      lastCheckoutFailure: {
+        occurredAt: "2026-11-21T12:15:00.000Z",
+        provider: "stripe",
+        mode: "live",
+        reasonCode: "STRIPE_KEY_MISSING_PERMISSION",
+        failureClass: "provider_permission",
+        upstreamStatus: 403,
+        stripeErrorType: "invalid_request_error",
+        stripeErrorCode: "permission_denied",
+        stripeErrorParam: "line_items",
+        invoicePublicId: invoiceId,
+        attemptPublicId: id,
+      },
+    },
+  });
+  renderSetupPage();
+  await screen.findByRole("heading", { name: "Stripe setup" });
+  await screen.findByText("Last checkout-session failure");
+});
+

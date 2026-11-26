@@ -202,6 +202,31 @@ export interface ProviderTestConnectionResult {
   readonly latencyMs: number;
   readonly verifiedAt: Date | null;
   readonly reasonCode: string | null;
+  readonly upstreamStatus?: number | null | undefined;
+  readonly stripeErrorType?: string | null | undefined;
+  readonly stripeErrorCode?: string | null | undefined;
+}
+
+export interface ProviderVerifyCheckoutSessionInput {
+  readonly credentials: ProviderCredentials;
+  readonly currency: string;
+  readonly canonicalOrigin: string;
+  readonly now: Date;
+  readonly signal?: AbortSignal | undefined;
+}
+
+export interface ProviderVerifyCheckoutSessionResult {
+  readonly ok: boolean;
+  readonly mode: PaymentEnvironmentMode;
+  readonly latencyMs: number;
+  readonly verifiedAt: Date | null;
+  readonly sessionId: string | null;
+  readonly expiredImmediately: boolean;
+  readonly reasonCode: string | null;
+  readonly upstreamStatus?: number | null | undefined;
+  readonly stripeErrorType?: string | null | undefined;
+  readonly stripeErrorCode?: string | null | undefined;
+  readonly stripeErrorParam?: string | null | undefined;
 }
 
 export interface PaymentRefundAdapter<P extends ActivePaymentProvider = ActivePaymentProvider> {
@@ -219,4 +244,7 @@ export interface PaymentProviderAdapter {
   verifyWebhook(input: ProviderVerifyWebhookInput): ProviderVerifyWebhookOutput;
   fetchPayment(input: ProviderFetchPaymentInput): Promise<ProviderFetchedPayment>;
   testConnection?(input: ProviderTestConnectionInput): Promise<ProviderTestConnectionResult>;
+  verifyCheckoutSession?(
+    input: ProviderVerifyCheckoutSessionInput,
+  ): Promise<ProviderVerifyCheckoutSessionResult>;
 }

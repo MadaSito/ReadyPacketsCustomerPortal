@@ -1,9 +1,19 @@
 import { KeyRound, ReceiptText, ShieldCheck } from "lucide-react";
-import { useState, type FormEvent } from "react";
+import { useRef, useState, type FormEvent } from "react";
 import type { PaymentsConfigValue, PaymentsReceiptsValue, PaymentsSmallTotalsValue } from "@server/modules/payments/settings";
 import type { PaymentsAdminSettingsView } from "@server/modules/payments/service";
 import { Badge, Button, Callout, Card, Checkbox, ConfirmDialog, CopyField, Field, Input, Money, Select, Textarea } from "@/ui";
 import { errorMessage } from "@/lib/trpc";
+import {
+  type CredentialFieldKey,
+  extractServerCredentialFieldError,
+  isLikelyValidWhsec,
+  normalizeCredentialInput,
+  SecretCredentialField,
+  validateSquareSecretField,
+  validateStripeSecretKeyField,
+  validateStripeWebhookSecretField,
+} from "./stripeCredentialValidation";
 
 export const providerLabels = {
   none: "Pay by invoice",
@@ -16,12 +26,7 @@ const smallTotalOptions = [
   { value: "waive", label: "Waive remaining small balance (default)" },
   { value: "block", label: "Block checkout when total is below provider minimum" },
 ];
-type SecretKey =
-  | "stripeSecretKey"
-  | "stripeWebhookSecret"
-  | "stripeWebhookSecretSecondary"
-  | "squareAccessToken"
-  | "squareWebhookSignatureKey";
+type SecretKey = CredentialFieldKey;
 const emptySecrets: Record<SecretKey, string> = {
   stripeSecretKey: "",
   stripeWebhookSecret: "",
@@ -59,11 +64,18 @@ export type PaymentSettingsView = Pick<
         | "inboundCountryAllowlistExempt"
         | "requiredEvents"
         | "ready"
+        | "statusHeadline"
+        | "customerExperienceSummary"
         | "lastApiVerifiedAt"
         | "lastVerifiedWebhookAt"
         | "lastVerifiedWebhookEventType"
         | "lastVerifiedWebhookStatus"
         | "lastSelfTestWebhookAt"
+        | "missingGates"
+        | "reverificationNeeded"
+        | "reverificationReasons"
+        | "lastCheckoutFailure"
+        | "lastCheckoutProbe"
       >
     >;
   square: PaymentsAdminSettingsView["square"];
@@ -76,7 +88,9 @@ function safePath(value: string) {
   return /^\/(?:checkout|invoices|orders)(?:\/[A-Za-z0-9_-]{1,64}){0,4}$/u.test(value) && value.length <= 200;
 }
 function keyHint(suffix: string | null) {
-  return suffix ? `Configured (ending in ${suffix}). Leave blank to keep it.` : "Not configured. The key is never displayed after saving.";
+  return suffix
+    ? `Configured (ending in ${suffix}). Leave blank to keep the saved value.`
+    : "Not configured yet. Encrypted at rest and never displayed after saving.";
 }
 
 export function PaymentSettings({ settings, saving, onSave }: {
@@ -89,7 +103,9 @@ export function PaymentSettings({ settings, saving, onSave }: {
   const [cancelPath, setCancelPath] = useState(settings.cancelPath);
   const [tolerance, setTolerance] = useState(String(settings.webhookToleranceSeconds));
   const [locationId, setLocationId] = useState(settings.square.locationId ?? "");
+  const [secretResetSeq, setSecretResetSeq] = useState(0);
   const [secrets, setSecrets] = useState(emptySecrets);
+  const [fieldErrors, setFieldErrors] = useState<Partial<Record<SecretKey, string>>>({});
   const [clearSecondary, setClearSecondary] = useState(false);
   const [belowMinimum, setBelowMinimum] = useState<"waive" | "block">(
     settings.smallTotals?.belowProviderMinimum ?? "waive",
@@ -98,7 +114,10 @@ export function PaymentSettings({ settings, saving, onSave }: {
   const [receiptsEmail, setReceiptsEmail] = useState<boolean>(settings.receipts?.emailCustomer ?? true);
   const [receiptsFooter, setReceiptsFooter] = useState<string>(settings.receipts?.footerText ?? "");
   const [notice, setNotice] = useState<string | null>(null);
+  const [signingSecretRotatedKind, setSigningSecretRotatedKind] = useState<"primary" | "secondary" | null>(null);
   const [confirm, setConfirm] = useState<PaymentSettingsInput | null>(null);
+  const fieldRefs = useRef<Partial<Record<SecretKey, HTMLInputElement | null>>>({});
+
   const activeSettings = provider === "none" ? undefined : settings[provider];
   const normalizedUpperCurrency = currency.trim().toUpperCase() || settings.currency;
   const activeMinMinor =
@@ -122,13 +141,49 @@ export function PaymentSettings({ settings, saving, onSave }: {
         ? !sameMode || !settings.square.accessTokenConfigured || !settings.square.webhookSignatureKeyConfigured
         : false;
 
+  const showSecondaryRolloverCallout =
+    provider === "stripe" &&
+    sameMode &&
+    settings.stripe.webhookSecretConfigured &&
+    !secrets.stripeWebhookSecret.trim() &&
+    isLikelyValidWhsec(secrets.stripeWebhookSecretSecondary);
+
+  function focusField(field: SecretKey) {
+    queueMicrotask(() => {
+      fieldRefs.current[field]?.focus();
+    });
+  }
+
+  function updateSecretField(field: SecretKey, nextValue: string) {
+    setSecrets((previous) => ({ ...previous, [field]: nextValue }));
+    setFieldErrors((previous) => {
+      if (!previous[field]) return previous;
+      const copy = { ...previous };
+      delete copy[field];
+      return copy;
+    });
+  }
+
   async function save(input: PaymentSettingsInput) {
     setNotice(null);
+    setFieldErrors({});
+    const rotatedKind: "primary" | "secondary" | null = input.stripeWebhookSecret
+      ? "primary"
+      : input.stripeWebhookSecretSecondary
+        ? "secondary"
+        : null;
     try {
       await onSave(input);
       setSecrets(emptySecrets);
+      setSecretResetSeq((n) => n + 1);
       setClearSecondary(false);
+      setSigningSecretRotatedKind(rotatedKind);
     } catch (error) {
+      const extracted = extractServerCredentialFieldError(error, "Payment settings could not be saved.");
+      if (extracted.field) {
+        setFieldErrors({ [extracted.field]: extracted.message });
+        focusField(extracted.field);
+      }
       setNotice(errorMessage(error, "Payment settings could not be saved."));
       throw error;
     }
@@ -136,6 +191,10 @@ export function PaymentSettings({ settings, saving, onSave }: {
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    setNotice(null);
+    setFieldErrors({});
+    setSigningSecretRotatedKind(null);
+
     const normalizedCurrency = currency.trim().toUpperCase();
     const seconds = Number(tolerance);
     if (!/^[A-Z]{3}$/u.test(normalizedCurrency) || !safePath(successPath) || !safePath(cancelPath) ||
@@ -160,10 +219,35 @@ export function PaymentSettings({ settings, saving, onSave }: {
         footerText: receiptsFooter.trim(),
       },
     };
-    for (const name of [...requiredSecrets, ...optionalSecrets]) {
-      const value = secrets[name].trim();
-      if (value) input[name] = value;
+
+    const nextFieldErrors: Partial<Record<SecretKey, string>> = {};
+    const orderedFields: SecretKey[] = [...requiredSecrets, ...optionalSecrets];
+    for (const name of orderedFields) {
+      const raw = secrets[name];
+      if (!raw.trim()) continue;
+      if (name === "stripeSecretKey") {
+        const res = validateStripeSecretKeyField(raw, mode);
+        if (!res.ok) nextFieldErrors[name] = res.error;
+        else input[name] = res.normalized;
+      } else if (name === "stripeWebhookSecret" || name === "stripeWebhookSecretSecondary") {
+        const res = validateStripeWebhookSecretField(raw, name);
+        if (!res.ok) nextFieldErrors[name] = res.error;
+        else input[name] = res.normalized;
+      } else {
+        const res = validateSquareSecretField(raw, name);
+        if (!res.ok) nextFieldErrors[name] = res.error;
+        else input[name] = normalizeCredentialInput(raw);
+      }
     }
+
+    const firstInvalid = orderedFields.find((f) => Boolean(nextFieldErrors[f]));
+    if (firstInvalid) {
+      setFieldErrors(nextFieldErrors);
+      setNotice(nextFieldErrors[firstInvalid] ?? "Correct the highlighted credential field before saving.");
+      focusField(firstInvalid);
+      return;
+    }
+
     if (provider === "stripe" && clearSecondary && !input.stripeWebhookSecretSecondary) {
       input.clearStripeWebhookSecretSecondary = true;
     }
@@ -180,6 +264,24 @@ export function PaymentSettings({ settings, saving, onSave }: {
                 (!settings.square.webhookSignatureKeyConfigured && !input.squareWebhookSignatureKey)))
           : false;
     if (missingRequired) {
+      if (provider === "stripe") {
+        if ((!sameMode || !settings.stripe.secretKeyConfigured) && !input.stripeSecretKey) {
+          nextFieldErrors.stripeSecretKey = "Enter a Stripe API secret key for the selected environment.";
+        }
+        if ((!sameMode || !settings.stripe.webhookSecretConfigured) && !input.stripeWebhookSecret) {
+          nextFieldErrors.stripeWebhookSecret = "Enter the Primary Stripe webhook signing secret for the selected environment.";
+        }
+      } else if (provider === "square") {
+        if ((!sameMode || !settings.square.accessTokenConfigured) && !input.squareAccessToken) {
+          nextFieldErrors.squareAccessToken = "Enter a Square access token for the selected environment.";
+        }
+        if ((!sameMode || !settings.square.webhookSignatureKeyConfigured) && !input.squareWebhookSignatureKey) {
+          nextFieldErrors.squareWebhookSignatureKey = "Enter the Square webhook signature key for the selected environment.";
+        }
+      }
+      setFieldErrors(nextFieldErrors);
+      const firstMissing = orderedFields.find((f) => Boolean(nextFieldErrors[f]));
+      if (firstMissing) focusField(firstMissing);
       setNotice("Enter both credentials for the selected provider and environment before activating it.");
       return;
     }
@@ -187,13 +289,6 @@ export function PaymentSettings({ settings, saving, onSave }: {
     else void save(input).catch(() => {});
   }
 
-  function keyInput(name: SecretKey, label: string, suffix: string | null, required = newCredentialsRequired) {
-    return <Field label={label} required={required}
-      hint={required && !sameMode ? "Enter a key issued for the selected environment." : keyHint(suffix)}>
-      <Input type="password" value={secrets[name]} autoComplete="new-password" spellCheck={false} maxLength={256} disabled={saving}
-        onChange={(event) => setSecrets((previous) => ({ ...previous, [name]: event.target.value }))} />
-    </Field>;
-  }
   return <div className="grid min-w-0 gap-5">
     <Card title={<span className="inline-flex items-center gap-2"><ShieldCheck className="size-4" aria-hidden />Checkout configuration</span>}
       description="Choose how customers pay newly issued invoices."
@@ -201,15 +296,15 @@ export function PaymentSettings({ settings, saving, onSave }: {
       <form className="grid min-w-0 gap-5" onSubmit={submit}>
         <div className="grid min-w-0 gap-4 sm:grid-cols-3">
           <Field label="Payment provider" required><Select value={provider} options={providerOptions} disabled={saving}
-            onChange={(event) => { setProvider(event.target.value as PaymentConfig["provider"]); setSecrets(emptySecrets); setClearSecondary(false); }} /></Field>
+            onChange={(event) => { setProvider(event.target.value as PaymentConfig["provider"]); setSecrets(emptySecrets); setSecretResetSeq((n) => n + 1); setFieldErrors({}); setClearSecondary(false); }} /></Field>
           <Field label="Environment" required><Select value={mode} options={modeOptions} disabled={saving}
-            onChange={(event) => { setMode(event.target.value as PaymentConfig["mode"]); setSecrets(emptySecrets); setClearSecondary(false); }} /></Field>
+            onChange={(event) => { setMode(event.target.value as PaymentConfig["mode"]); setSecrets(emptySecrets); setSecretResetSeq((n) => n + 1); setFieldErrors({}); setClearSecondary(false); }} /></Field>
           <Field label="Invoice currency" hint="Three-letter ISO currency code." required><Input value={currency} disabled={saving}
             maxLength={3} autoCapitalize="characters" onChange={(event) => setCurrency(event.target.value)} /></Field>
         </div>
         {provider !== "none" ? <Callout title={mode === "live" ? "Live charges" : "Test payments only"}
           tone={mode === "live" ? "warning" : "info"}>
-          {mode === "live" ? "Customers can make real payments after this change is saved. Use credentials and webhook settings for the live account." :
+          {mode === "live" ? "Customers can make real payments after this change is saved and readiness gates are verified. Use credentials and webhook settings for the live account." :
             "Use sandbox credentials on a staging instance with test invoices. Sandbox payments do not move real money."}
         </Callout> : <Callout title="Invoice-only payments" tone="info">No hosted payment link is offered. Customers can still receive invoices.</Callout>}
         <div className="grid min-w-0 gap-4 sm:grid-cols-2">
@@ -230,14 +325,50 @@ export function PaymentSettings({ settings, saving, onSave }: {
         {provider !== "none" ? <fieldset className="grid min-w-0 gap-4 rounded-[var(--radius-card)] border border-line bg-surface-sunken p-3 sm:p-4">
           <legend className="px-1 font-semibold text-ink"><span className="inline-flex items-center gap-2"><KeyRound className="size-4" aria-hidden />Provider credentials</span></legend>
           {provider === "stripe" ? <>
-            {keyInput("stripeSecretKey", "Stripe API secret key", settings.stripe.secretKeyLast4)}
-            {keyInput("stripeWebhookSecret", "Stripe webhook signing secret", settings.stripe.webhookSecretLast4)}
-            {keyInput(
-              "stripeWebhookSecretSecondary",
-              "Secondary Stripe webhook signing secret",
-              settings.stripe.webhookSecretSecondaryLast4 ?? null,
-              false,
-            )}
+            <SecretCredentialField
+              key={`sk-${secretResetSeq}`}
+              label="Stripe API secret key"
+              required={newCredentialsRequired && (!sameMode || !settings.stripe.secretKeyConfigured)}
+              hint={`${sameMode ? keyHint(settings.stripe.secretKeyLast4) : "Enter a key issued for the selected environment."} Copy from Stripe Dashboard > Developers > API keys > Secret key (sk_${mode}_…) or Restricted keys (rk_${mode}_… with Checkout Sessions: Write and Payment Intents: Read). Publishable keys (pk_…) are not used.`}
+              error={fieldErrors.stripeSecretKey}
+              value={secrets.stripeSecretKey}
+              disabled={saving}
+              inputRef={(el) => {
+                fieldRefs.current.stripeSecretKey = el;
+              }}
+              onChange={(val) => updateSecretField("stripeSecretKey", val)}
+            />
+            <SecretCredentialField
+              key={`wh1-${secretResetSeq}`}
+              label="Primary Stripe webhook signing secret"
+              required={newCredentialsRequired && (!sameMode || !settings.stripe.webhookSecretConfigured)}
+              hint={`${sameMode ? keyHint(settings.stripe.webhookSecretLast4) : "Enter the whsec_ signing secret for the selected environment."} Copy from Stripe Dashboard > Developers > Webhooks (or Workbench > Webhooks) > select your endpoint > Signing secret > Reveal (whsec_…).`}
+              error={fieldErrors.stripeWebhookSecret}
+              value={secrets.stripeWebhookSecret}
+              disabled={saving}
+              inputRef={(el) => {
+                fieldRefs.current.stripeWebhookSecret = el;
+              }}
+              onChange={(val) => updateSecretField("stripeWebhookSecret", val)}
+            />
+            <SecretCredentialField
+              key={`wh2-${secretResetSeq}`}
+              label="Secondary Stripe webhook signing secret (optional rollover)"
+              required={false}
+              hint={`${sameMode ? keyHint(settings.stripe.webhookSecretSecondaryLast4 ?? null) : "Leave empty during normal setup."} Optional rollover slot accepted alongside Primary only while rotating secrets in Stripe. To replace the saved signing secret, paste the new whsec_… value into Primary Stripe webhook signing secret above.`}
+              error={fieldErrors.stripeWebhookSecretSecondary}
+              value={secrets.stripeWebhookSecretSecondary}
+              disabled={saving}
+              inputRef={(el) => {
+                fieldRefs.current.stripeWebhookSecretSecondary = el;
+              }}
+              onChange={(val) => updateSecretField("stripeWebhookSecretSecondary", val)}
+            />
+            {showSecondaryRolloverCallout ? (
+              <Callout tone="info" title="Saving Secondary keeps your existing Primary signing secret">
+                You entered a <code>whsec_…</code> secret in <strong>Secondary Stripe webhook signing secret</strong> while leaving Primary blank. Secondary is only for zero-downtime rollover while Stripe signs with two secrets simultaneously, and the self-test verifies Primary. To replace your saved signing secret instead, move this value into <strong>Primary Stripe webhook signing secret</strong>.
+              </Callout>
+            ) : null}
             {sameMode && settings.stripe.webhookSecretSecondaryConfigured ? (
               <Checkbox
                 label="Remove secondary signing secret after rotation"
@@ -248,10 +379,42 @@ export function PaymentSettings({ settings, saving, onSave }: {
               />
             ) : null}
           </> : <>
-            {keyInput("squareAccessToken", "Square access token", settings.square.accessTokenLast4)}
-            {keyInput("squareWebhookSignatureKey", "Square webhook signature key", settings.square.webhookSignatureKeyLast4)}
+            <SecretCredentialField
+              key={`sq-at-${secretResetSeq}`}
+              label="Square access token"
+              required={newCredentialsRequired && (!sameMode || !settings.square.accessTokenConfigured)}
+              hint={sameMode ? keyHint(settings.square.accessTokenLast4) : "Enter an access token issued for the selected Square environment."}
+              error={fieldErrors.squareAccessToken}
+              value={secrets.squareAccessToken}
+              disabled={saving}
+              inputRef={(el) => {
+                fieldRefs.current.squareAccessToken = el;
+              }}
+              onChange={(val) => updateSecretField("squareAccessToken", val)}
+            />
+            <SecretCredentialField
+              key={`sq-wh-${secretResetSeq}`}
+              label="Square webhook signature key"
+              required={newCredentialsRequired && (!sameMode || !settings.square.webhookSignatureKeyConfigured)}
+              hint={sameMode ? keyHint(settings.square.webhookSignatureKeyLast4) : "Enter the webhook signature key issued for the selected Square environment."}
+              error={fieldErrors.squareWebhookSignatureKey}
+              value={secrets.squareWebhookSignatureKey}
+              disabled={saving}
+              inputRef={(el) => {
+                fieldRefs.current.squareWebhookSignatureKey = el;
+              }}
+              onChange={(val) => updateSecretField("squareWebhookSignatureKey", val)}
+            />
           </>}
         </fieldset> : null}
+        {signingSecretRotatedKind ? (
+          <Callout tone="warning" title="Re-verify your Stripe webhook signing secret">
+            {signingSecretRotatedKind === "primary"
+              ? "Your Primary Stripe webhook signing secret changed. Open the Stripe setup checklist to re-run Send self-test webhook so online card checkout stays active. "
+              : "Your Secondary rollover signing secret was updated. "}
+            Remember that the portal self-test only proves ReadyPackets&apos; local signature verification path — confirm real Stripe delivery from Stripe Workbench &gt; Webhooks &gt; Send test event (or a live/test checkout) to verify Stripe has the matching endpoint URL and signing secret.
+          </Callout>
+        ) : null}
         <fieldset className="grid min-w-0 gap-4 rounded-[var(--radius-card)] border border-line bg-surface-sunken p-3 sm:p-4">
           <legend className="px-1 font-semibold text-ink">Small totals &amp; provider minimums</legend>
           <Field
