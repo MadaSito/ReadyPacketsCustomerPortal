@@ -898,6 +898,7 @@ describe("payments.refunds — B5 console order refunds, reconciliation, webhook
       stripeWebhookSecret,
     });
     await payments.admin.testConnection(adminPrincipal);
+    await payments.admin.verifyCheckoutSession(adminPrincipal);
     await payments.admin.sendSelfTestWebhook(adminPrincipal);
     await payments.admin.updateSettings(adminPrincipal, {
       provider: "stripe",
@@ -1306,7 +1307,7 @@ describe("payments.refunds — B5 console order refunds, reconciliation, webhook
     });
     if (started.mode !== "redirect") throw new Error("expected redirect");
 
-    const sessionEntry = [...protocol.stripeSessions.values()][0]!;
+    const sessionEntry = protocol.stripeSessions.get(started.redirectUrl.split("/").pop()!)!;
     protocol.markStripeSessionPaid(sessionEntry.id);
     const tsSec = Math.floor(h.clock.now().getTime() / 1000);
     const paidBody = Buffer.from(
@@ -1592,7 +1593,7 @@ describe("payments.refunds — B5 console order refunds, reconciliation, webhook
     });
     if (started.mode !== "redirect") throw new Error("expected redirect");
 
-    const sessionEntry = [...protocol.stripeSessions.values()][0]!;
+    const sessionEntry = protocol.stripeSessions.get(started.redirectUrl.split("/").pop()!)!;
     protocol.markStripeSessionPaid(sessionEntry.id);
     const tsSec = Math.floor(h.clock.now().getTime() / 1000);
     const paidBody = Buffer.from(

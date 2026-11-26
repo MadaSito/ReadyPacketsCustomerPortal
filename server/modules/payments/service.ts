@@ -165,6 +165,7 @@ export type StripeMissingGateKey =
   | "webhook_secret"
   | "egress_allowlist"
   | "api_verified"
+  | "checkout_session_not_verified"
   | "checkout_session_failed"
   | "webhook_self_test"
   | "provider_activated";
@@ -309,6 +310,7 @@ export interface PaymentsReadinessChecklistItem {
     | "stripe_secret_key"
     | "stripe_webhook_secret"
     | "api_connection_verified"
+    | "checkout_session_verified"
     | "self_test_webhook_verified"
     | "provider_activated";
   label: string;
@@ -1261,7 +1263,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         (config.provider === "stripe" || diagnostics.stripeEverApiVerified)
       ) {
         reverificationReasons.push(
-          "Stripe API secret key or outbound allowlist changed after verification — run Test Stripe API (and Verify Checkout session creation) again.",
+          config.provider === "stripe"
+            ? "Stripe API secret key or outbound allowlist changed after verification — run Test Stripe API to resume checkout (and Verify Checkout session creation as a recommended permission check)."
+            : "Stripe API secret key or outbound allowlist changed after verification — run Test Stripe API and Verify Checkout session creation again before activating Stripe Checkout.",
         );
       }
       if (
@@ -4112,9 +4116,11 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     const stripeReturnPattern = new URL("/api/payments/return/stripe/<attemptId>", deps.config.canonicalOrigin).href;
     const squareReturnPattern = new URL("/api/payments/return/square/<attemptId>", deps.config.canonicalOrigin).href;
 
-    const effectiveMissingGates = checkoutSessionProbeFailed
-      ? ([...gate.missingGates, "checkout_session_failed"] as StripeMissingGateKey[])
-      : gate.missingGates;
+    const effectiveMissingGates: StripeMissingGateKey[] = checkoutSessionProbeFailed
+      ? [...gate.missingGates, "checkout_session_failed"]
+      : config.provider !== "stripe" && !checkoutSessionVerified
+        ? [...gate.missingGates, "checkout_session_not_verified"]
+        : gate.missingGates;
     const effectiveHeadline =
       config.provider === "stripe" && checkoutSessionProbeFailed
         ? `Online card checkout: NOT ACTIVE (Checkout session verification failed)`
@@ -4444,16 +4450,30 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             );
           }
           const probe = diagnostics.lastStripeCheckoutProbe;
-          if (
+          const probeMatchesExpected = Boolean(
             probe &&
-            probe.apiFingerprint === expectedApiFp &&
-            probe.mode === nextConfig.mode &&
-            !probe.ok
-          ) {
+              probe.apiFingerprint === expectedApiFp &&
+              probe.mode === nextConfig.mode,
+          );
+          if (isActivatingStripe) {
+            if (!probeMatchesExpected) {
+              throw validation(
+                "STRIPE_CHECKOUT_SESSION_NOT_VERIFIED",
+                'Run "Verify Checkout session creation" for the current staged Stripe API key and mode before activating Stripe Checkout.',
+              );
+            }
+            if (!probe!.ok) {
+              throw validation(
+                "STRIPE_CHECKOUT_SESSION_NOT_VERIFIED",
+                probe!.message ||
+                  'Stripe Checkout session verification failed for the current staged key. Resolve the error and re-run "Verify Checkout session creation" before activating.',
+              );
+            }
+          } else if (probeMatchesExpected && !probe!.ok) {
             throw validation(
               "STRIPE_CHECKOUT_SESSION_NOT_VERIFIED",
-              probe.message ||
-                "Stripe Checkout session verification failed for the current staged key. Resolve the error and re-run Verify Checkout session creation before activating.",
+              probe!.message ||
+                'Stripe Checkout session verification failed for the current staged key. Resolve the error and re-run "Verify Checkout session creation".',
             );
           }
           const expectedWhFp = computeStripeSelfTestFingerprint(nextConfig.mode, stripeWh);
@@ -4682,12 +4702,22 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       {
         key: "api_connection_verified",
         label: "Pinned Stripe API connection verified",
-        ready: stripeState.apiVerified && !checkoutSessionProbeFailed,
+        ready: stripeState.apiVerified,
+        detail: stripeState.effectiveLastApiVerifiedAt
+          ? `Verified at ${stripeState.effectiveLastApiVerifiedAt} for the current staged key, mode, and outbound allowlist.`
+          : "Run Test Stripe API to verify egress and key livemode for the current staged key.",
+      },
+      {
+        key: "checkout_session_verified",
+        label: "Checkout session creation verified",
+        ready: checkoutSessionVerified || (config.provider === "stripe" && !checkoutSessionProbeFailed),
         detail: checkoutSessionProbeFailed
           ? currentProbe!.message
-          : stripeState.effectiveLastApiVerifiedAt
-            ? `Verified at ${stripeState.effectiveLastApiVerifiedAt} for the current staged key, mode, and outbound allowlist.`
-            : "Run Test Stripe API to verify egress and key livemode for the current staged key.",
+          : checkoutSessionVerified
+            ? `Verified at ${currentProbe!.checkedAt} — probe Checkout Session created and immediately expired at zero cost.`
+            : config.provider === "stripe"
+              ? 'Recommended check (online card checkout remains active): run "Verify Checkout session creation" to confirm Checkout Sessions write permission and redirect domain.'
+              : 'Required before activating Stripe Checkout: run "Verify Checkout session creation" to confirm Checkout Sessions write permission and redirect domain.',
       },
       {
         key: "self_test_webhook_verified",
@@ -4709,9 +4739,11 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       },
     ];
 
-    const effectiveMissingGates = checkoutSessionProbeFailed
-      ? ([...gate.missingGates, "checkout_session_failed"] as StripeMissingGateKey[])
-      : gate.missingGates;
+    const effectiveMissingGates: StripeMissingGateKey[] = checkoutSessionProbeFailed
+      ? [...gate.missingGates, "checkout_session_failed"]
+      : config.provider !== "stripe" && !checkoutSessionVerified
+        ? [...gate.missingGates, "checkout_session_not_verified"]
+        : gate.missingGates;
 
     return {
       provider: config.provider,

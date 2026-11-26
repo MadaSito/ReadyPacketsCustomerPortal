@@ -24,6 +24,7 @@ import {
   paymentWebhookEvents,
 } from "./index.js";
 import * as paymentsSchema from "./schema.js";
+import { PAYMENTS_DIAGNOSTICS_SETTING } from "./settings.js";
 
 interface FakeOrderRecord {
   id: number;
@@ -794,7 +795,7 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
       reasonCode: "STRIPE_API_NOT_VERIFIED",
     });
 
-    // Stage while keeping Pay by invoice active, verify API + self-test webhook, then activate Stripe.
+    // Stage while keeping Pay by invoice active, verify API + Checkout session probe + self-test webhook, then activate Stripe.
     await h.payments.admin.updateSettings(adminPrincipal, {
       provider: "none",
       mode: "test",
@@ -803,6 +804,17 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
       stripeWebhookSecret: "whsec_validsecret_9876",
     });
     expect((await h.payments.admin.testConnection(adminPrincipal)).ok).toBe(true);
+    await expect(
+      h.payments.admin.updateSettings(adminPrincipal, {
+        provider: "stripe",
+        mode: "test",
+        currency: "USD",
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      reasonCode: "STRIPE_CHECKOUT_SESSION_NOT_VERIFIED",
+    });
+    expect((await h.payments.admin.verifyCheckoutSession(adminPrincipal)).ok).toBe(true);
     await expect(
       h.payments.admin.updateSettings(adminPrincipal, {
         provider: "stripe",
@@ -852,6 +864,7 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
       stripeWebhookSecret: "whsec_checkout_2222",
     });
     await h.payments.admin.testConnection(adminPrincipal);
+    await h.payments.admin.verifyCheckoutSession(adminPrincipal);
     await h.payments.admin.sendSelfTestWebhook(adminPrincipal);
     await h.payments.admin.updateSettings(adminPrincipal, {
       provider: "stripe",
@@ -999,6 +1012,7 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
       stripeWebhookSecret: webhookSecret,
     });
     await h.payments.admin.testConnection(adminPrincipal);
+    await h.payments.admin.verifyCheckoutSession(adminPrincipal);
     await h.payments.admin.sendSelfTestWebhook(adminPrincipal);
     await h.payments.admin.updateSettings(adminPrincipal, {
       provider: "stripe",
@@ -1203,6 +1217,7 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
       stripeWebhookSecret: "whsec_http_route_4444",
     });
     await h.payments.admin.testConnection(adminPrincipal);
+    await h.payments.admin.verifyCheckoutSession(adminPrincipal);
     await h.payments.admin.sendSelfTestWebhook(adminPrincipal);
     await h.payments.admin.updateSettings(adminPrincipal, {
       provider: "stripe",
@@ -1616,6 +1631,7 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
       stripeWebhookSecret: fakeWhsecToken,
     });
     expect((await h.payments.admin.testConnection(adminPrincipal)).ok).toBe(true);
+    expect((await h.payments.admin.verifyCheckoutSession(adminPrincipal)).ok).toBe(true);
     expect((await h.payments.admin.sendSelfTestWebhook(adminPrincipal)).ok).toBe(true);
     await h.payments.admin.updateSettings(adminPrincipal, {
       provider: "stripe",
@@ -1918,6 +1934,148 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
     ).rejects.toMatchObject({
       reasonCode: "EGRESS_HOST_NOT_ALLOWLISTED",
       details: expect.objectContaining({ failureClass: "egress", onlinePaymentAvailable: false }),
+    });
+  });
+
+  it("Fix Pack 07.2 follow-up — enforces Checkout-session probe on new/mode-switch activations while keeping upgraded already-active Stripe configs onlineEnabled without a probe", async () => {
+    const h = createHarness();
+
+    // 1. Activation without probe is refused with STRIPE_CHECKOUT_SESSION_NOT_VERIFIED + clear guidance
+    await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "none",
+      mode: "test",
+      currency: "USD",
+      stripeSecretKey: "sk_test_fake_gate_key_a_1111",
+      stripeWebhookSecret: "whsec_fake_gate_wh_a_2222",
+    });
+    expect((await h.payments.admin.testConnection(adminPrincipal)).ok).toBe(true);
+    expect((await h.payments.admin.sendSelfTestWebhook(adminPrincipal)).ok).toBe(true);
+
+    const beforeProbeSettings = await h.payments.admin.getSettings(adminPrincipal);
+    expect(beforeProbeSettings.stripe.checkoutSessionVerified).toBe(false);
+    expect(beforeProbeSettings.stripe.missingGates).toContain("checkout_session_not_verified");
+    const beforeProbeReadiness = await h.payments.admin.readiness(adminPrincipal);
+    expect(
+      beforeProbeReadiness.checklist.find((item) => item.key === "checkout_session_verified"),
+    ).toMatchObject({
+      ready: false,
+      detail: expect.stringMatching(/Required before activating Stripe Checkout/i),
+    });
+
+    await expect(
+      h.payments.admin.updateSettings(adminPrincipal, {
+        provider: "stripe",
+        mode: "test",
+        currency: "USD",
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      reasonCode: "STRIPE_CHECKOUT_SESSION_NOT_VERIFIED",
+      safeMessage: expect.stringContaining("Verify Checkout session creation"),
+    });
+
+    // 2. Stale probe after key change is refused on activation
+    const probeKeyA = await h.payments.admin.verifyCheckoutSession(adminPrincipal);
+    expect(probeKeyA.ok).toBe(true);
+
+    await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "none",
+      mode: "test",
+      currency: "USD",
+      stripeSecretKey: "sk_test_fake_gate_key_b_3333",
+    });
+    expect((await h.payments.admin.testConnection(adminPrincipal)).ok).toBe(true);
+    const staleProbeSettings = await h.payments.admin.getSettings(adminPrincipal);
+    expect(staleProbeSettings.stripe.lastCheckoutProbe).toBeNull();
+    expect(staleProbeSettings.stripe.checkoutSessionVerified).toBe(false);
+    expect(staleProbeSettings.stripe.missingGates).toContain("checkout_session_not_verified");
+
+    await expect(
+      h.payments.admin.updateSettings(adminPrincipal, {
+        provider: "stripe",
+        mode: "test",
+        currency: "USD",
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      reasonCode: "STRIPE_CHECKOUT_SESSION_NOT_VERIFIED",
+      safeMessage: expect.stringContaining("Verify Checkout session creation"),
+    });
+
+    // 3. Activation with passing probe for the current key and mode succeeds
+    const probeKeyB = await h.payments.admin.verifyCheckoutSession(adminPrincipal);
+    expect(probeKeyB.ok).toBe(true);
+    const activated = await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+    });
+    expect(activated.onlineEnabled).toBe(true);
+    expect(activated.stripe.checkoutSessionVerified).toBe(true);
+    expect(activated.stripe.missingGates).toEqual([]);
+
+    // 4. Upgraded already-active server with NO probe on record stays onlineEnabled = true (probe is recommended, not pausing checkout)
+    await h.deps.settings.set(PAYMENTS_DIAGNOSTICS_SETTING.key, {
+      stripeEverApiVerified: true,
+      stripeEverSelfTested: true,
+      lastCheckoutFailure: null,
+      lastStripeCheckoutProbe: null,
+    });
+
+    const upgradedSettings = await h.payments.admin.getSettings(adminPrincipal);
+    expect(upgradedSettings.provider).toBe("stripe");
+    expect(upgradedSettings.onlineEnabled).toBe(true);
+    expect(upgradedSettings.stripe.ready).toBe(true);
+    expect(upgradedSettings.stripe.checkoutSessionVerified).toBe(false);
+    expect(upgradedSettings.stripe.lastCheckoutProbe).toBeNull();
+    expect(upgradedSettings.stripe.missingGates).toEqual([]);
+    expect(upgradedSettings.stripe.statusHeadline).toContain("ACTIVE");
+
+    const upgradedReadiness = await h.payments.admin.readiness(adminPrincipal);
+    expect(upgradedReadiness.onlineEnabled).toBe(true);
+    expect(upgradedReadiness.missingGates).toEqual([]);
+    expect(
+      upgradedReadiness.checklist.find((item) => item.key === "checkout_session_verified"),
+    ).toMatchObject({
+      ready: true,
+      detail: expect.stringMatching(/Recommended check \(online card checkout remains active\)/i),
+    });
+    expect((await h.payments.getPublicCheckoutConfig()).onlineEnabled).toBe(true);
+
+    // Non-secret settings updates on an upgraded already-active server without a probe succeed cleanly
+    const updatedReceipts = await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+      receipts: { enabled: true, emailCustomer: true, footerText: "Thank you for your business." },
+    });
+    expect(updatedReceipts.onlineEnabled).toBe(true);
+
+    // In-place secret rotation keeps its current rules (pauses until Test Stripe API passes, then resumes onlineEnabled without requiring a probe)
+    const rotatedKeyInPlace = await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+      stripeSecretKey: "sk_test_fake_gate_key_c_4444",
+    });
+    expect(rotatedKeyInPlace.onlineEnabled).toBe(false);
+    expect((await h.payments.admin.testConnection(adminPrincipal)).ok).toBe(true);
+    const resumedAfterKeyRotate = await h.payments.admin.getSettings(adminPrincipal);
+    expect(resumedAfterKeyRotate.onlineEnabled).toBe(true);
+    expect(resumedAfterKeyRotate.stripe.lastCheckoutProbe).toBeNull();
+
+    // 5. Switching mode (test -> live) also requires a passing probe for the live key
+    await expect(
+      h.payments.admin.updateSettings(adminPrincipal, {
+        provider: "stripe",
+        mode: "live",
+        currency: "USD",
+        stripeSecretKey: "sk_live_fake_gate_key_live_5555",
+        stripeWebhookSecret: "whsec_fake_gate_wh_live_6666",
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      reasonCode: "STRIPE_API_NOT_VERIFIED",
     });
   });
 });

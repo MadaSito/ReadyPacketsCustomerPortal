@@ -465,7 +465,7 @@ it("keeps Activate Stripe Checkout disabled when API check fails (HTTP 401), req
   expect(screen.getByRole("button", { name: "Activate Stripe Checkout" })).toBeDisabled();
   firstRender.unmount();
 
-  // 2. Live mode with verified API + self-test requires typing ACTIVATE LIVE PAYMENTS in confirmation dialog.
+  // 2. Live mode with verified API + Checkout session probe + self-test requires typing ACTIVATE LIVE PAYMENTS in confirmation dialog.
   mocks.getSettings.mockResolvedValue({
     ...defaultConfig,
     provider: "none",
@@ -480,6 +480,14 @@ it("keeps Activate Stripe Checkout disabled when API check fails (HTTP 401), req
       webhookSecretLast4: "9876",
       lastApiVerifiedAt: "2026-11-21T12:05:00.000Z",
       lastSelfTestWebhookAt: "2026-11-21T12:06:00.000Z",
+      checkoutSessionVerified: true,
+      lastCheckoutProbe: {
+        checkedAt: "2026-11-21T12:05:30.000Z",
+        mode: "live",
+        ok: true,
+        reasonCode: "CHECKOUT_PROBE_OK",
+        message: "Verified Checkout session creation and immediate expiration.",
+      },
     },
   });
 
@@ -812,6 +820,80 @@ it("Fix Pack 07.2 Problem B (PaymentSettings) — validates inline per field, fo
   expect(
     await screen.findByText(/Re-verify your Stripe webhook signing secret/u),
   ).toBeInTheDocument();
+});
+
+it("Fix Pack 07.2 follow-up — gates new Stripe activation on Verify Checkout session creation while keeping upgraded already-active setups ACTIVE with recommended probe copy", async () => {
+  const user = userEvent.setup();
+  mocks.egressPresets.mockResolvedValue([
+    { key: "stripe", label: "Stripe API", enabled: true, parameterized: false },
+  ]);
+
+  // 1. New activation (provider === "none") without probe keeps Activate disabled until probe succeeds
+  mocks.getSettings.mockResolvedValue({
+    ...defaultConfig,
+    provider: "none",
+    mode: "test",
+    onlineEnabled: false,
+    stripe: {
+      ...defaultConfig.stripe,
+      egressAllowlisted: true,
+      secretKeyConfigured: true,
+      secretKeyLast4: "4242",
+      webhookSecretConfigured: true,
+      webhookSecretLast4: "9876",
+      lastApiVerifiedAt: "2026-11-21T12:05:00.000Z",
+      lastSelfTestWebhookAt: "2026-11-21T12:06:00.000Z",
+      checkoutSessionVerified: false,
+      lastCheckoutProbe: null,
+    },
+  });
+
+  const newSetupView = renderSetupPage();
+  const activateBtn = await screen.findByRole("button", { name: "Activate Stripe Checkout" });
+  expect(activateBtn).toBeDisabled();
+  expect(
+    screen.getByText(/Checkout session creation has not been verified for the current API key and mode/u),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText(/Required before activating Stripe Checkout: creates an unpaid Checkout Session/u),
+  ).toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: "Verify Checkout session creation" }));
+  expect(mocks.verifyCheckoutSession).toHaveBeenCalledWith({ provider: "stripe" });
+  expect(activateBtn).toBeEnabled();
+  newSetupView.unmount();
+
+  // 2. Upgraded already-active setup (provider === "stripe", onlineEnabled === true, no probe on record) stays ACTIVE and marks probe as recommended (never paused)
+  mocks.getSettings.mockResolvedValue({
+    ...defaultConfig,
+    provider: "stripe",
+    mode: "live",
+    onlineEnabled: true,
+    stripe: {
+      ...defaultConfig.stripe,
+      egressAllowlisted: true,
+      secretKeyConfigured: true,
+      secretKeyLast4: "4242",
+      webhookSecretConfigured: true,
+      webhookSecretLast4: "9876",
+      lastApiVerifiedAt: "2026-11-21T12:05:00.000Z",
+      lastSelfTestWebhookAt: "2026-11-21T12:06:00.000Z",
+      checkoutSessionVerified: false,
+      lastCheckoutProbe: null,
+      statusHeadline: "Online card checkout: ACTIVE (live)",
+      customerExperienceSummary:
+        "Customers are sent to Stripe Checkout (live) when placing an order or clicking Pay now.",
+      missingGates: [],
+    },
+  });
+
+  renderSetupPage();
+  expect(await screen.findByText("Online card checkout: ACTIVE (live)")).toBeInTheDocument();
+  expect(screen.queryByText(/paused pending verification/iu)).not.toBeInTheDocument();
+  expect(
+    screen.getAllByText(/Recommended check \(online card checkout remains active\)/u).length,
+  ).toBeGreaterThanOrEqual(2);
+  expect(screen.queryByText("Optional")).not.toBeInTheDocument();
 });
 
 pageA11y("/admin/payments/setup Fix Pack 07.2 diagnostics, banners, and secret toggles", async () => {

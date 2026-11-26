@@ -330,14 +330,18 @@ export default function PaymentSetupPage() {
   const apiVerified = Boolean(settings.stripe.lastApiVerifiedAt);
   const selfTestVerified = Boolean(settings.stripe.lastSelfTestWebhookAt);
 
+  const isAlreadyActiveStripe = settings.provider === "stripe";
   const persistedProbe = settings.stripe.lastCheckoutProbe ?? null;
   const effectiveProbeOk =
     checkoutProbeResult !== null
       ? checkoutProbeResult.ok
       : persistedProbe !== null
         ? persistedProbe.ok
-        : null;
+        : settings.stripe.checkoutSessionVerified
+          ? true
+          : null;
   const checkoutProbeFailed = effectiveProbeOk === false;
+  const checkoutProbeVerified = effectiveProbeOk === true;
 
   const stripePrereqsReady =
     egressAllowlisted &&
@@ -345,8 +349,9 @@ export default function PaymentSetupPage() {
     settings.stripe.webhookSecretConfigured &&
     apiVerified &&
     selfTestVerified &&
-    !checkoutProbeFailed;
-  const stripeActiveAndReady = settings.provider === "stripe" && settings.onlineEnabled && !checkoutProbeFailed;
+    !checkoutProbeFailed &&
+    (isAlreadyActiveStripe || checkoutProbeVerified);
+  const stripeActiveAndReady = isAlreadyActiveStripe && settings.onlineEnabled && !checkoutProbeFailed;
 
   const computedMissingGates: string[] = [];
   if (!egressAllowlisted) {
@@ -364,6 +369,10 @@ export default function PaymentSetupPage() {
   if (checkoutProbeFailed) {
     computedMissingGates.push(
       `Checkout session creation check failed (${checkoutProbeResult?.reasonCode ?? persistedProbe?.reasonCode ?? "STRIPE_CHECKOUT_PROBE_FAILED"}).`,
+    );
+  } else if (!isAlreadyActiveStripe && !checkoutProbeVerified) {
+    computedMissingGates.push(
+      'Checkout session creation has not been verified for the current API key and mode (run "Verify Checkout session creation").',
     );
   }
   if (!selfTestVerified) {
@@ -757,8 +766,10 @@ export default function PaymentSetupPage() {
             {persistedProbe.ok ? "Verified " : `Failed (${persistedProbe.reasonCode}) `}
             <DateTime value={persistedProbe.checkedAt} />.
           </span>
+        ) : isAlreadyActiveStripe ? (
+          "Recommended check (online card checkout remains active): creates an unpaid Checkout Session over pinned HTTPS and expires it immediately at zero cost to confirm Checkout Sessions write permission and redirect domain."
         ) : (
-          "Creates an unpaid test Checkout Session over pinned HTTPS and expires it immediately at zero cost. Catches restricted keys missing Checkout Sessions write permission and custom Checkout domains before customers try to pay."
+          "Required before activating Stripe Checkout: creates an unpaid Checkout Session over pinned HTTPS and expires it immediately at zero cost. Catches restricted keys missing Checkout Sessions write permission and custom Checkout domains before customers try to pay."
         ),
       state: effectiveProbeOk === true ? "done" : effectiveProbeOk === false ? "blocked" : "todo",
       action: (
@@ -885,6 +896,13 @@ export default function PaymentSetupPage() {
       >
         <div className="grid min-w-0 gap-2">
           <p>{customerExperienceSummary}</p>
+          {stripeActiveAndReady && !checkoutProbeVerified ? (
+            <p className="text-muted">
+              Recommended check (online card checkout remains active): run{" "}
+              <span className="font-medium text-fg">Verify Checkout session creation</span>{" "}
+              in the checklist below to confirm Checkout Sessions write permission and redirect domain.
+            </p>
+          ) : null}
           {!stripeActiveAndReady && missingGates.length > 0 ? (
             <div>
               <p className="font-semibold">Missing readiness gates:</p>
