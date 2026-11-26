@@ -35,24 +35,29 @@ function providerBadge(provider: ActivePaymentProvider, environment: "test" | "l
   </span>;
 }
 const publicId = /^[0-9A-HJKMNP-TV-Z]{26}$/u;
-const smallId = (id: string) => <span className="break-all font-mono text-xs">{id}</span>;
+const smallId = (id: string) => <span className="font-mono text-xs break-all [overflow-wrap:anywhere]">{id}</span>;
 
 function StripeReadinessBanner({ settings }: { settings: PaymentSettingsView }) {
   if (settings.provider !== "stripe") return null;
   if (settings.onlineEnabled) {
     if (!settings.stripe.lastCheckoutFailure) return null;
     return (
-      <div className="mb-5">
-        <Callout tone="danger" title="Recent Stripe Checkout session creation failed">
-          <p className="mb-2">
-            A customer could not be redirected to Stripe Checkout ({settings.stripe.lastCheckoutFailure.reasonCode}
-            {settings.stripe.lastCheckoutFailure.upstreamStatus !== null
-              ? `, HTTP ${settings.stripe.lastCheckoutFailure.upstreamStatus}`
-              : ""}). Inspect diagnostics and verify Checkout session creation.
-          </p>
-          <Link href="/admin/payments/setup" className="font-semibold text-action underline underline-offset-2">
-            Open Stripe setup checklist
-          </Link>
+      <div className="mb-5 min-w-0">
+        <Callout
+          tone="danger"
+          title={<span className="[overflow-wrap:anywhere]">Recent Stripe Checkout session creation failed</span>}
+        >
+          <div className="min-w-0 flex-1 [overflow-wrap:anywhere]">
+            <p className="mb-2 [overflow-wrap:anywhere]">
+              A customer could not be redirected to Stripe Checkout ({settings.stripe.lastCheckoutFailure.reasonCode}
+              {settings.stripe.lastCheckoutFailure.upstreamStatus !== null
+                ? `, HTTP ${settings.stripe.lastCheckoutFailure.upstreamStatus}`
+                : ""}). Inspect diagnostics and verify Checkout session creation.
+            </p>
+            <Link href="/admin/payments/setup" className="font-semibold text-action underline underline-offset-2 [overflow-wrap:anywhere]">
+              Open Stripe setup checklist
+            </Link>
+          </div>
         </Callout>
       </div>
     );
@@ -64,18 +69,23 @@ function StripeReadinessBanner({ settings }: { settings: PaymentSettingsView }) 
   if (settings.stripe.lastApiVerifiedAt === null) missing.push("verified Stripe API connection");
   if (settings.stripe.lastSelfTestWebhookAt === null) missing.push("passing signed webhook self-test");
   return (
-    <div className="mb-5">
-      <Callout tone="warning" title="Stripe checkout is selected, but readiness checks are incomplete">
-        <p className="mb-2">
-          Hosted checkout stays inactive (customers currently receive pay-by-invoice) until every prerequisite is in place
-          {missing.length > 0 ? `: ${missing.join(", ")}.` : "."}
-          {settings.stripe.reverificationNeeded
-            ? " Credentials or outbound allowlist settings changed after the previous verification."
-            : ""}
-        </p>
-        <Link href="/admin/payments/setup" className="font-semibold text-action underline underline-offset-2">
-          Open Stripe setup checklist
-        </Link>
+    <div className="mb-5 min-w-0">
+      <Callout
+        tone="warning"
+        title={<span className="[overflow-wrap:anywhere]">Stripe checkout is selected, but readiness checks are incomplete</span>}
+      >
+        <div className="min-w-0 flex-1 [overflow-wrap:anywhere]">
+          <p className="mb-2 [overflow-wrap:anywhere]">
+            Hosted checkout stays inactive (customers currently receive pay-by-invoice) until every prerequisite is in place
+            {missing.length > 0 ? `: ${missing.join(", ")}.` : "."}
+            {settings.stripe.reverificationNeeded
+              ? " Credentials or outbound allowlist settings changed after the previous verification."
+              : ""}
+          </p>
+          <Link href="/admin/payments/setup" className="font-semibold text-action underline underline-offset-2 [overflow-wrap:anywhere]">
+            Open Stripe setup checklist
+          </Link>
+        </div>
       </Callout>
     </div>
   );

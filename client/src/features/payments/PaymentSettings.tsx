@@ -469,17 +469,30 @@ export function PaymentSettings({ settings, saving, onSave }: {
             />
           </Field>
         </fieldset>
-        {notice ? <Callout title="Payment settings not saved" tone="danger" live="assertive">{notice}</Callout> : null}
+        {notice ? (
+          <Callout
+            title={<span className="[overflow-wrap:anywhere]">Payment settings not saved</span>}
+            tone="danger"
+            live="assertive"
+          >
+            <div className="min-w-0 flex-1 [overflow-wrap:anywhere]">{notice}</div>
+          </Callout>
+        ) : null}
         <div><Button type="submit" loading={saving} disabled={saving}>Save payment settings</Button></div>
       </form>
     </Card>
     {activeSettings ? <Card title="Provider webhook" description="Register this exact HTTPS URL with the selected provider. Only verified provider events can confirm a payment.">
-      <div className="grid gap-4">
+      <div className="grid min-w-0 grid-cols-1 gap-4">
         <CopyField label="Webhook notification URL" value={activeSettings.webhookUrl} copyLabel="Copy webhook URL" monospace />
-        <Callout tone={egressConfirmed && activeSettings.egressAllowlisted ? "success" : "warning"} title="Provider network access">
-          <span className="break-all font-mono">{egressHost}</span>: {egressConfirmed
-            ? (activeSettings.egressAllowlisted ? "Allowlist rule enabled." : "No enabled provider allowlist rule confirmed.")
-            : "Verify the rule for this environment before enabling checkout."}
+        <Callout
+          tone={egressConfirmed && activeSettings.egressAllowlisted ? "success" : "warning"}
+          title={<span className="[overflow-wrap:anywhere]">Provider network access</span>}
+        >
+          <div className="min-w-0 flex-1 [overflow-wrap:anywhere]">
+            <span className="font-mono break-all [overflow-wrap:anywhere]">{egressHost}</span>: {egressConfirmed
+              ? (activeSettings.egressAllowlisted ? "Allowlist rule enabled." : "No enabled provider allowlist rule confirmed.")
+              : "Verify the rule for this environment before enabling checkout."}
+          </div>
         </Callout>
       </div>
     </Card> : null}

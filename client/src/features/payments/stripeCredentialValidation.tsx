@@ -292,7 +292,12 @@ export function SecretCredentialField({
   const [revealed, setRevealed] = useState(false);
 
   return (
-    <Field label={label} hint={hint} error={error} required={required}>
+    <Field
+      label={label}
+      hint={hint ? <span className="break-words [overflow-wrap:anywhere]">{hint}</span> : undefined}
+      error={error ? <span className="min-w-0 flex-1 break-words [overflow-wrap:anywhere]">{error}</span> : undefined}
+      required={required}
+    >
       <div className="flex min-w-0 items-center gap-2">
         <Input
           ref={inputRef}

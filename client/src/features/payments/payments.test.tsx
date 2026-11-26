@@ -896,6 +896,120 @@ it("Fix Pack 07.2 follow-up — gates new Stripe activation on Verify Checkout s
   expect(screen.queryByText("Optional")).not.toBeInTheDocument();
 });
 
+it("Fix Pack 07.2 240px wrap & a11y — applies min-w-0 flex-1 and [overflow-wrap:anywhere] on status banner and reason codes, and wires aria-describedby on disabled Activate Stripe Checkout", async () => {
+  const user = userEvent.setup();
+  mocks.egressPresets.mockResolvedValue([
+    { key: "stripe", label: "Stripe API", enabled: true, parameterized: false },
+  ]);
+  mocks.getSettings.mockResolvedValue({
+    ...defaultConfig,
+    provider: "none",
+    mode: "live",
+    onlineEnabled: false,
+    stripe: {
+      ...defaultConfig.stripe,
+      egressAllowlisted: true,
+      secretKeyConfigured: true,
+      secretKeyLast4: "4242",
+      webhookSecretConfigured: true,
+      webhookSecretLast4: "9876",
+      lastApiVerifiedAt: "2026-11-21T12:05:00.000Z",
+      lastSelfTestWebhookAt: "2026-11-21T12:06:00.000Z",
+      checkoutSessionVerified: false,
+      lastCheckoutProbe: {
+        checkedAt: "2026-11-21T12:07:00.000Z",
+        mode: "live",
+        ok: false,
+        reasonCode: "STRIPE_AUTH_INVALID_KEY",
+        failureClass: "provider_auth",
+        upstreamStatus: 401,
+      },
+      lastCheckoutFailure: {
+        occurredAt: "2026-11-21T12:08:00.000Z",
+        provider: "stripe",
+        mode: "live",
+        reasonCode: "STRIPE_CHECKOUT_SESSION_NOT_VERIFIED",
+        failureClass: "not_ready",
+        upstreamStatus: null,
+        stripeErrorType: null,
+        stripeErrorCode: "PROVIDER_VERIFICATION_STALE",
+        stripeErrorParam: null,
+        invoicePublicId: invoiceId,
+        attemptPublicId: id,
+      },
+    },
+  });
+
+  renderSetupPage();
+  const gateItem = await screen.findByText(
+    "Checkout session creation check failed (STRIPE_AUTH_INVALID_KEY).",
+  );
+  expect(gateItem.tagName).toBe("LI");
+  expect(gateItem).toHaveClass("min-w-0", "[overflow-wrap:anywhere]");
+
+  const gatesList = gateItem.closest("ul");
+  expect(gatesList).not.toBeNull();
+  expect(gatesList?.id).toBeTruthy();
+
+  const bannerTextFlexChild = gatesList?.parentElement?.parentElement;
+  expect(bannerTextFlexChild).not.toBeNull();
+  expect(bannerTextFlexChild).toHaveClass("min-w-0", "flex-1", "[overflow-wrap:anywhere]");
+
+  const checklistReasonSpan = screen.getByText(/Failed \(STRIPE_AUTH_INVALID_KEY\)/u);
+  expect(checklistReasonSpan).toHaveClass("[overflow-wrap:anywhere]");
+
+  const diagReasonSpan = screen.getByText("STRIPE_CHECKOUT_SESSION_NOT_VERIFIED");
+  expect(diagReasonSpan).toHaveClass("[overflow-wrap:anywhere]");
+  expect(screen.getByText("PROVIDER_VERIFICATION_STALE")).toHaveClass("[overflow-wrap:anywhere]");
+
+  const activateBtn = screen.getByRole("button", { name: "Activate Stripe Checkout" });
+  expect(activateBtn).toBeDisabled();
+  const describedByIds = (activateBtn.getAttribute("aria-describedby") ?? "")
+    .split(/\s+/u)
+    .filter(Boolean);
+  expect(describedByIds.length).toBeGreaterThan(0);
+  expect(describedByIds).toContain(gatesList?.id);
+  for (const refId of describedByIds) {
+    expect(document.getElementById(refId)).not.toBeNull();
+  }
+
+  // Once Verify Checkout session creation passes, Activate becomes enabled and drops disabled-reason aria-describedby
+  await user.click(screen.getByRole("button", { name: "Verify Checkout session creation" }));
+  expect(activateBtn).toBeEnabled();
+  expect(activateBtn).not.toHaveAttribute("aria-describedby");
+});
+
+pageA11y("/admin/payments/setup Fix Pack 07.2 disabled Activate button aria-describedby and long reason codes", async () => {
+  mocks.egressPresets.mockResolvedValue([
+    { key: "stripe", label: "Stripe API", enabled: true, parameterized: false },
+  ]);
+  mocks.getSettings.mockResolvedValue({
+    ...defaultConfig,
+    provider: "none",
+    mode: "live",
+    onlineEnabled: false,
+    stripe: {
+      ...defaultConfig.stripe,
+      egressAllowlisted: true,
+      secretKeyConfigured: true,
+      secretKeyLast4: "4242",
+      webhookSecretConfigured: true,
+      webhookSecretLast4: "9876",
+      checkoutSessionVerified: false,
+      lastCheckoutProbe: {
+        checkedAt: "2026-11-21T12:07:00.000Z",
+        mode: "live",
+        ok: false,
+        reasonCode: "STRIPE_AUTH_INVALID_KEY",
+        failureClass: "provider_auth",
+        upstreamStatus: 401,
+      },
+    },
+  });
+  renderSetupPage();
+  await screen.findByRole("button", { name: "Activate Stripe Checkout" });
+});
+
 pageA11y("/admin/payments/setup Fix Pack 07.2 diagnostics, banners, and secret toggles", async () => {
   mocks.egressPresets.mockResolvedValue([
     { key: "stripe", label: "Stripe API", enabled: true, parameterized: false },
