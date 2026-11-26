@@ -58,11 +58,25 @@ export async function collectAndWriteExport(
         rootOrderIds.push(order.id);
       }
     }
+    // A selected order travels with its whole order group (the project's first order and every order added to it),
+    // so group links always resolve inside the package.
+    let groupRootIds: number[] | undefined;
+    if (rootOrderIds) {
+      const roots = new Set<number>();
+      let after: number | undefined;
+      do {
+        const page = await deps.services.orders.portableOrders(tx, { after, limit: ORDERS_PAGE, orderIds: rootOrderIds });
+        for (const order of page.items) roots.add(order.groupRootOrderId ?? order.id);
+        if (page.nextAfter !== null && page.nextAfter === after) throw new CustodyError();
+        after = page.nextAfter ?? undefined;
+      } while (after !== undefined);
+      groupRootIds = [...roots];
+    }
     const customerByInternal = new Map<number, string>();
     let cursor: number | undefined;
     do {
       const { items, nextAfter } = await deps.services.orders.portableOrders(tx, {
-        after: cursor, limit: ORDERS_PAGE, orderIds: rootOrderIds, customerIds: rootCustomerIds,
+        after: cursor, limit: ORDERS_PAGE, customerIds: rootCustomerIds, ...(groupRootIds ? { groupRootIds } : {}),
       });
       for (const order of items) {
         let ownerPublicId = customerByInternal.get(order.ownerUserId);
@@ -76,6 +90,8 @@ export async function collectAndWriteExport(
         orders.set(order.id, { order, ownerPublicId });
         emit("orders", {
           publicId: order.publicId, customerPublicId: ownerPublicId, orderNumber: order.reference,
+          // Omitted for a root so packages without groups stay readable by increment 07 installations.
+          ...(order.groupRootPublicId ? { groupRootOrderPublicId: order.groupRootPublicId } : {}),
           projectName: order.projectName, status: order.statusKey, paymentStatus: "unknown", paymentRequirement: null,
           currency: order.currency, subtotal: { amountMinor: order.subtotalMinor, currency: order.currency },
           discount: { amountMinor: order.discountMinor, currency: order.currency }, discountLabel: order.discountLabel,
@@ -107,7 +123,10 @@ export async function collectAndWriteExport(
       if (nextAfter !== null && nextAfter === cursor) throw new CustodyError();
       cursor = nextAfter ?? undefined;
     } while (cursor !== undefined);
-    if (rootOrderIds && orders.size !== rootOrderIds.length) throw notFound("PORTABLE_SELECTION_NOT_FOUND");
+    if (rootOrderIds?.some((id) => !orders.has(id))) throw notFound("PORTABLE_SELECTION_NOT_FOUND");
+    for (const { order } of orders.values()) {
+      if (order.groupRootOrderId !== null && (!order.groupRootPublicId || !orders.has(order.groupRootOrderId))) throw new CustodyError();
+    }
 
     async function enumerateCustomers(ids?: string[]) {
       let after: string | null = null;
@@ -116,11 +135,20 @@ export async function collectAndWriteExport(
         const customers = await deps.services.identity.portableCustomers(tx, after, 100, ids);
         for (const item of customers) {
           expectedIds?.delete(item.publicId);
+          const user = await deps.services.identity.getUserByPublicId(item.publicId, { tx });
+          if (!user || user.role !== "customer") throw new CustodyError();
+          const billing = await deps.services.billingProfile.getForUserInTx(tx, user.id);
+          // Stored name parts travel as parts; otherwise the display name keeps its legacy place (preferredName).
+          const parts = item.firstName && item.lastName
+            ? { firstName: item.firstName, lastName: item.lastName, preferredName: item.preferredName }
+            : { firstName: null, lastName: null, preferredName: item.name };
           emit("customers", {
             publicId: item.publicId, customerNumber: item.customerRef, status: "business-profile",
-            email: item.email, firstName: null, middleName: null, lastName: null, preferredName: item.name,
+            email: item.email, ...parts, middleName: null,
             suffix: null, company: null, phone: null, address: null, timezone: null, locale: null,
             marketingOptIn: false, createdAt: item.createdAt.toISOString(), updatedAt: null,
+            // Omitted when there is none so such packages stay readable by increment 07 installations.
+            ...(billing ? { billingProfile: billing.details } : {}),
           });
         }
         if (customers.length < 100) break;
@@ -190,7 +218,7 @@ export async function collectAndWriteExport(
         { category: "provider-runtime", reason: "Provider and workflow execution state are outside business transfer." },
         { category: "file-history", reason: "Only active current file versions are included in this export." },
         { category: "internal-order-notes", reason: "Internal order comments, access grants, and order task notes and waivers are not exported." },
-        { category: "historical-evidence", reason: "Engagement, billing (invoices, payments, payment receipts and receipt refund notes) and compliance collectors do not contribute to this export." },
+        { category: "historical-evidence", reason: "Engagement, billing (invoices, payments and payment attempts including their booking source, payment receipts and receipt refund notes) and compliance collectors do not contribute to this export." },
         { category: "promotions", reason: "Promotion codes, batches and redemptions are live installation configuration and redeemable secrets; orders carry only the promo amount and label." },
         { category: "cart-upsell-offers", reason: "Cart upsell offers are installation sales configuration, not customer business records." },
         { category: "security-operations", reason: "Security incidents, their timelines and correlation state are installation security operations, not business records." },

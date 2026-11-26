@@ -2,7 +2,8 @@ import { OrderItemRecord, OrderRecord } from "../../../portable/src/index.js";
 import type { FileCategory } from "../files/index.js";
 import { validation } from "../../core/errors.js";
 import { ULID_PATTERN } from "../../core/ids.js";
-import { nameSchema } from "../identity/normalize.js";
+import { billingDetailsSchema, type BillingDetails } from "../../../shared/billingDetails.js";
+import { firstNameSchema, fullNameOf, lastNameSchema, nameSchema, preferredNameSchema, type NameParts } from "../identity/normalize.js";
 import type { ImportOrderInput } from "../orders/index.js";
 import type { JsonRecord, PortableInputRecord } from "./importPlanning.js";
 
@@ -17,6 +18,56 @@ export function customerName(record: JsonRecord) {
   const valid = nameSchema.safeParse(supplied);
   if (!valid.success) throw invalidTarget();
   return valid.data;
+}
+
+const present = (value: unknown): value is string => typeof value === "string" && Boolean(value.trim());
+
+/**
+ * Display name and, when the record carries them, name parts (increment 08). A record with both a first and a last
+ * name is read as parts: display = "<First> <Last>", preferredName = nickname. Anything else is a legacy record
+ * (≤ increment 07 exports put the display name in preferredName) and keeps the legacy display-name rule.
+ */
+export function customerIdentity(record: JsonRecord): { name: string; nameParts?: NameParts } {
+  if (!present(record.firstName) || !present(record.lastName)) return { name: customerName(record) };
+  const firstName = firstNameSchema.safeParse(record.firstName);
+  const lastName = lastNameSchema.safeParse(record.lastName);
+  const preferredName = preferredNameSchema.safeParse(typeof record.preferredName === "string" ? record.preferredName : "");
+  if (!firstName.success || !lastName.success || !preferredName.success) throw invalidTarget();
+  const nameParts = { firstName: firstName.data, lastName: lastName.data, preferredName: preferredName.data };
+  const name = nameSchema.safeParse(fullNameOf(nameParts));
+  if (!name.success) throw invalidTarget();
+  return { name: name.data, nameParts };
+}
+
+/** Saved billing profile carried on a customer record (increment 08). Absent / null = none. Re-validated here. */
+export function customerBillingProfile(record: JsonRecord): BillingDetails | null {
+  if (record.billingProfile === undefined || record.billingProfile === null) return null;
+  const parsed = billingDetailsSchema.safeParse(record.billingProfile);
+  if (!parsed.success) throw invalidTarget();
+  return parsed.data;
+}
+
+/** Portable id of the order group root (increment 08). Absent / null = the order is its own root. */
+export function groupRootOf(record: JsonRecord): string | null {
+  const value = record.groupRootOrderPublicId;
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || !ULID_PATTERN.test(value) || value === record.publicId) throw invalidTarget();
+  return value;
+}
+
+/**
+ * Group links must stay consistent: the root is another order in the same package, is itself a root and has the
+ * same customer and currency. Returns a reason code, or null when the record is fine.
+ */
+export function groupLinkProblem(record: JsonRecord, ordersById: ReadonlyMap<string, JsonRecord>): string | null {
+  let rootId: string | null;
+  try { rootId = groupRootOf(record); } catch { return "PORTABLE_ORDER_GROUP_INVALID"; }
+  if (rootId === null) return null;
+  const root = ordersById.get(rootId);
+  if (!root) return "PORTABLE_ORDER_GROUP_ROOT_MISSING";
+  if ((root.groupRootOrderPublicId ?? null) !== null || root.customerPublicId !== record.customerPublicId ||
+    root.currency !== record.currency) return "PORTABLE_ORDER_GROUP_INVALID";
+  return null;
 }
 
 export function fileCategory(value: unknown): FileCategory {

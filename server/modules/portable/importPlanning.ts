@@ -5,7 +5,10 @@ import { customerRefSchema, emailSchema } from "../identity/normalize.js";
 import { canonical, digest } from "./custody.js";
 import { portableMappings, type PlanSummary } from "./schema.js";
 import { TRANSFER_MAX_RECORDS } from "./transferPolicy.js";
-import { customerCreatedAt, customerName, fileCategory, projectedOrder, selectLiveVersions, stringField, targetDate } from "./importShapes.js";
+import {
+  customerBillingProfile, customerCreatedAt, customerIdentity, fileCategory, groupLinkProblem, projectedOrder, selectLiveVersions,
+  stringField, targetDate,
+} from "./importShapes.js";
 
 export type JsonRecord = Record<string, unknown> & { publicId: string };
 export interface PortableInputRecord { type: string; record: JsonRecord }
@@ -51,6 +54,7 @@ export async function buildPlan(deps: ModuleDeps, args: {
     const { parents, latest, duplicated } = selectLiveVersions(args.records);
     const orderItems = groupChildren(args.records, "order-items");
     const orderHistory = groupChildren(args.records, "order-status-history");
+    const ordersById = new Map(args.records.filter((item) => item.type === "orders").map((item) => [item.record.publicId, item.record]));
     const customerFieldCounts = new Map<string, number>();
     const knownStatuses = new Map<string, boolean>();
     for (const item of args.records) {
@@ -108,16 +112,20 @@ export async function buildPlan(deps: ModuleDeps, args: {
             step.disposition = "conflict";
             step.reason = collision ? "PORTABLE_EMAIL_COLLISION" : idCollision ? "PORTABLE_PUBLIC_ID_COLLISION" : "PORTABLE_CUSTOMER_REF_COLLISION";
           } else {
-            try { customerName(item.record); customerCreatedAt(item.record.createdAt); }
+            try { customerIdentity(item.record); customerBillingProfile(item.record); customerCreatedAt(item.record.createdAt); }
             catch { step.disposition = "conflict"; step.reason = "PORTABLE_TARGET_POLICY"; }
           }
         }
       } else if (item.type === "orders") {
         const order = await deps.services.orders.findImportedOrder(args.sourceSystem, item.record.publicId, tx);
         const owner = selected.get(`customers:${String(item.record.customerPublicId)}`);
+        const groupProblem = groupLinkProblem(item.record, ordersById);
         if (order || !owner || owner.disposition === "conflict") {
           step.disposition = "conflict";
           step.reason = order ? "PORTABLE_ORDER_PROVENANCE_COLLISION" : "PORTABLE_OWNER_NOT_PLANNED";
+        } else if (groupProblem) {
+          step.disposition = "conflict";
+          step.reason = groupProblem;
         } else {
           try {
             const fields = projectedOrder(item.record, orderItems.get(item.record.publicId) ?? [], orderHistory.get(item.record.publicId) ?? []);
