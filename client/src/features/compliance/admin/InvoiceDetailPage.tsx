@@ -3,6 +3,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { Download } from "lucide-react";
 import { useState } from "react";
 import { Link, useParams } from "wouter";
+import { AdminCheckStripePaymentButton } from "@/features/payments/AdminCheckStripePaymentButton";
 import { useSession } from "@/lib/session";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import { Badge, Breadcrumbs, Button, Callout, Card, ConfirmDialog, DataTable, DateTime, Field, Input, KeyValueList, Money, PageHeader, Select, Textarea, useToast } from "@/ui";
@@ -66,6 +67,16 @@ export default function InvoiceDetailPage() {
                 </Button>
                 <Button onClick={() => setAction({ kind: "issue" })}>Issue invoice</Button>
               </>
+            ) : null}
+            {inv.canRecordPayment && inv.status === "issued" && inv.balanceDueMinor > 0 ? (
+              <AdminCheckStripePaymentButton
+                invoicePublicId={inv.invoicePublicId}
+                invoiceStatus={inv.status}
+                origin={inv.origin}
+                onUpdated={() => {
+                  void detail.refetch();
+                }}
+              />
             ) : null}
             {inv.canRecordPayment && inv.status === "issued" ? <Button onClick={() => setAction({ kind: "payment" })}>Record payment</Button> : null}
             {inv.canManage && (inv.status === "draft" || inv.status === "issued") ? (
