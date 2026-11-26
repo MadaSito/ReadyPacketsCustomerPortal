@@ -87,6 +87,19 @@ export interface ClearBillingProfileResult {
   cleared: boolean;
 }
 
+export interface GetBillingProfileInTxOptions {
+  /**
+   * Perform a current locking read (`FOR UPDATE`) on `customer_billing_profiles` under a caller-held
+   * `users FOR UPDATE` lock so InnoDB `REPEATABLE READ` does not return an earlier pre-lock snapshot.
+   */
+  forUpdate?: boolean;
+  /**
+   * Perform a shared current locking read (`FOR SHARE`) on `customer_billing_profiles` under a caller-held
+   * `users` lock so InnoDB `REPEATABLE READ` does not return an earlier pre-lock snapshot.
+   */
+  forShare?: boolean;
+}
+
 export interface BillingProfileModule extends ModuleLifecycle {
   /** Owner-scoped read for the signed-in account. Returns `null` when no billing profile is saved. */
   get(principal: SessionPrincipal): Promise<BillingProfileView | null>;
@@ -101,7 +114,11 @@ export interface BillingProfileModule extends ModuleLifecycle {
    * Cross-module transactional read port (cart checkout, portable export).
    * Uses `tx` strictly — never opens a nested transaction or second pool connection.
    */
-  getForUserInTx(tx: DbOrTx, userId: number): Promise<BillingProfileRecord | null>;
+  getForUserInTx(
+    tx: DbOrTx,
+    userId: number,
+    options?: GetBillingProfileInTxOptions,
+  ): Promise<BillingProfileRecord | null>;
 
   /**
    * Cross-module transactional upsert port (registration on new account creation, checkout "Save as my billing

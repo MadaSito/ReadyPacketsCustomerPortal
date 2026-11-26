@@ -19,7 +19,7 @@ Stores at most one saved billing contact and address per account (`customer_bill
 - `billingProfile.clear` (`protectedProcedure` mutation, rate limit `form_submission`): input `{ expectedVersion: number, expectedPublicId: string }`. Returns `{ cleared: boolean }` (`false` when already absent); throws `CONFLICT` (`BILLING_PROFILE_VERSION_CONFLICT`) when `expectedVersion` or `expectedPublicId` mismatches.
 
 ## Cross-Module Transactional Ports (`services.billingProfile`)
-- `getForUserInTx(tx: DbOrTx, userId: number): Promise<BillingProfileRecord | null>`
+- `getForUserInTx(tx: DbOrTx, userId: number, options?: { forUpdate?: boolean; forShare?: boolean }): Promise<BillingProfileRecord | null>` (`{ forUpdate: true }` / `{ forShare: true }` issue a current locking read under caller-held `users` lock so InnoDB `REPEATABLE READ` does not return an earlier pre-lock snapshot)
 - `saveForUserInTx(tx: Tx, userId: number, details: BillingDetailsInput, actor: BillingProfileWriteActor): Promise<BillingProfileRecord>`
   - Runs strictly on `tx` (never opens a nested transaction or second pool connection).
   - Never enqueues mail; records durable audit event `billing_profile.saved` on `tx` without field values.

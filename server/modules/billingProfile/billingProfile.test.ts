@@ -456,4 +456,51 @@ describe("billingProfile module (MySQL)", () => {
       .where(eq(customerBillingProfiles.userId, tempUser.id));
     expect(remaining).toHaveLength(0);
   });
+
+  it("performs a current locking read in getForUserInTx({ forUpdate: true }) past an earlier REPEATABLE READ snapshot", async () => {
+    const callerA = callerFor(userA.principal);
+
+    // 1. Concurrent create + update while outer checkout-like tx already opened its RR snapshot.
+    await t.db.transaction(async (tx) => {
+      // Establish InnoDB REPEATABLE READ snapshot before any profile row exists.
+      await tx.select({ id: users.id }).from(users).where(eq(users.id, userA.id));
+      expect(await billingProfile.getForUserInTx(tx, userA.id)).toBeNull();
+
+      // Concurrent settings tab creates v1 and updates to v2 on separate committed transactions.
+      const v1 = await callerA.billingProfile.save({ details: SYNTHETIC_BILLING_A, expectedVersion: 0 });
+      const v2 = await callerA.billingProfile.save({
+        details: SYNTHETIC_BILLING_B,
+        expectedVersion: 1,
+        expectedPublicId: v1.publicId,
+      });
+
+      // Plain snapshot read still sees the pre-commit empty snapshot under REPEATABLE READ.
+      expect(await billingProfile.getForUserInTx(tx, userA.id)).toBeNull();
+
+      // Caller acquires `users FOR UPDATE` then calls `getForUserInTx(..., { forUpdate: true })` -> sees committed v2.
+      await tx.select({ id: users.id }).from(users).where(eq(users.id, userA.id)).for("update");
+      const current = await billingProfile.getForUserInTx(tx, userA.id, { forUpdate: true });
+      expect(current).toMatchObject({
+        publicId: v2.publicId,
+        version: 2,
+        details: expect.objectContaining({ fullName: "Hera Vance" }),
+      });
+    });
+
+    // 2. Concurrent clear after RR snapshot established -> `{ forUpdate: true }` sees null rather than stale v2.
+    await t.db.transaction(async (tx) => {
+      const staleSnapshot = await billingProfile.getForUserInTx(tx, userA.id);
+      expect(staleSnapshot?.version).toBe(2);
+
+      await callerA.billingProfile.clear({
+        expectedVersion: 2,
+        expectedPublicId: staleSnapshot!.publicId,
+      });
+
+      // Plain snapshot read still returns v2, whereas `{ forUpdate: true }` sees the committed deletion.
+      expect((await billingProfile.getForUserInTx(tx, userA.id))?.version).toBe(2);
+      await tx.select({ id: users.id }).from(users).where(eq(users.id, userA.id)).for("update");
+      expect(await billingProfile.getForUserInTx(tx, userA.id, { forUpdate: true })).toBeNull();
+    });
+  });
 });

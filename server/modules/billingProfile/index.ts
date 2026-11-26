@@ -22,6 +22,7 @@ export {
   type BillingProfileWriteSource,
   type ClearBillingProfileInput,
   type ClearBillingProfileResult,
+  type GetBillingProfileInTxOptions,
   type SaveBillingProfileInput,
 } from "./types.js";
 

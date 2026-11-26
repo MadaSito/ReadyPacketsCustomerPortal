@@ -32,6 +32,7 @@ import {
   type BillingProfileWriteActor,
   type ClearBillingProfileInput,
   type ClearBillingProfileResult,
+  type GetBillingProfileInTxOptions,
   type SaveBillingProfileInput,
 } from "./types.js";
 
@@ -127,9 +128,13 @@ export function createBillingProfileService(deps: ModuleDeps): BillingProfileMod
     return { id: user.id, publicId: user.publicId };
   }
 
-  async function getForUserInTx(tx: DbOrTx, userId: number): Promise<BillingProfileRecord | null> {
+  async function getForUserInTx(
+    tx: DbOrTx,
+    userId: number,
+    options?: GetBillingProfileInTxOptions,
+  ): Promise<BillingProfileRecord | null> {
     if (!Number.isSafeInteger(userId) || userId <= 0) return null;
-    const [joined] = await tx
+    const baseQuery = tx
       .select({
         profile: customerBillingProfiles,
         userPublicId: users.publicId,
@@ -137,6 +142,12 @@ export function createBillingProfileService(deps: ModuleDeps): BillingProfileMod
       .from(customerBillingProfiles)
       .innerJoin(users, eq(users.id, customerBillingProfiles.userId))
       .where(eq(customerBillingProfiles.userId, userId));
+
+    const [joined] = options?.forUpdate
+      ? await baseQuery.for("update")
+      : options?.forShare
+        ? await baseQuery.for("share")
+        : await baseQuery;
 
     if (!joined) return null;
     const details = decryptDetails(joined.profile, joined.userPublicId);
