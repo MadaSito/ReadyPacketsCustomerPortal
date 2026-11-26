@@ -1,20 +1,19 @@
 /**
- * Payments module — Core domain service (Increment 04, Package K).
- * Owner: compliance_engineer.
+ * Payments module — Core domain service (Increment 04 Package K, updated Increment 08 Decision D5).
+ * Owner: integrations_engineer.
  *
- * Enforces ADR 0035 & Contract Decision 12:
+ * Enforces ADR 0035 & Increment 08 Decision D5:
  *  - Off by default (`provider = "none"` -> `{ mode: "invoice" }`, zero network activity).
  *  - Hosted Stripe Checkout & Square Payment Links over `integrations.egress.fetchPinned`.
  *  - Attempt state machine (`created -> redirected -> paid | failed | expired | cancelled`) guarded by CAS `version`.
- *  - Double-verification invariant: an invoice is booked as paid ONLY when BOTH:
- *      (a) a valid signed, fresh (`<= 300s`), deduplicated webhook is recorded (`verifiedWebhookEventId`), AND
- *      (b) `adapter.fetchPayment` matches `provider`, `mode`/`livemode`, `providerRef`, `amountMinor`, `currency`,
- *          and `invoicePublicId` / `attemptPublicId`.
+ *  - Authoritative payment confirmation (D5, replacing Decision 12): a payment is booked through ONE idempotent
+ *    booking function from EITHER a verified signed webhook OR an authoritative server-to-provider lookup over
+ *    pinned TLS when ALL strict session/status/amount/currency/livemode/metadata checks hold.
  *  - Inert return route (`GET /api/payments/return/...`) performs zero DB reads/writes and redirects only to
- *    hardcoded reviewed same-origin paths.
+ *    hardcoded reviewed same-origin paths; browser URL parameters are never trusted as proof of payment.
  */
 import { createHash } from "node:crypto";
-import { and, asc, count, desc, eq, gte, inArray, lt, ne, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, or } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
@@ -29,6 +28,7 @@ import {
   REFUND_RECONCILE_JOB,
   type RefundReconcileContext,
 } from "../jobs/refundSupport.js";
+import { stripeWebhookDeliveryMissingAlert } from "../opsAlerts/stripeWebhook.js";
 import { isSecretConfigured, readSecret, readSetting, writeSetting } from "../platform/index.js";
 import { createSquareProviderAdapter } from "./providers/square.js";
 import { createSquareRefundAdapter } from "./providers/square-refund.js";
@@ -50,6 +50,7 @@ import {
   paymentAttempts,
   type PaymentAttemptRow,
   type PaymentAttemptStatus,
+  type PaymentBookingSource,
   type PaymentEnvironmentMode,
   type PaymentProviderChoice,
   paymentRefunds,
@@ -190,6 +191,7 @@ export interface CheckoutStatusView {
     provider: ActivePaymentProvider;
     environment: PaymentEnvironmentMode;
     status: PaymentAttemptStatus;
+    bookingSource: PaymentBookingSource | null;
     cartPublicId: string | null;
     amountMinor: number;
     currency: string;
@@ -197,8 +199,69 @@ export interface CheckoutStatusView {
     redirectedAt: Date | null;
     paidAt: Date | null;
     expiresAt: Date | null;
+    reconciliationNote: string | null;
     failureReasonCode: string | null;
   } | null;
+}
+
+export type CustomerPaymentConfirmationState = "paid" | "processing" | "unpaid";
+
+export interface ConfirmCheckoutPaymentResult {
+  attemptPublicId: string;
+  orderPublicId: string;
+  orderReference: string | null;
+  invoicePublicId: string;
+  invoiceNumber: string | null;
+  invoiceStatus: "draft" | "issued" | "paid" | "void";
+  receiptPublicId: string | null;
+  cartPublicId: string | null;
+  provider: ActivePaymentProvider;
+  environment: PaymentEnvironmentMode;
+  attemptStatus: PaymentAttemptStatus;
+  state: CustomerPaymentConfirmationState;
+  bookedNow: boolean;
+  bookingSource: PaymentBookingSource | null;
+  paidAt: string | null;
+  cooldownRemainingMs: number;
+}
+
+export interface AdminCheckWithStripeInput {
+  attemptPublicId?: string | undefined;
+  invoicePublicId?: string | undefined;
+}
+
+export interface AdminCheckWithStripeResult {
+  checkedCount: number;
+  booked: boolean;
+  alreadyPaid: boolean;
+  invoicePublicId: string;
+  invoiceStatus: "draft" | "issued" | "paid" | "void";
+  receiptPublicId: string | null;
+  attemptPublicId: string | null;
+  attemptStatus: PaymentAttemptStatus | null;
+  bookingSource: PaymentBookingSource | null;
+  reasonCode: string;
+}
+
+export interface StripeWebhookRejectionReasonSummary {
+  reasonCode: string;
+  reasonLabel: string;
+  count: number;
+  latestAt: string;
+}
+
+export interface StripeWebhookDeliveryDiagnosticsView {
+  missingWebhookDetected: boolean;
+  unwebhookedLookupPaidCount: number;
+  oldestUnwebhookedPaidAt: string | null;
+  graceSeconds: number;
+  lastVerifiedWebhookAt: string | null;
+  lastVerifiedWebhookEventType: string | null;
+  recentRejectionCount: number;
+  recentRejectionReasons: StripeWebhookRejectionReasonSummary[];
+  endpointUrl: string;
+  requiredEvents: readonly string[];
+  usualCauses: readonly [string, string, string];
 }
 
 export interface CancelAttemptResult {
@@ -261,6 +324,7 @@ export interface PaymentsAdminSettingsView
     returnUrlPattern: string;
     egressHost: "api.stripe.com";
     egressAllowlisted: boolean;
+    webhookDelivery: StripeWebhookDeliveryDiagnosticsView;
   };
   square: {
     locationId: string | null;
@@ -438,6 +502,7 @@ export interface AdminPaymentAttemptSummary {
   providerOrderRef: string | null;
   providerPaymentRef: string | null;
   verifiedWebhookEventId: string | null;
+  bookingSource: PaymentBookingSource | null;
   compliancePaymentPublicId: string | null;
   reconciliationNote: string | null;
   failureReasonCode: string | null;
@@ -573,6 +638,13 @@ export interface PaymentsServiceOptions {
 
 const DEFAULT_ATTEMPT_TTL_MS = 24 * 60 * 60 * 1000;
 const REFUND_RECONCILE_INITIAL_DELAY_MS = 2 * 60 * 1000;
+export const CUSTOMER_CONFIRM_COOLDOWN_MS = 2_000;
+export const MISSING_WEBHOOK_GRACE_MS = 2 * 60 * 1000;
+export const STRIPE_WEBHOOK_USUAL_CAUSES: readonly [string, string, string] = [
+  "The webhook endpoint URL is not registered in the Stripe Dashboard for this environment (Test mode and Live mode maintain separate webhook endpoint lists).",
+  "One or more required events (such as checkout.session.completed or checkout.session.async_payment_succeeded) are not subscribed on the Stripe endpoint.",
+  "The signing secret saved here belongs to a different Stripe endpoint or CLI session (the built-in self-test signs locally with the saved secret, so it verifies server route health rather than Stripe's Dashboard configuration).",
+];
 const CARD_PAN_LIKE_PATTERN = /\b(?:\d[ -]*?){13,19}\b/u;
 
 function formatRefundNoticeAmount(amountMinor: number, currency: string): string {
@@ -623,6 +695,7 @@ function toAdminAttemptSummary(row: PaymentAttemptRow): AdminPaymentAttemptSumma
     providerOrderRef: row.providerOrderRef,
     providerPaymentRef: row.providerPaymentRef,
     verifiedWebhookEventId: row.verifiedWebhookEventId,
+    bookingSource: row.bookingSource,
     compliancePaymentPublicId: row.compliancePaymentPublicId,
     reconciliationNote: row.reconciliationNote,
     failureReasonCode: row.failureReasonCode,
@@ -1411,6 +1484,59 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         squareLocationId: config.squareLocationId,
       },
       webhookSecret: webhookSignatureKey,
+    };
+  }
+
+  /**
+   * Loads Stripe API credentials for authoritative server-to-Stripe lookup (`fetchPayment`) in the
+   * attempt's environment, enforcing active provider & mode alignment and computing a key digest so
+   * post-egress transactions can detect key rotation, provider disable, or mode changes in flight.
+   */
+  async function loadStripeLookupCredentials(
+    environment: PaymentEnvironmentMode,
+    opts?: {
+      tx?: Tx | undefined;
+      allowDisabledProvider?: boolean | undefined;
+    },
+  ): Promise<{ credentials: ProviderCredentials; keyDigest: string }> {
+    const tx = opts?.tx;
+    const [config, secretKey] = await Promise.all([
+      loadConfig(tx),
+      readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx),
+    ]);
+    if (!opts?.allowDisabledProvider && config.provider !== "stripe") {
+      throw new DomainError(
+        "UNAVAILABLE",
+        "PAYMENT_PROVIDER_NOT_CONFIGURED",
+        "Stripe is not the active payment provider.",
+      );
+    }
+    if (config.mode !== environment) {
+      throw conflict(
+        "STRIPE_KEY_MODE_MISMATCH",
+        `Payment attempt was created in ${environment} mode while payments are currently configured in ${config.mode} mode.`,
+      );
+    }
+    if (!secretKey) {
+      throw new DomainError(
+        "UNAVAILABLE",
+        "PAYMENT_PROVIDER_NOT_CONFIGURED",
+        "Stripe API secret key is not configured.",
+      );
+    }
+    const expectedPrefix = environment === "live" ? /^(?:sk|rk)_live_/u : /^(?:sk|rk)_test_/u;
+    if (!expectedPrefix.test(secretKey)) {
+      throw conflict(
+        "STRIPE_KEY_MODE_MISMATCH",
+        `Payment attempt was created in ${environment} mode, while the saved Stripe API key is for ${environment === "live" ? "test" : "live"} mode.`,
+      );
+    }
+    const keyDigest = createHash("sha256")
+      .update(`${config.provider}:${config.mode}:${secretKey}`)
+      .digest("hex");
+    return {
+      credentials: { mode: environment, secretKey },
+      keyDigest,
     };
   }
 
@@ -2273,6 +2399,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             provider: attemptRow.provider,
             environment: attemptRow.environment,
             status: attemptRow.status,
+            bookingSource: attemptRow.bookingSource,
             cartPublicId: attemptRow.cartPublicId,
             amountMinor: attemptRow.amountMinor,
             currency: attemptRow.currency,
@@ -2280,6 +2407,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             redirectedAt: attemptRow.redirectedAt,
             paidAt: attemptRow.paidAt,
             expiresAt: attemptRow.expiresAt,
+            reconciliationNote: attemptRow.reconciliationNote,
             failureReasonCode: attemptRow.failureReasonCode,
           }
         : null,
@@ -2423,48 +2551,191 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     return runComplianceTx(deps, principal, { type: "payment_attempt" }, run);
   }
 
-  function checkFetchedMatchesAttempt(
+  /**
+   * Common strict provider-binding matcher shared across ALL provider responses (paid, asyncPending,
+   * open, expired, failed) so a malformed or wrong echoed Stripe session can NEVER mutate an attempt's
+   * status/diagnostics without strict identity, mode, amount, currency, and metadata agreement.
+   */
+  function checkFetchedBindingMatchesAttempt(
     attempt: PaymentAttemptRow,
     fetched: ProviderFetchedPayment,
   ): { matches: true } | { matches: false; reasonCode: string } {
-    const expectedLive = attempt.environment === "live";
-    if (fetched.livemode !== expectedLive) {
-      return { matches: false, reasonCode: "MODE_MISMATCH" };
-    }
-    if (attempt.providerRef && fetched.providerRef && fetched.providerRef !== attempt.providerRef) {
+    if (!attempt.providerRef || !fetched.providerRef || fetched.providerRef !== attempt.providerRef) {
       return { matches: false, reasonCode: "PROVIDER_REF_MISMATCH" };
     }
-    if (fetched.amountMinor !== attempt.amountMinor) {
+    const expectedLive = attempt.environment === "live";
+    if (
+      (attempt.provider === "stripe" && fetched.livemodeValid !== true) ||
+      fetched.livemodeValid === false ||
+      fetched.livemode !== expectedLive
+    ) {
+      return { matches: false, reasonCode: "MODE_MISMATCH" };
+    }
+    if (
+      (attempt.provider === "stripe" && fetched.amountValid !== true) ||
+      fetched.amountValid === false ||
+      !Number.isSafeInteger(fetched.amountMinor) ||
+      fetched.amountMinor < 0 ||
+      fetched.amountMinor !== attempt.amountMinor
+    ) {
       return { matches: false, reasonCode: "AMOUNT_MISMATCH" };
     }
-    if (fetched.currency.toUpperCase() !== attempt.currency.toUpperCase()) {
+    const normalizedFetchedCurrency = fetched.currency.trim().toUpperCase();
+    if (
+      !/^[A-Z]{3}$/u.test(normalizedFetchedCurrency) ||
+      normalizedFetchedCurrency !== attempt.currency.toUpperCase()
+    ) {
       return { matches: false, reasonCode: "CURRENCY_MISMATCH" };
     }
-    if (fetched.invoicePublicId !== attempt.invoicePublicId) {
+    if (
+      fetched.hasReferenceConflict ||
+      (fetched.clientReferenceId !== undefined &&
+        fetched.clientReferenceId !== null &&
+        fetched.clientReferenceId !== attempt.publicId)
+    ) {
+      return { matches: false, reasonCode: "CLIENT_REFERENCE_MISMATCH" };
+    }
+    if (
+      !fetched.attemptPublicId ||
+      fetched.attemptPublicId !== attempt.publicId ||
+      (fetched.paymentIntentAttemptPublicId && fetched.paymentIntentAttemptPublicId !== attempt.publicId)
+    ) {
+      return { matches: false, reasonCode: "ATTEMPT_METADATA_MISMATCH" };
+    }
+    if (
+      !fetched.invoicePublicId ||
+      fetched.invoicePublicId !== attempt.invoicePublicId ||
+      (fetched.paymentIntentInvoicePublicId && fetched.paymentIntentInvoicePublicId !== attempt.invoicePublicId)
+    ) {
       return { matches: false, reasonCode: "INVOICE_METADATA_MISMATCH" };
     }
-    if (fetched.attemptPublicId !== attempt.publicId) {
-      return { matches: false, reasonCode: "ATTEMPT_METADATA_MISMATCH" };
+    if (fetched.orderPublicId && fetched.orderPublicId !== attempt.orderPublicId) {
+      return { matches: false, reasonCode: "ORDER_METADATA_MISMATCH" };
     }
     return { matches: true };
   }
 
   /**
-   * Decision 12 booking critical section:
-   * Marks attempt `paid` and books `compliance.bookVerifiedProviderPayment` ONLY when the locked attempt
-   * row carries a non-null `verifiedWebhookEventId`, a matching locked `payment_webhook_events` receipt row
-   * exists, AND `fetched` passed `checkFetchedMatchesAttempt`.
+   * Strict Increment 08 D5 provider-fact matcher shared by BOTH verified webhooks and
+   * authoritative server-to-Stripe lookups (`confirmCheckoutPayment`, reconciliation, admin repair).
+   *
+   * Enforces `checkFetchedBindingMatchesAttempt` PLUS strict paid-state completion invariants:
+   * for Stripe, requires `sessionStatus === "complete"` and `paymentStatus === "paid"` (or
+   * `no_payment_required` strictly when expected `amountMinor === 0 && fetched.amountMinor === 0`).
    */
-  async function finalizeVerifiedPaidAttemptInTx(
+  function checkFetchedMatchesAttempt(
+    attempt: PaymentAttemptRow,
+    fetched: ProviderFetchedPayment,
+  ): { matches: true } | { matches: false; reasonCode: string } {
+    const bindingCheck = checkFetchedBindingMatchesAttempt(attempt, fetched);
+    if (!bindingCheck.matches) {
+      return bindingCheck;
+    }
+    if (attempt.provider === "stripe") {
+      if (fetched.sessionStatus !== "complete") {
+        return { matches: false, reasonCode: "SESSION_NOT_COMPLETE" };
+      }
+      if (fetched.paymentStatus === "no_payment_required") {
+        if (attempt.amountMinor !== 0 || fetched.amountMinor !== 0) {
+          return { matches: false, reasonCode: "UNEXPECTED_NO_PAYMENT_REQUIRED" };
+        }
+      } else if (fetched.paymentStatus !== "paid") {
+        return { matches: false, reasonCode: "PAYMENT_STATUS_NOT_PAID" };
+      }
+    } else if (fetched.status !== "paid") {
+      return { matches: false, reasonCode: "PAYMENT_STATUS_NOT_PAID" };
+    }
+    return { matches: true };
+  }
+
+  async function recordLookupMismatchInTx(
+    tx: Tx,
+    locked: PaymentAttemptRow,
+    fetched: ProviderFetchedPayment,
+    reasonCode: string,
+    actor: { userId?: number | undefined; role: SessionPrincipal["role"] | "system" },
+  ): Promise<void> {
+    const now = deps.clock.now();
+    const auditActor = actor.userId ? { userId: actor.userId, role: actor.role } : { role: actor.role };
+    await tx
+      .update(paymentAttempts)
+      .set({
+        reconciliationNote: `lookup_mismatch:${reasonCode}`.slice(0, 120),
+        failureReasonCode: reasonCode,
+        lastReconciledAt: now,
+        updatedAt: now,
+      })
+      .where(eq(paymentAttempts.id, locked.id));
+
+    await deps.audit.record(
+      {
+        category: "security",
+        eventName: "payments.verification.mismatch",
+        action: "verify",
+        outcome: "refused",
+        severity: "ERROR",
+        reasonCode,
+        actor: auditActor,
+        resource: { type: "payment_attempt", publicId: locked.publicId },
+        orderPublicId: locked.orderPublicId,
+        attributes: {
+          order_public_id: locked.orderPublicId,
+          invoice_public_id: locked.invoicePublicId,
+          provider: locked.provider,
+          booking_source: "provider_lookup",
+          expected_amount_minor: locked.amountMinor,
+          fetched_amount_minor: fetched.amountMinor,
+          expected_currency: locked.currency,
+          fetched_currency: fetched.currency,
+        },
+      },
+      tx,
+    );
+
+    await emitPaymentOpsAlert(
+      {
+        dedupKey: `verification-mismatch:${locked.publicId}`,
+        severity: "error",
+        code: reasonCode,
+        title: "Payment verification mismatch held booking",
+        text: "Upstream payment details did not match the expected invoice amount, currency, mode, or metadata.",
+        orderPublicId: locked.orderPublicId,
+      },
+      tx,
+    );
+  }
+
+  /**
+   * Increment 08 D5 unified idempotent booking critical section:
+   * Fed by EITHER a verified signed webhook (`source: "webhook"`) OR an authoritative server-to-provider
+   * lookup (`source: "provider_lookup"`).
+   *
+   * Locks `payment_attempts` `FOR UPDATE`, validates all strict provider facts via
+   * `checkFetchedMatchesAttempt`, books the invoice payment once (`pmt-attempt:<attemptPublicId>`),
+   * records `bookingSource`, and guarantees that webhook-then-lookup, lookup-then-webhook, and
+   * concurrent confirms are no-ops after the first booking.
+   */
+  async function bookAuthoritativeAttemptPaymentInTx(
     tx: Tx,
     input: {
       attemptId: number;
-      webhookRowId: number;
+      source: PaymentBookingSource;
+      webhookRowId?: number | undefined;
       fetched: ProviderFetchedPayment;
+      actor?: { userId?: number | undefined; role: SessionPrincipal["role"] | "system" } | undefined;
+      allowRepair?: boolean | undefined;
     },
-  ): Promise<{ booked: boolean; reasonCode: string }> {
+  ): Promise<{
+    booked: boolean;
+    alreadyPaid: boolean;
+    reasonCode: string;
+    attempt: PaymentAttemptRow | null;
+  }> {
     const complianceSvc = requireComplianceService();
     const now = deps.clock.now();
+    const auditActor = input.actor?.userId
+      ? { userId: input.actor.userId, role: input.actor.role }
+      : { role: input.actor?.role ?? "system" };
 
     const [locked] = await tx
       .select()
@@ -2474,68 +2745,173 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       .limit(1);
 
     if (!locked) {
-      return { booked: false, reasonCode: "ATTEMPT_NOT_FOUND" };
-    }
-    // Enforce Decision 12 invariant at the storage boundary: NEVER book without a verified webhook receipt!
-    if (!locked.verifiedWebhookEventId) {
-      return { booked: false, reasonCode: "WEBHOOK_VERIFICATION_REQUIRED" };
+      return { booked: false, alreadyPaid: false, reasonCode: "ATTEMPT_NOT_FOUND", attempt: null };
     }
 
-    const [whRow] = await tx
-      .select()
-      .from(paymentWebhookEvents)
-      .where(eq(paymentWebhookEvents.id, input.webhookRowId))
-      .for("update")
-      .limit(1);
+    let whRow: PaymentWebhookEventRow | null = null;
+    if (input.source === "webhook") {
+      if (!input.webhookRowId) {
+        return { booked: false, alreadyPaid: false, reasonCode: "WEBHOOK_VERIFICATION_REQUIRED", attempt: locked };
+      }
+      const [foundWh] = await tx
+        .select()
+        .from(paymentWebhookEvents)
+        .where(eq(paymentWebhookEvents.id, input.webhookRowId))
+        .for("update")
+        .limit(1);
 
-    if (
-      !whRow ||
-      whRow.attemptId !== locked.id ||
-      whRow.provider !== locked.provider ||
-      whRow.environment !== locked.environment ||
-      whRow.externalEventId !== locked.verifiedWebhookEventId ||
-      (whRow.providerPaymentRef &&
-        input.fetched.providerPaymentRef &&
-        whRow.providerPaymentRef !== input.fetched.providerPaymentRef)
-    ) {
-      return { booked: false, reasonCode: "WEBHOOK_RECEIPT_MISMATCH" };
+      if (
+        !foundWh ||
+        foundWh.attemptId !== locked.id ||
+        foundWh.provider !== locked.provider ||
+        foundWh.environment !== locked.environment ||
+        (locked.status !== "paid" &&
+          (!locked.verifiedWebhookEventId || foundWh.externalEventId !== locked.verifiedWebhookEventId)) ||
+        (foundWh.providerPaymentRef &&
+          input.fetched.providerPaymentRef &&
+          foundWh.providerPaymentRef !== input.fetched.providerPaymentRef)
+      ) {
+        return { booked: false, alreadyPaid: false, reasonCode: "WEBHOOK_RECEIPT_MISMATCH", attempt: locked };
+      }
+      whRow = foundWh;
     }
 
     if (locked.status === "paid") {
-      await tx
-        .update(paymentWebhookEvents)
-        .set({ status: "processed", reasonCode: "ALREADY_PAID", processedAt: now })
-        .where(eq(paymentWebhookEvents.id, whRow.id));
-      return { booked: true, reasonCode: "ALREADY_PAID" };
+      if (whRow) {
+        await tx
+          .update(paymentWebhookEvents)
+          .set({ status: "processed", reasonCode: "ALREADY_PAID", processedAt: now })
+          .where(eq(paymentWebhookEvents.id, whRow.id));
+        if (!locked.verifiedWebhookEventId) {
+          await tx
+            .update(paymentAttempts)
+            .set({
+              verifiedWebhookEventId: whRow.externalEventId,
+              updatedAt: now,
+            })
+            .where(eq(paymentAttempts.id, locked.id));
+        }
+      }
+      return {
+        booked: true,
+        alreadyPaid: true,
+        reasonCode: "ALREADY_PAID",
+        attempt: whRow && !locked.verifiedWebhookEventId
+          ? { ...locked, verifiedWebhookEventId: whRow.externalEventId }
+          : locked,
+      };
+    }
+
+    if (!input.allowRepair) {
+      if (input.source === "provider_lookup") {
+        if (locked.status !== "created" && locked.status !== "redirected") {
+          return { booked: false, alreadyPaid: false, reasonCode: "ATTEMPT_NOT_ACTIVE", attempt: locked };
+        }
+      } else if (locked.status === "failed") {
+        if (whRow) {
+          await tx
+            .update(paymentWebhookEvents)
+            .set({ status: "ignored", reasonCode: "ATTEMPT_FAILED", processedAt: now })
+            .where(eq(paymentWebhookEvents.id, whRow.id));
+        }
+        return { booked: false, alreadyPaid: false, reasonCode: "ATTEMPT_NOT_ACTIVE", attempt: locked };
+      }
+    }
+
+    const currentInvoice = await complianceSvc.getInvoiceForCheckout(locked.invoicePublicId, { tx });
+    if (currentInvoice.status === "paid") {
+      if (whRow) {
+        await tx
+          .update(paymentWebhookEvents)
+          .set({ status: "ignored", reasonCode: "INVOICE_ALREADY_PAID", processedAt: now })
+          .where(eq(paymentWebhookEvents.id, whRow.id));
+      }
+      await emitPaymentOpsAlert(
+        {
+          dedupKey: `duplicate-paid-attempt:${locked.publicId}`,
+          severity: "warning",
+          code: "INVOICE_ALREADY_PAID",
+          title: "Additional paid provider session detected on an already-paid invoice",
+          text: "A second payment attempt settled after the invoice was already paid. Review for possible refund.",
+          orderPublicId: locked.orderPublicId,
+        },
+        tx,
+      );
+      return { booked: false, alreadyPaid: false, reasonCode: "INVOICE_ALREADY_PAID", attempt: locked };
+    }
+    if (currentInvoice.status !== "issued" || currentInvoice.voidedAt !== null) {
+      if (whRow) {
+        await tx
+          .update(paymentWebhookEvents)
+          .set({ status: "ignored", reasonCode: "INVOICE_NOT_PAYABLE", processedAt: now })
+          .where(eq(paymentWebhookEvents.id, whRow.id));
+      }
+      return { booked: false, alreadyPaid: false, reasonCode: "INVOICE_NOT_PAYABLE", attempt: locked };
     }
 
     const matchCheck = checkFetchedMatchesAttempt(locked, input.fetched);
     if (!matchCheck.matches) {
-      await tx
-        .update(paymentAttempts)
-        .set({
-          status: "failed",
-          failureReasonCode: matchCheck.reasonCode,
-          lastReconciledAt: now,
-          version: locked.version + 1,
-          updatedAt: now,
-        })
-        .where(and(eq(paymentAttempts.id, locked.id), eq(paymentAttempts.version, locked.version)));
+      if (input.source === "webhook" && whRow) {
+        await tx
+          .update(paymentAttempts)
+          .set({
+            status: "failed",
+            failureReasonCode: matchCheck.reasonCode,
+            lastReconciledAt: now,
+            version: locked.version + 1,
+            updatedAt: now,
+          })
+          .where(and(eq(paymentAttempts.id, locked.id), eq(paymentAttempts.version, locked.version)));
 
-      await tx
-        .update(paymentWebhookEvents)
-        .set({
-          status: "verification_mismatch",
-          reasonCode: matchCheck.reasonCode,
-          processedAt: now,
-        })
-        .where(eq(paymentWebhookEvents.id, whRow.id));
+        await tx
+          .update(paymentWebhookEvents)
+          .set({
+            status: "verification_mismatch",
+            reasonCode: matchCheck.reasonCode,
+            processedAt: now,
+          })
+          .where(eq(paymentWebhookEvents.id, whRow.id));
 
-      await notifyOrderPaymentEventInTx(tx, {
-        orderPublicId: locked.orderPublicId,
-        kind: "failed",
-        eventRef: locked.publicId,
-      });
+        await notifyOrderPaymentEventInTx(tx, {
+          orderPublicId: locked.orderPublicId,
+          kind: "failed",
+          eventRef: locked.publicId,
+        });
+
+        await deps.audit.record(
+          {
+            category: "business",
+            eventName: "payments.attempt.failed",
+            action: "verify",
+            outcome: "failed",
+            severity: "WARN",
+            reasonCode: matchCheck.reasonCode,
+            actor: { role: "system" },
+            resource: { type: "payment_attempt", publicId: locked.publicId },
+            orderPublicId: locked.orderPublicId,
+            attributes: {
+              order_public_id: locked.orderPublicId,
+              invoice_public_id: locked.invoicePublicId,
+              provider: locked.provider,
+              reason_code: matchCheck.reasonCode,
+              payment_state: "failed",
+            },
+          },
+          tx,
+        );
+      } else {
+        // Provider lookup mismatch: refuse to book, keep attempt pending (never mark invoice paid or destroy a valid session),
+        // record clear diagnostic note, audit, and emit ops alert.
+        await tx
+          .update(paymentAttempts)
+          .set({
+            reconciliationNote: `lookup_mismatch:${matchCheck.reasonCode}`.slice(0, 120),
+            failureReasonCode: matchCheck.reasonCode,
+            lastReconciledAt: now,
+            updatedAt: now,
+          })
+          .where(eq(paymentAttempts.id, locked.id));
+      }
 
       await deps.audit.record(
         {
@@ -2545,39 +2921,18 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           outcome: "refused",
           severity: "ERROR",
           reasonCode: matchCheck.reasonCode,
-          actor: { role: "system" },
+          actor: auditActor,
           resource: { type: "payment_attempt", publicId: locked.publicId },
           orderPublicId: locked.orderPublicId,
           attributes: {
             order_public_id: locked.orderPublicId,
             invoice_public_id: locked.invoicePublicId,
             provider: locked.provider,
+            booking_source: input.source,
             expected_amount_minor: locked.amountMinor,
             fetched_amount_minor: input.fetched.amountMinor,
             expected_currency: locked.currency,
             fetched_currency: input.fetched.currency,
-          },
-        },
-        tx,
-      );
-
-      await deps.audit.record(
-        {
-          category: "business",
-          eventName: "payments.attempt.failed",
-          action: "verify",
-          outcome: "failed",
-          severity: "WARN",
-          reasonCode: matchCheck.reasonCode,
-          actor: { role: "system" },
-          resource: { type: "payment_attempt", publicId: locked.publicId },
-          orderPublicId: locked.orderPublicId,
-          attributes: {
-            order_public_id: locked.orderPublicId,
-            invoice_public_id: locked.invoicePublicId,
-            provider: locked.provider,
-            reason_code: matchCheck.reasonCode,
-            payment_state: "failed",
           },
         },
         tx,
@@ -2589,12 +2944,12 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           severity: "error",
           code: matchCheck.reasonCode,
           title: "Payment verification mismatch held booking",
-          text: "Upstream payment details did not match the expected invoice amount, currency, or metadata.",
+          text: "Upstream payment details did not match the expected invoice amount, currency, mode, or metadata.",
           orderPublicId: locked.orderPublicId,
         },
         tx,
       );
-      return { booked: false, reasonCode: matchCheck.reasonCode };
+      return { booked: false, alreadyPaid: false, reasonCode: matchCheck.reasonCode, attempt: locked };
     }
 
     const paidAt = input.fetched.paidAt ?? now;
@@ -2603,29 +2958,43 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     const cleanBrand = sanitizeCardBrand(input.fetched.paymentMethodBrand);
     const cleanLast4 = sanitizeCardLast4(input.fetched.paymentMethodLast4);
 
-    const booking = await complianceSvc.bookVerifiedProviderPayment(
-      {
-        invoicePublicId: locked.invoicePublicId,
-        provider: locked.provider,
-        environment: locked.environment,
-        attemptPublicId: locked.publicId,
-        providerPaymentRef,
-        amountMinor: locked.amountMinor,
-        currency: locked.currency,
-        paidAt,
-        idempotencyKey: `pmt-attempt:${locked.publicId}`,
-        paymentMethodBrand: cleanBrand,
-        paymentMethodLast4: cleanLast4,
-      },
-      tx,
-    );
+    let compliancePaymentPublicId: string | null = null;
+    if (locked.amountMinor === 0 && typeof complianceSvc.settleCheckoutInvoiceInTx === "function") {
+      await complianceSvc.settleCheckoutInvoiceInTx(
+        { settlementKind: "zero_total", invoicePublicId: locked.invoicePublicId },
+        tx,
+      );
+    } else {
+      const booking = await complianceSvc.bookVerifiedProviderPayment(
+        {
+          invoicePublicId: locked.invoicePublicId,
+          provider: locked.provider,
+          environment: locked.environment,
+          attemptPublicId: locked.publicId,
+          providerPaymentRef,
+          amountMinor: locked.amountMinor,
+          currency: locked.currency,
+          paidAt,
+          idempotencyKey: `pmt-attempt:${locked.publicId}`,
+          paymentMethodBrand: cleanBrand,
+          paymentMethodLast4: cleanLast4,
+        },
+        tx,
+      );
+      compliancePaymentPublicId = booking.paymentPublicId;
+    }
+
+    const effectiveWebhookEventId =
+      whRow ? (locked.verifiedWebhookEventId ?? whRow.externalEventId) : locked.verifiedWebhookEventId;
 
     await tx
       .update(paymentAttempts)
       .set({
         status: "paid",
+        bookingSource: input.source,
+        verifiedWebhookEventId: effectiveWebhookEventId,
         providerPaymentRef,
-        compliancePaymentPublicId: booking.paymentPublicId,
+        compliancePaymentPublicId,
         paymentMethodBrand: cleanBrand,
         paymentMethodLast4: cleanLast4,
         reconciliationNote: null,
@@ -2637,17 +3006,20 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       })
       .where(and(eq(paymentAttempts.id, locked.id), eq(paymentAttempts.version, locked.version)));
 
-    await tx
-      .update(paymentWebhookEvents)
-      .set({
-        status: "processed",
-        providerPaymentRef,
-        reasonCode: "BOOKED",
-        processedAt: now,
-      })
-      .where(eq(paymentWebhookEvents.id, whRow.id));
+    if (whRow) {
+      await tx
+        .update(paymentWebhookEvents)
+        .set({
+          status: "processed",
+          providerPaymentRef,
+          reasonCode: "BOOKED",
+          processedAt: now,
+        })
+        .where(eq(paymentWebhookEvents.id, whRow.id));
+    }
 
     await resolvePaymentOpsAlert(`webhook-verify:${locked.publicId}`, tx);
+    await resolvePaymentOpsAlert(`verification-mismatch:${locked.publicId}`, tx);
 
     await deps.audit.record(
       {
@@ -2655,25 +3027,437 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         eventName: "payments.attempt.paid",
         action: "transition",
         outcome: "completed",
-        actor: { role: "system" },
+        actor: auditActor,
         resource: { type: "payment_attempt", publicId: locked.publicId },
         orderPublicId: locked.orderPublicId,
         attributes: {
           invoice_public_id: locked.invoicePublicId,
           order_public_id: locked.orderPublicId,
-          compliance_payment_public_id: booking.paymentPublicId,
+          compliance_payment_public_id: compliancePaymentPublicId,
           provider: locked.provider,
           environment: locked.environment,
           amount_minor: locked.amountMinor,
           currency: locked.currency,
-          verified_webhook_event_id: locked.verifiedWebhookEventId,
+          booking_source: input.source,
+          verified_webhook_event_id: effectiveWebhookEventId,
           payment_state: "paid",
         },
       },
       tx,
     );
 
-    return { booked: true, reasonCode: "BOOKED" };
+    const updatedAttempt: PaymentAttemptRow = {
+      ...locked,
+      status: "paid",
+      bookingSource: input.source,
+      verifiedWebhookEventId: effectiveWebhookEventId,
+      providerPaymentRef,
+      compliancePaymentPublicId,
+      paymentMethodBrand: cleanBrand,
+      paymentMethodLast4: cleanLast4,
+      reconciliationNote: null,
+      failureReasonCode: null,
+      paidAt,
+      lastReconciledAt: now,
+      version: locked.version + 1,
+      updatedAt: now,
+    };
+
+    return { booked: true, alreadyPaid: false, reasonCode: "BOOKED", attempt: updatedAttempt };
+  }
+
+  async function finalizeVerifiedPaidAttemptInTx(
+    tx: Tx,
+    input: {
+      attemptId: number;
+      webhookRowId: number;
+      fetched: ProviderFetchedPayment;
+    },
+  ): Promise<{ booked: boolean; reasonCode: string }> {
+    const res = await bookAuthoritativeAttemptPaymentInTx(tx, {
+      attemptId: input.attemptId,
+      source: "webhook",
+      webhookRowId: input.webhookRowId,
+      fetched: input.fetched,
+    });
+    return { booked: res.booked, reasonCode: res.reasonCode };
+  }
+
+  async function readOrderReferenceSafe(orderId: number): Promise<string | null> {
+    const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+    if (!ordersSvc || typeof ordersSvc.getOrderRefById !== "function") return null;
+    try {
+      const ref = await ordersSvc.getOrderRefById(orderId);
+      return ref?.reference ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  function buildConfirmViewFromInvoiceAndAttempt(
+    invoice: {
+      invoicePublicId: string;
+      invoiceNumber: string | null;
+      status: "draft" | "issued" | "paid" | "void";
+      receiptPublicId?: string | null | undefined;
+    },
+    attempt: PaymentAttemptRow,
+    opts?: {
+      orderReference?: string | null | undefined;
+      bookedNow?: boolean | undefined;
+      cooldownRemainingMs?: number | undefined;
+      forceState?: CustomerPaymentConfirmationState | undefined;
+    },
+  ): ConfirmCheckoutPaymentResult {
+    const isPaid = invoice.status === "paid" || attempt.status === "paid";
+    let state: CustomerPaymentConfirmationState;
+    if (opts?.forceState && !isPaid) {
+      state = opts.forceState;
+    } else if (isPaid) {
+      state = "paid";
+    } else if (
+      attempt.status === "cancelled" ||
+      attempt.status === "expired" ||
+      attempt.status === "failed" ||
+      invoice.status === "void"
+    ) {
+      state = "unpaid";
+    } else {
+      state = "processing";
+    }
+
+    return {
+      attemptPublicId: attempt.publicId,
+      orderPublicId: attempt.orderPublicId,
+      orderReference: opts?.orderReference ?? null,
+      invoicePublicId: invoice.invoicePublicId,
+      invoiceNumber: invoice.invoiceNumber ?? null,
+      invoiceStatus: isPaid ? "paid" : invoice.status,
+      receiptPublicId: invoice.receiptPublicId ?? null,
+      cartPublicId: attempt.cartPublicId,
+      provider: attempt.provider,
+      environment: attempt.environment,
+      attemptStatus: isPaid ? "paid" : attempt.status,
+      state,
+      bookedNow: opts?.bookedNow ?? false,
+      bookingSource: attempt.bookingSource,
+      paidAt: attempt.paidAt ? attempt.paidAt.toISOString() : null,
+      cooldownRemainingMs: Math.max(0, opts?.cooldownRemainingMs ?? 0),
+    };
+  }
+
+  /**
+   * Increment 08 D5 customer payment confirmation (`payments.confirmCheckoutPayment`):
+   * Accepts ONLY `{ attemptPublicId }` from an authenticated customer session, verifies live customer role
+   * and resource ownership against both `payment_attempts` and `compliance.getInvoiceForCheckout`
+   * (returning identical `PAYMENT_ATTEMPT_NOT_FOUND` for another customer's attempt), enforces a per-attempt
+   * lookup cooldown, queries Stripe authoritatively by the stored `providerRef`, re-verifies live actor,
+   * ownership, attempt identity, and Stripe config/key digest in the post-egress transaction, and books
+   * via `bookAuthoritativeAttemptPaymentInTx` when paid & strictly matched.
+   */
+  async function confirmCheckoutPayment(
+    principal: SessionPrincipal,
+    input: { attemptPublicId: string },
+    opts?: { signal?: AbortSignal | undefined; beforeSend?: (() => Promise<void>) | undefined },
+  ): Promise<ConfirmCheckoutPaymentResult> {
+    requireComplianceService();
+
+    const loadOwnedCustomerAttemptInTx = async (tx: Tx, expectedAttemptId?: number) => {
+      const liveActor = await assertLiveActorInTx(deps, principal, tx);
+      if (liveActor.role !== "customer") {
+        throw forbidden("CUSTOMER_ONLY");
+      }
+      const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
+      const complianceSvc = requireComplianceService();
+
+      const [attempt] = await tx
+        .select()
+        .from(paymentAttempts)
+        .where(
+          expectedAttemptId !== undefined
+            ? and(
+                eq(paymentAttempts.id, expectedAttemptId),
+                eq(paymentAttempts.publicId, input.attemptPublicId),
+              )
+            : eq(paymentAttempts.publicId, input.attemptPublicId),
+        )
+        .for("update")
+        .limit(1);
+
+      if (!attempt || attempt.customerUserId !== liveActor.userId) {
+        throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+      }
+
+      let invoice: Awaited<ReturnType<typeof complianceSvc.getInvoiceForCheckout>>;
+      try {
+        invoice = await complianceSvc.getInvoiceForCheckout(attempt.invoicePublicId, {
+          principal: livePrincipal,
+          tx,
+        });
+      } catch (err) {
+        if (err instanceof DomainError && (err.code === "NOT_FOUND" || err.code === "FORBIDDEN")) {
+          throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+        }
+        throw err;
+      }
+
+      if (invoice.ownerUserId !== liveActor.userId || attempt.invoiceId !== invoice.invoiceId) {
+        throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+      }
+
+      return { liveActor, livePrincipal, attempt, invoice };
+    };
+
+    const staged = await runComplianceTx(
+      deps,
+      principal,
+      { type: "payment_attempt", publicId: input.attemptPublicId },
+      async (tx) => {
+        const { liveActor, livePrincipal, attempt, invoice } = await loadOwnedCustomerAttemptInTx(tx);
+
+        if (
+          invoice.status === "paid" ||
+          attempt.status === "paid" ||
+          attempt.status === "cancelled" ||
+          attempt.status === "expired" ||
+          attempt.status === "failed" ||
+          invoice.status === "void" ||
+          attempt.provider !== "stripe" ||
+          !attempt.providerRef
+        ) {
+          return {
+            kind: "immediate" as const,
+            invoice,
+            attempt,
+            cooldownRemainingMs: 0,
+          };
+        }
+
+        const now = deps.clock.now();
+        if (attempt.lastCustomerLookupAt) {
+          const elapsedMs = now.getTime() - attempt.lastCustomerLookupAt.getTime();
+          if (elapsedMs >= 0 && elapsedMs < CUSTOMER_CONFIRM_COOLDOWN_MS) {
+            return {
+              kind: "immediate" as const,
+              invoice,
+              attempt,
+              cooldownRemainingMs: CUSTOMER_CONFIRM_COOLDOWN_MS - elapsedMs,
+            };
+          }
+        }
+
+        let loadedCreds: { credentials: ProviderCredentials; keyDigest: string };
+        try {
+          loadedCreds = await loadStripeLookupCredentials(attempt.environment, { tx });
+        } catch {
+          return {
+            kind: "immediate" as const,
+            invoice,
+            attempt,
+            cooldownRemainingMs: 0,
+          };
+        }
+
+        await tx
+          .update(paymentAttempts)
+          .set({
+            lastCustomerLookupAt: now,
+            updatedAt: now,
+          })
+          .where(eq(paymentAttempts.id, attempt.id));
+
+        return {
+          kind: "lookup" as const,
+          attempt: { ...attempt, lastCustomerLookupAt: now },
+          invoice,
+          credentials: loadedCreds.credentials,
+          keyDigest: loadedCreds.keyDigest,
+          liveActor,
+          livePrincipal,
+        };
+      },
+    );
+
+    const orderReference = await readOrderReferenceSafe(staged.invoice.orderId);
+
+    if (staged.kind === "immediate") {
+      return buildConfirmViewFromInvoiceAndAttempt(staged.invoice, staged.attempt, {
+        orderReference,
+        bookedNow: false,
+        cooldownRemainingMs: staged.cooldownRemainingMs,
+      });
+    }
+
+    let fetched: ProviderFetchedPayment;
+    try {
+      fetched = await adapters.stripe.fetchPayment({
+        providerRef: staged.attempt.providerRef!,
+        providerOrderRef: staged.attempt.providerOrderRef,
+        providerPaymentRef: staged.attempt.providerPaymentRef,
+        credentials: staged.credentials,
+        ...(opts?.signal ? { signal: opts.signal } : {}),
+        ...(opts?.beforeSend ? { beforeSend: opts.beforeSend } : {}),
+      });
+    } catch {
+      return buildConfirmViewFromInvoiceAndAttempt(staged.invoice, staged.attempt, {
+        orderReference,
+        bookedNow: false,
+        forceState: "processing",
+      });
+    }
+
+    return runComplianceTx(
+      deps,
+      principal,
+      { type: "payment_attempt", publicId: staged.attempt.publicId },
+      async (tx) => {
+        const { liveActor, livePrincipal, attempt: locked, invoice } = await loadOwnedCustomerAttemptInTx(
+          tx,
+          staged.attempt.id,
+        );
+
+        if (
+          locked.provider !== "stripe" ||
+          locked.providerRef !== staged.attempt.providerRef ||
+          locked.environment !== staged.attempt.environment
+        ) {
+          throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+        }
+
+        if (invoice.status === "paid" || locked.status === "paid") {
+          return buildConfirmViewFromInvoiceAndAttempt(invoice, locked, {
+            orderReference,
+            bookedNow: false,
+          });
+        }
+
+        let postCreds: { credentials: ProviderCredentials; keyDigest: string };
+        try {
+          postCreds = await loadStripeLookupCredentials(locked.environment, { tx });
+        } catch {
+          return buildConfirmViewFromInvoiceAndAttempt(invoice, locked, {
+            orderReference,
+            bookedNow: false,
+            forceState: "processing",
+          });
+        }
+        if (postCreds.keyDigest !== staged.keyDigest) {
+          return buildConfirmViewFromInvoiceAndAttempt(invoice, locked, {
+            orderReference,
+            bookedNow: false,
+            forceState: "processing",
+          });
+        }
+
+        if (fetched.status === "paid") {
+          const complianceSvc = requireComplianceService();
+          const booked = await bookAuthoritativeAttemptPaymentInTx(tx, {
+            attemptId: locked.id,
+            source: "provider_lookup",
+            fetched,
+            actor: { userId: liveActor.userId, role: liveActor.role },
+          });
+          const refreshedInvoice = await complianceSvc.getInvoiceForCheckout(locked.invoicePublicId, {
+            principal: livePrincipal,
+            tx,
+          });
+          const currentAttempt = booked.attempt ?? locked;
+          return buildConfirmViewFromInvoiceAndAttempt(refreshedInvoice, currentAttempt, {
+            orderReference,
+            bookedNow: booked.booked && !booked.alreadyPaid,
+            ...(booked.booked ? {} : { forceState: "processing" as const }),
+          });
+        }
+
+        const bindingCheck = checkFetchedBindingMatchesAttempt(locked, fetched);
+        if (!bindingCheck.matches) {
+          await recordLookupMismatchInTx(tx, locked, fetched, bindingCheck.reasonCode, {
+            userId: liveActor.userId,
+            role: liveActor.role,
+          });
+          return buildConfirmViewFromInvoiceAndAttempt(invoice, locked, {
+            orderReference,
+            bookedNow: false,
+            forceState: "processing",
+          });
+        }
+
+        const now = deps.clock.now();
+        if (fetched.asyncPending) {
+          const wasAlreadyAsync = locked.reconciliationNote === "awaiting_async_settlement";
+          await tx
+            .update(paymentAttempts)
+            .set({
+              reconciliationNote: "awaiting_async_settlement",
+              lastReconciledAt: now,
+              updatedAt: now,
+            })
+            .where(eq(paymentAttempts.id, locked.id));
+
+          if (!wasAlreadyAsync) {
+            await notifyOrderPaymentEventInTx(tx, {
+              orderPublicId: locked.orderPublicId,
+              kind: "pending_async",
+              eventRef: locked.publicId,
+            });
+            await deps.audit.record(
+              {
+                category: "business",
+                eventName: "payments.attempt.pending_async",
+                action: "transition",
+                outcome: "completed",
+                actor: { userId: liveActor.userId, role: liveActor.role },
+                resource: { type: "payment_attempt", publicId: locked.publicId },
+                orderPublicId: locked.orderPublicId,
+                attributes: {
+                  order_public_id: locked.orderPublicId,
+                  invoice_public_id: locked.invoicePublicId,
+                  provider: locked.provider,
+                  payment_state: "pending_async",
+                },
+              },
+              tx,
+            );
+          }
+
+          return buildConfirmViewFromInvoiceAndAttempt(
+            invoice,
+            { ...locked, reconciliationNote: "awaiting_async_settlement", lastReconciledAt: now },
+            { orderReference, bookedNow: false, forceState: "processing" },
+          );
+        }
+
+        if (fetched.status === "expired") {
+          if (locked.status === "redirected" || locked.status === "created") {
+            await tx
+              .update(paymentAttempts)
+              .set({
+                status: "expired",
+                lastReconciledAt: now,
+                version: locked.version + 1,
+                updatedAt: now,
+              })
+              .where(and(eq(paymentAttempts.id, locked.id), eq(paymentAttempts.version, locked.version)));
+            return buildConfirmViewFromInvoiceAndAttempt(
+              invoice,
+              { ...locked, status: "expired", lastReconciledAt: now, version: locked.version + 1 },
+              { orderReference, bookedNow: false, forceState: "unpaid" },
+            );
+          }
+          return buildConfirmViewFromInvoiceAndAttempt(invoice, locked, {
+            orderReference,
+            bookedNow: false,
+            forceState: "unpaid",
+          });
+        }
+
+        return buildConfirmViewFromInvoiceAndAttempt(invoice, locked, {
+          orderReference,
+          bookedNow: false,
+          forceState: "processing",
+        });
+      },
+    );
   }
 
   async function findAttemptForWebhookInTx(
@@ -3345,11 +4129,15 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       }
 
       // outcomeHint === "paid": record verified webhook receipt BEFORE calling provider fetchPayment outside tx!
+      // Preserve an existing `verifiedWebhookEventId` when the attempt is already paid so a second event never clobbers the original receipt.
       await tx
         .update(paymentAttempts)
         .set({
-          verifiedWebhookEventId: verified.externalEventId,
-          providerPaymentRef: verified.providerPaymentRef ?? attempt.providerPaymentRef,
+          verifiedWebhookEventId:
+            attempt.status === "paid"
+              ? (attempt.verifiedWebhookEventId ?? verified.externalEventId)
+              : verified.externalEventId,
+          providerPaymentRef: attempt.providerPaymentRef ?? verified.providerPaymentRef,
           updatedAt: now,
         })
         .where(eq(paymentAttempts.id, attempt.id));
@@ -3716,14 +4504,50 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
     if (fetched.status === "open") {
       const settledWaitAt = deps.clock.now();
-      await deps.db.transaction(async (tx) => {
-        await tx
-          .update(paymentAttempts)
-          .set({
-            reconciliationNote: "awaiting_async_settlement",
-            updatedAt: settledWaitAt,
-          })
-          .where(eq(paymentAttempts.id, attempt.id));
+      const openOutcome = await deps.db.transaction(async (tx) => {
+        const [locked] = await tx
+          .select()
+          .from(paymentAttempts)
+          .where(eq(paymentAttempts.id, attempt.id))
+          .for("update")
+          .limit(1);
+
+        if (locked?.status === "paid") {
+          await tx
+            .update(paymentWebhookEvents)
+            .set({
+              status: "processed",
+              reasonCode: "ALREADY_PAID",
+              processedAt: settledWaitAt,
+            })
+            .where(eq(paymentWebhookEvents.id, webhookRowId));
+          return { alreadyPaid: true, mismatchReason: null as string | null };
+        }
+
+        if (locked) {
+          const bindingCheck = checkFetchedBindingMatchesAttempt(locked, fetched);
+          if (!bindingCheck.matches) {
+            await tx
+              .update(paymentWebhookEvents)
+              .set({
+                status: "verification_mismatch",
+                reasonCode: bindingCheck.reasonCode,
+                processedAt: settledWaitAt,
+              })
+              .where(eq(paymentWebhookEvents.id, webhookRowId));
+            await recordLookupMismatchInTx(tx, locked, fetched, bindingCheck.reasonCode, {
+              role: "system",
+            });
+            return { alreadyPaid: false, mismatchReason: bindingCheck.reasonCode };
+          }
+          await tx
+            .update(paymentAttempts)
+            .set({
+              reconciliationNote: "awaiting_async_settlement",
+              updatedAt: settledWaitAt,
+            })
+            .where(eq(paymentAttempts.id, locked.id));
+        }
 
         await tx
           .update(paymentWebhookEvents)
@@ -3759,13 +4583,23 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           },
           tx,
         );
+        return { alreadyPaid: false, mismatchReason: null as string | null };
       });
+      if (openOutcome.mismatchReason) {
+        return {
+          httpStatus: 200,
+          accepted: true,
+          duplicate: staged.duplicate,
+          booked: false,
+          reasonCode: openOutcome.mismatchReason,
+        };
+      }
       return {
         httpStatus: 200,
         accepted: true,
         duplicate: staged.duplicate,
-        booked: false,
-        reasonCode: "AWAITING_ASYNC_SETTLEMENT",
+        booked: openOutcome.alreadyPaid,
+        reasonCode: openOutcome.alreadyPaid ? "ALREADY_PAID" : "AWAITING_ASYNC_SETTLEMENT",
       };
     }
 
@@ -3773,17 +4607,59 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       const termStatus: PaymentAttemptStatus = fetched.status === "expired" ? "expired" : "failed";
       const termReason = `FETCH_${termStatus.toUpperCase()}`;
       const termAt = deps.clock.now();
-      await deps.db.transaction(async (tx) => {
-        await tx
-          .update(paymentAttempts)
-          .set({
-            status: termStatus,
-            failureReasonCode: termReason,
-            lastReconciledAt: termAt,
-            version: attempt.version + 1,
-            updatedAt: termAt,
-          })
-          .where(and(eq(paymentAttempts.id, attempt.id), eq(paymentAttempts.version, attempt.version)));
+      const termOutcome = await deps.db.transaction(async (tx) => {
+        const [locked] = await tx
+          .select()
+          .from(paymentAttempts)
+          .where(eq(paymentAttempts.id, attempt.id))
+          .for("update")
+          .limit(1);
+
+        if (locked?.status === "paid") {
+          await tx
+            .update(paymentWebhookEvents)
+            .set({
+              status: "processed",
+              reasonCode: "ALREADY_PAID",
+              processedAt: termAt,
+            })
+            .where(eq(paymentWebhookEvents.id, webhookRowId));
+          return { alreadyPaid: true, mismatchReason: null as string | null };
+        }
+
+        if (locked) {
+          const bindingCheck = checkFetchedBindingMatchesAttempt(locked, fetched);
+          if (!bindingCheck.matches) {
+            await tx
+              .update(paymentWebhookEvents)
+              .set({
+                status: "verification_mismatch",
+                reasonCode: bindingCheck.reasonCode,
+                processedAt: termAt,
+              })
+              .where(eq(paymentWebhookEvents.id, webhookRowId));
+            await recordLookupMismatchInTx(tx, locked, fetched, bindingCheck.reasonCode, {
+              role: "system",
+            });
+            return { alreadyPaid: false, mismatchReason: bindingCheck.reasonCode };
+          }
+        }
+
+        const didTransition = Boolean(
+          locked && locked.status !== termStatus,
+        );
+        if (locked) {
+          await tx
+            .update(paymentAttempts)
+            .set({
+              status: termStatus,
+              failureReasonCode: termReason,
+              lastReconciledAt: termAt,
+              version: locked.version + 1,
+              updatedAt: termAt,
+            })
+            .where(and(eq(paymentAttempts.id, locked.id), eq(paymentAttempts.version, locked.version)));
+        }
 
         await tx
           .update(paymentWebhookEvents)
@@ -3794,7 +4670,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           })
           .where(eq(paymentWebhookEvents.id, webhookRowId));
 
-        if (termStatus === "failed") {
+        if (termStatus === "failed" && didTransition) {
           await notifyOrderPaymentEventInTx(tx, {
             orderPublicId: attempt.orderPublicId,
             kind: "failed",
@@ -3823,13 +4699,23 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             tx,
           );
         }
+        return { alreadyPaid: false, mismatchReason: null as string | null };
       });
+      if (termOutcome.mismatchReason) {
+        return {
+          httpStatus: 200,
+          accepted: true,
+          duplicate: staged.duplicate,
+          booked: false,
+          reasonCode: termOutcome.mismatchReason,
+        };
+      }
       return {
         httpStatus: 200,
         accepted: true,
         duplicate: staged.duplicate,
-        booked: false,
-        reasonCode: termReason,
+        booked: termOutcome.alreadyPaid,
+        reasonCode: termOutcome.alreadyPaid ? "ALREADY_PAID" : termReason,
       };
     }
 
@@ -3850,6 +4736,96 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     };
   }
 
+  /**
+   * Evaluates whether any Stripe attempt was booked via `provider_lookup` more than `MISSING_WEBHOOK_GRACE_MS`
+   * ago without a verified Stripe webhook ever arriving since `paidAt`, and emits a non-auto-resolving
+   * ops alert (`stripeWebhookDeliveryMissingAlert(env)`) so operators notice silent webhook misconfiguration.
+   */
+  async function evaluateMissingStripeWebhookAlerts(now: Date): Promise<void> {
+    const cutoff = new Date(now.getTime() - MISSING_WEBHOOK_GRACE_MS);
+    const overdue = await deps.db
+      .select({
+        id: paymentAttempts.id,
+        environment: paymentAttempts.environment,
+        paidAt: paymentAttempts.paidAt,
+      })
+      .from(paymentAttempts)
+      .where(
+        and(
+          eq(paymentAttempts.provider, "stripe"),
+          eq(paymentAttempts.status, "paid"),
+          eq(paymentAttempts.bookingSource, "provider_lookup"),
+          isNull(paymentAttempts.verifiedWebhookEventId),
+          isNull(paymentAttempts.missingWebhookAlertedAt),
+          isNotNull(paymentAttempts.paidAt),
+          lte(paymentAttempts.paidAt, cutoff),
+        ),
+      )
+      .orderBy(asc(paymentAttempts.paidAt), asc(paymentAttempts.id))
+      .limit(50);
+
+    if (overdue.length === 0) return;
+
+    const byEnv = new Map<PaymentEnvironmentMode, { ids: number[]; oldestPaidAt: Date }>();
+    for (const row of overdue) {
+      if (!row.paidAt) continue;
+      const existing = byEnv.get(row.environment);
+      if (existing) {
+        existing.ids.push(row.id);
+        if (row.paidAt.getTime() < existing.oldestPaidAt.getTime()) {
+          existing.oldestPaidAt = row.paidAt;
+        }
+      } else {
+        byEnv.set(row.environment, { ids: [row.id], oldestPaidAt: row.paidAt });
+      }
+    }
+
+    for (const [env, group] of byEnv) {
+      const [verifiedSince] = await deps.db
+        .select({ id: paymentWebhookEvents.id })
+        .from(paymentWebhookEvents)
+        .where(
+          and(
+            eq(paymentWebhookEvents.provider, "stripe"),
+            eq(paymentWebhookEvents.environment, env),
+            ne(paymentWebhookEvents.eventType, "readypackets.self_test"),
+            inArray(paymentWebhookEvents.status, ["processed", "awaiting_settlement"]),
+            gte(paymentWebhookEvents.receivedAt, group.oldestPaidAt),
+          ),
+        )
+        .limit(1);
+
+      await deps.db.transaction(async (tx) => {
+        await tx
+          .update(paymentAttempts)
+          .set({ missingWebhookAlertedAt: now, updatedAt: now })
+          .where(inArray(paymentAttempts.id, group.ids));
+
+        if (!verifiedSince) {
+          await emitPaymentOpsAlert(stripeWebhookDeliveryMissingAlert(env), tx);
+          await deps.audit.record(
+            {
+              category: "security",
+              eventName: "payments.webhook.delivery_missing_alert",
+              action: "verify",
+              outcome: "attempted",
+              severity: "WARN",
+              reasonCode: "STRIPE_WEBHOOK_DELIVERY_MISSING",
+              actor: { role: "system" },
+              resource: { type: "payments_settings" },
+              attributes: {
+                provider: "stripe",
+                environment: env,
+                unwebhooked_lookup_paid_count: group.ids.length,
+              },
+            },
+            tx,
+          );
+        }
+      });
+    }
+  }
+
   async function reconcilePendingAttempts(opts?: {
     limit?: number | undefined;
     signal?: AbortSignal | undefined;
@@ -3863,6 +4839,8 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       return { scanned: 0, booked: 0, expired: 0, failed: 0, stillPending: 0 };
     }
     const activeProvider: ActivePaymentProvider = config.provider;
+    // Starvation-free selection: filter in SQL to rows with non-null `providerRef` and either `redirected`
+    // or (`cancelled` with `verifiedWebhookEventId`), ordered oldest-reconciled first (`NULL` first in MySQL ASC).
     const candidates = await deps.db
       .select()
       .from(paymentAttempts)
@@ -3870,13 +4848,17 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         and(
           eq(paymentAttempts.provider, activeProvider),
           eq(paymentAttempts.environment, config.mode),
+          isNotNull(paymentAttempts.providerRef),
           or(
             eq(paymentAttempts.status, "redirected"),
-            eq(paymentAttempts.status, "cancelled"),
+            and(
+              eq(paymentAttempts.status, "cancelled"),
+              isNotNull(paymentAttempts.verifiedWebhookEventId),
+            ),
           ),
         ),
       )
-      .orderBy(desc(paymentAttempts.id))
+      .orderBy(asc(paymentAttempts.lastReconciledAt), asc(paymentAttempts.id))
       .limit(limit);
 
     let scanned = 0;
@@ -3887,9 +4869,6 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
     for (const attempt of candidates) {
       if (opts?.signal?.aborted) break;
-      if (attempt.status === "cancelled" && !attempt.verifiedWebhookEventId) {
-        continue;
-      }
       if (!attempt.providerRef) {
         continue;
       }
@@ -3897,12 +4876,19 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       const now = deps.clock.now();
 
       let credentials: ProviderCredentials;
+      let stripeKeyDigest: string | null = null;
       try {
-        const loaded = await loadProviderCredentials(attempt.provider, {
-          ...config,
-          mode: attempt.environment,
-        });
-        credentials = loaded.credentials;
+        if (attempt.provider === "stripe") {
+          const loaded = await loadStripeLookupCredentials(attempt.environment);
+          credentials = loaded.credentials;
+          stripeKeyDigest = loaded.keyDigest;
+        } else {
+          const loaded = await loadProviderCredentials(attempt.provider, {
+            ...config,
+            mode: attempt.environment,
+          });
+          credentials = loaded.credentials;
+        }
       } catch {
         stillPending += 1;
         continue;
@@ -3923,6 +4909,16 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         continue;
       }
 
+      const verifyPostEgressStripeDigestInTx = async (tx: Tx): Promise<boolean> => {
+        if (attempt.provider !== "stripe" || !stripeKeyDigest) return true;
+        try {
+          const post = await loadStripeLookupCredentials(attempt.environment, { tx });
+          return post.keyDigest === stripeKeyDigest;
+        } catch {
+          return false;
+        }
+      };
+
       if (fetched.status === "paid") {
         if (attempt.verifiedWebhookEventId) {
           const [pendingWh] = await deps.db
@@ -3936,70 +4932,129 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             )
             .limit(1);
 
-          if (!pendingWh) {
-            stillPending += 1;
+          if (pendingWh) {
+            const res = await deps.db.transaction(async (tx) => {
+              if (!(await verifyPostEgressStripeDigestInTx(tx))) {
+                return { booked: false, alreadyPaid: false, drifted: true };
+              }
+              const bookedRes = await bookAuthoritativeAttemptPaymentInTx(tx, {
+                attemptId: attempt.id,
+                source: "webhook",
+                webhookRowId: pendingWh.id,
+                fetched,
+              });
+              return { ...bookedRes, drifted: false };
+            });
+            if (res.drifted) {
+              stillPending += 1;
+            } else if (res.booked) {
+              if (!res.alreadyPaid) booked += 1;
+            } else {
+              failed += 1;
+            }
             continue;
           }
+        }
 
-          const res = await deps.db.transaction((tx) =>
-            finalizeVerifiedPaidAttemptInTx(tx, {
+        if (attempt.provider === "stripe") {
+          const res = await deps.db.transaction(async (tx) => {
+            if (!(await verifyPostEgressStripeDigestInTx(tx))) {
+              return { booked: false, alreadyPaid: false };
+            }
+            return bookAuthoritativeAttemptPaymentInTx(tx, {
               attemptId: attempt.id,
-              webhookRowId: pendingWh.id,
+              source: "provider_lookup",
               fetched,
-            }),
-          );
+            });
+          });
           if (res.booked) {
-            booked += 1;
+            if (!res.alreadyPaid) booked += 1;
           } else {
-            failed += 1;
+            stillPending += 1;
           }
         } else {
-          // Decision 12: NEVER mark invoice paid without a verified signed webhook receipt.
-          await deps.db
-            .update(paymentAttempts)
-            .set({
-              reconciliationNote: "awaiting_webhook",
-              lastReconciledAt: now,
-              updatedAt: now,
-            })
-            .where(eq(paymentAttempts.id, attempt.id));
+          await deps.db.transaction(async (tx) => {
+            const [locked] = await tx
+              .select()
+              .from(paymentAttempts)
+              .where(eq(paymentAttempts.id, attempt.id))
+              .for("update")
+              .limit(1);
+            if (!locked || locked.status === "paid") return;
+            await tx
+              .update(paymentAttempts)
+              .set({
+                reconciliationNote: "awaiting_webhook",
+                lastReconciledAt: now,
+                updatedAt: now,
+              })
+              .where(eq(paymentAttempts.id, locked.id));
+          });
           stillPending += 1;
         }
         continue;
       }
 
-      const isPastExpiry = Boolean(attempt.expiresAt && attempt.expiresAt.getTime() <= now.getTime());
-      if (fetched.status === "expired" || (fetched.status === "open" && isPastExpiry && !attempt.verifiedWebhookEventId)) {
-        await deps.db
-          .update(paymentAttempts)
-          .set({
-            status: "expired",
-            lastReconciledAt: now,
-            version: attempt.version + 1,
-            updatedAt: now,
-          })
-          .where(and(eq(paymentAttempts.id, attempt.id), eq(paymentAttempts.version, attempt.version)));
-        expired += 1;
-        continue;
-      }
+      const nonPaidOutcome = await deps.db.transaction(async (tx) => {
+        if (!(await verifyPostEgressStripeDigestInTx(tx))) {
+          return "pending" as const;
+        }
+        const [locked] = await tx
+          .select()
+          .from(paymentAttempts)
+          .where(eq(paymentAttempts.id, attempt.id))
+          .for("update")
+          .limit(1);
+        if (!locked || locked.status === "paid") {
+          return "already_paid" as const;
+        }
 
-      if (fetched.status === "failed") {
-        await deps.db.transaction(async (tx) => {
+        const bindingCheck = checkFetchedBindingMatchesAttempt(locked, fetched);
+        if (!bindingCheck.matches) {
+          await recordLookupMismatchInTx(tx, locked, fetched, bindingCheck.reasonCode, {
+            role: "system",
+          });
+          return "pending" as const;
+        }
+
+        const isPastExpiry = Boolean(locked.expiresAt && locked.expiresAt.getTime() <= now.getTime());
+        if (
+          fetched.status === "expired" ||
+          (fetched.status === "open" &&
+            !fetched.asyncPending &&
+            isPastExpiry &&
+            !locked.verifiedWebhookEventId)
+        ) {
+          if (locked.status === "expired") return "already_terminal" as const;
+          await tx
+            .update(paymentAttempts)
+            .set({
+              status: "expired",
+              lastReconciledAt: now,
+              version: locked.version + 1,
+              updatedAt: now,
+            })
+            .where(and(eq(paymentAttempts.id, locked.id), eq(paymentAttempts.version, locked.version)));
+          return "expired" as const;
+        }
+
+        if (fetched.status === "failed") {
+          if (locked.status === "failed") return "already_terminal" as const;
           await tx
             .update(paymentAttempts)
             .set({
               status: "failed",
               failureReasonCode: "RECONCILE_PROVIDER_FAILED",
               lastReconciledAt: now,
-              version: attempt.version + 1,
+              version: locked.version + 1,
               updatedAt: now,
             })
-            .where(and(eq(paymentAttempts.id, attempt.id), eq(paymentAttempts.version, attempt.version)));
+            .where(and(eq(paymentAttempts.id, locked.id), eq(paymentAttempts.version, locked.version)));
 
           await notifyOrderPaymentEventInTx(tx, {
-            orderPublicId: attempt.orderPublicId,
+            orderPublicId: locked.orderPublicId,
             kind: "failed",
-            eventRef: attempt.publicId,
+            eventRef: locked.publicId,
           });
 
           await deps.audit.record(
@@ -4011,30 +5066,42 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
               severity: "WARN",
               reasonCode: "RECONCILE_PROVIDER_FAILED",
               actor: { role: "system" },
-              resource: { type: "payment_attempt", publicId: attempt.publicId },
-              orderPublicId: attempt.orderPublicId,
+              resource: { type: "payment_attempt", publicId: locked.publicId },
+              orderPublicId: locked.orderPublicId,
               attributes: {
-                order_public_id: attempt.orderPublicId,
-                invoice_public_id: attempt.invoicePublicId,
-                provider: attempt.provider,
+                order_public_id: locked.orderPublicId,
+                invoice_public_id: locked.invoicePublicId,
+                provider: locked.provider,
                 reason_code: "RECONCILE_PROVIDER_FAILED",
                 payment_state: "failed",
               },
             },
             tx,
           );
-        });
-        failed += 1;
-        continue;
-      }
+          return "failed" as const;
+        }
 
-      await deps.db
-        .update(paymentAttempts)
-        .set({ lastReconciledAt: now, updatedAt: now })
-        .where(eq(paymentAttempts.id, attempt.id));
-      stillPending += 1;
+        await tx
+          .update(paymentAttempts)
+          .set({
+            ...(fetched.asyncPending ? { reconciliationNote: "awaiting_async_settlement" } : {}),
+            lastReconciledAt: now,
+            updatedAt: now,
+          })
+          .where(eq(paymentAttempts.id, locked.id));
+        return "pending" as const;
+      });
+
+      if (nonPaidOutcome === "expired") {
+        expired += 1;
+      } else if (nonPaidOutcome === "failed") {
+        failed += 1;
+      } else if (nonPaidOutcome === "pending") {
+        stillPending += 1;
+      }
     }
 
+    await evaluateMissingStripeWebhookAlerts(deps.clock.now());
     return { scanned, booked, expired, failed, stillPending };
   }
 
@@ -4095,6 +5162,10 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           : false;
 
     const dbOrTx = tx ?? deps.db;
+    const now = deps.clock.now();
+    const graceCutoff = new Date(now.getTime() - MISSING_WEBHOOK_GRACE_MS);
+    const recentRejectionCutoff = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
     const [latestStripeWebhook] = await dbOrTx
       .select({
         receivedAt: paymentWebhookEvents.receivedAt,
@@ -4105,11 +5176,82 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       .where(
         and(
           eq(paymentWebhookEvents.provider, "stripe"),
+          eq(paymentWebhookEvents.environment, config.mode),
           ne(paymentWebhookEvents.eventType, "readypackets.self_test"),
+          inArray(paymentWebhookEvents.status, ["processed", "awaiting_settlement"]),
         ),
       )
       .orderBy(desc(paymentWebhookEvents.id))
       .limit(1);
+
+    const [recentRejectionRows, unwebhookedLookupRows] = await Promise.all([
+      dbOrTx
+        .select({
+          reasonCode: paymentWebhookRejections.reasonCode,
+          receivedAt: paymentWebhookRejections.receivedAt,
+        })
+        .from(paymentWebhookRejections)
+        .where(
+          and(
+            eq(paymentWebhookRejections.provider, "stripe"),
+            gte(paymentWebhookRejections.receivedAt, recentRejectionCutoff),
+            or(
+              eq(paymentWebhookRejections.environmentHint, config.mode),
+              eq(paymentWebhookRejections.environmentHint, "unknown"),
+            ),
+          ),
+        )
+        .orderBy(desc(paymentWebhookRejections.id))
+        .limit(50),
+      dbOrTx
+        .select({
+          paidAt: paymentAttempts.paidAt,
+        })
+        .from(paymentAttempts)
+        .where(
+          and(
+            eq(paymentAttempts.provider, "stripe"),
+            eq(paymentAttempts.environment, config.mode),
+            eq(paymentAttempts.status, "paid"),
+            eq(paymentAttempts.bookingSource, "provider_lookup"),
+            isNull(paymentAttempts.verifiedWebhookEventId),
+            isNotNull(paymentAttempts.paidAt),
+            lte(paymentAttempts.paidAt, graceCutoff),
+          ),
+        )
+        .orderBy(asc(paymentAttempts.paidAt), asc(paymentAttempts.id))
+        .limit(50),
+    ]);
+
+    const reasonCounts = new Map<string, { count: number; latestAt: Date }>();
+    for (const r of recentRejectionRows) {
+      const prev = reasonCounts.get(r.reasonCode);
+      if (prev) {
+        prev.count += 1;
+        if (r.receivedAt.getTime() > prev.latestAt.getTime()) {
+          prev.latestAt = r.receivedAt;
+        }
+      } else {
+        reasonCounts.set(r.reasonCode, { count: 1, latestAt: r.receivedAt });
+      }
+    }
+    const recentRejectionReasons: StripeWebhookRejectionReasonSummary[] = [...reasonCounts.entries()]
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, 5)
+      .map(([reasonCode, info]) => ({
+        reasonCode,
+        reasonLabel: labelWebhookRejectionReason(reasonCode),
+        count: info.count,
+        latestAt: info.latestAt.toISOString(),
+      }));
+
+    const oldestUnwebhooked = unwebhookedLookupRows[0]?.paidAt ?? null;
+    const hasVerifiedWebhookSinceOldest = Boolean(
+      oldestUnwebhooked &&
+        latestStripeWebhook &&
+        latestStripeWebhook.receivedAt.getTime() >= oldestUnwebhooked.getTime(),
+    );
+    const missingWebhookDetected = Boolean(oldestUnwebhooked && !hasVerifiedWebhookSinceOldest);
 
     const stripeWebhookUrl = new URL("/api/payments/webhooks/stripe", deps.config.canonicalOrigin).href;
     const squareWebhookUrl = new URL("/api/payments/webhooks/square", deps.config.canonicalOrigin).href;
@@ -4171,6 +5313,19 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         returnUrlPattern: stripeReturnPattern,
         egressHost: "api.stripe.com",
         egressAllowlisted: egress.stripeAllowlisted,
+        webhookDelivery: {
+          missingWebhookDetected,
+          unwebhookedLookupPaidCount: unwebhookedLookupRows.length,
+          oldestUnwebhookedPaidAt: oldestUnwebhooked ? oldestUnwebhooked.toISOString() : null,
+          graceSeconds: Math.floor(MISSING_WEBHOOK_GRACE_MS / 1000),
+          lastVerifiedWebhookAt: latestStripeWebhook ? latestStripeWebhook.receivedAt.toISOString() : null,
+          lastVerifiedWebhookEventType: latestStripeWebhook?.eventType ?? null,
+          recentRejectionCount: recentRejectionRows.length,
+          recentRejectionReasons,
+          endpointUrl: stripeWebhookUrl,
+          requiredEvents: STRIPE_REQUIRED_WEBHOOK_EVENTS,
+          usualCauses: STRIPE_WEBHOOK_USUAL_CAUSES,
+        },
       },
       square: {
         locationId: config.squareLocationId,
@@ -5375,6 +6530,300 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     });
 
     return result;
+  }
+
+  /**
+   * Increment 08 D5 step-up admin repair & live status check (`payments.admin.checkWithStripeNow`):
+   * Accepts `{ attemptPublicId }` or `{ invoicePublicId }`, requires `payments.manage` + fresh step-up,
+   * inspects Stripe Checkout session(s) over pinned TLS (including attempts left in `redirected`,
+   * `expired`, `cancelled`, or `failed` before the upgrade), and books any verified paid session
+   * idempotently via `bookAuthoritativeAttemptPaymentInTx` (`allowRepair: true`).
+   */
+  async function adminCheckWithStripeNow(
+    principal: SessionPrincipal,
+    input: AdminCheckWithStripeInput,
+    opts?: { signal?: AbortSignal | undefined; beforeSend?: (() => Promise<void>) | undefined },
+  ): Promise<AdminCheckWithStripeResult> {
+    if (!input.attemptPublicId && !input.invoicePublicId) {
+      throw validation("MISSING_STRIPE_CHECK_TARGET", "Provide attemptPublicId or invoicePublicId.");
+    }
+    requireComplianceService();
+
+    const staged = await runComplianceTx(
+      deps,
+      principal,
+      { type: "payment_attempt", publicId: input.attemptPublicId ?? input.invoicePublicId },
+      async (tx) => {
+        const liveActor = await assertLiveActorInTx(deps, principal, tx, "payments.manage");
+        const complianceSvc = requireComplianceService();
+
+        let candidates: PaymentAttemptRow[];
+        let targetInvoicePublicId: string;
+        if (input.attemptPublicId) {
+          const [found] = await tx
+            .select()
+            .from(paymentAttempts)
+            .where(eq(paymentAttempts.publicId, input.attemptPublicId))
+            .limit(1);
+          if (!found) {
+            throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+          }
+          if (found.provider !== "stripe") {
+            throw validation("NOT_STRIPE_ATTEMPT", "Selected payment attempt was not created with Stripe.");
+          }
+          targetInvoicePublicId = found.invoicePublicId;
+          candidates = [found];
+        } else {
+          targetInvoicePublicId = input.invoicePublicId!;
+          candidates = await tx
+            .select()
+            .from(paymentAttempts)
+            .where(
+              and(
+                eq(paymentAttempts.invoicePublicId, targetInvoicePublicId),
+                eq(paymentAttempts.provider, "stripe"),
+              ),
+            )
+            .orderBy(desc(paymentAttempts.id))
+            .limit(10);
+        }
+
+        const invoice = await complianceSvc.getInvoiceForCheckout(targetInvoicePublicId, { tx });
+
+        await deps.audit.record(
+          {
+            category: "admin",
+            eventName: "payments.admin.stripe_check_triggered",
+            action: "execute",
+            outcome: "attempted",
+            actor: { userId: liveActor.userId, role: liveActor.role },
+            resource: {
+              type: "payment_attempt",
+              publicId: input.attemptPublicId ?? targetInvoicePublicId,
+            },
+            orderPublicId: invoice.orderPublicId,
+            attributes: {
+              invoice_public_id: targetInvoicePublicId,
+              attempt_public_id: input.attemptPublicId ?? null,
+              candidate_count: candidates.length,
+            },
+          },
+          tx,
+        );
+
+        const credentialsByEnv = new Map<
+          PaymentEnvironmentMode,
+          { credentials: ProviderCredentials; keyDigest: string }
+        >();
+        for (const cand of candidates) {
+          if (!cand.providerRef || cand.status === "paid" || credentialsByEnv.has(cand.environment)) {
+            continue;
+          }
+          const loaded = await loadStripeLookupCredentials(cand.environment, {
+            tx,
+            allowDisabledProvider: true,
+          });
+          credentialsByEnv.set(cand.environment, loaded);
+        }
+
+        return {
+          liveActor,
+          invoice,
+          targetInvoicePublicId,
+          candidates,
+          credentialsByEnv,
+        };
+      },
+    );
+
+    if (staged.candidates.length === 0) {
+      return {
+        checkedCount: 0,
+        booked: false,
+        alreadyPaid: staged.invoice.status === "paid",
+        invoicePublicId: staged.invoice.invoicePublicId,
+        invoiceStatus: staged.invoice.status,
+        receiptPublicId: staged.invoice.receiptPublicId ?? null,
+        attemptPublicId: null,
+        attemptStatus: null,
+        bookingSource: null,
+        reasonCode: "NO_STRIPE_ATTEMPTS",
+      };
+    }
+
+    const paidExisting = staged.candidates.find((c) => c.status === "paid");
+    if (staged.invoice.status === "paid" || paidExisting) {
+      const ref = paidExisting ?? staged.candidates[0]!;
+      return {
+        checkedCount: 0,
+        booked: false,
+        alreadyPaid: true,
+        invoicePublicId: staged.invoice.invoicePublicId,
+        invoiceStatus: "paid",
+        receiptPublicId: staged.invoice.receiptPublicId ?? null,
+        attemptPublicId: ref.publicId,
+        attemptStatus: ref.status,
+        bookingSource: ref.bookingSource,
+        reasonCode: "ALREADY_PAID",
+      };
+    }
+
+    const fetchedEntries: Array<{
+      candidate: PaymentAttemptRow;
+      fetched: ProviderFetchedPayment;
+      keyDigest: string;
+    }> = [];
+    for (const cand of staged.candidates) {
+      if (!cand.providerRef) continue;
+      const envCreds = staged.credentialsByEnv.get(cand.environment);
+      if (!envCreds) continue;
+      const fetched = await adapters.stripe.fetchPayment({
+        providerRef: cand.providerRef,
+        providerOrderRef: cand.providerOrderRef,
+        providerPaymentRef: cand.providerPaymentRef,
+        credentials: envCreds.credentials,
+        ...(opts?.signal ? { signal: opts.signal } : {}),
+        ...(opts?.beforeSend ? { beforeSend: opts.beforeSend } : {}),
+      });
+      fetchedEntries.push({ candidate: cand, fetched, keyDigest: envCreds.keyDigest });
+      if (fetched.status === "paid") {
+        break;
+      }
+    }
+
+    return runComplianceTx(
+      deps,
+      principal,
+      { type: "payment_attempt", publicId: input.attemptPublicId ?? staged.targetInvoicePublicId },
+      async (tx) => {
+        const liveActor = await assertLiveActorInTx(deps, principal, tx, "payments.manage");
+        const complianceSvc = requireComplianceService();
+        let lastReasonCode = "STILL_UNPAID";
+        let primaryAttempt: PaymentAttemptRow = staged.candidates[0]!;
+        let didBook = false;
+        let wasAlreadyPaid = false;
+
+        for (const entry of fetchedEntries) {
+          const postCreds = await loadStripeLookupCredentials(entry.candidate.environment, {
+            tx,
+            allowDisabledProvider: true,
+          });
+          if (postCreds.keyDigest !== entry.keyDigest) {
+            throw conflict("STRIPE_CREDENTIALS_CHANGED", "Stripe credentials changed during verification; retry.");
+          }
+
+          if (entry.fetched.status === "paid") {
+            const booked = await bookAuthoritativeAttemptPaymentInTx(tx, {
+              attemptId: entry.candidate.id,
+              source: "provider_lookup",
+              fetched: entry.fetched,
+              actor: { userId: liveActor.userId, role: liveActor.role },
+              allowRepair: true,
+            });
+            primaryAttempt = booked.attempt ?? entry.candidate;
+            lastReasonCode = booked.reasonCode;
+            if (booked.booked) {
+              didBook = !booked.alreadyPaid;
+              wasAlreadyPaid = booked.alreadyPaid;
+              break;
+            }
+            continue;
+          }
+
+          const [locked] = await tx
+            .select()
+            .from(paymentAttempts)
+            .where(eq(paymentAttempts.id, entry.candidate.id))
+            .for("update")
+            .limit(1);
+          if (!locked) continue;
+          primaryAttempt = locked;
+          if (locked.status === "paid") {
+            wasAlreadyPaid = true;
+            lastReasonCode = "ALREADY_PAID";
+            break;
+          }
+
+          const bindingCheck = checkFetchedBindingMatchesAttempt(locked, entry.fetched);
+          if (!bindingCheck.matches) {
+            await recordLookupMismatchInTx(tx, locked, entry.fetched, bindingCheck.reasonCode, {
+              userId: liveActor.userId,
+              role: liveActor.role,
+            });
+            lastReasonCode = bindingCheck.reasonCode;
+            continue;
+          }
+
+          const now = deps.clock.now();
+          if (entry.fetched.asyncPending) {
+            await tx
+              .update(paymentAttempts)
+              .set({
+                reconciliationNote: "awaiting_async_settlement",
+                lastReconciledAt: now,
+                updatedAt: now,
+              })
+              .where(eq(paymentAttempts.id, locked.id));
+            primaryAttempt = { ...locked, reconciliationNote: "awaiting_async_settlement", lastReconciledAt: now };
+            lastReasonCode = "AWAITING_ASYNC_SETTLEMENT";
+          } else if (entry.fetched.status === "expired" && (locked.status === "redirected" || locked.status === "created")) {
+            await tx
+              .update(paymentAttempts)
+              .set({
+                status: "expired",
+                lastReconciledAt: now,
+                version: locked.version + 1,
+                updatedAt: now,
+              })
+              .where(and(eq(paymentAttempts.id, locked.id), eq(paymentAttempts.version, locked.version)));
+            primaryAttempt = { ...locked, status: "expired", lastReconciledAt: now, version: locked.version + 1 };
+            lastReasonCode = "SESSION_EXPIRED";
+          } else {
+            await tx
+              .update(paymentAttempts)
+              .set({ lastReconciledAt: now, updatedAt: now })
+              .where(eq(paymentAttempts.id, locked.id));
+            lastReasonCode = entry.fetched.status === "expired" ? "SESSION_EXPIRED" : "STILL_UNPAID";
+          }
+        }
+
+        const refreshedInvoice = await complianceSvc.getInvoiceForCheckout(staged.targetInvoicePublicId, { tx });
+
+        await deps.audit.record(
+          {
+            category: "admin",
+            eventName: "payments.admin.stripe_checked",
+            action: "execute",
+            outcome: "completed",
+            actor: { userId: liveActor.userId, role: liveActor.role },
+            resource: { type: "payment_attempt", publicId: primaryAttempt.publicId },
+            orderPublicId: refreshedInvoice.orderPublicId,
+            attributes: {
+              invoice_public_id: refreshedInvoice.invoicePublicId,
+              attempt_public_id: primaryAttempt.publicId,
+              checked_count: fetchedEntries.length,
+              booked: didBook,
+              already_paid: wasAlreadyPaid,
+              reason_code: lastReasonCode,
+            },
+          },
+          tx,
+        );
+
+        return {
+          checkedCount: fetchedEntries.length,
+          booked: didBook,
+          alreadyPaid: wasAlreadyPaid || refreshedInvoice.status === "paid",
+          invoicePublicId: refreshedInvoice.invoicePublicId,
+          invoiceStatus: refreshedInvoice.status,
+          receiptPublicId: refreshedInvoice.receiptPublicId ?? null,
+          attemptPublicId: primaryAttempt.publicId,
+          attemptStatus: primaryAttempt.status,
+          bookingSource: primaryAttempt.bookingSource,
+          reasonCode: lastReasonCode,
+        };
+      },
+    );
   }
 
   async function loadProviderRefundCredentials(
@@ -6800,6 +8249,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         .select({
           id: paymentAttempts.id,
           status: paymentAttempts.status,
+          amountMinor: paymentAttempts.amountMinor,
           compliancePaymentPublicId: paymentAttempts.compliancePaymentPublicId,
           verifiedWebhookEventId: paymentAttempts.verifiedWebhookEventId,
         })
@@ -6813,7 +8263,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           r.status === "created" ||
           r.status === "redirected" ||
           r.status === "cancelled" ||
-          (r.status === "paid" && r.compliancePaymentPublicId === null) ||
+          (r.status === "paid" && r.amountMinor > 0 && r.compliancePaymentPublicId === null) ||
           (r.status === "failed" && r.verifiedWebhookEventId !== null),
       );
       return { providerCapturePending, providerAttemptEver };
@@ -6829,6 +8279,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     startCheckout,
     startInvoiceCheckout,
     getCheckoutStatus,
+    confirmCheckoutPayment,
     cancelAttemptIfUnpaid,
     handleSignedWebhook,
     recordHttpRejection,
@@ -6852,6 +8303,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       getAttempt: adminGetAttempt,
       listWebhooks: adminListWebhooks,
       reconcileNow: adminReconcileNow,
+      checkWithStripeNow: adminCheckWithStripeNow,
     },
     healthCounts,
   };

@@ -142,6 +142,22 @@ export const paymentsRouter = router({
       requirePaymentsModule(ctx.services).getCheckoutStatus(ctx.session, input),
     ),
 
+  /**
+   * Increment 08 D5 authoritative customer payment confirmation (`payments.confirmCheckoutPayment`).
+   * Queries Stripe Checkout session server-side over pinned TLS for an attempt owned by the customer,
+   * enforces strict binding/amount/currency/livemode checks + per-attempt cooldown, and books idempotently.
+   */
+  confirmCheckoutPayment: protectedProcedure
+    .meta({ rateLimit: "form_submission" })
+    .input(
+      z.strictObject({
+        attemptPublicId: publicIdSchema,
+      }),
+    )
+    .mutation(({ ctx, input }) =>
+      requirePaymentsModule(ctx.services).confirmCheckoutPayment(ctx.session, input),
+    ),
+
   /** POST-only customer cancellation of an unpaid attempt. */
   cancelAttempt: protectedProcedure
     .meta({ rateLimit: "form_submission" })
@@ -275,6 +291,27 @@ export const paymentsRouter = router({
       )
       .mutation(({ ctx, input }) =>
         requirePaymentsModule(ctx.services).admin.reconcileNow(ctx.session, input),
+      ),
+
+    /**
+     * Increment 08 D5 step-up live Stripe check & pre-upgrade payment repair (`payments.admin.checkWithStripeNow`).
+     * Requires `payments.manage` (which enforces fresh MFA step-up via `STEP_UP_CAPABILITIES`).
+     */
+    checkWithStripeNow: paymentsManageProc
+      .meta({ rateLimit: "auth_high_risk" })
+      .input(
+        z
+          .strictObject({
+            attemptPublicId: publicIdSchema.optional(),
+            invoicePublicId: publicIdSchema.optional(),
+          })
+          .refine(
+            (v) => Boolean(v.attemptPublicId || v.invoicePublicId),
+            "Provide attemptPublicId or invoicePublicId.",
+          ),
+      )
+      .mutation(({ ctx, input }) =>
+        requirePaymentsModule(ctx.services).admin.checkWithStripeNow(ctx.session, input),
       ),
   }),
 

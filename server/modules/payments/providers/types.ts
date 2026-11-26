@@ -98,15 +98,34 @@ export interface ProviderFetchPaymentInput {
 }
 
 export interface ProviderFetchedPayment {
+  /** Echoed upstream session/order/link identifier — never substituted from request input when missing. */
   providerRef: string;
   providerOrderRef: string | null;
   providerPaymentRef: string | null;
   status: "paid" | "open" | "failed" | "expired";
+  /** Raw upstream session status when applicable (e.g. Stripe `open` | `complete` | `expired`). */
+  sessionStatus?: string | null | undefined;
+  /** Raw upstream payment status when applicable (e.g. Stripe `paid` | `unpaid` | `no_payment_required`). */
+  paymentStatus?: string | null | undefined;
+  /** True when a Stripe session is `complete` while an async payment method is still `unpaid`. */
+  asyncPending?: boolean | undefined;
+  /** Non-negative integer minor units, or `-1` when upstream `amount_total` was missing/malformed. */
   amountMinor: number;
+  /** Explicit flag `false` when upstream amount was missing, negative, or non-integer. */
+  amountValid?: boolean | undefined;
   currency: string;
   livemode: boolean;
+  /** Explicit flag `false` when upstream `livemode` was missing or non-boolean. */
+  livemodeValid?: boolean | undefined;
   attemptPublicId: string | null;
+  /** Explicit upstream `client_reference_id` when present. */
+  clientReferenceId?: string | null | undefined;
+  /** True when `metadata.attempt_public_id` and `client_reference_id` are both present and disagree. */
+  hasReferenceConflict?: boolean | undefined;
   invoicePublicId: string | null;
+  orderPublicId?: string | null | undefined;
+  paymentIntentAttemptPublicId?: string | null | undefined;
+  paymentIntentInvoicePublicId?: string | null | undefined;
   paidAt: Date | null;
   paymentMethodBrand?: string | null | undefined;
   paymentMethodLast4?: string | null | undefined;
