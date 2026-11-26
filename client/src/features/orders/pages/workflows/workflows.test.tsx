@@ -1,7 +1,8 @@
 /** Workflow designer client: list + install, wizard, canvas, versions and read-only published view (fake tRPC only). */
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { useState } from "react";
 import { Route } from "wouter";
 import type * as trpcModule from "@/lib/trpc";
 import { pageA11y } from "@/test/a11y";
@@ -9,6 +10,7 @@ import { expectNoAxeViolations, renderUi } from "@/ui/testing";
 import AdminWorkflowsPage, { resetPhasesNoticeForTests } from "../AdminWorkflowsPage";
 import { RulesReviewSummary } from "./rulesFields";
 import WorkflowDesignerPage, { addCatalogStatuses, startPhases } from "./WorkflowDesignerPage";
+import { PublishDraftRowAction, publishBlockers, publishedSummary } from "./PublishDraftDialog";
 import WorkflowVersionPage from "./WorkflowVersionPage";
 import WorkflowVersionsPage from "./WorkflowVersionsPage";
 
@@ -434,10 +436,21 @@ describe("workflow designer", () => {
     await user.click(screen.getByRole("button", { name: "Save and continue" }));
     expect(await screen.findByRole("heading", { level: 2, name: "Review and publish" })).toBeInTheDocument();
     expect(screen.getByText("The draft has no problems and is ready to publish.")).toBeInTheDocument();
-    await user.click(screen.getByRole("checkbox", { name: /Use for new orders/ }));
-    await user.type(screen.getByLabelText(/Change note/), "Customers may finish");
-    await expectNoAxeViolations(container);
-    await user.click(screen.getByRole("button", { name: "Publish" }));
+    // Increment 08 (D7): the wizard's Publish opens the shared publish dialog (change note, default, step-up).
+    const publishButtons = screen.getAllByRole("button", { name: "Publish" });
+    expect(publishButtons).toHaveLength(2); // persistent header button + the wizard's final step
+    await user.click(publishButtons.at(-1)!);
+    const dialog = await screen.findByRole("dialog", { name: /^Publish “.+”\?$/ });
+    await user.click(within(dialog).getByRole("checkbox", { name: /Use for new orders/ }));
+    await user.type(within(dialog).getByLabelText(/Change note/), "Customers may finish");
+    await expectNoAxeViolations(document.body);
+    await user.click(within(dialog).getByRole("button", { name: "Publish" }));
+    const done = await screen.findByRole("dialog", { name: "Workflow published" });
+    expect(within(done).getByTestId("workflow-published")).toHaveTextContent(/Version 2 of “.+” is published\./);
+    expect(within(done).getByTestId("workflow-published")).toHaveTextContent("It is now the default workflow for new orders.");
+    await waitFor(() => expect(within(done).getByTestId("workflow-published")).toHaveFocus());
+    expect(location.history.at(-1)).toBe(`/admin/workflows/drafts/${DRAFT}`);
+    await user.click(within(done).getByRole("button", { name: "Done" }));
     await waitFor(() => expect(location.history.at(-1)).toBe(`/admin/workflows/${WF}/versions`));
 
     const lastSave = calls.filter((c) => c.path === "orders.admin.workflows.drafts.save").at(-1)?.input as { definition: { transitions: unknown[] } };
@@ -692,7 +705,9 @@ describe("workflow designer — review summary", () => {
     expect(summary).toHaveTextContent("Example: Orders/RP-2026-000123");
     // 07.2: where the default lives (a new version of an existing workflow).
     expect(screen.getByText(/A draft must be published before it can be the default\./)).toHaveTextContent("You can change the default workflow any time with “Set as default” on the Workflows list.");
-    expect(screen.getByRole("checkbox", { name: /Use for new orders \(default workflow\)/ })).toBeInTheDocument();
+    // Increment 08 (D7): the default choice moved into the publish dialog.
+    expect(screen.queryByRole("checkbox", { name: /Use for new orders \(default workflow\)/ })).toBeNull();
+    expect(screen.getByText(/Publish opens a short dialog to add a change note/)).toBeInTheDocument();
     await expectNoAxeViolations(container);
   });
 
@@ -708,8 +723,127 @@ describe("workflow designer — review summary", () => {
       await user.click(screen.getByRole("button", { name: "Save and continue" }));
       expect(await screen.findByRole("heading", { level: 2, name: next })).toBeInTheDocument();
     }
-    expect(screen.getByRole("checkbox", { name: /Use for new orders \(default workflow\)/ })).toBeInTheDocument();
-    expect(screen.getByText(/Tick the box above to make this new workflow the default when you publish it, or publish now and choose it later\./)).toHaveTextContent("“Set as default” on the Workflows list");
+    expect(screen.getByText(/You can make this new workflow the default in the publish dialog, or publish now and choose it later\./)).toHaveTextContent("“Set as default” on the Workflows list");
+    await user.click(screen.getByTestId("workflow-publish"));
+    const dialog = await screen.findByRole("dialog", { name: "Publish “Rush”?" });
+    expect(dialog).toHaveTextContent("Publishing creates version 1 of this new workflow.");
+    expect(within(dialog).getByRole("checkbox", { name: /Use for new orders \(default workflow\)/ })).not.toBeChecked();
+  });
+});
+
+describe("increment 08 D7: persistent Publish and the drafts row action", () => {
+  it("publishBlockers lists the reasons and the confirmation names the version and the default", () => {
+    expect(publishBlockers({ errorCount: 0 })).toEqual([]);
+    expect(publishBlockers({ errorCount: 1, busy: true, nameMissing: true })).toEqual(["Fix 1 problem in the draft first.", "Enter a name for the workflow.", "Wait until saving finishes."]);
+    expect(publishBlockers({ errorCount: 3 })).toEqual(["Fix 3 problems in the draft first."]);
+    expect(publishedSummary("Rush", { versionNumber: 4, isDefault: true })).toEqual({ title: "Version 4 of “Rush” is published.", detail: expect.stringContaining("It is now the default workflow for new orders.") });
+    expect(publishedSummary("Rush", { versionNumber: 1, isDefault: false }).detail).toMatch(/^It is not the default workflow, so new orders keep using the current default\./);
+  });
+
+  it("header Publish is on every tab, disabled with listed reasons while the saved draft has errors", async () => {
+    handlers.set("orders.admin.workflows.drafts.get", () => draftView([], [deadEnd]));
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    const user = userEvent.setup();
+    const { container } = designer();
+    const publish = await screen.findByTestId("workflow-publish");
+    expect(publish).toBeDisabled();
+    const reasons = screen.getByTestId("workflow-publish-reasons");
+    expect(publish).toHaveAttribute("aria-describedby", reasons.id);
+    expect(reasons).toHaveTextContent("Publishing is not available yet:");
+    expect(reasons).toHaveTextContent("Fix 1 problem in the draft first.");
+    for (const tab of ["Phases", "Statuses wizard", "Canvas"]) {
+      await user.click(screen.getByRole("tab", { name: tab }));
+      expect(screen.getByTestId("workflow-publish")).toBeDisabled();
+    }
+    await expectNoAxeViolations(container);
+  });
+
+  it("header Publish with unsaved edits saves first; errors keep the dialog closed and open the problem list", async () => {
+    handlers.set("orders.admin.workflows.drafts.get", () => draftView([transition], []));
+    handlers.set("orders.admin.workflows.drafts.save", () => ({ rowVersion: 2, issues: [deadEnd], publishable: false }));
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    const user = userEvent.setup();
+    designer();
+    const publish = await screen.findByTestId("workflow-publish");
+    expect(publish).toBeEnabled();
+    await user.type(screen.getByLabelText(/Workflow name/), " edited");
+    await user.click(publish);
+    expect(await screen.findByText("Fix the problems listed below before publishing.")).toBeInTheDocument();
+    expect(calls.some((c) => c.path === "orders.admin.workflows.drafts.save")).toBe(true);
+    expect(calls.some((c) => c.path === "orders.admin.workflows.drafts.publish")).toBe(false);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByTestId("workflow-publish")).toBeDisabled();
+  });
+
+  it("header Publish on the Phases tab opens the dialog; Cancel publishes nothing and returns focus", async () => {
+    handlers.set("orders.admin.workflows.drafts.get", () => draftView([transition], []));
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    const user = userEvent.setup();
+    designer();
+    const publish = await screen.findByTestId("workflow-publish");
+    expect(screen.queryByTestId("workflow-publish-reasons")).toBeNull();
+    await user.click(publish);
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByRole("checkbox", { name: /Use for new orders/ })).toBeInTheDocument();
+    expect(within(dialog).getByLabelText(/Change note/)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(screen.getByTestId("workflow-publish")).toHaveFocus());
+    expect(calls.some((c) => c.path === "orders.admin.workflows.drafts.publish")).toBe(false);
+  });
+
+  it("row action: shown only for drafts that validate; publishes with the row's version and confirms (not default)", async () => {
+    handlers.set("orders.admin.workflows.drafts.publish", () => ({ workflowPublicId: WF, versionNumber: 3, isDefault: false }));
+    const user = userEvent.setup();
+    const ok = { publicId: DRAFT, name: "Rush jobs", rowVersion: 5, newWorkflow: false, errorCount: 0 };
+    // The row (and its opener) disappears once the drafts list refetches; focus must land somewhere persistent.
+    let refetch = () => {};
+    function Rows() {
+      const [rows, setRows] = useState([ok]);
+      refetch = () => setRows([]);
+      return (
+        <main id="main" tabIndex={-1}>
+          <h1>Workflows</h1>
+          {rows.map((row) => (
+            <PublishDraftRowAction key={row.publicId} draft={row} />
+          ))}
+        </main>
+      );
+    }
+    const first = renderUi(<PublishDraftRowAction draft={{ ...ok, errorCount: 2 }} />);
+    expect(screen.queryByRole("button", { name: /Publish draft/ })).toBeNull();
+    first.unmount();
+    renderUi(<Rows />);
+    await user.click(screen.getByRole("button", { name: "Publish draft Rush jobs" }));
+    const dialog = await screen.findByRole("dialog", { name: "Publish “Rush jobs”?" });
+    expect(dialog).toHaveTextContent("Publishing creates a new version. Orders already in progress keep the version they started on.");
+    await expectNoAxeViolations(document.body);
+    await user.click(within(dialog).getByRole("button", { name: "Publish" }));
+    const done = await screen.findByRole("dialog", { name: "Workflow published" });
+    expect(done).toHaveTextContent("Version 3 of “Rush jobs” is published.");
+    expect(done).toHaveTextContent("It is not the default workflow, so new orders keep using the current default.");
+    expect(calls.find((c) => c.path === "orders.admin.workflows.drafts.publish")?.input).toEqual({ draftId: DRAFT, expectedVersion: 5, makeDefault: false });
+    await expectNoAxeViolations(document.body);
+    await user.click(within(done).getByRole("button", { name: "Done" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(screen.getByRole("main")).toHaveFocus());
+    // Delayed refetch removes the row: focus stays on the persistent target, never drops to <body>.
+    act(() => refetch());
+    expect(screen.queryByRole("button", { name: "Publish draft Rush jobs" })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("main"));
+  });
+
+  it("row action: a server refusal is shown in the dialog without publishing", async () => {
+    handlers.set("orders.admin.workflows.drafts.publish", () => {
+      throw Object.assign(new Error("stale"), { data: { safe: { domainCode: "CONFLICT", reasonCode: "STALE_VERSION", safeMessage: "This draft was changed by someone else. Reload it and try again.", requestId: "r" } } });
+    });
+    const user = userEvent.setup();
+    renderUi(<PublishDraftRowAction draft={{ publicId: DRAFT, name: "Rush jobs", rowVersion: 1, newWorkflow: true, errorCount: 0 }} />);
+    await user.click(screen.getByRole("button", { name: "Publish draft Rush jobs" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "Publish" }));
+    expect(await within(dialog).findByText("This draft was changed by someone else. Reload it and try again.")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Workflow published" })).toBeNull();
   });
 });
 
