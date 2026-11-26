@@ -64,9 +64,9 @@ Run these 15 checks, marking the results in the main worksheet below. For Stripe
 
 | ID | Priority | Where and what to do | Expected | Result / evidence / tester |
 | --- | --- | --- | --- | --- |
-| REG-01 | Blocker | Open `/register`. | First name, Last name, and Preferred name inputs appear. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| REG-02 | Blocker | `/register` → leave First name blank; fill other required fields → **Create account**. | First name is flagged; no account created. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| REG-03 | Blocker | `/register` → leave Last name blank; fill other required fields → **Create account**. | Last name is flagged; no account created. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| REG-01 | Blocker | Open `/register`. | **First name**, **Last name**, and **Preferred name (optional)** inputs appear. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| REG-02 | Blocker | `/register` → leave **First name** blank; fill other required inputs → **Create account**. | **Enter your first name.** | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| REG-03 | Blocker | `/register` → leave **Last name** blank; fill other required inputs → **Create account**. | **Enter your last name.** | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | REG-04 | Important | `/register` → paste 51 `A` characters into each name input. | Each caps input at 50 UTF-16 code units (50 `A`s). | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | REG-05 | Blocker | `/register` → `Zeus`, `Greene`, `Z` → **Create account**; verify and sign in. | Customer greeting uses `Z`. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | REG-06 | Important | Register the second synthetic customer with Preferred name empty; verify and sign in. | Greeting falls back to First name. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
@@ -109,13 +109,13 @@ Run these 15 checks, marking the results in the main worksheet below. For Stripe
 
 | ID | Priority | Where and what to do | Expected | Result / evidence / tester |
 | --- | --- | --- | --- | --- |
-| BIL-01 | Blocker | `/register` → leave the optional billing section collapsed → **Create account**. | Valid registration succeeds without a billing profile. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| BIL-02 | Blocker | `/register` → enter only part of an approved synthetic billing address → **Create account**. | Missing billing fields are identified and submission is blocked. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BIL-01 | Blocker | `/register` → fill required account inputs.<br>Leave **Billing information (optional — you can add it later)** closed.<br>Click **Create account**. | **Check your email** appears without entering billing. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BIL-02 | Blocker | `/register` → open **Billing information (optional — you can add it later)**.<br>Enter only **City or locality** `Testville` in billing.<br>With required account inputs complete, click **Create account**. | **Billing name** shows **Enter the billing contact name.** | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | BIL-03 | Important | `/register` → use an existing synthetic mailbox and different billing values. | Existing account’s billing profile is unchanged. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | BIL-04 | Blocker | `/account/billing` → **Billing name** `Zeus Greene`; **Billing email** = test mailbox.<br>**Address line 1** `100 Test Street`; **City or locality** `Testville`; **Postal code** `12345`; **Country code** `US`.<br>Click **Save billing information**; reload. | **Saved billing summary** shows the new address. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| BIL-05 | Blocker | Sign in as a customer with saved billing and open `/cart/checkout`. | Saved billing choice is selected by default and shows its summary. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| BIL-06 | Blocker | `/cart/checkout` → choose different billing details; leave save unchecked and finish checkout. | Invoice uses the new details without replacing the profile. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| BIL-07 | Important | As a customer without saved billing, open `/cart/checkout` and inspect the save checkbox. | Save is initially checked; customer can uncheck it. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BIL-05 | Blocker | Sign in as a customer with saved billing and open `/cart/checkout`. | **Use my saved billing information** is selected by default. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BIL-06 | Blocker | `/cart/checkout` → **Enter different billing information**.<br>Use BIL-04 details with `200 Test Street`; leave **Save as my billing information** unchecked.<br>Place the order and open its invoice. | Invoice **Bill to** uses `200 Test Street`; saved profile still uses `100 Test Street`. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BIL-07 | Important | As a customer without saved billing, open `/cart/checkout`. | **Save as my billing information** is initially checked. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | BIL-08 | Important | `/account/billing` → **Clear billing information**.<br>In **Clear saved billing information?**, click **Clear billing information**. | **No saved billing information**. This clears billing only. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Stripe test mode and live mode
@@ -136,13 +136,13 @@ Start with **test mode** in isolation. The portal’s **Send self-test webhook**
 | PAY-08 | Blocker | Stripe Dashboard test endpoint → **Event deliveries** → open the actual Checkout event. | Delivery to this endpoint is HTTP **2xx**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | PAY-09 | Blocker | Follow Stripe’s return to `/checkout/return`. | **Payment received**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | PAY-10 | Blocker | `/invoices` → open the invoice for that order. | Invoice status is **Paid**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| PAY-11 | Blocker | `/checkout/return` → open the receipt offered after confirmation. | A receipt for that order and amount is available. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| PAY-12 | Blocker | `/checkout/return` → follow the link to the matching order. | The wizard opens with the payment gate cleared. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-11 | Blocker | `/checkout/return` → **View receipt**. | Receipt opens for the matching invoice and amount. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-12 | Blocker | `/checkout/return` → **Continue to your order**. | The wizard opens with the payment gate cleared. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | PAY-13 | Blocker | Operator, isolated test mode only: disable the Stripe endpoint; pay a fresh order and return. | Lookup books the matching payment without a webhook. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | PAY-14 | Blocker | Keep PAY-13 isolated until the grace period elapses; open `/admin/alerts`. | One **Stripe is not delivering webhooks to this server** alert. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| PAY-15 | Blocker | Pay a separate test order without returning; admin opens its invoice/attempt → **Check with Stripe now** → fresh MFA. | Previously pending matching payment is booked. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-15 | Blocker | With the test endpoint still off, pay a separate order without returning.<br>`/admin/invoices/:id` → **Check with Stripe now** → fresh MFA. | **Stripe payment verified and booked**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | PAY-16 | Blocker | Re-enable delivery and resend PAY-13’s verified provider event from Stripe. | One payment remains; no second booking. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| PAY-17 | Important | If offered, complete a test asynchronous Checkout whose final payment is still unpaid. | Return shows processing; invoice remains unpaid. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-17 | Important | If offered, complete asynchronous test Checkout before it settles. Open `/checkout/return`. | **Confirming your payment with the payment provider**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | PAY-18 | Blocker | `/admin/orders/:id/refund` → **Prepare refund**.<br>Enter approved amount and **Refund reason** `Go-live test`.<br>Type `REFUND ORDER` → **Send refund** → fresh MFA. | **Refund history** records one matching test refund. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | PAY-19 | Blocker | Stripe test endpoint → **Event deliveries** → open the event for that refund. | Test refund delivery is HTTP **2xx**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
@@ -162,8 +162,8 @@ Do not reuse a test endpoint secret or intentionally interrupt live delivery. Ru
 | PAY-28 | Blocker | Stripe Dashboard live endpoint → **Event deliveries** → open the actual Checkout event. | Delivery to this endpoint is HTTP **2xx** in live mode. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | PAY-29 | Blocker | Follow Stripe’s return to `/checkout/return`. | **Payment received**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | PAY-30 | Blocker | `/invoices` → open the matching live order invoice. | Invoice status is **Paid**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| PAY-31 | Blocker | `/checkout/return` → open the receipt offered after live confirmation. | A receipt for that order and amount is available. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| PAY-32 | Blocker | `/checkout/return` → follow the link to the matching order. | The wizard opens with the payment gate cleared. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-31 | Blocker | `/checkout/return` → **View receipt**. | Receipt opens for the matching live invoice and amount. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-32 | Blocker | `/checkout/return` → **Continue to your order**. | The wizard opens with the payment gate cleared. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | PAY-33 | Blocker | `/admin/orders/:id/refund` → **Prepare refund**.<br>Enter approved amount and **Refund reason** `Go-live verification`.<br>Type `REFUND ORDER` → **Send refund** → fresh MFA. | **Refund history** records one matching live refund. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | PAY-34 | Blocker | Stripe live endpoint → **Event deliveries** → open the event for that refund. | Live refund delivery is HTTP **2xx**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | PAY-35 | Blocker | Open the refund in Stripe after processing finishes. | Live refund status and amount match the portal. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
@@ -368,8 +368,3 @@ In Stripe, open **each** configured endpoint and compare its subscribed events w
 - **Load test:** Test capacity in an isolated environment with an approved plan.
 - **Legal review:** Have the owner arrange privacy, payment, tax and contractual review.
 - **Real screen-reader users:** Operator checks are not a substitute for testing with people who rely on assistive technology.
-
-### TODO for release lead: confirm final Increment 08 labels
-
-- **D1/D4:** Confirm registration billing disclosure and checkout radio and checkbox copy (BIL-01–02, BIL-05–07).
-- **D5:** Confirm admin repair placement and the new paid banner, receipt and wizard actions (PAY-09, PAY-11–12, PAY-15, PAY-29, PAY-31–32).
