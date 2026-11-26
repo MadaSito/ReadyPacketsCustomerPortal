@@ -999,6 +999,31 @@ export default function PaymentSetupPage() {
         </Callout>
       ) : null}
 
+      {settings.stripe.webhookDelivery?.missingWebhookDetected ? (
+        <div data-testid="stripe-missing-webhook-banner" className="min-w-0">
+          <Callout
+            tone="warning"
+            live="polite"
+            title={
+              <span className="[overflow-wrap:anywhere]">
+                Stripe webhook delivery has not arrived for recent confirmed payments
+              </span>
+            }
+          >
+            <div className="grid min-w-0 gap-2 [overflow-wrap:anywhere]">
+              <p className="[overflow-wrap:anywhere]">
+                {settings.stripe.webhookDelivery.unwebhookedLookupPaidCount} Stripe payment
+                {settings.stripe.webhookDelivery.unwebhookedLookupPaidCount === 1 ? " was" : "s were"} confirmed via direct API lookup more than{" "}
+                {Math.max(1, Math.round(settings.stripe.webhookDelivery.graceSeconds / 60))} minutes ago without a verified Stripe webhook arriving. Customer orders were booked safely, and asynchronous payment updates or provider-initiated refunds still depend on live webhook delivery.
+              </p>
+              <p className="text-sm [overflow-wrap:anywhere]">
+                Review the webhook delivery diagnostics below to verify your endpoint URL, signing secret, and subscribed events in Stripe.
+              </p>
+            </div>
+          </Callout>
+        </div>
+      ) : null}
+
       <Checklist title="Stripe readiness checklist" items={checklistItems} />
 
       <Card
@@ -1258,8 +1283,44 @@ export default function PaymentSetupPage() {
                   "Not run yet"
                 ),
               },
+              ...(settings.stripe.webhookDelivery
+                ? [
+                    {
+                      label: "Recent rejections (24h)",
+                      value:
+                        settings.stripe.webhookDelivery.recentRejectionCount > 0 ? (
+                          <span className="[overflow-wrap:anywhere]">
+                            {settings.stripe.webhookDelivery.recentRejectionCount} rejected (
+                            {settings.stripe.webhookDelivery.recentRejectionReasons
+                              .map((r) => `${r.reasonLabel}: ${r.count}`)
+                              .join(", ")}
+                            )
+                          </span>
+                        ) : (
+                          "0 in the last 24 hours"
+                        ),
+                    },
+                  ]
+                : []),
             ]}
           />
+          {settings.stripe.webhookDelivery ? (
+            <div
+              data-testid="stripe-webhook-diagnostics"
+              className="grid min-w-0 gap-2 rounded-lg border border-line bg-surface-sunken p-3 text-sm"
+            >
+              <p className="font-semibold [overflow-wrap:anywhere]">
+                Three usual causes when Stripe webhooks do not arrive
+              </p>
+              <ol className="min-w-0 list-decimal space-y-1 pl-5 [overflow-wrap:anywhere]">
+                {settings.stripe.webhookDelivery.usualCauses.map((cause) => (
+                  <li key={cause} className="min-w-0 break-words [overflow-wrap:anywhere]">
+                    {cause}
+                  </li>
+                ))}
+              </ol>
+            </div>
+          ) : null}
         </div>
       </Card>
 
