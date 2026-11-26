@@ -10,7 +10,7 @@ procedure.
 Requested by the owner on 2026-11-26 (prompt 30). See the [session log](docs/session-logs/2026-11-26-session-01.md).
 - **No database migration.** New values use existing settings and columns.
 - **Upgrade commands** are unchanged.
-- **PR and merge commit:** (filled at merge).
+- **PR and merge commit:** PR #21, merge commit `762ea41`.
 
 ### Fixed
 

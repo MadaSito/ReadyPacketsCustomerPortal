@@ -1,6 +1,6 @@
 # ReadyPackets Portal — Status
 
-Last updated: 2026-11-25 (increment 07 merged to `main` as `c337492` through PR #16; fix pack 07.1 merged to `main` as `547a31d` through PR #19; fix pack 07.2 on `fix/increment-07-2`, PR and merge commit filled at merge). Keep this file current; it is the honest state of the build,
+Last updated: 2026-11-26 (increment 07 merged to `main` as `c337492` through PR #16; fix pack 07.1 merged to `main` as `547a31d` through PR #19; fix pack 07.2 merged to `main` as `762ea41` through PR #21). Keep this file current; it is the honest state of the build,
 not a certification. "Verified" below means the integrator ran the check and saw the result. Anything not
 listed under "Verified" has not been proven and must not be described as working in production.
 
@@ -467,8 +467,8 @@ The lead ran these checks in Chromium only, on a running production build of `fi
 
 ### Gates
 
-- **Full test suite:** (filled at merge)
-- **CI:** (filled at merge)
+- **Full test suite:** run by the lead at `0cb03fa`: 234 test files, 2,991 tests passed, 4 todo; type check and eslint clean. The jobs folder (60 tests) was re-run after `568a45f`.
+- **CI:** on PR #21 the first run failed the security workflow twice over: gitleaks flagged a synthetic `productKey` fixture in `workflowDefault.test.ts` (reviewed, baselined in `06aa20c`), and CodeQL flagged a single-pass tag strip used only for comparison in `server/modules/jobs/mail.ts` (replaced by a linear scanner in `568a45f`, no baseline exception). The ci, security, container and native-install workflows then passed on `568a45f`.
 
 ### Not verified
 
