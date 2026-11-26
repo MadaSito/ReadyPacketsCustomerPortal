@@ -53,7 +53,7 @@ type PlacedPaymentHandoff = {
   invoiceNumber: string;
   currency: string;
   totalMinor: number;
-  onlinePaymentAvailable: boolean;
+  onlinePaymentAvailable?: boolean | undefined;
   safeMessage: string;
 };
 
@@ -62,6 +62,7 @@ function PlacedOrderPaymentHandoff({ handoff }: { handoff: PlacedPaymentHandoff 
   const alertRef = useRef<HTMLDivElement | null>(null);
   const retryErrorRef = useRef<HTMLDivElement | null>(null);
   const [payRetryError, setPayRetryError] = useState<string | null>(null);
+  const showPayNow = handoff.onlinePaymentAvailable !== false;
 
   useEffect(() => {
     alertRef.current?.focus();
@@ -118,38 +119,54 @@ function PlacedOrderPaymentHandoff({ handoff }: { handoff: PlacedPaymentHandoff 
         </dl>
 
         <div className="mt-4 flex flex-wrap items-center gap-3">
-          <InvoiceOnlinePayAction
-            invoicePublicId={handoff.invoicePublicId}
-            label="Pay now"
-            variant="primary"
-            successPath="/checkout/return"
-            cancelPath="/checkout/cancel"
-            onCheckoutError={(message) => {
-              setPayRetryError(message);
-              if (message) requestAnimationFrame(() => retryErrorRef.current?.focus());
-            }}
-            onSettled={() => {
-              navigate(`/checkout/return?cart=${encodeURIComponent(handoff.cartPublicId)}`, { replace: true });
-            }}
-          />
-          <Button asChild variant="secondary">
-            <Link href={`/invoices/${encodeURIComponent(handoff.invoicePublicId)}`}>View invoice</Link>
-          </Button>
-          <Button asChild variant="secondary">
-            <Link href={`/orders/${encodeURIComponent(handoff.orderPublicId)}`}>View order</Link>
-          </Button>
-          <Button asChild variant="secondary">
-            <Link href={`/checkout/return?cart=${encodeURIComponent(handoff.cartPublicId)}`}>View payment status</Link>
-          </Button>
+          {showPayNow ? (
+            <>
+              <InvoiceOnlinePayAction
+                invoicePublicId={handoff.invoicePublicId}
+                label="Pay now"
+                variant="primary"
+                successPath="/checkout/return"
+                cancelPath="/checkout/cancel"
+                onCheckoutError={(message) => {
+                  setPayRetryError(message);
+                  if (message) requestAnimationFrame(() => retryErrorRef.current?.focus());
+                }}
+                onSettled={() => {
+                  navigate(`/checkout/return?cart=${encodeURIComponent(handoff.cartPublicId)}`, { replace: true });
+                }}
+              />
+              <Button asChild variant="secondary">
+                <Link href={`/invoices/${encodeURIComponent(handoff.invoicePublicId)}`}>View invoice</Link>
+              </Button>
+              <Button asChild variant="secondary">
+                <Link href={`/orders/${encodeURIComponent(handoff.orderPublicId)}`}>View order</Link>
+              </Button>
+              <Button asChild variant="secondary">
+                <Link href={`/checkout/return?cart=${encodeURIComponent(handoff.cartPublicId)}`}>View payment status</Link>
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button asChild variant="primary">
+                <Link href={`/invoices/${encodeURIComponent(handoff.invoicePublicId)}`}>View invoice</Link>
+              </Button>
+              <Button asChild variant="secondary">
+                <Link href={`/orders/${encodeURIComponent(handoff.orderPublicId)}`}>View order</Link>
+              </Button>
+              <Button asChild variant="secondary">
+                <Link href={`/checkout/return?cart=${encodeURIComponent(handoff.cartPublicId)}`}>View payment status</Link>
+              </Button>
+              <Button asChild variant="secondary">
+                <Link href="/support">Contact support</Link>
+              </Button>
+            </>
+          )}
         </div>
 
-        {!handoff.onlinePaymentAvailable ? (
+        {!showPayNow ? (
           <p className="mt-3 text-sm text-muted">
-            If online payment is still unavailable, open your invoice for payment instructions or{" "}
-            <Link href="/support" className="font-semibold text-action underline underline-offset-2">
-              contact support
-            </Link>
-            .
+            No online payment was collected. Open your invoice for the balance due and payment instructions, or contact
+            support if you need assistance completing payment.
           </p>
         ) : null}
       </Card>

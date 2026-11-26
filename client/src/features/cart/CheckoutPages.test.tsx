@@ -719,15 +719,119 @@ it("Fix pack 07.2: handles post-commit provider failure (payment_unavailable) wi
   expect(screen.getByRole("link", { name: "View invoice" })).toHaveAttribute("href", `/invoices/${invoiceId}`);
   expect(screen.getByRole("link", { name: "View order" })).toHaveAttribute("href", `/orders/${orderId}`);
 
+  // If clicking "Pay now" fails first, the danger callout "Could not open online payment" is shown and focused; retry succeeds
+  mocks.startInvoiceCheckout
+    .mockRejectedValueOnce(new Error("Online payment temporarily unavailable."))
+    .mockResolvedValueOnce({
+      mode: "redirect",
+      attemptPublicId: id(9),
+      invoicePublicId: invoiceId,
+      provider: "stripe",
+      environment: "live",
+      redirectUrl: "https://checkout.stripe.com/pay/cs_live_synthetic_retry",
+      expiresAt: new Date("2026-11-21T12:30:00Z"),
+    });
+
+  await user.click(screen.getByRole("button", { name: "Pay now" }));
+  expect(await screen.findByText("Could not open online payment")).toBeInTheDocument();
+
   await user.click(screen.getByRole("button", { name: "Pay now" }));
   await waitFor(() => {
-    expect(mocks.startInvoiceCheckout).toHaveBeenCalledWith({
-      invoicePublicId: invoiceId,
-      successPath: "/checkout/return",
-      cancelPath: "/checkout/cancel",
-    });
+    expect(mocks.startInvoiceCheckout).toHaveBeenCalledTimes(2);
     expect(redirectSpy).toHaveBeenCalledWith("https://checkout.stripe.com/pay/cs_live_synthetic_retry");
   });
+});
+
+pageA11y("/cart/checkout placed-order handoff when online payment unavailable", async () => {
+  const user = userEvent.setup();
+  mocks.cart.mockResolvedValue({
+    ...cart,
+    pendingPolicies: [],
+    onlinePaymentEnabled: true,
+    paymentProvider: "stripe",
+    paymentEnvironment: "live",
+  });
+  mocks.checkout.mockResolvedValue({
+    mode: "payment_unavailable",
+    cartPublicId: cartId,
+    orderPublicId: orderId,
+    orderReference: "RP-SYNTHETIC-STALE",
+    invoicePublicId: invoiceId,
+    invoiceNumber: "INV-SYNTHETIC-STALE",
+    currency: "USD",
+    totalMinor: 120,
+    onlinePaymentAvailable: false,
+    reasonCode: "PROVIDER_VERIFICATION_STALE",
+    failureClass: "configuration",
+    safeMessage: "Online card payment is temporarily unavailable while payment settings are being updated. Your order and invoice are ready.",
+  });
+  review();
+  await user.click(await screen.findByRole("button", { name: "Place order and continue to payment" }));
+  await screen.findByText("Your order RP-SYNTHETIC-STALE is placed, but we could not open the secure payment page");
+});
+
+it("Fix pack 07.2: hides Pay now on /cart/checkout handoff when onlinePaymentAvailable is false (making View invoice primary with invoice instructions), while still showing Pay now when onlinePaymentAvailable is undefined", async () => {
+  const user = userEvent.setup();
+  const onlineCart = {
+    ...cart,
+    pendingPolicies: [],
+    onlinePaymentEnabled: true,
+    paymentProvider: "stripe" as const,
+    paymentEnvironment: "live" as const,
+  };
+
+  // 1. `onlinePaymentAvailable === false` (e.g. PROVIDER_VERIFICATION_STALE): hides Pay now, makes View invoice primary, shows invoice instructions
+  mocks.cart.mockResolvedValueOnce(onlineCart);
+  mocks.checkout.mockResolvedValueOnce({
+    mode: "payment_unavailable",
+    cartPublicId: cartId,
+    orderPublicId: orderId,
+    orderReference: "RP-SYNTHETIC-STALE",
+    invoicePublicId: invoiceId,
+    invoiceNumber: "INV-SYNTHETIC-STALE",
+    currency: "USD",
+    totalMinor: 120,
+    onlinePaymentAvailable: false,
+    reasonCode: "PROVIDER_VERIFICATION_STALE",
+    failureClass: "configuration",
+    safeMessage: "Online card payment is temporarily unavailable while payment settings are being updated. Your order and invoice are ready.",
+  });
+
+  const staleView = review();
+  await user.click(await screen.findByRole("button", { name: "Place order and continue to payment" }));
+  expect(
+    await screen.findByText("Your order RP-SYNTHETIC-STALE is placed, but we could not open the secure payment page"),
+  ).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Pay now" })).not.toBeInTheDocument();
+  expect(screen.getByText(/Open your invoice for the balance due and payment instructions/i)).toBeInTheDocument();
+  const viewInvoiceLink = screen.getByRole("link", { name: "View invoice" });
+  expect(viewInvoiceLink).toHaveAttribute("href", `/invoices/${invoiceId}`);
+  expect(viewInvoiceLink.className).toContain("bg-action");
+  staleView.unmount();
+
+  // 2. Older server payload where `onlinePaymentAvailable` is omitted/undefined still shows primary "Pay now"
+  mocks.cart.mockResolvedValueOnce(onlineCart);
+  mocks.checkout.mockResolvedValueOnce({
+    mode: "payment_unavailable",
+    cartPublicId: cartId,
+    orderPublicId: orderId,
+    orderReference: "RP-SYNTHETIC-COMPAT",
+    invoicePublicId: invoiceId,
+    invoiceNumber: "INV-SYNTHETIC-COMPAT",
+    currency: "USD",
+    totalMinor: 120,
+    reasonCode: "STRIPE_UPSTREAM_5XX",
+    failureClass: "provider_transient",
+    safeMessage: "We could not open the secure payment page right now.",
+  } as unknown as CheckoutCartResult);
+
+  const compatView = review();
+  await user.click(await screen.findByRole("button", { name: "Place order and continue to payment" }));
+  expect(
+    await screen.findByText("Your order RP-SYNTHETIC-COMPAT is placed, but we could not open the secure payment page"),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Pay now" })).toBeInTheDocument();
+  compatView.unmount();
 });
 
 it("Fix pack 07.2: distinguishes waiting-for-provider (?attempt= redirected) from awaiting_payment (?cart= / failed / no attempt) with Pay now, in-flight warning, and offline instructions fallback", async () => {
