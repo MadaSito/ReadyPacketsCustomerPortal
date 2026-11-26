@@ -195,6 +195,34 @@ Existing orders keep their pinned workflow version. The start-up job `orders.inc
   - **Receipts issued before the upgrade** keep their original PDF.
 - **Default workflow.** Nothing changes by itself. To use another published workflow for new orders, choose **Set as default** in **Workflows**.
 
+## Increment 08 and migration `0008`
+
+<!-- DRAFT by platform_engineer. Table and column counts come from /root once 0008 is generated: PENDING-LEAD. -->
+
+`0008_increment_08` is additive: new tables, nullable columns or columns with defaults, and new indexes. It drops and renames nothing. Backfill runs in code, at start-up or lazily, never in SQL.
+
+- **Schema.** The expected additions, per the contract, are:
+  - `users`: first, last and preferred name, encrypted;
+  - `orders.group_root_order_id`;
+  - `carts.add_to_order_public_id`;
+  - the new table `customer_billing_profiles`;
+  - the payment booking source.
+
+  Final list and counts: PENDING-LEAD.
+- **Native upgrade.** Follow sections 2–5 without `--yes`, with the same backup, fence and `BACKUP-VERIFIED` steps as for increment 07.
+  - Release validation requires the SQL file and journal entry `0008_increment_08`.
+  - Never run the SQL by hand or mark it applied.
+  - If the migration is interrupted, follow [section 6](#6-recovery-if-an-upgrade-stops-mid-way).
+- **Docker Compose.** The image build requires the same SQL and journal entry.
+- **What stays the same after the upgrade:**
+  - existing orders keep their `RP-YYYY-NNNNNN` reference;
+  - existing users keep signing in, and their name parts are filled in the next time the profile is saved;
+  - active Stripe configurations stay active;
+  - API v1 responses stay backward compatible.
+- **After the upgrade:**
+  - **Stripe.** Open `/admin/payments/setup` and check the webhook section. For an invoice that was paid on Stripe but still shows "Issued", use **Check with Stripe now** on that invoice. PENDING-OWNER integrations_engineer: confirm the button name and location.
+  - **Go-live checklist.** Run [GO_LIVE_CHECKLIST.md](GO_LIVE_CHECKLIST.md) before taking live payments.
+
 ## 6. Recovery if an upgrade stops mid-way
 
 Never delete `/etc/readypackets/upgrade-state` or `/etc/nginx/readypackets-maintenance` blindly. Inspect `/etc/readypackets/upgrade-state` (`sudo cat /etc/readypackets/upgrade-state` — read as data, never `source` it):

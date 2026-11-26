@@ -287,6 +287,21 @@ This fix pack answers the owner's prompt 30 of 2026-11-26 ([session log](../sess
 - **Update prompt.** **Later** is per navigation, and nothing is applied automatically.
 - **Limits.** A real Stripe account, real mail, physical devices and screen readers were not verifiable here.
 
+## Increment 08: go-live checklist, order wizard, payment confirmation, add-on orders, billing profile, names, order numbers
+
+<!-- DRAFT by platform_engineer from the contract; PENDING-OWNER items are confirmed against commits before release. -->
+
+The owner requested this on 2026-11-26 (prompt 34). The contract is [INCREMENT_08_CONTRACT.md](../engineering/INCREMENT_08_CONTRACT.md), decisions D1–D8. Migration `0008_increment_08` is additive only.
+
+- **D1 Names.** `users` gains encrypted first, last and preferred name. The display name stays "First Last". Parts for older accounts are derived lazily. Greetings use the preferred name, else the first name. Port: `identity.users.namePartsInTx`. <!-- PENDING-OWNER identity_engineer: confirm against commits -->
+- **D2 Order numbers.** `buildReferenceStem` in `server/modules/orders/references.ts` builds `<prefix>-<C4>-<F3><L3>-<P6>`. `NNN` is allocated under a row lock and never reused. The stem is frozen at creation, and existing references are unchanged. <!-- PENDING-OWNER orders_engineer: confirm against commits -->
+- **D3 Order groups.** `orders.group_root_order_id` and `carts.add_to_order_public_id` support additions. An addition reuses the root's stem with the next number. A packet already in the group is refused with `PACKET_ALREADY_IN_PROJECT`. <!-- PENDING-OWNER orders_engineer, recovery_ops_engineer: confirm against commits -->
+- **D4 Billing profile.** The new module `billingProfile` stores one encrypted profile per user in `customer_billing_profiles`, validated by `shared/billingDetails.ts`. It is owner only and audited without field values. It is part of export and erasure. <!-- PENDING-OWNER compliance_engineer: confirm against commits -->
+- **D5 Payment confirmation.** Payments are booked from a signed webhook or a provider lookup, through one idempotent function. The booking source is recorded. Missing webhooks raise a de-duplicated alert. This replaces increment 07 decision 12. <!-- PENDING-OWNER integrations_engineer: confirm against commits -->
+- **D6 Wizard.** The customer order page opens on a stepper for the current phase, and the old tabs are under **Order details**. <!-- PENDING-OWNER audit_engineer: confirm against commits -->
+- **D7 Publish and tiers.** The designer has a persistent **Publish** button, and choosing a tier expands its deliverables. <!-- PENDING-OWNER ui_foundation_engineer: confirm against commits -->
+- **D8.** The go-live checklist is in `docs/operations/GO_LIVE_CHECKLIST.md`.
+
 ## Deployment profiles
 
 | Profile | Purpose | Session transport | Routing |

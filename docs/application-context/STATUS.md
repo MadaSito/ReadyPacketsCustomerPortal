@@ -1,6 +1,6 @@
 # ReadyPackets Portal — Status
 
-Last updated: 2026-11-26 (increment 07 merged to `main` as `c337492` through PR #16; fix pack 07.1 merged to `main` as `547a31d` through PR #19; fix pack 07.2 merged to `main` as `762ea41` through PR #21). Keep this file current; it is the honest state of the build,
+Last updated: 2026-11-26 (increment 07 merged to `main` as `c337492` through PR #16; fix pack 07.1 merged to `main` as `547a31d` through PR #19; fix pack 07.2 merged to `main` as `762ea41` through PR #21; increment 08 in progress on `feat/increment-08`). Keep this file current; it is the honest state of the build,
 not a certification. "Verified" below means the integrator ran the check and saw the result. Anything not
 listed under "Verified" has not been proven and must not be described as working in production.
 
@@ -381,6 +381,27 @@ Details are in `docs/session-logs/2026-11-22-session-03.md`.
   `bundle_scope_manifest` as a JSON string); a second "Start Phase I" was refused; Phase II was offered and
   not started; the pipeline switch was turned off afterwards. webhook.site is a request inspector, so this
   proves delivery and format, not the production receiver.
+
+## Increment 08 (in progress)
+
+<!-- DRAFT by platform_engineer. Rows move to "Implemented" only after the owner's commit and /root's verification. -->
+
+Owner's prompt 34 of 2026-11-26 ([session log](../session-logs/2026-11-26-session-02.md), [contract](../engineering/INCREMENT_08_CONTRACT.md)). Migration `0008_increment_08`, additive only.
+
+| Decision | What | Owner | State |
+| --- | --- | --- | --- |
+| D1 | First, last and preferred name | identity_engineer | in progress |
+| D2 | Order numbers `RP-<C4>-<F3><L3>-<P6>-<NNN>` | orders_engineer | in progress |
+| D3 | Add packets to an earlier order (order group) | orders_engineer, recovery_ops_engineer | in progress |
+| D4 | Saved billing profile; choice at checkout | compliance_engineer, recovery_ops_engineer, identity_engineer | in progress |
+| D5 | Payment booked by webhook or provider lookup; missing-webhook alert | integrations_engineer | in progress |
+| D6 | Customer order wizard | audit_engineer | in progress |
+| D7 | Workflow **Publish** button; tier expansion | ui_foundation_engineer | in progress |
+| D8 | Go-live checklist; documents | assurance_engineer, platform_engineer | in progress |
+
+### Verification for increment 08
+
+> **PLACEHOLDER — PENDING-LEAD (increment 08 verification).** Verified by the lead, peer-reported, not verified, and gates.
 
 ## Verification for increment 07.2
 
