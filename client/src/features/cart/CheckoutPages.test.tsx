@@ -14,48 +14,71 @@ import type { CartViewData } from "./CartPage";
 
 const mocks = vi.hoisted(() => ({
   cart: vi.fn(),
+  billingProfile: vi.fn(),
   checkout: vi.fn(),
   status: vi.fn(),
+  confirmCheckoutPayment: vi.fn(),
   restore: vi.fn(),
   startInvoiceCheckout: vi.fn(),
   policyMyStatus: vi.fn(),
   policyAccept: vi.fn(),
 }));
+const trpcMock = {
+  cart: {
+    pathKey: () => ["cart"],
+    get: { queryKey: () => ["cart"], queryOptions: (_input?: unknown, options?: object) => ({ ...options, queryKey: ["cart"], queryFn: mocks.cart }) },
+    badgeCount: { queryKey: () => ["badge"] },
+    checkoutStatus: { queryOptions: (input: unknown, options: object) => ({
+      ...options, queryKey: ["checkout", input], queryFn: () => mocks.status(input),
+    }) },
+    restoreCheckout: { mutationOptions: () => ({ mutationFn: (input: unknown) => mocks.restore(input) }) },
+  },
+  orders: {
+    pathKey: () => ["orders"],
+  },
+  billingProfile: {
+    get: {
+      queryKey: () => ["billingProfile.get"],
+      queryOptions: (_input?: unknown, options?: object) => ({
+        ...options,
+        queryKey: ["billingProfile.get"],
+        queryFn: mocks.billingProfile,
+      }),
+    },
+  },
+  payments: {
+    pathKey: () => ["payments"],
+    confirmCheckoutPayment: {
+      mutationOptions: () => ({ mutationFn: (input: unknown) => mocks.confirmCheckoutPayment(input) }),
+    },
+    startInvoiceCheckout: {
+      mutationOptions: () => ({ mutationFn: (input: unknown) => mocks.startInvoiceCheckout(input) }),
+    },
+  },
+  compliance: {
+    pathKey: () => ["compliance"],
+    invoices: {
+      pathKey: () => ["compliance.invoices"],
+    },
+    receipts: {
+      pathKey: () => ["compliance.receipts"],
+    },
+    policies: {
+      myStatus: {
+        queryKey: () => ["compliance.policies.myStatus"],
+        queryOptions: () => ({ queryKey: ["compliance.policies.myStatus"], queryFn: mocks.policyMyStatus }),
+      },
+      accept: {
+        mutationOptions: () => ({ mutationFn: (input: unknown) => mocks.policyAccept(input) }),
+      },
+    },
+  },
+};
+const trpcClientMock = { cart: { checkout: { mutate: mocks.checkout } } };
 vi.mock("@/lib/trpc", async (original) => ({
   ...await original<typeof transport>(),
-  useTRPC: () => ({
-    cart: {
-      get: { queryKey: () => ["cart"], queryOptions: () => ({ queryKey: ["cart"], queryFn: mocks.cart }) },
-      badgeCount: { queryKey: () => ["badge"] },
-      checkoutStatus: { queryOptions: (input: unknown, options: object) => ({
-        ...options, queryKey: ["checkout", input], queryFn: () => mocks.status(input),
-      }) },
-      restoreCheckout: { mutationOptions: () => ({ mutationFn: (input: unknown) => mocks.restore(input) }) },
-    },
-    payments: {
-      startInvoiceCheckout: {
-        mutationOptions: () => ({ mutationFn: (input: unknown) => mocks.startInvoiceCheckout(input) }),
-      },
-    },
-    compliance: {
-      invoices: {
-        pathKey: () => ["compliance.invoices"],
-      },
-      receipts: {
-        pathKey: () => ["compliance.receipts"],
-      },
-      policies: {
-        myStatus: {
-          queryKey: () => ["compliance.policies.myStatus"],
-          queryOptions: () => ({ queryKey: ["compliance.policies.myStatus"], queryFn: mocks.policyMyStatus }),
-        },
-        accept: {
-          mutationOptions: () => ({ mutationFn: (input: unknown) => mocks.policyAccept(input) }),
-        },
-      },
-    },
-  }),
-  useTRPCClient: () => ({ cart: { checkout: { mutate: mocks.checkout } } }),
+  useTRPC: () => trpcMock,
+  useTRPCClient: () => trpcClientMock,
 }));
 
 const id = (end: number) => `01J${"0".repeat(22)}${end}`;
@@ -106,8 +129,20 @@ beforeEach(() => {
   vi.resetAllMocks();
   redirectSpy = vi.spyOn(invoiceCheckoutNavigation, "redirectToHostedCheckout").mockImplementation(() => {});
   mocks.cart.mockResolvedValue(cart);
+  mocks.billingProfile.mockResolvedValue(null);
   mocks.checkout.mockResolvedValue(invoice);
   mocks.status.mockResolvedValue(pending);
+  mocks.confirmCheckoutPayment.mockResolvedValue({
+    state: "processing",
+    attemptPublicId: attemptId,
+    orderPublicId: orderId,
+    orderReference: "RP-SYNTHETIC",
+    invoicePublicId: invoiceId,
+    invoiceNumber: "INV-SYNTHETIC",
+    receiptPublicId: null,
+    bookingSource: null,
+    cooldownRemainingMs: 0,
+  });
   mocks.startInvoiceCheckout.mockResolvedValue({
     mode: "redirect",
     attemptPublicId: id(9),
@@ -161,7 +196,7 @@ pageA11y("/cart/checkout review", async () => {
 });
 pageA11y("/checkout/return pending confirmation", async () => {
   returned();
-  await screen.findByText("Waiting for payment confirmation");
+  await screen.findByText("Confirming your payment with the payment provider");
 });
 pageA11y("/checkout/return waived small total", async () => {
   mocks.status.mockResolvedValue({
@@ -195,7 +230,8 @@ it("places an invoice order with versioned policy evidence and profile link hint
   await user.click(screen.getByRole("button", { name: "Place order and receive invoice" }));
   await waitFor(() => expect(location.history?.at(-1)).toBe(`/checkout/return?cart=${cartId}`));
   expect(mocks.checkout.mock.calls[0]?.[0]).toEqual({
-    cartPublicId: cartId, expectedVersion: 3, projectName: cart.projectName, note: "", billing: cart.billing,
+    cartPublicId: cartId, expectedVersion: 3, projectName: cart.projectName, note: "",
+    billingSource: "custom", billing: cart.billing, saveAsBillingProfile: true, savedBillingVersion: 0,
     policyAcceptances: [{ versionPublicId: requiredPolicy.versionPublicId, contentHash: requiredPolicy.contentHash, signerName: "Synthetic Customer" }],
     idempotencyKey: expect.stringMatching(/^checkout:[a-f0-9-]{36}$/u),
   });
@@ -464,17 +500,57 @@ it("renders D5 small-total waive and block callouts and shows waived amount on C
   expect(screen.getByText("Amount waived")).toBeInTheDocument();
 });
 
-it("polls read-only until the server confirms payment, and does not perform a write on return", async () => {
+it("D5 + cart status: confirms redirect attempts via PaymentReturnConfirmation (?attempt=) and polls read-only for cart status (?cart=)", async () => {
+  // 1. `?attempt=` delegates to PaymentReturnConfirmation (`payments.confirmCheckoutPayment`) and removes cart recovery once paid
+  mocks.confirmCheckoutPayment
+    .mockResolvedValueOnce({
+      state: "processing",
+      attemptPublicId: attemptId,
+      orderPublicId: orderId,
+      orderReference: "RP-SYNTHETIC",
+      invoicePublicId: invoiceId,
+      invoiceNumber: "INV-SYNTHETIC",
+      receiptPublicId: null,
+      bookingSource: null,
+      cooldownRemainingMs: 0,
+    })
+    .mockResolvedValue({
+      state: "paid",
+      attemptPublicId: attemptId,
+      orderPublicId: orderId,
+      orderReference: "RP-SYNTHETIC",
+      invoicePublicId: invoiceId,
+      invoiceNumber: "INV-SYNTHETIC",
+      receiptPublicId: id(8),
+      bookingSource: "return_lookup",
+      cooldownRemainingMs: 0,
+    });
+  const attemptRender = returned();
+  expect(await screen.findByText("Confirming your payment with the payment provider")).toBeInTheDocument();
+  expect(await screen.findByRole("link", { name: "Review cart recovery" })).toHaveAttribute(
+    "href",
+    `/checkout/cancel?attempt=${attemptId}`,
+  );
+  expect(await screen.findByText("Payment received", {}, { timeout: 4500 })).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Continue to your order" })).toHaveAttribute("href", `/orders/${orderId}`);
+  expect(screen.queryByRole("link", { name: "Review cart recovery" })).not.toBeInTheDocument();
+  expect(mocks.confirmCheckoutPayment).toHaveBeenNthCalledWith(1, { attemptPublicId: attemptId });
+  expect(mocks.confirmCheckoutPayment).toHaveBeenNthCalledWith(2, { attemptPublicId: attemptId });
+  expect(mocks.restore).not.toHaveBeenCalled();
+  attemptRender.unmount();
+
+  // 2. `?cart=` polls read-only `cart.checkoutStatus` until settled
   mocks.status.mockResolvedValueOnce(pending).mockResolvedValue({
     ...pending, confirmationState: "paid", attemptStatus: "paid", invoiceStatus: "paid", balanceDueMinor: 0, canRestoreToCart: false,
   });
-  returned();
+  const cartRender = returned(`?cart=${cartId}`);
   expect(await screen.findByText("Waiting for payment confirmation")).toBeInTheDocument();
   expect(await screen.findByText("Payment confirmed", {}, { timeout: 4500 })).toBeInTheDocument();
-  expect(mocks.status).toHaveBeenNthCalledWith(1, { attemptPublicId: attemptId });
-  expect(mocks.status).toHaveBeenNthCalledWith(2, { attemptPublicId: attemptId });
+  expect(mocks.status).toHaveBeenNthCalledWith(1, { cartPublicId: cartId });
+  expect(mocks.status).toHaveBeenNthCalledWith(2, { cartPublicId: cartId });
   expect(mocks.restore).not.toHaveBeenCalled();
-}, 10_000);
+  cartRender.unmount();
+}, 12_000);
 
 it("shows invoice instructions without implying payment and links to the invoice", async () => {
   mocks.status.mockResolvedValue({ ...pending, confirmationState: "invoice_issued", paymentMode: "invoice", canRestoreToCart: false });
@@ -904,3 +980,168 @@ it("Fix pack 07.2: distinguishes waiting-for-provider (?attempt= redirected) fro
   expect(screen.getByRole("link", { name: "View invoice" })).toHaveAttribute("href", `/invoices/${invoiceId}`);
   offlineCancelView.unmount();
 });
+
+pageA11y("/cart/checkout with saved billing profile and D3 project target", async () => {
+  const rootOrderId = id(5);
+  mocks.cart.mockResolvedValue({
+    ...cart,
+    pendingPolicies: [],
+    projectName: "Ice Queen",
+    addToOrder: {
+      orderPublicId: rootOrderId,
+      rootPublicId: rootOrderId,
+      rootReference: "RP-2026-00001",
+      projectName: "Ice Queen",
+      currency: "USD",
+      packetNumbers: [1],
+      targetAvailable: true,
+      currencyMismatch: false,
+      conflictingItemPublicIds: [],
+    },
+  });
+  mocks.billingProfile.mockResolvedValue({
+    publicId: id(6),
+    version: 2,
+    updatedAt: date,
+    details: {
+      fullName: "Zeus Greene",
+      company: "ReadyPackets Synthetic LLC",
+      email: "zeus@example.test",
+      country: "US",
+      region: "NY",
+      addressLine1: "42 Olympus Way",
+      addressLine2: "Suite 8",
+      city: "New York",
+      postalCode: "10001",
+      taxId: "",
+    },
+  });
+  review();
+  await screen.findByTestId("checkout-adding-to-project");
+});
+
+it("Increment 08 D3 + D4 + D6: supports saved vs custom billing choice, save-as-billing-information toggle, SAVED_BILLING_CHANGED refresh, D3 project summary lock, and Continue to your order handoff", async () => {
+  const user = userEvent.setup();
+  const rootOrderId = id(5);
+  const savedProfileId = id(6);
+  const savedDetails = {
+    fullName: "Zeus Greene",
+    company: "ReadyPackets Synthetic LLC",
+    email: "zeus@example.test",
+    country: "US",
+    region: "NY",
+    addressLine1: "42 Olympus Way",
+    addressLine2: "",
+    city: "New York",
+    postalCode: "10001",
+    taxId: "",
+  };
+
+  mocks.cart.mockResolvedValue({
+    ...cart,
+    pendingPolicies: [],
+    projectName: "Ice Queen",
+    addToOrder: {
+      orderPublicId: rootOrderId,
+      rootPublicId: rootOrderId,
+      rootReference: "RP-2026-00001",
+      projectName: "Ice Queen",
+      currency: "USD",
+      packetNumbers: [1],
+      targetAvailable: true,
+      currencyMismatch: false,
+      conflictingItemPublicIds: [],
+    },
+  });
+  mocks.billingProfile.mockResolvedValue({
+    publicId: savedProfileId,
+    version: 2,
+    updatedAt: date,
+    details: savedDetails,
+  });
+
+  // 1. Saved billing profile selected by default + D3 Adding to project summary & locked project details
+  const savedRender = review();
+  expect(await screen.findByTestId("checkout-adding-to-project")).toHaveTextContent(
+    "Adding to project Ice Queen (RP-2026-00001)",
+  );
+  expect(screen.getByTestId("checkout-target-project-lock")).toHaveTextContent("Adding to project Ice Queen");
+  expect(screen.getByTestId("checkout-billing-section")).toHaveAttribute("data-has-saved-profile", "true");
+  expect(screen.getByTestId("checkout-billing-section")).toHaveAttribute("data-billing-mode", "saved");
+  expect(screen.getByTestId("checkout-billing-choice-saved")).toBeChecked();
+  expect(screen.getByTestId("checkout-saved-billing-summary")).toHaveTextContent("Zeus Greene");
+  expect(screen.queryByTestId("checkout-custom-billing-fields")).not.toBeInTheDocument();
+
+  // SAVED_BILLING_CHANGED conflict refetches billingProfile.get + cart.get and surfaces alert
+  mocks.checkout.mockRejectedValueOnce(
+    Object.assign(new Error("Your saved billing information changed in another window."), {
+      data: {
+        safe: {
+          domainCode: "CONFLICT",
+          reasonCode: "SAVED_BILLING_CHANGED",
+          safeMessage: "Your saved billing information changed in another window.",
+        },
+      },
+    }),
+  );
+  mocks.billingProfile.mockResolvedValue({
+    publicId: savedProfileId,
+    version: 3,
+    updatedAt: date,
+    details: savedDetails,
+  });
+  await user.click(screen.getByRole("button", { name: "Place order and receive invoice" }));
+  expect(await screen.findByText(/changed in another window/i)).toBeInTheDocument();
+  expect(mocks.checkout.mock.calls[0]?.[0]).toEqual({
+    cartPublicId: cartId,
+    expectedVersion: 3,
+    projectName: "Ice Queen",
+    note: "",
+    billingSource: "saved",
+    savedBillingPublicId: savedProfileId,
+    savedBillingVersion: 2,
+    policyAcceptances: [],
+    idempotencyKey: expect.stringMatching(/^checkout:[a-f0-9-]{36}$/u),
+  });
+
+  // Switch to custom billing + check "Save as my billing information" -> submits custom details with CAS version 3
+  mocks.checkout.mockResolvedValueOnce(invoice);
+  await user.click(screen.getByTestId("checkout-billing-choice-custom"));
+  expect(screen.getByTestId("checkout-billing-section")).toHaveAttribute("data-billing-mode", "custom");
+  const saveCheckbox = screen.getByTestId("checkout-save-billing-checkbox");
+  expect(saveCheckbox).not.toBeChecked();
+  await user.click(saveCheckbox);
+  expect(saveCheckbox).toBeChecked();
+  await user.click(screen.getByRole("button", { name: "Place order and receive invoice" }));
+  await waitFor(() => expect(savedRender.location.history?.at(-1)).toBe(`/checkout/return?cart=${cartId}`));
+  expect(mocks.checkout.mock.calls[1]?.[0]).toEqual({
+    cartPublicId: cartId,
+    expectedVersion: 3,
+    projectName: "Ice Queen",
+    note: "",
+    billingSource: "custom",
+    billing: cart.billing,
+    saveAsBillingProfile: true,
+    savedBillingPublicId: savedProfileId,
+    savedBillingVersion: 3,
+    policyAcceptances: [],
+    idempotencyKey: expect.stringMatching(/^checkout:[a-f0-9-]{36}$/u),
+  });
+  savedRender.unmount();
+
+  // 2. D6 handoff on settled `/checkout/return`: renders primary "Continue to your order" link to `/orders/:orderPublicId`
+  mocks.status.mockResolvedValueOnce({
+    ...pending,
+    confirmationState: "paid",
+    attemptStatus: "paid",
+    invoiceStatus: "paid",
+    balanceDueMinor: 0,
+    canRestoreToCart: false,
+  });
+  const paidReturn = returned(`?cart=${cartId}`);
+  const continueLink = await screen.findByRole("link", { name: "Continue to your order" });
+  expect(continueLink).toHaveAttribute("href", `/orders/${orderId}`);
+  expect(continueLink.className).toContain("bg-action");
+  paidReturn.unmount();
+}, 15_000);
+

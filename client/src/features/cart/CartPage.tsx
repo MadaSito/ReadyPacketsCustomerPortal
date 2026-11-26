@@ -41,9 +41,22 @@ export const STALE_MESSAGE = "Your cart changed in another tab or window. We ref
 const SUMMARY_FALLBACK_FOCUS_ID = "cart-summary-focus";
 const EMPTY_CART_FALLBACK_FOCUS_ID = "cart-empty-focus";
 
-/** Checkout is offered only for a non-empty, single-currency cart whose items are all still available. */
-export function canCheckout(cart: Pick<CartViewData, "items" | "hasUnavailableItems" | "mixedCurrency">): boolean {
-  return cart.items.length > 0 && !cart.hasUnavailableItems && !cart.mixedCurrency;
+/**
+ * Checkout is offered only for a non-empty, single-currency cart whose items are all still available
+ * and (when adding to an existing project under D3) whose target project is available without duplicate packets.
+ */
+export function canCheckout(
+  cart: Pick<CartViewData, "items" | "hasUnavailableItems" | "mixedCurrency"> & {
+    addToOrder?: CartViewData["addToOrder"];
+  },
+): boolean {
+  if (cart.items.length === 0 || cart.hasUnavailableItems || cart.mixedCurrency) return false;
+  if (cart.items.some((line) => line.alreadyInTargetProject)) return false;
+  if (cart.addToOrder) {
+    if (!cart.addToOrder.targetAvailable || cart.addToOrder.currencyMismatch) return false;
+    if (cart.addToOrder.conflictingItemPublicIds.length > 0) return false;
+  }
+  return true;
 }
 
 function money(amountMinor: number, currency: string | null) {
@@ -102,6 +115,7 @@ function CustomerCartPage() {
   const clear = useMutation(trpc.cart.clear.mutationOptions());
   const add = useMutation(trpc.cart.addItems.mutationOptions());
   const save = useMutation(trpc.cart.saveDraftDetails.mutationOptions());
+  const setTarget = useMutation(trpc.cart.setTarget.mutationOptions());
   const applyPromo = useMutation(trpc.cart.applyCode.mutationOptions());
   const removePromo = useMutation(trpc.cart.removeCode.mutationOptions());
   const acceptUpsell = useMutation(trpc.cart.upsell.accept.mutationOptions());
@@ -113,6 +127,7 @@ function CustomerCartPage() {
     clear.isPending ||
     add.isPending ||
     save.isPending ||
+    setTarget.isPending ||
     applyPromo.isPending ||
     removePromo.isPending ||
     acceptUpsell.isPending ||
@@ -187,6 +202,12 @@ function CustomerCartPage() {
     [catalog.data],
   );
 
+  const addableProducts = useMemo(() => {
+    const taken = new Set(cart?.addToOrder?.packetNumbers ?? []);
+    if (taken.size === 0) return products;
+    return products.filter((p) => p.packetNumber === null || !taken.has(p.packetNumber));
+  }, [products, cart?.addToOrder?.packetNumbers]);
+
   const showUpsells = Boolean(
     cart && cart.items.length > 0 && !cart.hasUnavailableItems && !cart.mixedCurrency && cart.upsells.length > 0,
   );
@@ -209,6 +230,56 @@ function CustomerCartPage() {
       ) : (
         <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(18rem,22rem)]">
           <div className="flex min-w-0 flex-col gap-6">
+            {cart.addToOrder ? (
+              <div data-testid="cart-adding-to-project">
+                <Callout
+                  tone={
+                    !cart.addToOrder.targetAvailable ||
+                    cart.addToOrder.currencyMismatch ||
+                    cart.addToOrder.conflictingItemPublicIds.length > 0
+                      ? "warning"
+                      : "info"
+                  }
+                  title={
+                    cart.addToOrder.projectName && cart.addToOrder.rootReference
+                      ? `Adding to project ${cart.addToOrder.projectName} (${cart.addToOrder.rootReference})`
+                      : "Target project unavailable"
+                  }
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <p className="min-w-0 break-words">
+                      {!cart.addToOrder.targetAvailable
+                        ? cart.addToOrder.currencyMismatch
+                          ? "Items in your cart use a different currency than this project. Remove mismatched items or start a separate project."
+                          : "Packets can no longer be added to this project. Start a separate project to continue."
+                        : cart.addToOrder.conflictingItemPublicIds.length > 0
+                          ? "One or more packets in your cart are already part of this project. Remove the marked items or start a separate project."
+                          : "New packets and add-ons in this checkout will be linked to your existing project."}
+                    </p>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      data-testid="cart-clear-target-order"
+                      disabled={busy}
+                      loading={setTarget.isPending}
+                      onClick={() =>
+                        void run(
+                          () =>
+                            setTarget.mutateAsync({
+                              ...(cart.cartPublicId ? { expectedVersion: cart.version } : {}),
+                              addToOrderPublicId: null,
+                            }),
+                          "Switched cart to start a separate project.",
+                        )
+                      }
+                    >
+                      Start a separate project
+                    </Button>
+                  </div>
+                </Callout>
+              </div>
+            ) : null}
             {cart.items.length === 0 ? (
               <div id={EMPTY_CART_FALLBACK_FOCUS_ID} tabIndex={-1} className="outline-none">
                 <EmptyState
@@ -287,7 +358,7 @@ function CustomerCartPage() {
             ) : null}
 
             <AddItemCard
-              products={products}
+              products={addableProducts}
               loading={catalog.isPending}
               failed={catalog.isError}
               busy={busy}
@@ -295,9 +366,10 @@ function CustomerCartPage() {
             />
 
             <DraftDetailsCard
-              key={`${cart.cartPublicId ?? "none"}:${cart.version}`}
+              key={`${cart.cartPublicId ?? "none"}:${cart.version}:${cart.addToOrder?.rootPublicId ?? "standalone"}`}
               projectName={cart.projectName}
               note={cart.note}
+              addToOrder={cart.addToOrder ?? null}
               busy={busy}
               disabled={cart.cartPublicId === null}
               onSave={(projectName, note) =>
@@ -367,6 +439,7 @@ function CartLineRow({
           {line.packetNumber !== null ? <span>Packet {line.packetNumber}</span> : null}
           {line.timeline ? <span>{line.timeline}</span> : null}
           {!line.available ? <Badge tone="warning">No longer available</Badge> : null}
+          {line.alreadyInTargetProject ? <Badge tone="warning">Already in project</Badge> : null}
         </div>
         <div className="mt-3 flex flex-wrap items-end gap-3">
           {line.packetNumber !== null && tierOptions.length > 1 ? (
@@ -466,31 +539,45 @@ function AddItemCard({
 function DraftDetailsCard({
   projectName,
   note,
+  addToOrder,
   busy,
   disabled,
   onSave,
 }: {
   projectName: string;
   note: string;
+  addToOrder: CartViewData["addToOrder"];
   busy: boolean;
   disabled: boolean;
   onSave: (projectName: string, note: string) => void;
 }) {
-  const [name, setName] = useState(projectName);
+  const lockedProjectName =
+    addToOrder && addToOrder.targetAvailable && addToOrder.projectName ? addToOrder.projectName : null;
+  const [name, setName] = useState(lockedProjectName ?? projectName);
   const [text, setText] = useState(note);
-  const changed = name !== projectName || text !== note;
+  const changed = (lockedProjectName === null && name !== projectName) || text !== note;
   return (
     <Card title="Project details" description="Saved with your cart and used at checkout.">
       <form
         className="flex flex-col gap-4"
         onSubmit={(event) => {
           event.preventDefault();
-          if (changed) onSave(name.trim(), text);
+          if (changed) onSave((lockedProjectName ?? name).trim(), text);
         }}
       >
-        <Field label="Project name">
-          <Input value={name} maxLength={160} onChange={(event) => setName(event.target.value)} disabled={busy || disabled} autoComplete="off" />
-        </Field>
+        {lockedProjectName ? (
+          <div className="rounded-lg border border-line bg-surface-sunken px-3.5 py-2.5 text-sm">
+            <p className="font-medium text-ink break-words">
+              Adding to project {lockedProjectName}
+              {addToOrder?.rootReference ? ` (${addToOrder.rootReference})` : ""}
+            </p>
+            <p className="mt-0.5 text-xs text-muted">Project name is inherited from your existing project.</p>
+          </div>
+        ) : (
+          <Field label="Project name">
+            <Input value={name} maxLength={160} onChange={(event) => setName(event.target.value)} disabled={busy || disabled} autoComplete="off" />
+          </Field>
+        )}
         <Field label="Note for the ReadyPackets team" hint="Optional. Do not include passwords or payment card details.">
           <Textarea value={text} maxLength={4000} rows={4} onChange={(event) => setText(event.target.value)} disabled={busy || disabled} />
         </Field>
@@ -616,6 +703,18 @@ function SummaryCard({
         {cart.mixedCurrency ? (
           <Callout tone="warning" className="mt-4">
             Your cart has items in more than one currency. Keep items in one currency to check out.
+          </Callout>
+        ) : null}
+        {cart.addToOrder && !cart.addToOrder.targetAvailable ? (
+          <Callout tone="warning" className="mt-4">
+            {cart.addToOrder.currencyMismatch
+              ? "Your cart currency does not match the target project. Remove mismatched items or start a separate project."
+              : "Packets can no longer be added to the selected project. Start a separate project to check out."}
+          </Callout>
+        ) : null}
+        {cart.addToOrder && cart.addToOrder.conflictingItemPublicIds.length > 0 ? (
+          <Callout tone="warning" className="mt-4">
+            Remove packets that are already part of {cart.addToOrder.projectName ?? "this project"} before checking out.
           </Callout>
         ) : null}
         <div className="mt-4">

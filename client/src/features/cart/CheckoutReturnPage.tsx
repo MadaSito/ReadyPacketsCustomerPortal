@@ -5,6 +5,7 @@ import { useRef, useState, type ReactNode } from "react";
 import { Link, useSearch } from "wouter";
 import { StaffOrderHandoff } from "@/app/portal";
 import { InvoiceOnlinePayAction } from "@/features/compliance/customer/InvoicePages";
+import { PaymentReturnConfirmation } from "@/features/payments/PaymentReturnConfirmation";
 import { useTRPC } from "@/lib/trpc";
 import { Button, Callout, Card, EmptyState, ErrorState, Money, PageHeader, Skeleton } from "@/ui";
 import { useCartViewerGate } from "./viewerGate";
@@ -150,6 +151,15 @@ function CheckoutResult({
                 <Link href="/support">Contact support</Link>
               </Button>
             </>
+          ) : data.confirmationState === "paid" || data.confirmationState === "no_payment_due" ? (
+            <>
+              <Button asChild variant="primary">
+                <Link href={`/orders/${encodeURIComponent(data.orderPublicId)}`}>Continue to your order</Link>
+              </Button>
+              <Button asChild variant="secondary">
+                <Link href={`/invoices/${encodeURIComponent(data.invoicePublicId)}`}>View invoice</Link>
+              </Button>
+            </>
           ) : (
             <>
               <Button asChild variant="secondary">
@@ -204,6 +214,25 @@ function CheckoutStatusLoader({ target, cancelRoute, renderActions }: {
   </div>} />;
 }
 
+function AttemptReturnHandoff({ attemptPublicId }: { attemptPublicId: string }) {
+  const [paid, setPaid] = useState(false);
+  return (
+    <PaymentReturnConfirmation
+      attemptPublicId={attemptPublicId}
+      onPaid={() => setPaid(true)}
+      extraActions={
+        paid ? null : (
+          <Button asChild variant="secondary">
+            <Link href={`/checkout/cancel?attempt=${encodeURIComponent(attemptPublicId)}`}>
+              Review cart recovery
+            </Link>
+          </Button>
+        )
+      }
+    />
+  );
+}
+
 export function CheckoutStatusPage({ cancelRoute = false, renderActions }: {
   cancelRoute?: boolean;
   renderActions?: ((data: CheckoutStatus, target: CheckoutTarget, onChanged: () => void) => ReactNode) | undefined;
@@ -221,9 +250,16 @@ export function CheckoutStatusPage({ cancelRoute = false, renderActions }: {
     <PageHeader title={cancelRoute ? "Checkout recovery" : "Checkout status"}
       description={cancelRoute ? "Check the current status before returning items to your cart." : "Follow your order and invoice after checkout."}
       actions={<Button asChild variant="secondary"><Link href="/cart">Back to cart</Link></Button>} />
-    {target ? <CheckoutStatusLoader target={target} cancelRoute={cancelRoute} renderActions={renderActions} /> :
+    {target ? (
+      !cancelRoute && "attemptPublicId" in target ? (
+        <AttemptReturnHandoff key={target.attemptPublicId} attemptPublicId={target.attemptPublicId} />
+      ) : (
+        <CheckoutStatusLoader target={target} cancelRoute={cancelRoute} renderActions={renderActions} />
+      )
+    ) : (
       <EmptyState title="Checkout reference unavailable" description="Open your orders or invoices to check the status of a recent checkout."
-        action={<Button asChild><Link href="/orders">View orders</Link></Button>} />}
+        action={<Button asChild><Link href="/orders">View orders</Link></Button>} />
+    )}
   </div>;
 }
 
