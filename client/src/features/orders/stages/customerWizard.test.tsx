@@ -23,6 +23,9 @@ vi.mock("@/lib/trpc", async (original) => {
       get: (_t, prop: string) => {
         const key = path.join(".");
         if (prop === "queryOptions") return (input?: unknown) => ({ queryKey: [key, input ?? null], queryFn: () => call(key, input), retry: false });
+        if (prop === "infiniteQueryOptions") return (input?: unknown) => ({
+          queryKey: [key, input ?? null], queryFn: () => call(key, input), initialPageParam: null, getNextPageParam: () => null, retry: false,
+        });
         if (prop === "mutationOptions") return () => ({ mutationFn: (input: unknown) => call(key, input) });
         if (prop === "queryKey" || prop === "pathKey") return () => [key];
         return node([...path, prop]);
@@ -48,6 +51,13 @@ vi.mock("../../files/PhaseFiles", () => ({
   PhaseTeamFiles: (p: { stageKey: string }) => <p>{`team ${p.stageKey}`}</p>,
 }));
 vi.mock("../../files/archives/ArchiveAction", () => ({ PhaseArchiveAction: (p: { stageKey: string }) => <p>{`zip ${p.stageKey}`}</p> }));
+vi.mock("../../files/FileUploadPanel", () => ({
+  FileUploadPanel: (p: { policy: { extensions: string[] }; slot?: { key: string }; audio?: unknown }) => (
+    <p>{`file panel ${p.slot?.key ?? "order"} ${p.policy.extensions.join(",")}${p.audio ? " audio" : ""}`}</p>
+  ),
+}));
+vi.mock("../../compliance/customer/OrderIntakeTab", () => ({ default: () => <p>intake questionnaires</p> }));
+vi.mock("../WorkflowRulesPanel", () => ({ AcknowledgementDialog: () => <div role="dialog" aria-label="Acknowledge" /> }));
 
 const ORDER = "01JTESTORDER00000000000001";
 const actions = { uploadDocuments: true, answerQuestions: true, recordAudio: false, uploadAudio: false, teamFileReview: false };
@@ -65,7 +75,13 @@ const ws = (patch: Partial<WizardWorkspace> = {}): WizardWorkspace => ({
 });
 const safeError = (reasonCode: string) => Object.assign(new Error(reasonCode), { data: { safe: { reasonCode, safeMessage: "Server says no.", domainCode: "CONFLICT", requestId: "r" } } });
 
-beforeEach(() => { for (const key of Object.keys(handlers)) delete handlers[key]; uploadPending.clear(); });
+beforeEach(() => {
+  for (const key of Object.keys(handlers)) delete handlers[key];
+  uploadPending.clear();
+  // What the steps read before choosing where to resume: no uploads yet, no questions.
+  handlers["files.list"] = () => ({ items: [], nextCursor: null });
+  handlers["orders.questions.customerList"] = () => ({ canAnswer: true, questions: [] });
+});
 
 describe("CustomerPhaseWizard", () => {
   it("mounts the enabled panels for the current phase with the right props and the phase ZIP", async () => {
@@ -82,19 +98,27 @@ describe("CustomerPhaseWizard", () => {
     handlers["orders.stages.workspace"] = () => ws();
     handlers["orders.stages.next"] = (input) => { seen.push(input); return { version: 13, currentStageKey: "review", progressPercent: 50 }; };
     renderUi(<CustomerPhaseWizard orderId={ORDER} />);
-    await userEvent.setup().click(await screen.findByRole("button", { name: "Next" }));
+    const user = userEvent.setup();
+    // Resumes on the documents step (questions have nothing required); Next only moves to the review step.
+    expect(await screen.findByRole("heading", { name: "Step 2 of 3: Upload documents" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Next" }));
+    expect(seen).toEqual([]);
+    await user.click(screen.getByRole("button", { name: "Finish this phase" }));
     await waitFor(() => expect(seen).toEqual([{ orderId: ORDER, stageKey: "intake", expectedVersion: 12 }]));
   });
 
-  it("a refused Next shows the customer message for the reason code and reads the workspace again", async () => {
+  it("a refused Finish shows the customer message for the reason code and reads the workspace again", async () => {
     let reads = 0;
     handlers["orders.stages.workspace"] = () => { reads += 1; return ws(); };
     handlers["orders.stages.next"] = () => { throw safeError("QUESTIONS_UNANSWERED"); };
     renderUi(<CustomerPhaseWizard orderId={ORDER} />);
-    await userEvent.setup().click(await screen.findByRole("button", { name: "Next" }));
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Next" }));
+    await user.click(screen.getByRole("button", { name: "Finish this phase" }));
     expect(await screen.findByText("Please answer every required question in this phase first.")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Please check the following" })).toHaveFocus();
     handlers["orders.stages.next"] = () => { throw safeError("STALE_VERSION"); };
-    await userEvent.setup().click(screen.getByRole("button", { name: "Next" }));
+    await user.click(screen.getByRole("button", { name: "Finish this phase" }));
     expect(await screen.findByText(/This order changed in the meantime/)).toBeInTheDocument();
     await waitFor(() => expect(reads).toBeGreaterThan(1));
   });
@@ -105,41 +129,63 @@ describe("CustomerPhaseWizard", () => {
     expect(await screen.findByText("Legacy checklist")).toBeInTheDocument();
   });
 
-  it("blocks Next while a file is selected but not uploaded, and focuses the reason", async () => {
-    const seen: unknown[] = [];
+  it("Next waits while a file is selected but not uploaded and says why next to the button", async () => {
     handlers["orders.stages.workspace"] = () => ws();
-    handlers["orders.stages.next"] = (input) => { seen.push(input); return { version: 13 }; };
     renderUi(<CustomerPhaseWizard orderId={ORDER} />);
     const next = await screen.findByRole("button", { name: "Next" });
     act(() => uploadPending.get("intake:document")?.(1));
-    await userEvent.setup().click(next);
-    const reason = screen.getByText("1 file is selected but not uploaded yet. Upload it or clear the selection.");
-    await waitFor(() => expect(reason.closest("[tabindex='-1']")).toHaveFocus());
-    expect(next).toBeEnabled();
-    expect(seen).toEqual([]);
+    expect(next).toBeDisabled();
+    expect(next).toHaveAccessibleDescription("1 file is selected but not uploaded yet. Upload it or clear the selection.");
     act(() => uploadPending.get("intake:document")?.(0));
+    expect(next).toBeEnabled();
     expect(screen.queryByText(/is selected but not uploaded/)).toBeNull();
-    await userEvent.setup().click(next);
-    await waitFor(() => expect(seen).toHaveLength(1));
   });
 
-  it("does not continue with an unanswered required question: lists it and focuses the first", async () => {
-    const seen: unknown[] = [];
+  it("resumes on the questions step while a required question is unanswered; files already uploaded count", async () => {
     handlers["orders.stages.workspace"] = () => ws();
+    handlers["files.list"] = () => ({ nextCursor: null, items: [
+      { visibility: "customer_visible", deletedAt: null, supersededAt: null, category: "supporting", contentType: "application/pdf" },
+    ] });
     handlers["orders.questions.customerList"] = () => ({ canAnswer: true, questions: [
       { questionId: "q1", prompt: "Your date of birth?", required: true, askedAt: new Date(), latestAnswer: null },
       { questionId: "q2", prompt: "Anything else?", required: false, askedAt: new Date(), latestAnswer: null },
     ] });
-    handlers["orders.stages.next"] = (input) => { seen.push(input); return { version: 13 }; };
-    const view = renderUi(<CustomerPhaseWizard orderId={ORDER} />);
-    const next = await screen.findByRole("button", { name: "Next" });
-    await waitFor(() => expect(view.queryClient.getQueryData(["orders.questions.customerList", { orderId: ORDER, stageKey: "intake" }])).toBeDefined());
-    await userEvent.setup().click(next);
-    expect(await screen.findByText("Answer the required questions first")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Your date of birth?" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Anything else?" })).toBeNull();
-    await waitFor(() => expect(document.querySelector("[data-question-id='q1']")).toHaveFocus());
-    expect(seen).toEqual([]);
+    renderUi(<CustomerPhaseWizard orderId={ORDER} />);
+    expect(await screen.findByRole("heading", { name: "Step 1 of 3: Questions" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Next" })).toHaveAccessibleDescription("Answer the required question to continue.");
+    expect(screen.getByText("1 file uploaded")).toBeInTheDocument();
+  });
+
+  it("a derived order offers the allowed uploads, then Finish makes the one forward status change", async () => {
+    const seen: unknown[] = [];
+    handlers["orders.stages.workspace"] = () => ws({ derived: true, workflowFormat: 2, stages: [stage({ canNext: false, actions: { ...actions, answerQuestions: false, uploadDocuments: false } })] });
+    handlers["orders.get"] = () => ({ statusKind: "active", version: 3, transitions: [
+      { to: "in_review", label: "In review", actionLabel: "Send for review", requiresNote: false, destructive: false },
+      { to: "canceled", label: "Canceled", actionLabel: "Cancel order", requiresNote: true, destructive: true },
+    ] });
+    handlers["orders.requirements.forOrder"] = () => ({ status: { key: "submitted" }, acknowledgements: [], uploads: [] });
+    handlers["files.list"] = () => ({ items: [], nextCursor: null, canUpload: true, uploadSlots: null, audio: { enabled: false, maxMinutes: 10 },
+      uploadPolicy: { extensions: ["pdf", "png", "mp3", "exe"], maxBytes: 1000 } });
+    handlers["compliance.intake.listForOrder"] = () => ({ items: [], lockState: "none" });
+    handlers["orders.transition"] = (input) => { seen.push(input); return { version: 4 }; };
+    renderUi(<CustomerPhaseWizard orderId={ORDER} />);
+    expect(await screen.findByRole("heading", { name: "Step 1 of 2: Upload documents" })).toBeInTheDocument();
+    expect(screen.getByText("file panel order pdf,png")).toBeInTheDocument();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Next" }));
+    await user.click(screen.getByRole("button", { name: "Send for review" }));
+    await waitFor(() => expect(seen).toEqual([{ orderId: ORDER, expectedVersion: 3, toStatus: "in_review" }]));
+  });
+
+  it("a derived order with nothing to do shows one waiting screen, never a dead end", async () => {
+    handlers["orders.stages.workspace"] = () => ws({ derived: true, workflowFormat: 1, stages: [stage({ canNext: false, actions: { ...actions, answerQuestions: false, uploadDocuments: false } })] });
+    handlers["orders.get"] = () => ({ statusKind: "active", version: 3, transitions: [] });
+    handlers["orders.requirements.forOrder"] = () => ({ status: { key: "submitted" }, acknowledgements: [], uploads: [] });
+    handlers["files.list"] = () => ({ items: [], nextCursor: null, canUpload: false, uploadSlots: null, audio: null, uploadPolicy: null });
+    handlers["compliance.intake.listForOrder"] = () => ({ items: [], lockState: "none" });
+    renderUi(<CustomerPhaseWizard orderId={ORDER} />);
+    expect(await screen.findByRole("heading", { name: "We are working on this phase" })).toBeInTheDocument();
+    expect(screen.queryByText("There is nothing to upload or answer in this phase.")).toBeNull();
   });
 
   it("a phase waiting for payment says so and links to the payable invoice; a team phase says nothing is needed", async () => {
@@ -150,7 +196,7 @@ describe("CustomerPhaseWizard", () => {
     ] });
     const view = renderUi(<CustomerPhaseWizard orderId={ORDER} />);
     expect(await screen.findByText("This step completes when your payment is confirmed.")).toBeInTheDocument();
-    expect(await screen.findByRole("link", { name: "Pay invoice INV-2" })).toHaveAttribute("href", "/invoices/inv_open");
+    expect(await screen.findByRole("link", { name: "Pay now (invoice INV-2)" })).toHaveAttribute("href", "/invoices/inv_open");
     expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
     view.unmount();
     handlers["compliance.invoices.listForOrder"] = () => ({ items: [] });
