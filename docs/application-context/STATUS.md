@@ -382,26 +382,86 @@ Details are in `docs/session-logs/2026-11-22-session-03.md`.
   not started; the pipeline switch was turned off afterwards. webhook.site is a request inspector, so this
   proves delivery and format, not the production receiver.
 
-## Increment 08 (in progress)
-
-<!-- Rows move to "Implemented" only after /root's verification. -->
+## Increment 08
 
 Owner's prompt 34 of 2026-11-26 ([session log](../session-logs/2026-11-26-session-02.md), [contract](../engineering/INCREMENT_08_CONTRACT.md)). Migration `0008_increment_08`, additive only.
 
 | Decision | What | Owner | State |
 | --- | --- | --- | --- |
-| D1 | First, last and preferred name | identity_engineer | committed (8d73893, a6cc951, 1f96d68); awaiting lead verification |
-| D2 | Order numbers `RP-<C4>-<F3><L3>-<P6>-<NNN>` | orders_engineer | committed (acdd2ac); awaiting lead verification |
-| D3 | Add packets to an earlier order (order group) | orders_engineer, recovery_ops_engineer | committed (acdd2ac, 35df3ed, 88a3e90, b332d1b, 331a3e4, 3f8bcf3); awaiting lead verification |
-| D4 | Saved billing profile; choice at checkout | compliance_engineer, recovery_ops_engineer, identity_engineer | committed (faab6fe, dfcc89a, 8d73893, 35df3ed, 331a3e4); awaiting lead verification |
-| D5 | Payment booked by webhook or provider lookup; missing-webhook alert | integrations_engineer | committed (4331010, b4962ee, 07883a2, 62e0ddc, 4c5a1a3); awaiting lead verification |
-| D6 | Customer order wizard | audit_engineer | committed (f12afdc, a2450b9, 4d0914f); awaiting lead verification |
-| D7 | Workflow **Publish** button; tier expansion | ui_foundation_engineer | committed (09654b4, b332d1b); awaiting lead verification |
-| D8 | Go-live checklist; documents | assurance_engineer, platform_engineer | in progress |
+| D1 | First, last and preferred name | identity_engineer | implemented; verified by the lead on QA (8d73893, a6cc951, 1f96d68) |
+| D2 | Order numbers `RP-<C4>-<F3><L3>-<P6>-<NNN>` | orders_engineer | implemented; verified by the lead on QA (acdd2ac) |
+| D3 | Add packets to an earlier order (order group) | orders_engineer, recovery_ops_engineer | implemented; verified by the lead on QA (acdd2ac, 35df3ed, 88a3e90, b332d1b, 331a3e4, 3f8bcf3, 76e767f) |
+| D4 | Saved billing profile; choice at checkout | compliance_engineer, recovery_ops_engineer, identity_engineer | implemented; verified by the lead on QA (faab6fe, dfcc89a, 8d73893, 35df3ed, 331a3e4, 56b222a, b7ae064, 472ca21) |
+| D5 | Payment booked by webhook or provider lookup; missing-webhook alert | integrations_engineer | implemented; settings and admin check seen on QA, paid path covered by tests only (4331010, b4962ee, 07883a2, 62e0ddc, 4c5a1a3, 868cab4, 0630885) |
+| D6 | Customer order wizard | audit_engineer | implemented; verified by the lead on QA (f12afdc, a2450b9, 4d0914f, 80cc19d) |
+| D7 | Workflow **Publish** button; tier expansion | ui_foundation_engineer | implemented; verified by the lead on QA (09654b4, b332d1b) |
+| D8 | Go-live checklist; documents | assurance_engineer, platform_engineer | checklist written, to be run on the owner's server (8b5e70c, c0349d6, 48d1ead, 531db76, bc6ee9b; QA scenarios f9c95cd); documents fc2654d–df0c0d7 and this update |
 
 ### Verification for increment 08
 
-> **PLACEHOLDER — PENDING-LEAD (increment 08 verification).** Verified by the lead, peer-reported, not verified, and gates.
+Branch HEAD `76e767f`. PR and merge commit: (filled at merge).
+
+**Verified by the lead** on a running QA build of the branch, in Chromium, with synthetic data in pay-by-invoice mode. Migration 0008 was applied to a copy of the QA database, which then reported 9 migrations.
+- **Registration and home page (D1, D4).** Registration shows **First name**, **Last name**, **Preferred name (optional)** and a collapsed optional billing section. Submitting it empty shows an error summary and moves focus to it. The home page greets the customer by preferred name, or by first name.
+- **Tiers (D7).** Choosing a tier expands its outcome and deliverables and collapses the others. "Not included" collapses them all.
+- **Billing at checkout (D4).**
+  - Without a saved profile, checkout shows the billing form with **Save as my billing information**.
+  - With one, it offers **Use my saved billing information** or **Enter different billing information**.
+  - `/account/billing` shows, edits and clears the profile.
+- **Order numbers and add-ons (D2, D3).**
+  - A synthetic customer's new order got a reference of the form `RP-<C4>-<F3><L3>-ICEQUE-001`.
+  - Adding packet 2 to the same project created `…-002`, a linked order with its own invoice.
+  - The order page lists **Orders in this project**.
+  - A packet already in the project is refused with 409 and "A selected packet is already part of this project".
+- **Wizard (D6).**
+  - The customer order page opens on the wizard: a progress stepper and the current phase with **Back** and **Next**. Focus moves to each step heading.
+  - The steps were Review and accept, Upload documents, Record or upload audio, then Review and submit. Questions appears only when the phase has questions.
+  - An order waiting for payment shows "Waiting for your payment" with **Pay now** as the main button.
+  - Orders in the old format get wizard steps too. With an agreement still pending, they show only "Accept the agreement above to continue."
+- **Publish (D7).**
+  - `/admin/workflows` has **Publish** in the designer header on every step and a "Publish draft <name>" row action.
+  - The dialog offers the default-workflow choice and a change note, then shows a success dialog, and focus returns to the page.
+  - The published workflow appears as version 1.
+- **Payment setup (D5).** `/admin/payments/setup` shows the endpoint URL, the 9 required events, the last verified webhook, the last self-test, rejections in the last 24 hours and the three usual causes. The admin invoice page shows **Check with Stripe now**.
+- **Accessibility.** The axe-core WCAG 2.0, 2.1 and 2.2 A and AA rules found no violations in light and dark themes on 19 changed pages. Those pages showed no horizontal overflow at 240–1440 px, after one fix in 76e767f.
+- **Tests.**
+  - The lead ran the full vitest suite at 0630885: 242 files, 3,137 passed, 2 failed, 4 todo. Both failures were gaps in the tests themselves, fixed in 76e767f and re-run green individually:
+    - `tests/integration/isolation.test.ts` now has cross-customer probes for the new procedures. Customer B gets 404 or null for A's orders, cart target and payment attempt, and 409 for A's billing-profile token. A's data stays unchanged.
+    - `adminOrdersPhase.test.tsx`: the reference link now wraps.
+  - The type check and eslint over the whole repository were clean at 0630885 plus the lead's changes.
+  - gitleaks v8.30.1 over the full history found no leaks.
+  - The final full-suite pass is the CI run on the PR.
+
+**Reported by owners, not re-run by the lead individually.**
+- **Tests:**
+  - paymentConfirmationD5 12/12, payments 11/11, stripeCompletion.e2e 5/5, refunds 8/8, PaymentReturnConfirmation 9/9;
+  - cartIncrement08 6/6 (with a forced InnoDB REPEATABLE READ overlap), cart 8/8, CheckoutPages 34/34;
+  - billingProfile server 6/6 and client 10/10, receiptsAndSmallTotals 7/7, complianceAdmin 20/20;
+  - customerWizard 14/14, wizard 36/36.
+- **Security review.** http_security_engineer cleared the D4 and D5 findings at 0630885 by source review.
+
+**Not verified:**
+- a real Stripe payment. QA keys are synthetic, so the paid path, return-page confirmation, reconciliation job and admin check are covered only by tests against a fake Stripe;
+- the owner's server and its Stripe endpoint;
+- real mail, Entra, SharePoint and the production receiver;
+- a Docker or VPS upgrade with migration 0008 on real data;
+- screen readers, physical devices, and browsers other than Chromium;
+- webhook, customer check and worker all overlapping under real row locks. The tests start concurrent calls but do not force the locks to overlap.
+
+## Accepted risks and known gaps (increment 08)
+
+Accepted by /root for this increment. Each item is a limit of what was built, not a defect that blocks release.
+
+1. **Webhooks on cancelled attempts.** A verified signed "paid" webhook can still book a payment on a cancelled or expired attempt, which is the historical recovery behaviour. A lookup alone never does: it raises `PAID_ON_CANCELLED_ATTEMPT` and waits for an administrator's step-up **Check with Stripe now**.
+2. **Per-process cool-down.** The cool-down on a customer repeatedly checking a cancelled attempt is kept per server process, not shared between processes.
+3. **Old Stripe sessions.** Stripe sessions created before increment 07.2 lack the three metadata IDs. A lookup does not book them automatically, so they need manual review.
+4. **Registration timing.** The timing or outcome of a registration can reveal whether the billing store is unavailable.
+5. **Zero-width characters in names.** Existed before increment 08. A name containing ZWJ or ZWNJ passes name validation, but the typed-signature validator rejects these characters, so typed signatures can mismatch the account name.
+6. **Fast replay of order creation.** Existed before increment 08. A fast idempotent replay of order creation does not re-check the actor after waiting.
+7. **No export or erasure.** There is no self-service account export or erasure, including of saved billing details. An administrator handles privacy requests, and a customer can clear their own saved billing information under **Account → Billing information**.
+8. **Name fragments in order references.** This is by the owner's requirement. References appear wherever they already appeared: e-mails, invoices, audit events and their export. See the [threat model](../security/THREAT_MODEL.md).
+9. **Shared counters.** Orders of different projects that share the same reference stem (the same customer and the same first six project characters) share one counter.
+10. **Square** is still booked only from webhooks. There is no provider lookup or administrator check for it.
 
 ## Verification for increment 07.2
 
@@ -765,9 +825,7 @@ Defects found in lead QA and fixed before merge:
 
 ## Outstanding and known limits
 
-- **Increment 08 known gaps:**
-  - Low severity, existed before increment 08, no code change: account names may contain zero-width joiners (ZWJ/ZWNJ), but the typed-signature validator rejects these format characters. Exact-name matching may also not accept a version without them.
-  - ReadyPackets has no self-service account data export or account erasure yet; an administrator handles privacy requests, and a customer can clear their own saved billing information under Account settings → Billing information.
+- **Increment 08 known gaps:** see [Accepted risks and known gaps (increment 08)](#accepted-risks-and-known-gaps-increment-08).
 - Increment 07 decisions the owner should confirm (ADRs 0055–0062):
   - the progress formula: weighted, capped at 99 until a `done` status, and the higher of derived and explicit;
   - publishing the prepared phases draft of the default workflow; running orders keep their version;

@@ -5,7 +5,7 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See `docs/engineering/SDLC.md` for the release
 procedure.
 
-## Increment 08 (in progress)
+## Increment 08
 
 Requested by the owner on 2026-11-26 (prompt 34). See the [session log](docs/session-logs/2026-11-26-session-02.md) and the [contract](docs/engineering/INCREMENT_08_CONTRACT.md).
 - **Database migration** `0008_increment_08`, additive only. Details are in [UPGRADE.md](docs/operations/UPGRADE.md#increment-08-and-migration-0008).
@@ -37,7 +37,11 @@ Requested by the owner on 2026-11-26 (prompt 34). See the [session log](docs/ses
 
 ### Accessibility
 
-The changed screens are designed and tested against WCAG 2.2 AA. <!-- PENDING-LEAD: sweep facts and limits -->
+The changed screens are designed and tested against WCAG 2.2 AA.
+- **Automated checks.** The lead ran the axe-core WCAG 2.0, 2.1 and 2.2 A and AA rules in Chromium, in light and dark themes, on 19 changed pages, including registration with the billing section closed and open, the order pages, cart, checkout, saved billing, workflows and payment setup. No violations were found.
+- **Widths.** No horizontal overflow at 240, 320, 390, 768, 1024 or 1440 px, after one fix to the saved-billing choice at 240 px (76e767f).
+- **Keyboard focus.** Focus moves to each wizard step heading. It also stays in place when **Clear billing information** or **Check with Stripe now** is removed from the page (472ca21).
+- **Not checked:** screen readers, physical devices, and browsers other than Chromium.
 
 
 Requested by the owner on 2026-11-26 (prompt 30). See the [session log](docs/session-logs/2026-11-26-session-01.md).

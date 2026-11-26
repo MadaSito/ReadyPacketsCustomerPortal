@@ -230,3 +230,7 @@ without a signed webhook") is therefore replaced:
 Type check, eslint and the touched test files pass; every new write is owner-checked, audited and idempotent;
 no new personal data in logs; both themes; no overflow 240–1440 px; axe WCAG 2.2 AA tags clean on changed
 routes; documents updated; `/root` has verified the behaviour on the QA server.
+
+The result, the verification and the accepted risks and known gaps for this increment are recorded in
+[STATUS.md](../application-context/STATUS.md#verification-for-increment-08) and
+[Accepted risks and known gaps (increment 08)](../application-context/STATUS.md#accepted-risks-and-known-gaps-increment-08).
