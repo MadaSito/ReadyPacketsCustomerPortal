@@ -384,7 +384,7 @@ Details are in `docs/session-logs/2026-11-22-session-03.md`.
 
 ## Verification for increment 07.2
 
-Fix pack for the owner's prompt 30 of 2026-11-26 ([session log](../session-logs/2026-11-26-session-01.md)). Code commits: `1be1cc2`, `4fb93be`, `8a9901b`, `fdd5583`, `c082b4e`, `8d20507`, `53786b0`, `c90b183` (Pay now hidden on the placed-order page when online payment is unavailable), `47872b8` (a passing probe is required for new Stripe activations; servers already active stay active). Nothing under `migrations/` changed (checked with `git diff main..HEAD --stat -- migrations`), and the upgrade commands are unchanged.
+Fix pack for the owner's prompt 30 of 2026-11-26 ([session log](../session-logs/2026-11-26-session-01.md)). Code commits: `1be1cc2`, `4fb93be`, `8a9901b`, `fdd5583`, `c082b4e`, `8d20507`, `53786b0`, `c90b183` (Pay now hidden on the placed-order page when online payment is unavailable), `47872b8` (a passing probe is required for new Stripe activations; servers already active stay active), `c565487` (the compliance test helper runs the probe before activation), `dd5ddfa` (isolation test: online payment off means `ONLINE_PAYMENT_DISABLED`), `0cb03fa` (long reason codes wrap at 240 px; the disabled Activate button has `aria-describedby`). Nothing under `migrations/` changed (checked with `git diff main..HEAD --stat -- migrations`), and the upgrade commands are unchanged.
 
 ### What changed
 
@@ -402,25 +402,85 @@ Fix pack for the owner's prompt 30 of 2026-11-26 ([session log](../session-logs/
 
 ### Verified by the lead
 
-Verified by lead on a running build: <TO FILL BY LEAD>
+The lead ran these checks in Chromium only, on a running production build of `fix/increment-07-2` on the QA instance. The Stripe keys were placeholders in the test format, which Stripe does not accept.
 
-### Peer-reported (automated tests, not driven by the lead in a browser)
+- **Stripe setup** (`/admin/payments/setup`):
+  - the banner read "Online card checkout: NOT ACTIVE (Pay by invoice)", with the missing readiness gates;
+  - the checklist has 8 steps;
+  - **Activate Stripe Checkout** stays blocked until the API test, the Checkout session probe and the webhook self-test pass.
+- **Credential fields.** Each field showed its own error, with focus moved to the first invalid field, for these pastes:
+  - a publishable key in a secret field;
+  - an API key in the signing-secret field;
+  - a signing secret in the API-key field;
+  - an endpoint ID (`we_…`);
+  - a value without the `whsec_` prefix.
 
-<TO FILL BY LEAD: peer-reported test counts, labelled as peer-reported>
+  The note for a Secondary-only entry and the Show/Hide buttons worked.
+- **Verify Checkout session creation** ran against the real Stripe API from QA with the placeholder key.
+  - Stripe answered HTTP 401, and the page showed "Stripe rejected the staged secret key (HTTP 401)…".
+  - The gate changed to "Checkout session creation check failed (STRIPE_AUTH_INVALID_KEY)".
+- **Simulated "Stripe selected but verification stale".** The provider was set directly in the QA database and restored afterwards.
+  - **Customer checkout** showed "Your order … is placed, but we could not open the secure payment page", with focus on the message and the order and invoice references. Nothing was resubmitted, and there was no **Pay now** button while online payment was unavailable.
+  - **`/checkout/return`** showed "Payment not completed yet — your order is placed and waiting for payment".
+  - **Admin side:**
+    - the banner read "NOT ACTIVE (paused pending verification)";
+    - **Last checkout-session failure** showed the diagnostics, with reason `PROVIDER_VERIFICATION_STALE`;
+    - `/admin/alerts` showed an alert with the next step;
+    - the audit events `payments.attempt.failed` and `cart.checkout_payment_start_failed` were recorded.
+- **PDFs.** An invoice PDF and a newly issued receipt PDF were opened and inspected.
+  - They showed the logo, the brand colour band, the legal name, the tagline, the Order and Project block, and a footer with page numbers.
+  - "·" renders correctly, and the PDF title is set and the document tagged.
+  - A receipt issued before 07.2 keeps its original stored PDF, while its page shows Order and Project.
+  - The invoice list, the invoice page and the receipt page show Order and Project, for both customers and admins.
+- **Workflows** (`/admin/workflows`):
+  - the default summary line, and **Set as default** on published workflows that are not the default;
+  - the confirmation dialog's wording, and **Cancel** returns focus to the button;
+  - confirming, after step-up, moved the Default badge, showed the success message and moved focus to the summary;
+  - `workflow.default.changed` was recorded.
+- **App update prompt**, with a service worker holding a waiting version:
+  - the new title and body appear, above the phone tab bar at 390 px;
+  - **Later** and **Reload** are 44 px high;
+  - **Later** hides the prompt, and it returns on the next in-app navigation;
+  - **Reload** loads the new version and keeps the session.
+- **axe-core and overflow.** axe-core (WCAG 2.0, 2.1 and 2.2 A and AA rule tags) reported 0 violations in light and dark. There was no horizontal overflow at 240, 320, 390, 768, 1024 and 1440 px. The pages checked were:
+  - `/admin/payments/setup`, including the failed-probe state;
+  - `/admin/payments`, `/admin/workflows`, `/admin/alerts`, `/admin/invoices` and an admin invoice page;
+  - `/checkout/return`, `/checkout/cancel` and `/cart`;
+  - `/invoices`, a customer invoice page and a receipt page.
+- **Tests.** The lead ran vitest for payments, cart, integrations, automations phase actions, `tests/http` and `tests/integration`.
+  - One failure was found, in the isolation test.
+  - It was fixed in `dd5ddfa`, and the re-run passed.
+
+### Peer-reported (engineers' own runs, not re-run individually by the lead)
+
+- **Payments:**
+  - payments server 11/11;
+  - refunds 8/8;
+  - stripeCompletion e2e 5/5;
+  - client payments 22/22, and OrderRefundTab 12/12.
+- **Cart and checkout:** cart 8/8; CheckoutPages 30/30.
+- **Compliance:** compliance folder 128/128 (10 files).
+- **Workflows:** workflowDefault 8/8; workflows page 28/28.
+- **Other client:** PwaUpdatePrompt 3/3.
+- **Jobs and mail:** jobs 59; mail templates 6.
+- **Static checks:** type check and eslint clean on the folders touched.
 
 ### Gates
 
-<TO FILL BY LEAD>
+- **Full test suite:** (filled at merge)
+- **CI:** (filled at merge)
 
-### Not verifiable here
+### Not verified
 
-- A real Stripe account, in test or live mode, including a real webhook delivery and a real Checkout redirect.
-- Real mail delivery of the branded e-mails.
-- Physical phones and tablets.
-- Screen readers.
-- PDF/UA: it is not claimed (see [CHANGELOG](../../CHANGELOG.md)).
+- **Real Stripe.** A successful redirect to Stripe Checkout and a paid webhook round trip with real keys, because there is no valid Stripe account here.
+- **Restricted-key error.** The HTTP 403 path against real Stripe; only unit tests with fakes cover it.
+- **The owner's server.** The root cause there, because we have no access to its logs. The build now records the cause and shows it.
+- **Mail.** The invoice and receipt e-mails in a real mail client.
+- **Refund notes.** The refund note PDF, visually.
+- **Screen reader on the Activate button.** The `aria-describedby` on the disabled **Activate Stripe Checkout** button, with a screen reader.
+- **Other platforms.** Any screen reader, physical device or non-Chromium browser pass.
 
-The interfaces are designed and tested against WCAG 2.2 AA.
+The interfaces are designed and tested against WCAG 2.2 AA. This is not a certification or conformance claim, and PDF/UA is not claimed.
 
 ## Verification for increment 07.1
 

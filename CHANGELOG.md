@@ -15,7 +15,11 @@ Requested by the owner on 2026-11-26 (prompt 30). See the [session log](docs/ses
 ### Fixed
 
 - **Customers placed an order but were not sent to Stripe** (`c082b4e`, `53786b0`). The cause on the owner's server is **not confirmed**: we had no access to its logs, and a real Stripe account is not testable here. Every such failure is now explicit, recorded and recoverable.
-  - **Checkout result.** After the order and invoice commit, checkout returns a typed `payment_unavailable` result instead of falling through silently. The customer sees "Your order … is placed, but we could not open the secure payment page", with the order, the invoice and **Pay now**.
+  - **Checkout result.** After the order and invoice commit, checkout returns a typed `payment_unavailable` result instead of falling through silently. The customer sees "Your order … is placed, but we could not open the secure payment page", with the order and the invoice, plus **Pay now** when online payment is available.
+  - **Pay online with no online provider** (`dd5ddfa`).
+    - Before 07.2, `payments.startInvoiceCheckout` returned mode `invoice` when no online provider was active, and the **Pay online** button silently did nothing.
+    - It now answers 503 `UNAVAILABLE` / `ONLINE_PAYMENT_DISABLED`, and the customer sees why.
+    - The internal service `startCheckout` used by cart checkout still returns mode `invoice`.
   - **Redirect allowlist.** The browser's allowlist now matches the server's (`https://checkout.stripe.com` only).
   - **Return and cancel pages.** `/checkout/return` and `/checkout/cancel` tell "awaiting payment" apart from "pending confirmation", and offer **Pay now** when online payment is available.
   - **Diagnosis.**
@@ -67,6 +71,7 @@ Requested by the owner on 2026-11-26 (prompt 30). See the [session log](docs/ses
 
 ### Accessibility
 
+- **Payments pages** (`0cb03fa`). Long reason codes wrap at 240 px, and the disabled **Activate Stripe Checkout** button is linked to its explanation with `aria-describedby`.
 - **PDFs.** The PDFs set the document language and title. They mark the content as tagged, give the logo alternative text, and keep the text selectable. **PDF/UA is not claimed**: the standard Helvetica font is not embedded with a Unicode map, and there are no full table structure tags.
 - **Screens.** The changed screens are designed and tested against WCAG 2.2 AA.
 - **Not done.** No screen-reader pass and no physical-device pass were done.
