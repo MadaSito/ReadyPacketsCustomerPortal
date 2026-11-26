@@ -112,11 +112,11 @@ Run these 15 checks, marking the results in the main worksheet below. For Stripe
 | BIL-01 | Blocker | `/register` → leave the optional billing section collapsed → **Create account**. | Valid registration succeeds without a billing profile. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | BIL-02 | Blocker | `/register` → enter only part of an approved synthetic billing address → **Create account**. | Missing billing fields are identified and submission is blocked. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | BIL-03 | Important | `/register` → use an existing synthetic mailbox and different billing values. | Existing account’s billing profile is unchanged. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| BIL-04 | Blocker | `/account/billing` → enter `Zeus Greene`, `100 Test Street`, `Testville`, `12345`, `US`.<br>Click **Save billing information**; reload. | **Current saved billing address** shows the saved address. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BIL-04 | Blocker | `/account/billing` → **Billing name** `Zeus Greene`; **Billing email** = test mailbox.<br>**Address line 1** `100 Test Street`; **City or locality** `Testville`; **Postal code** `12345`; **Country code** `US`.<br>Click **Save billing information**; reload. | **Saved billing summary** shows the new address. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | BIL-05 | Blocker | Sign in as a customer with saved billing and open `/cart/checkout`. | Saved billing choice is selected by default and shows its summary. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | BIL-06 | Blocker | `/cart/checkout` → choose different billing details; leave save unchecked and finish checkout. | Invoice uses the new details without replacing the profile. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | BIL-07 | Important | As a customer without saved billing, open `/cart/checkout` and inspect the save checkbox. | Save is initially checked; customer can uncheck it. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| BIL-08 | Important | `/account/billing` → **Clear saved billing information** → **Clear billing information**. | **No saved billing information**. This clears billing only. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BIL-08 | Important | `/account/billing` → **Clear billing information**.<br>In **Clear saved billing information?**, click **Clear billing information**. | **No saved billing information**. This clears billing only. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Stripe test mode and live mode
 
@@ -132,7 +132,7 @@ Start with **test mode** in isolation. The portal’s **Send self-test webhook**
 | PAY-04 | Blocker | `/admin/payments/setup` → **Verify Checkout session creation**. | Session verification passes for the current test key. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | PAY-05 | Blocker | `/admin/payments/setup` → **Send self-test webhook**. | Portal local signature check passes. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | PAY-06 | Blocker | `/admin/payments/setup` → **Activate Stripe Checkout** in test mode. | Portal marks card checkout active in test mode. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| PAY-07 | Blocker | Checkout a synthetic order and pay on Stripe with the documented test card. | Stripe completes the test Checkout session. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-07 | Blocker | `/cart/checkout` → **Place order and continue to payment**.<br>On Stripe, pay with the documented test card. | Stripe completes the test Checkout session. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | PAY-08 | Blocker | Stripe Dashboard test endpoint → **Event deliveries** → open the actual Checkout event. | Delivery to this endpoint is HTTP **2xx**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | PAY-09 | Blocker | Follow Stripe’s return to `/checkout/return`. | **Payment received**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | PAY-10 | Blocker | `/invoices` → open the invoice for that order. | Invoice status is **Paid**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
@@ -212,7 +212,7 @@ In Stripe, open **each** configured endpoint and compare its subscribed events w
 | WIZ-02 | Blocker | Open a phase requiring acceptance; leave it unaccepted. | **Next** cannot advance and shows a visible reason. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | WIZ-03 | Blocker | Complete acceptance on a configured full phase → **Next**. | Questions follow acceptance; no unrelated step appears. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | WIZ-04 | Blocker | Save a question answer, advance and reload mid-phase. | Resumes at first incomplete step. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| WIZ-05 | Blocker | Complete the configured requirements and submit from final review. | Phase is submitted and customer edits are locked. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| WIZ-05 | Blocker | On an order with a locking phase, complete its steps.<br>**Review and submit** → **Submit**. | Phase is **Submitted** and customer edits are locked. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | WIZ-06 | Important | Open a legacy order with a permitted intake form but no configured phase actions. | The wizard offers its existing intake action. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | WIZ-07 | Blocker | Open a purchased order that is waiting on the team. | Screen explains who acts next rather than showing a dead end. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | WIZ-08 | Important | Open an existing former-tab deep link for the synthetic order. | Correct order-detail content is still reachable. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
@@ -227,8 +227,8 @@ In Stripe, open **each** configured endpoint and compare its subscribed events w
 | --- | --- | --- | --- | --- |
 | FIL-01 | Blocker | Purchased order → **Upload documents** step → choose the prepared synthetic PDF. | Its upload completes and appears in the phase. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | FIL-02 | Important | In that step select an unsupported synthetic file type. | Upload rejected with an understandable reason. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| FIL-03 | Blocker | `/orders/:id` → **Record or upload audio** → deny microphone permission in the browser prompt. | Audio upload remains available as an alternative. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| FIL-04 | Blocker | In the audio step, allow microphone and record a brief synthetic clip. | Saved recording can be played back. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| FIL-03 | Blocker | `/orders/:id` → **Record or upload audio** → **Start recording**.<br>Deny access in the browser prompt. | **Upload audio** remains available in a phase configured with both actions. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| FIL-04 | Blocker | **Record or upload audio** → **Start recording**; allow access.<br>Speak a brief synthetic phrase → **Stop recording**.<br>Play the local recording. | The phrase is audible in the preview. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | FIL-05 | Blocker | Open the synthetic order’s file or phase ZIP as its owner, then try with customer B. | Customer B cannot download it. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | FIL-06 | Optional-if-enabled | `/admin/sharepoint-sync` → check the synthetic order’s run and matching SharePoint destination. | One matching item in the authorized destination. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
@@ -254,7 +254,7 @@ In Stripe, open **each** configured endpoint and compare its subscribed events w
 
 | ID | Priority | Where and what to do | Expected | Result / evidence / tester |
 | --- | --- | --- | --- | --- |
-| AUD-01 | Blocker | After a synthetic staff action, open `/admin/audit` and filter by event/time. | Expected action and outcome are found. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| AUD-01 | Blocker | After AUD-03, open `/admin/audit`.<br>**Time range** → **Last 24 hours** → **Apply filters**. | The `audit.integrity.verified` event appears. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | AUD-02 | Important | Operator: follow [Correlation](LOGGING_AND_AUDIT.md#2-correlation-following-one-workflow) for one synthetic request. | The same request/correlation ID connects app and edge evidence. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | AUD-03 | Blocker | `/admin/audit/integrity` → **Verify now**. | **Chain verified**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | AUD-04 | Blocker | Inspect a redacted audit record for a synthetic billing profile change. | Action is logged without the billing values. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
@@ -373,5 +373,4 @@ In Stripe, open **each** configured endpoint and compare its subscribed events w
 
 - **D1/D4:** Confirm registration billing disclosure and checkout radio and checkbox copy (BIL-01–02, BIL-05–07).
 - **D3:** Confirm final checkout project-target text and console related-orders heading (ADD-03, ADD-07).
-- **D5:** Confirm admin repair placement and return-page receipt and wizard actions (PAY-11–12, PAY-15, PAY-31–32).
-- **D6:** Confirm audio recorder control text and final submit label (WIZ-05, FIL-03–04).
+- **D5:** Confirm admin repair placement and the new paid banner, receipt and wizard actions (PAY-09, PAY-11–12, PAY-15, PAY-29, PAY-31–32).
