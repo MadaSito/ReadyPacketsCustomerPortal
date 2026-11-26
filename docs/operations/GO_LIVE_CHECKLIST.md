@@ -67,7 +67,7 @@ Run these 15 checks, marking the results in the main worksheet below. For Stripe
 | REG-01 | Blocker | Open `/register`. | First name, Last name, and Preferred name inputs appear. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | REG-02 | Blocker | `/register` → leave First name blank; fill other required fields → **Create account**. | First name is flagged; no account created. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | REG-03 | Blocker | `/register` → leave Last name blank; fill other required fields → **Create account**. | Last name is flagged; no account created. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| REG-04 | Important | `/register` → try 81 `A` characters in each name input. | No name longer than 80 is accepted. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| REG-04 | Important | `/register` → paste 51 `A` characters into each name input. | Each caps input at 50 UTF-16 code units (50 `A`s). | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | REG-05 | Blocker | `/register` → `Zeus`, `Greene`, `Z` → **Create account**; verify and sign in. | Customer greeting uses `Z`. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | REG-06 | Important | Register the second synthetic customer with Preferred name empty; verify and sign in. | Greeting falls back to First name. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | REG-07 | Important | `/account` → open a synthetic pre-upgrade profile and save its displayed name parts. | Derived parts persist after reload. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
@@ -212,7 +212,7 @@ In Stripe, open **each** configured endpoint and compare its subscribed events w
 | WIZ-02 | Blocker | Open a phase requiring acceptance; leave it unaccepted. | **Next** cannot advance and shows a visible reason. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | WIZ-03 | Blocker | Complete acceptance on a configured full phase → **Next**. | Questions follow acceptance; no unrelated step appears. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | WIZ-04 | Blocker | Save a question answer, advance and reload mid-phase. | Resumes at first incomplete step. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| WIZ-05 | Blocker | On an order with a locking phase, complete its steps.<br>**Review and submit** → **Submit**. | Phase is **Submitted** and customer edits are locked. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| WIZ-05 | Blocker | On a locking phase, complete the steps.<br>**Review and submit** → **Submit**.<br>In **Submit and lock “[phase]”?**, click **Submit**. | Phase is **Submitted** and customer edits are locked. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | WIZ-06 | Important | Open a legacy order with a permitted intake form but no configured phase actions. | The wizard offers its existing intake action. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | WIZ-07 | Blocker | Open a purchased order that is waiting on the team. | Screen explains who acts next rather than showing a dead end. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | WIZ-08 | Important | Open an existing former-tab deep link for the synthetic order. | Correct order-detail content is still reachable. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
