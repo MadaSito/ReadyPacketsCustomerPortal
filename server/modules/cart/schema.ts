@@ -67,6 +67,8 @@ export const carts = mysqlTable(
     /** Non-null (`= ownerUserId`) strictly while `status = 'open'`; NULL otherwise to enforce 1 open cart per customer. */
     activeOwnerSlot: refColumn("active_owner_slot"),
     status: mysqlEnum("status", CART_STATUSES).notNull().default("open"),
+    /** Optional target order public ID when adding packets to an earlier order/project (Increment 08, D3). */
+    addToOrderPublicId: char("add_to_order_public_id", { length: 26 }),
     projectName: varchar("project_name", { length: 160 }),
     /** Optional AES-256-GCM encrypted customer order note (`carts.note:<publicId>`). */
     noteEnc: text("note_enc"),
