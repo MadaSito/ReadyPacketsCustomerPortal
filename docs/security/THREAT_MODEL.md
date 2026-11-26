@@ -61,6 +61,7 @@ of scope (ADR 0010).
 | Session identifiers and CSRF secrets | Browser cookie, `user_sessions` | Opaque random IDs, only keyed hashes stored (ADR 0002) |
 | Customer PII (name, e-mail, address) | `identity`, `orders` | Field encryption plus blind indexes for lookup |
 | Orders, notes, workflow history, price snapshots | `orders` | Object-level authorization (`server/modules/orders/policy.ts`) |
+| Order references from increment 08 (`RP-<C4>-<F3><L3>-<P6>-<NNN>`). They contain name fragments: the last 4 characters of the customer ID, the first 3 of the first name and of the last name, and the first 6 of the project name | `orders`, `order_references`, and wherever references already appear | A business identifier by the owner's requirement (D2), not a secret. /root's ruling on how it is used: (1) no new log fields carry it, and operational and request logs keep public IDs; (2) the name parts and stem inputs are never logged; (3) URLs use public IDs, never the reference; (4) it stays in existing audit events as the order's label |
 | Files and deliverables | Object store | Private, opaque keys, single-use download tickets |
 | Messages, tickets, intake answers, policy acceptances, invoices | `engagement`, `compliance` | Encrypted at rest (per module API.md) |
 | Audit trail | `audit_events`, chain, checkpoints | Fail-closed in-tx writes, HMAC chain, Ed25519 checkpoints, keyed tombstones |
@@ -273,6 +274,13 @@ file handle, COMP-01–03, IPv6 transition classification. Client C-01–C-05 an
   ascending → session → grant FOR UPDATE → files; identity API.md records the order-first exception) and
   tested for specific interleavings, not proven globally.
 - **Supply chain.** No SCA, SBOM, provenance or release signing.
+- **Name fragments in order references (increment 08, accepted).** New order references reveal short parts of the customer's name and project to anyone who sees a reference. Places where references appear:
+  - audit events and the SIEM export;
+  - mail, invoices and receipts;
+  - P101 / P201 payloads;
+  - SharePoint folder names.
+
+  The trade-off was accepted by /root on the owner's explicit requirement. It is documented in the [Admin guide](../guides/ADMIN_GUIDE.md#order-numbers-increment-08). <!-- PENDING-OWNER orders_engineer / portable_contract_engineer: what account erasure does to existing references -->
 
 ## 10. Increment 03 trust boundaries and validation gates
 
@@ -325,3 +333,4 @@ or SharePoint destination is verified here. The historical base sections above a
 - 2026-11-20 — AC-11 (increment 02 pricing and offerings import) added (orders_engineer).
 - 2026-11-21 — Increment 03 boundary, review gates and evidence distinctions added (http_security_engineer).
 - 2026-11-21 — AC-12 and section 10a (increment 04 workflow rules and console order actions) added (orders_engineer).
+- 2026-11-26 — Increment 08: name fragments in order references added to assets and residual risks, per /root's ruling on D2 (platform_engineer).

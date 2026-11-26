@@ -60,6 +60,8 @@ TLS, upgrades, and go-live checks are in the [deployment profiles](../../deploy/
   - [Company branding on invoices and receipts](#company-branding-on-invoices-and-receipts)
   - [Setting the default workflow](#setting-the-default-workflow)
   - [The "ReadyPackets was updated on the server" prompt](#the-readypackets-was-updated-on-the-server-prompt)
+- [Increment 08 (draft)](#increment-08-draft)
+  - [Order numbers](#order-numbers-increment-08)
 - [Customer tasks and the order agreement](./WORKFLOW_CUSTOMER_TASKS.md)
 
 ## Increment 04 operating guides
@@ -591,6 +593,39 @@ On builds before 07.1, reloading or bookmarking a template editor whose key has 
   - the account is not suspended;
   - the feature in use is on at `/admin/settings/features`.
   Then look up the request's correlation ID in the audit centre.
+
+## Increment 08 (draft)
+
+<!-- DRAFT by platform_engineer. Sections for D1 and D3–D7 are added after each owner's commit. -->
+
+### Order numbers (increment 08)
+
+New orders get a reference built from the customer and the project: `RP-<C4>-<F3><L3>-<P6>-<NNN>`, for example `RP-JJG5-ZEUGRE-ICEQUE-001` for the synthetic customer Zeus Greene (`RPCUS-A1B2CJJG5`) and the project "Ice Queen".
+
+- **The parts:**
+  - `RP` is the order reference prefix setting;
+  - `C4` is the last 4 letters or digits of the customer ID (`0000` if there is none);
+  - `F3` and `L3` are the first 3 of the first and last name;
+  - `P6` is the first 6 of the project name;
+  - `NNN` is the next unused number for that customer and project, starting at `001`. Additions to the project get `002`, `003`, and so on.
+- **Characters.** Accents are removed and only `A–Z` and `0–9` are kept. Short parts are padded with `X`.
+- **Frozen at creation.** Renaming the customer or the project later never changes a reference.
+- **Existing orders** keep their `RP-YYYY-NNNNNN` reference. Changing a reference by hand works as before.
+
+**Privacy: references contain name fragments.** This is by the owner's requirement.
+- **What a reference reveals.** Part of the customer ID, three letters each of the first and last name, and six of the project name. Anyone who sees a reference sees these fragments.
+- **Where references appear.** Wherever they already appear:
+  - audit events (as the order's label) and their SIEM export;
+  - e-mails, invoices and receipts;
+  - P101 / P201 webhook payloads;
+  - SharePoint folder names.
+- **What the portal never does:**
+  - put references in new log fields; operational and request logs use public IDs;
+  - log the name parts or other inputs of the reference;
+  - use a reference in a URL.
+- **Before go-live,** tell customers about this in your privacy notice, and consider it before sharing references outside your team.
+
+<!-- PENDING-OWNER orders_engineer: confirm details (padding, 0000 rule, portable import fallback) against commits. -->
 
 ## Increment 07.2: payments, branding and the default workflow
 

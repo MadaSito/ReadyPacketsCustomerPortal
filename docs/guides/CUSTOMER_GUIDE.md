@@ -238,6 +238,8 @@ These flows have not yet been checked in real browsers or on physical devices.
 
 ## Privacy and analytics
 
+**Order numbers (from increment 08).** New order numbers are built from part of your customer ID, the first three letters of your first and last name, and the first six letters of your project name, for example `RP-JJG5-ZEUGRE-ICEQUE-001`. They appear on your orders, invoices, receipts and e-mails.
+
 - Analytics (Microsoft Clarity and PostHog) are off by default. If ReadyPackets turns them on, they run only on the
   public privacy and terms pages and only after you accept the consent banner. They never run on sign-in, account,
   order, file, message, invoice or administration pages.
