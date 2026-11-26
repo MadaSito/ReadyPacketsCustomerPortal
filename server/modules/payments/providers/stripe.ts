@@ -673,7 +673,8 @@ export function createStripeProvider(
       const hasReferenceConflict = Boolean(
         metadataAttemptPublicId && clientReferenceId && metadataAttemptPublicId !== clientReferenceId,
       );
-      const attemptPublicId = metadataAttemptPublicId ?? clientReferenceId;
+      // Strict authoritative binding: never synthesize `attemptPublicId` from `client_reference_id`.
+      const attemptPublicId = metadataAttemptPublicId;
       const invoicePublicId =
         typeof metadata?.invoice_public_id === "string" && metadata.invoice_public_id.trim().length > 0
           ? metadata.invoice_public_id.trim()

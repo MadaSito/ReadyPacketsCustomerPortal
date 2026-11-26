@@ -19,7 +19,7 @@
  *    and admin `"Check with Stripe now"` (`payments.admin.checkWithStripeNow`, step-up + pre-upgrade repair)
  */
 import { createHmac } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Services } from "../../container.js";
 import { DomainError } from "../../core/errors.js";
@@ -785,6 +785,19 @@ describe("Increment 08 — Package D5 Payment confirmation (authoritative bookin
         }),
       },
       {
+        label: "missing metadata.attempt_public_id even with matching client_reference_id (no fallback)",
+        expectedReason: "ATTEMPT_METADATA_MISMATCH",
+        mutate: (b) => {
+          const meta = { ...(b.metadata as Record<string, string>) };
+          delete meta.attempt_public_id;
+          return {
+            ...b,
+            client_reference_id: checkout.attemptPublicId,
+            metadata: meta,
+          };
+        },
+      },
+      {
         label: "metadata mismatch on invoice_public_id",
         expectedReason: "INVOICE_METADATA_MISMATCH",
         mutate: (b) => ({
@@ -799,6 +812,18 @@ describe("Increment 08 — Package D5 Payment confirmation (authoritative bookin
           ...b,
           metadata: { ...(b.metadata as Record<string, string>), order_public_id: ulid() },
         }),
+      },
+      {
+        label: "missing metadata.order_public_id on Stripe session",
+        expectedReason: "ORDER_METADATA_MISMATCH",
+        mutate: (b) => {
+          const meta = { ...(b.metadata as Record<string, string>) };
+          delete meta.order_public_id;
+          return {
+            ...b,
+            metadata: meta,
+          };
+        },
       },
       {
         label: "contradictory client_reference_id",
@@ -1195,5 +1220,314 @@ describe("Increment 08 — Package D5 Payment confirmation (authoritative bookin
       .where(eq(paymentAttempts.publicId, legacyCheckout.attemptPublicId));
     expect(repairedAttempt?.status).toBe("paid");
     expect(repairedAttempt?.bookingSource).toBe("provider_lookup");
+  });
+
+  it("repairs an exact 07.2-shaped Stripe Checkout Session via step-up admin checkWithStripeNow", async () => {
+    const stack = await buildActivatedStack();
+    const { h, fakeStripe, admin, callerFor, createCustomerCheckout } = stack;
+
+    const session072 = await createCustomerCheckout();
+    fakeStripe.markSessionPaid(session072.sessionId);
+
+    // 07.2 (`2c3367f:server/modules/payments/providers/stripe.ts:251-256`) wrote:
+    // - `client_reference_id = attemptPublicId`
+    // - `metadata = { attempt_public_id, invoice_public_id, order_public_id }`
+    // - `payment_intent.metadata = { attempt_public_id, invoice_public_id }` (no `order_public_id` on PI)
+    fakeStripe.setSessionGetTransform((sid, base) => {
+      if (sid !== session072.sessionId) return base;
+      const pi = { ...(base.payment_intent as Record<string, unknown>) };
+      pi.metadata = {
+        attempt_public_id: session072.attemptPublicId,
+        invoice_public_id: session072.invoicePublicId,
+      };
+      return {
+        ...base,
+        client_reference_id: session072.attemptPublicId,
+        metadata: {
+          attempt_public_id: session072.attemptPublicId,
+          invoice_public_id: session072.invoicePublicId,
+          order_public_id: session072.orderPublicId,
+        },
+        payment_intent: pi,
+      };
+    });
+
+    await tdb.db
+      .update(paymentAttempts)
+      .set({
+        status: "expired",
+        reconciliationNote: "awaiting_webhook",
+      })
+      .where(eq(paymentAttempts.publicId, session072.attemptPublicId));
+
+    const freshStepUpAdmin: SessionPrincipal = {
+      ...admin.principal,
+      stepUpAt: h.clock.now(),
+    };
+    const repaired = await callerFor(freshStepUpAdmin).payments.admin.checkWithStripeNow({
+      invoicePublicId: session072.invoicePublicId,
+    });
+    fakeStripe.setSessionGetTransform(null);
+
+    expect(repaired.booked).toBe(true);
+    expect(repaired.alreadyPaid).toBe(false);
+    expect(repaired.invoiceStatus).toBe("paid");
+    expect(repaired.attemptStatus).toBe("paid");
+    expect(repaired.bookingSource).toBe("provider_lookup");
+    expect(repaired.receiptPublicId).toBeTruthy();
+  });
+
+  it("holds customer confirmation without mutating cancelled attempts paid on Stripe, emits PAID_ON_CANCELLED_ATTEMPT ops alert, repairs via step-up admin check, and blocks delayed mutations on terminal attempts/void invoices", async () => {
+    const stack = await buildActivatedStack();
+    const {
+      h,
+      fakeStripe,
+      complianceMod,
+      paymentsMod,
+      admin,
+      buyer,
+      stripeWh,
+      callerFor,
+      createCustomerCheckout,
+    } = stack;
+    const buyerCaller = callerFor(buyer.principal);
+
+    // 1. Cancelled attempt whose Stripe session was genuinely paid in another tab:
+    //    - Customer confirmCheckoutPayment performs ZERO DB mutation on payment_attempts / compliance_invoices / orders
+    //    - Surfaces `PAID_ON_CANCELLED_ATTEMPT` ops alert + security audit event
+    //    - Step-up `admin.checkWithStripeNow` repairs & books it and resolves the alert
+    const paidAfterCancel = await createCustomerCheckout();
+    await paymentsMod.cancelAttemptIfUnpaid(buyer.principal, {
+      attemptPublicId: paidAfterCancel.attemptPublicId,
+    });
+    fakeStripe.markSessionPaid(paidAfterCancel.sessionId);
+
+    const [attemptBeforeCustomerCheck] = await tdb.db
+      .select()
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, paidAfterCancel.attemptPublicId));
+    expect(attemptBeforeCustomerCheck?.status).toBe("cancelled");
+
+    const [invBeforeCustomerCheck] = await tdb.db
+      .select()
+      .from(complianceTables.complianceInvoices)
+      .where(eq(complianceTables.complianceInvoices.publicId, paidAfterCancel.invoicePublicId));
+    const [orderBeforeCustomerCheck] = await tdb.db
+      .select()
+      .from(orderTables.orders)
+      .where(eq(orderTables.orders.publicId, paidAfterCancel.orderPublicId));
+
+    h.clock.advance(5_000);
+    const heldConfirm = await buyerCaller.payments.confirmCheckoutPayment({
+      attemptPublicId: paidAfterCancel.attemptPublicId,
+    });
+    expect(heldConfirm.bookedNow).toBe(false);
+    expect(heldConfirm.state).toBe("unpaid");
+    expect(heldConfirm.attemptStatus).toBe("cancelled");
+    expect(heldConfirm.invoiceStatus).toBe("issued");
+
+    const [attemptAfterCustomerCheck] = await tdb.db
+      .select()
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, paidAfterCancel.attemptPublicId));
+    const [invAfterCustomerCheck] = await tdb.db
+      .select()
+      .from(complianceTables.complianceInvoices)
+      .where(eq(complianceTables.complianceInvoices.publicId, paidAfterCancel.invoicePublicId));
+    const [orderAfterCustomerCheck] = await tdb.db
+      .select()
+      .from(orderTables.orders)
+      .where(eq(orderTables.orders.publicId, paidAfterCancel.orderPublicId));
+
+    // Strict zero-mutation proof across payment_attempts, compliance_invoices, and orders
+    expect(attemptAfterCustomerCheck).toEqual(attemptBeforeCustomerCheck);
+    expect(invAfterCustomerCheck).toEqual(invBeforeCustomerCheck);
+    expect(orderAfterCustomerCheck).toEqual(orderBeforeCustomerCheck);
+
+    const [cancelledPaidAlert] = await tdb.db
+      .select()
+      .from(opsAlertTables.operationalAlerts)
+      .where(
+        and(
+          eq(opsAlertTables.operationalAlerts.code, "PAID_ON_CANCELLED_ATTEMPT"),
+          eq(opsAlertTables.operationalAlerts.orderPublicId, paidAfterCancel.orderPublicId),
+        ),
+      );
+    expect(cancelledPaidAlert?.state).toBe("open");
+    expect(cancelledPaidAlert?.code).toBe("PAID_ON_CANCELLED_ATTEMPT");
+    expect(
+      h.audit.events.some(
+        (e) =>
+          e.eventName === "payments.attempt.paid_after_cancel_held" &&
+          e.resource?.publicId === paidAfterCancel.attemptPublicId,
+      ),
+    ).toBe(true);
+
+    // Admin repairs it via step-up Check with Stripe now -> books cleanly and resolves alert
+    const freshStepUpAdmin: SessionPrincipal = {
+      ...admin.principal,
+      stepUpAt: h.clock.now(),
+    };
+    const adminRepair = await callerFor(freshStepUpAdmin).payments.admin.checkWithStripeNow({
+      invoicePublicId: paidAfterCancel.invoicePublicId,
+    });
+    expect(adminRepair.booked).toBe(true);
+    expect(adminRepair.invoiceStatus).toBe("paid");
+    expect(adminRepair.attemptStatus).toBe("paid");
+    expect(adminRepair.receiptPublicId).toBeTruthy();
+
+    const [resolvedCancelledAlert] = await tdb.db
+      .select()
+      .from(opsAlertTables.operationalAlerts)
+      .where(
+        and(
+          eq(opsAlertTables.operationalAlerts.code, "PAID_ON_CANCELLED_ATTEMPT"),
+          eq(opsAlertTables.operationalAlerts.orderPublicId, paidAfterCancel.orderPublicId),
+        ),
+      );
+    expect(resolvedCancelledAlert?.state).toBe("resolved");
+
+    // 2. Delayed asyncPending / expired outcomes on customer, webhook, and worker paths NEVER mutate a cancelled attempt
+    const delayedAsyncOnCancelled = await createCustomerCheckout();
+    await paymentsMod.cancelAttemptIfUnpaid(buyer.principal, {
+      attemptPublicId: delayedAsyncOnCancelled.attemptPublicId,
+    });
+    fakeStripe.markSessionAsyncProcessing(delayedAsyncOnCancelled.sessionId);
+
+    const [cancelledSnapBefore] = await tdb.db
+      .select()
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, delayedAsyncOnCancelled.attemptPublicId));
+
+    h.clock.advance(5_000);
+    const asyncCustomerRes = await buyerCaller.payments.confirmCheckoutPayment({
+      attemptPublicId: delayedAsyncOnCancelled.attemptPublicId,
+    });
+    expect(asyncCustomerRes.state).toBe("unpaid");
+    expect(asyncCustomerRes.attemptStatus).toBe("cancelled");
+
+    // Signed expired webhook on an already-cancelled attempt must NOT overwrite `cancelled` to `expired`
+    const s = fakeStripe.sessions.get(delayedAsyncOnCancelled.sessionId)!;
+    s.status = "expired";
+    const nowSec = Math.floor(h.clock.now().getTime() / 1000);
+    const expWebhookBody = Buffer.from(
+      JSON.stringify({
+        id: `evt_exp_after_cancel_${ulid().toLowerCase()}`,
+        object: "event",
+        type: "checkout.session.expired",
+        created: nowSec,
+        livemode: false,
+        data: {
+          object: {
+            id: s.id,
+            object: "checkout.session",
+            status: "expired",
+            payment_status: "unpaid",
+            metadata: s.metadata,
+          },
+        },
+      }),
+      "utf8",
+    );
+    const expWhOut = await paymentsMod.handleSignedWebhook({
+      provider: "stripe",
+      rawBody: expWebhookBody,
+      headers: { "stripe-signature": signStripeWebhook(expWebhookBody, stripeWh, nowSec) },
+      notificationUrl: "https://portal.example.test/api/payments/webhooks/stripe",
+    });
+    expect(expWhOut.booked).toBe(false);
+    expect(expWhOut.reasonCode).toBe("ATTEMPT_NOT_ACTIVE");
+
+    await paymentsMod.reconcilePendingAttempts();
+
+    const [cancelledSnapAfter] = await tdb.db
+      .select()
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, delayedAsyncOnCancelled.attemptPublicId));
+    expect(cancelledSnapAfter?.status).toBe("cancelled");
+    expect(cancelledSnapAfter?.reconciliationNote).toBeNull();
+    expect(cancelledSnapAfter?.version).toBe(cancelledSnapBefore?.version);
+
+    // 3. Voided invoice is treated as terminal on customer confirmCheckoutPayment before mismatch/async/status
+    const voidCheckout = await createCustomerCheckout();
+    fakeStripe.markSessionAsyncProcessing(voidCheckout.sessionId);
+    await complianceMod.invoices.admin.void(freshStepUpAdmin, {
+      invoicePublicId: voidCheckout.invoicePublicId,
+      reason: "Order cancelled before payment settlement",
+    });
+
+    h.clock.advance(5_000);
+    const voidConfirm = await buyerCaller.payments.confirmCheckoutPayment({
+      attemptPublicId: voidCheckout.attemptPublicId,
+    });
+    expect(voidConfirm.bookedNow).toBe(false);
+    expect(voidConfirm.invoiceStatus).toBe("void");
+    expect(voidConfirm.state).toBe("unpaid");
+  });
+
+  it("does not suppress missing-webhook alert when an unrelated Stripe webhook is processed later in the same mode", async () => {
+    const stack = await buildActivatedStack();
+    const {
+      h,
+      fakeStripe,
+      paymentsMod,
+      admin,
+      buyer,
+      callerFor,
+      createCustomerCheckout,
+      deliverSignedCompletedWebhook,
+    } = stack;
+    const buyerCaller = callerFor(buyer.principal);
+
+    // Attempt 1 is booked via customer provider_lookup with NO webhook ever arriving for Attempt 1
+    const unmatchedLookup = await createCustomerCheckout();
+    fakeStripe.markSessionPaid(unmatchedLookup.sessionId);
+    const bookedLookup = await buyerCaller.payments.confirmCheckoutPayment({
+      attemptPublicId: unmatchedLookup.attemptPublicId,
+    });
+    expect(bookedLookup.bookedNow).toBe(true);
+    expect(bookedLookup.bookingSource).toBe("provider_lookup");
+
+    // Clear any prior test's deduped alert row in the shared test DB so we observe a fresh emission
+    await tdb.db
+      .delete(opsAlertTables.operationalAlerts)
+      .where(eq(opsAlertTables.operationalAlerts.code, "STRIPE_WEBHOOK_DELIVERY_MISSING"));
+
+    // 2 minutes later, a DIFFERENT Attempt 2 receives a genuine signed Stripe webhook in the same mode
+    h.clock.advance(2 * 60 * 1_000);
+    const unrelatedWebhookCheckout = await createCustomerCheckout();
+    fakeStripe.markSessionPaid(unrelatedWebhookCheckout.sessionId);
+    const whRes = await deliverSignedCompletedWebhook(
+      unrelatedWebhookCheckout.sessionId,
+      `evt_unrelated_${ulid().toLowerCase()}`,
+    );
+    expect(whRes.booked).toBe(true);
+
+    // Advance past Attempt 1's 10-minute grace window: Attempt 1 is STILL unmatched (`verifiedWebhookEventId IS NULL`)
+    // and MUST raise `STRIPE_WEBHOOK_DELIVERY_MISSING` despite Attempt 2's later webhook!
+    h.clock.advance(9 * 60 * 1_000);
+    await paymentsMod.reconcilePendingAttempts();
+
+    const [unmatchedAfter] = await tdb.db
+      .select()
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, unmatchedLookup.attemptPublicId));
+    expect(unmatchedAfter?.verifiedWebhookEventId).toBeNull();
+    expect(unmatchedAfter?.missingWebhookAlertedAt).not.toBeNull();
+
+    const [openMissingAlert] = await tdb.db
+      .select()
+      .from(opsAlertTables.operationalAlerts)
+      .where(
+        and(
+          eq(opsAlertTables.operationalAlerts.code, "STRIPE_WEBHOOK_DELIVERY_MISSING"),
+          eq(opsAlertTables.operationalAlerts.state, "open"),
+        ),
+      );
+    expect(openMissingAlert?.state).toBe("open");
+
+    const settings = await callerFor(admin.principal).payments.admin.getSettings();
+    expect(settings.stripe.webhookDelivery.missingWebhookDetected).toBe(true);
+    expect(settings.stripe.webhookDelivery.unwebhookedLookupPaidCount).toBeGreaterThanOrEqual(1);
   });
 });

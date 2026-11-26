@@ -424,4 +424,132 @@ describe("D5 PaymentReturnConfirmation & AdminCheckStripePaymentButton", () => {
     );
     await waitFor(() => expect(onUpdated).toHaveBeenCalledTimes(1));
   });
+
+  it("preserves WCAG 2.2 AA 2.4.3 focus on manual Check payment status (including first-error retry -> processing -> paid) without stealing focus on background polls", async () => {
+    const user = userEvent.setup();
+
+    // 1. Initial check fails -> user activates `Check payment status` in error state -> moves focus to summary `Check payment status` -> user activates again -> moves focus to `Continue to your order` on Paid
+    mocks.confirmCheckoutPayment
+      .mockRejectedValueOnce(new Error("Temporary Stripe timeout"))
+      .mockResolvedValueOnce({
+        attemptPublicId: attemptId,
+        orderPublicId: orderId,
+        orderReference: "RP-ORD-2026-0091",
+        invoicePublicId: invoiceId,
+        invoiceNumber: "INV-2026-0091",
+        invoiceStatus: "issued",
+        receiptPublicId: null,
+        cartPublicId: cartId,
+        provider: "stripe",
+        environment: "test",
+        attemptStatus: "redirected",
+        state: "processing",
+        bookedNow: false,
+        bookingSource: null,
+        paidAt: null,
+        cooldownRemainingMs: 0,
+      })
+      .mockResolvedValueOnce({
+        attemptPublicId: attemptId,
+        orderPublicId: orderId,
+        orderReference: "RP-ORD-2026-0091",
+        invoicePublicId: invoiceId,
+        invoiceNumber: "INV-2026-0091",
+        invoiceStatus: "paid",
+        receiptPublicId: receiptId,
+        cartPublicId: cartId,
+        provider: "stripe",
+        environment: "test",
+        attemptStatus: "paid",
+        state: "paid",
+        bookedNow: true,
+        bookingSource: "provider_lookup",
+        paidAt: "2026-11-26T12:00:05.000Z",
+        cooldownRemainingMs: 0,
+      });
+
+    const { unmount } = renderUi(
+      <main>
+        <PaymentReturnConfirmation attemptPublicId={attemptId} />
+      </main>,
+      { path: `/checkout/return?attempt=${attemptId}` },
+    );
+
+    const errorRetryBtn = await screen.findByRole("button", { name: "Check payment status" });
+    errorRetryBtn.focus();
+    expect(errorRetryBtn).toHaveFocus();
+    await user.keyboard("{Enter}");
+
+    await screen.findByText(/Confirming your payment with the payment provider/i);
+    const processingCheckBtn = screen.getByRole("button", { name: "Check payment status" });
+    await waitFor(() => expect(processingCheckBtn).toHaveFocus());
+
+    await user.keyboard("{Enter}");
+    await screen.findByText("Payment received");
+    expect(screen.queryByRole("button", { name: "Check payment status" })).toBeNull();
+    const continueLink = screen.getByRole("link", { name: "Continue to your order" });
+    await waitFor(() => expect(continueLink).toHaveFocus());
+    unmount();
+
+    // 2. Background automatic poll transitioning processing -> paid does NOT steal focus from another focused control
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    mocks.confirmCheckoutPayment
+      .mockReset()
+      .mockResolvedValueOnce({
+        attemptPublicId: attemptId,
+        orderPublicId: orderId,
+        orderReference: "RP-ORD-2026-0092",
+        invoicePublicId: invoiceId,
+        invoiceNumber: "INV-2026-0092",
+        invoiceStatus: "issued",
+        receiptPublicId: null,
+        cartPublicId: cartId,
+        provider: "stripe",
+        environment: "test",
+        attemptStatus: "redirected",
+        state: "processing",
+        bookedNow: false,
+        bookingSource: null,
+        paidAt: null,
+        cooldownRemainingMs: 0,
+      })
+      .mockResolvedValueOnce({
+        attemptPublicId: attemptId,
+        orderPublicId: orderId,
+        orderReference: "RP-ORD-2026-0092",
+        invoicePublicId: invoiceId,
+        invoiceNumber: "INV-2026-0092",
+        invoiceStatus: "paid",
+        receiptPublicId: receiptId,
+        cartPublicId: cartId,
+        provider: "stripe",
+        environment: "test",
+        attemptStatus: "paid",
+        state: "paid",
+        bookedNow: true,
+        bookingSource: "provider_lookup",
+        paidAt: "2026-11-26T12:00:10.000Z",
+        cooldownRemainingMs: 0,
+      });
+
+    renderUi(
+      <main>
+        <PaymentReturnConfirmation attemptPublicId={attemptId} />
+      </main>,
+      { path: `/checkout/return?attempt=${attemptId}` },
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20);
+    });
+    const openInvoiceLink = await screen.findByRole("link", { name: "Open invoice" });
+    openInvoiceLink.focus();
+    expect(openInvoiceLink).toHaveFocus();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(CONFIRM_BACKOFF_DELAYS_MS[0] + 50);
+    });
+    await screen.findByText("Payment received");
+    expect(openInvoiceLink).toHaveFocus();
+  });
 });

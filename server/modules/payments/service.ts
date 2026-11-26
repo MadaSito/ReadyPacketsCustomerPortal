@@ -13,7 +13,7 @@
  *    hardcoded reviewed same-origin paths; browser URL parameters are never trusted as proof of payment.
  */
 import { createHash } from "node:crypto";
-import { and, asc, count, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, or } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
@@ -2476,6 +2476,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         invoice = await complianceSvc.getInvoiceForCheckout(targetInvoicePublicId, {
           principal: livePrincipal,
           tx,
+          forUpdate: true,
         });
       } catch (err) {
         if (target.attemptPublicId && !target.invoicePublicId && err instanceof DomainError && err.code === "NOT_FOUND") {
@@ -2620,16 +2621,16 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       return { matches: false, reasonCode: "CURRENCY_MISMATCH" };
     }
     if (
-      fetched.hasReferenceConflict ||
-      (fetched.clientReferenceId !== undefined &&
-        fetched.clientReferenceId !== null &&
-        fetched.clientReferenceId !== attempt.publicId)
+      fetched.clientReferenceId !== undefined &&
+      fetched.clientReferenceId !== null &&
+      fetched.clientReferenceId !== attempt.publicId
     ) {
       return { matches: false, reasonCode: "CLIENT_REFERENCE_MISMATCH" };
     }
     if (
       !fetched.attemptPublicId ||
       fetched.attemptPublicId !== attempt.publicId ||
+      fetched.hasReferenceConflict ||
       (fetched.paymentIntentAttemptPublicId && fetched.paymentIntentAttemptPublicId !== attempt.publicId)
     ) {
       return { matches: false, reasonCode: "ATTEMPT_METADATA_MISMATCH" };
@@ -2641,7 +2642,10 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     ) {
       return { matches: false, reasonCode: "INVOICE_METADATA_MISMATCH" };
     }
-    if (fetched.orderPublicId && fetched.orderPublicId !== attempt.orderPublicId) {
+    if (
+      (attempt.provider === "stripe" && !fetched.orderPublicId) ||
+      (fetched.orderPublicId && fetched.orderPublicId !== attempt.orderPublicId)
+    ) {
       return { matches: false, reasonCode: "ORDER_METADATA_MISMATCH" };
     }
     return { matches: true };
@@ -2737,6 +2741,44 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     );
   }
 
+  async function emitPaidOnCancelledAttemptAlertInTx(
+    tx: Tx,
+    locked: PaymentAttemptRow,
+    auditActor: { userId?: number | undefined; role: SessionPrincipal["role"] | "system" },
+  ): Promise<void> {
+    await emitPaymentOpsAlert(
+      {
+        dedupKey: `paid-cancelled-attempt:${locked.publicId}`,
+        severity: "error",
+        code: "PAID_ON_CANCELLED_ATTEMPT",
+        title: "Cancelled checkout attempt was paid on Stripe",
+        text: "Customer completed payment on Stripe after the checkout attempt was cancelled. Open the invoice and run Check with Stripe now to verify and book.",
+        orderPublicId: locked.orderPublicId,
+      },
+      tx,
+    );
+    await deps.audit.record(
+      {
+        category: "security",
+        eventName: "payments.attempt.paid_after_cancel_held",
+        action: "verify",
+        outcome: "refused",
+        severity: "WARN",
+        reasonCode: "PAID_ON_CANCELLED_ATTEMPT",
+        actor: auditActor,
+        resource: { type: "payment_attempt", publicId: locked.publicId },
+        orderPublicId: locked.orderPublicId,
+        attributes: {
+          order_public_id: locked.orderPublicId,
+          invoice_public_id: locked.invoicePublicId,
+          provider: locked.provider,
+          attempt_status: locked.status,
+        },
+      },
+      tx,
+    );
+  }
+
   /**
    * Increment 08 D5 unified idempotent booking critical section:
    * Fed by EITHER a verified signed webhook (`source: "webhook"`) OR an authoritative server-to-provider
@@ -2768,6 +2810,26 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     const auditActor = input.actor?.userId
       ? { userId: input.actor.userId, role: input.actor.role }
       : { role: input.actor?.role ?? "system" };
+
+    // Canonical lock hierarchy: lock parent `orders` -> `compliance_invoices` -> ledger sums FIRST
+    // via `getInvoiceForCheckout(..., { tx, forUpdate: true })`, THEN lock `payment_attempts`.
+    const [attemptMeta] = await tx
+      .select({
+        id: paymentAttempts.id,
+        invoicePublicId: paymentAttempts.invoicePublicId,
+      })
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.id, input.attemptId))
+      .limit(1);
+
+    if (!attemptMeta) {
+      return { booked: false, alreadyPaid: false, reasonCode: "ATTEMPT_NOT_FOUND", attempt: null };
+    }
+
+    const currentInvoice = await complianceSvc.getInvoiceForCheckout(attemptMeta.invoicePublicId, {
+      tx,
+      forUpdate: true,
+    });
 
     const [locked] = await tx
       .select()
@@ -2837,6 +2899,14 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     if (!input.allowRepair) {
       if (input.source === "provider_lookup") {
         if (locked.status !== "created" && locked.status !== "redirected") {
+          if (
+            locked.status === "cancelled" &&
+            currentInvoice.status === "issued" &&
+            currentInvoice.voidedAt === null &&
+            checkFetchedMatchesAttempt(locked, input.fetched).matches
+          ) {
+            await emitPaidOnCancelledAttemptAlertInTx(tx, locked, auditActor);
+          }
           return { booked: false, alreadyPaid: false, reasonCode: "ATTEMPT_NOT_ACTIVE", attempt: locked };
         }
       } else if (locked.status === "failed") {
@@ -2850,7 +2920,6 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       }
     }
 
-    const currentInvoice = await complianceSvc.getInvoiceForCheckout(locked.invoicePublicId, { tx });
     if (currentInvoice.status === "paid") {
       if (whRow) {
         await tx
@@ -3052,9 +3121,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
     await resolvePaymentOpsAlert(`webhook-verify:${locked.publicId}`, tx);
     await resolvePaymentOpsAlert(`verification-mismatch:${locked.publicId}`, tx);
-    if (input.source === "webhook" && locked.provider === "stripe") {
-      await resolvePaymentOpsAlert(stripeWebhookDeliveryMissingAlert(locked.environment).dedupKey, tx);
-    }
+    await resolvePaymentOpsAlert(`paid-cancelled-attempt:${locked.publicId}`, tx);
 
     await deps.audit.record(
       {
@@ -3190,54 +3257,61 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
    * ownership, attempt identity, and Stripe config/key digest in the post-egress transaction, and books
    * via `bookAuthoritativeAttemptPaymentInTx` when paid & strictly matched.
    */
+  const cancelledCustomerLookupCooldownMs = new Map<number, number>();
+
   async function confirmCheckoutPayment(
     principal: SessionPrincipal,
     input: { attemptPublicId: string },
     opts?: { signal?: AbortSignal | undefined; beforeSend?: (() => Promise<void>) | undefined },
   ): Promise<ConfirmCheckoutPaymentResult> {
-    requireComplianceService();
+    const complianceSvc = requireComplianceService();
+    if (principal.role !== "customer") {
+      throw forbidden("CUSTOMER_ONLY");
+    }
 
-    const loadOwnedCustomerAttemptInTx = async (tx: Tx, expectedAttemptId?: number) => {
-      const liveActor = await assertLiveActorInTx(deps, principal, tx);
-      if (liveActor.role !== "customer") {
-        throw forbidden("CUSTOMER_ONLY");
-      }
-      const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
-      const complianceSvc = requireComplianceService();
+    // Stage owner-scoped candidate BEFORE opening any locking transaction so another customer's
+    // or a reassigned order's attempt never acquires a foreign row lock (`FOR UPDATE`).
+    const [candidate] = await deps.db
+      .select({
+        id: paymentAttempts.id,
+        publicId: paymentAttempts.publicId,
+        invoiceId: paymentAttempts.invoiceId,
+        invoicePublicId: paymentAttempts.invoicePublicId,
+        orderPublicId: paymentAttempts.orderPublicId,
+        customerUserId: paymentAttempts.customerUserId,
+      })
+      .from(paymentAttempts)
+      .where(
+        and(
+          eq(paymentAttempts.publicId, input.attemptPublicId),
+          eq(paymentAttempts.customerUserId, principal.userId),
+        ),
+      )
+      .limit(1);
 
-      let resolvedId = expectedAttemptId;
-      if (resolvedId === undefined) {
-        const [lookup] = await tx
-          .select({ id: paymentAttempts.id })
-          .from(paymentAttempts)
-          .where(eq(paymentAttempts.publicId, input.attemptPublicId))
-          .limit(1);
-        if (!lookup) {
-          throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
-        }
-        resolvedId = lookup.id;
-      }
+    if (!candidate) {
+      throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+    }
 
-      const [attempt] = await tx
-        .select()
-        .from(paymentAttempts)
-        .where(eq(paymentAttempts.id, resolvedId))
-        .for("update")
-        .limit(1);
-
-      if (
-        !attempt ||
-        attempt.publicId !== input.attemptPublicId ||
-        attempt.customerUserId !== liveActor.userId
-      ) {
+    const ordersSvc = deps.services.orders?.orders;
+    if (ordersSvc && typeof ordersSvc.getOrderRefByPublicId === "function") {
+      const preOrder = await ordersSvc.getOrderRefByPublicId(candidate.orderPublicId);
+      if (!preOrder || preOrder.ownerUserId !== principal.userId) {
         throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
       }
+    }
 
+    // Canonical lock hierarchy inside tx:
+    // 1. `orders` FOR UPDATE -> `compliance_invoices` FOR UPDATE -> current ledger sums (`getInvoiceForCheckout(..., { forUpdate: true })`)
+    // 2. `users` FOR UPDATE (`assertLiveActorInTx`) + verify current owner
+    // 3. `payment_attempts` FOR UPDATE by primary key
+    const loadOwnedCustomerAttemptInTx = async (tx: Tx) => {
       let invoice: Awaited<ReturnType<typeof complianceSvc.getInvoiceForCheckout>>;
       try {
-        invoice = await complianceSvc.getInvoiceForCheckout(attempt.invoicePublicId, {
-          principal: livePrincipal,
+        invoice = await complianceSvc.getInvoiceForCheckout(candidate.invoicePublicId, {
+          principal,
           tx,
+          forUpdate: true,
         });
       } catch (err) {
         if (err instanceof DomainError && (err.code === "NOT_FOUND" || err.code === "FORBIDDEN")) {
@@ -3246,81 +3320,137 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         throw err;
       }
 
-      if (invoice.ownerUserId !== liveActor.userId || attempt.invoiceId !== invoice.invoiceId) {
+      if (invoice.ownerUserId !== principal.userId) {
+        throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+      }
+
+      const liveActor = await assertLiveActorInTx(deps, principal, tx);
+      if (liveActor.role !== "customer") {
+        throw forbidden("CUSTOMER_ONLY");
+      }
+      if (invoice.ownerUserId !== liveActor.userId) {
+        throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+      }
+      const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
+
+      const [attempt] = await tx
+        .select()
+        .from(paymentAttempts)
+        .where(eq(paymentAttempts.id, candidate.id))
+        .for("update")
+        .limit(1);
+
+      if (
+        !attempt ||
+        attempt.publicId !== input.attemptPublicId ||
+        attempt.customerUserId !== liveActor.userId ||
+        attempt.invoiceId !== invoice.invoiceId ||
+        attempt.orderPublicId !== invoice.orderPublicId
+      ) {
         throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
       }
 
       return { liveActor, livePrincipal, attempt, invoice };
     };
 
-    const staged = await runComplianceTx(
-      deps,
-      principal,
-      { type: "payment_attempt", publicId: input.attemptPublicId },
-      async (tx) => {
-        const { liveActor, livePrincipal, attempt, invoice } = await loadOwnedCustomerAttemptInTx(tx);
+    const staged = await runWithMysqlDeadlockRetry(() =>
+      runComplianceTx(
+        deps,
+        principal,
+        { type: "payment_attempt", publicId: input.attemptPublicId },
+        async (tx) => {
+          const { liveActor, livePrincipal, attempt, invoice } = await loadOwnedCustomerAttemptInTx(tx);
 
-        if (
-          invoice.status === "paid" ||
-          attempt.status === "paid" ||
-          attempt.status === "cancelled" ||
-          attempt.status === "expired" ||
-          attempt.status === "failed" ||
-          invoice.status === "void" ||
-          attempt.provider !== "stripe" ||
-          !attempt.providerRef
-        ) {
-          return {
-            kind: "immediate" as const,
-            invoice,
-            attempt,
-            cooldownRemainingMs: 0,
-          };
-        }
-
-        const now = deps.clock.now();
-        if (attempt.lastCustomerLookupAt) {
-          const elapsedMs = now.getTime() - attempt.lastCustomerLookupAt.getTime();
-          if (elapsedMs >= 0 && elapsedMs < CUSTOMER_CONFIRM_COOLDOWN_MS) {
+          if (
+            invoice.status === "paid" ||
+            attempt.status === "paid" ||
+            attempt.status === "expired" ||
+            attempt.status === "failed" ||
+            invoice.status === "void" ||
+            attempt.provider !== "stripe" ||
+            !attempt.providerRef
+          ) {
             return {
               kind: "immediate" as const,
               invoice,
               attempt,
-              cooldownRemainingMs: CUSTOMER_CONFIRM_COOLDOWN_MS - elapsedMs,
+              cooldownRemainingMs: 0,
             };
           }
-        }
 
-        let loadedCreds: { credentials: ProviderCredentials; keyDigest: string };
-        try {
-          loadedCreds = await loadStripeLookupCredentials(attempt.environment, { tx });
-        } catch {
+          const now = deps.clock.now();
+          if (attempt.status === "cancelled") {
+            const lastCancelledCheckMs = cancelledCustomerLookupCooldownMs.get(attempt.id);
+            if (lastCancelledCheckMs !== undefined) {
+              const elapsedMs = now.getTime() - lastCancelledCheckMs;
+              if (elapsedMs >= 0 && elapsedMs < CUSTOMER_CONFIRM_COOLDOWN_MS) {
+                return {
+                  kind: "immediate" as const,
+                  invoice,
+                  attempt,
+                  cooldownRemainingMs: CUSTOMER_CONFIRM_COOLDOWN_MS - elapsedMs,
+                };
+              }
+            }
+          } else if (attempt.lastCustomerLookupAt) {
+            const elapsedMs = now.getTime() - attempt.lastCustomerLookupAt.getTime();
+            if (elapsedMs >= 0 && elapsedMs < CUSTOMER_CONFIRM_COOLDOWN_MS) {
+              return {
+                kind: "immediate" as const,
+                invoice,
+                attempt,
+                cooldownRemainingMs: CUSTOMER_CONFIRM_COOLDOWN_MS - elapsedMs,
+              };
+            }
+          }
+
+          let loadedCreds: { credentials: ProviderCredentials; keyDigest: string };
+          try {
+            loadedCreds = await loadStripeLookupCredentials(attempt.environment, { tx });
+          } catch {
+            return {
+              kind: "immediate" as const,
+              invoice,
+              attempt,
+              cooldownRemainingMs: 0,
+            };
+          }
+
+          if (attempt.status === "cancelled") {
+            if (cancelledCustomerLookupCooldownMs.size > 2_000) {
+              cancelledCustomerLookupCooldownMs.clear();
+            }
+            cancelledCustomerLookupCooldownMs.set(attempt.id, now.getTime());
+            return {
+              kind: "lookup" as const,
+              attempt,
+              invoice,
+              credentials: loadedCreds.credentials,
+              keyDigest: loadedCreds.keyDigest,
+              liveActor,
+              livePrincipal,
+            };
+          }
+
+          await tx
+            .update(paymentAttempts)
+            .set({
+              lastCustomerLookupAt: now,
+              updatedAt: now,
+            })
+            .where(eq(paymentAttempts.id, attempt.id));
+
           return {
-            kind: "immediate" as const,
+            kind: "lookup" as const,
+            attempt: { ...attempt, lastCustomerLookupAt: now },
             invoice,
-            attempt,
-            cooldownRemainingMs: 0,
+            credentials: loadedCreds.credentials,
+            keyDigest: loadedCreds.keyDigest,
+            liveActor,
+            livePrincipal,
           };
-        }
-
-        await tx
-          .update(paymentAttempts)
-          .set({
-            lastCustomerLookupAt: now,
-            updatedAt: now,
-          })
-          .where(eq(paymentAttempts.id, attempt.id));
-
-        return {
-          kind: "lookup" as const,
-          attempt: { ...attempt, lastCustomerLookupAt: now },
-          invoice,
-          credentials: loadedCreds.credentials,
-          keyDigest: loadedCreds.keyDigest,
-          liveActor,
-          livePrincipal,
-        };
-      },
+        },
+      ),
     );
 
     const orderReference = await readOrderReferenceSafe(staged.invoice.orderId);
@@ -3357,63 +3487,94 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         principal,
         { type: "payment_attempt", publicId: staged.attempt.publicId },
         async (tx) => {
-          const { liveActor, livePrincipal, attempt: locked, invoice } = await loadOwnedCustomerAttemptInTx(
-            tx,
-            staged.attempt.id,
-          );
+          const { liveActor, livePrincipal, attempt: locked, invoice } = await loadOwnedCustomerAttemptInTx(tx);
 
-        if (
-          locked.provider !== "stripe" ||
-          locked.providerRef !== staged.attempt.providerRef ||
-          locked.environment !== staged.attempt.environment
-        ) {
-          throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
-        }
+          if (
+            locked.provider !== "stripe" ||
+            locked.providerRef !== staged.attempt.providerRef ||
+            locked.environment !== staged.attempt.environment
+          ) {
+            throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+          }
 
-        if (invoice.status === "paid" || locked.status === "paid") {
-          return buildConfirmViewFromInvoiceAndAttempt(invoice, locked, {
-            orderReference,
-            bookedNow: false,
-          });
-        }
+          if (invoice.status === "paid" || locked.status === "paid") {
+            return buildConfirmViewFromInvoiceAndAttempt(invoice, locked, {
+              orderReference,
+              bookedNow: false,
+            });
+          }
 
-        let postCreds: { credentials: ProviderCredentials; keyDigest: string };
-        try {
-          postCreds = await loadStripeLookupCredentials(locked.environment, { tx });
-        } catch {
-          return buildConfirmViewFromInvoiceAndAttempt(invoice, locked, {
-            orderReference,
-            bookedNow: false,
-            forceState: "processing",
-          });
-        }
-        if (postCreds.keyDigest !== staged.keyDigest) {
-          return buildConfirmViewFromInvoiceAndAttempt(invoice, locked, {
-            orderReference,
-            bookedNow: false,
-            forceState: "processing",
-          });
-        }
+          if (invoice.status === "void" || invoice.voidedAt !== null) {
+            return buildConfirmViewFromInvoiceAndAttempt(invoice, locked, {
+              orderReference,
+              bookedNow: false,
+            });
+          }
 
-        if (fetched.status === "paid") {
-          const complianceSvc = requireComplianceService();
-          const booked = await bookAuthoritativeAttemptPaymentInTx(tx, {
-            attemptId: locked.id,
-            source: "provider_lookup",
-            fetched,
-            actor: { userId: liveActor.userId, role: liveActor.role },
-          });
-          const refreshedInvoice = await complianceSvc.getInvoiceForCheckout(locked.invoicePublicId, {
-            principal: livePrincipal,
-            tx,
-          });
-          const currentAttempt = booked.attempt ?? locked;
-          return buildConfirmViewFromInvoiceAndAttempt(refreshedInvoice, currentAttempt, {
-            orderReference,
-            bookedNow: booked.booked && !booked.alreadyPaid,
-            ...(booked.booked ? {} : { forceState: "processing" as const }),
-          });
-        }
+          let postCreds: { credentials: ProviderCredentials; keyDigest: string };
+          try {
+            postCreds = await loadStripeLookupCredentials(locked.environment, { tx });
+          } catch {
+            return buildConfirmViewFromInvoiceAndAttempt(invoice, locked, {
+              orderReference,
+              bookedNow: false,
+              ...(locked.status === "created" || locked.status === "redirected"
+                ? { forceState: "processing" as const }
+                : {}),
+            });
+          }
+          if (postCreds.keyDigest !== staged.keyDigest) {
+            return buildConfirmViewFromInvoiceAndAttempt(invoice, locked, {
+              orderReference,
+              bookedNow: false,
+              ...(locked.status === "created" || locked.status === "redirected"
+                ? { forceState: "processing" as const }
+                : {}),
+            });
+          }
+
+          // Terminal non-active attempt guard BEFORE mismatch/async/status mutation:
+          // Never mutate `payment_attempts`, `compliance_invoices`, or `orders` on the customer path
+          // when `locked.status` is not `created | redirected`. If a `cancelled` attempt was genuinely
+          // paid on Stripe (e.g. customer cancelled in one tab and paid in another), surface a
+          // deduplicated ops alert so an administrator can repair it via step-up "Check with Stripe now".
+          if (locked.status !== "created" && locked.status !== "redirected") {
+            if (
+              locked.status === "cancelled" &&
+              invoice.status === "issued" &&
+              fetched.status === "paid" &&
+              checkFetchedMatchesAttempt(locked, fetched).matches
+            ) {
+              await emitPaidOnCancelledAttemptAlertInTx(tx, locked, {
+                userId: liveActor.userId,
+                role: liveActor.role,
+              });
+            }
+            return buildConfirmViewFromInvoiceAndAttempt(invoice, locked, {
+              orderReference,
+              bookedNow: false,
+            });
+          }
+
+          if (fetched.status === "paid") {
+            const booked = await bookAuthoritativeAttemptPaymentInTx(tx, {
+              attemptId: locked.id,
+              source: "provider_lookup",
+              fetched,
+              actor: { userId: liveActor.userId, role: liveActor.role },
+            });
+            const refreshedInvoice = await complianceSvc.getInvoiceForCheckout(locked.invoicePublicId, {
+              principal: livePrincipal,
+              tx,
+              forUpdate: true,
+            });
+            const currentAttempt = booked.attempt ?? locked;
+            return buildConfirmViewFromInvoiceAndAttempt(refreshedInvoice, currentAttempt, {
+              orderReference,
+              bookedNow: booked.booked && !booked.alreadyPaid,
+              ...(booked.booked ? {} : { forceState: "processing" as const }),
+            });
+          }
 
         const bindingCheck = checkFetchedBindingMatchesAttempt(locked, fetched);
         if (!bindingCheck.matches) {
@@ -4103,24 +4264,64 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
       if (verified.outcomeHint === "expired" || verified.outcomeHint === "failed") {
         const nextStatus: PaymentAttemptStatus = verified.outcomeHint === "expired" ? "expired" : "failed";
-        if (attempt.status === "created" || attempt.status === "redirected") {
-          await tx
-            .update(paymentAttempts)
-            .set({
-              status: nextStatus,
-              failureReasonCode: verified.eventType.slice(0, 64),
-              version: attempt.version + 1,
-              updatedAt: now,
-            })
-            .where(and(eq(paymentAttempts.id, attempt.id), eq(paymentAttempts.version, attempt.version)));
+        const ordersSvc = deps.services.orders?.orders;
+        if (ordersSvc && typeof ordersSvc.getOrderRefByPublicId === "function") {
+          await ordersSvc.getOrderRefByPublicId(attempt.orderPublicId, tx, { forUpdate: true });
+        }
+        const [lockedAttempt] = await tx
+          .select()
+          .from(paymentAttempts)
+          .where(eq(paymentAttempts.id, attempt.id))
+          .for("update")
+          .limit(1);
 
-          if (nextStatus === "failed") {
-            await notifyOrderPaymentEventInTx(tx, {
-              orderPublicId: attempt.orderPublicId,
-              kind: "failed",
-              eventRef: verified.externalEventId,
+        if (!lockedAttempt || (lockedAttempt.status !== "created" && lockedAttempt.status !== "redirected")) {
+          const whStatus = lockedAttempt?.status === "paid" ? "processed" : "ignored";
+          const whReason = lockedAttempt?.status === "paid" ? "ALREADY_PAID" : "ATTEMPT_NOT_ACTIVE";
+          if (existing) {
+            await tx
+              .update(paymentWebhookEvents)
+              .set({ status: whStatus, reasonCode: whReason, processedAt: now })
+              .where(eq(paymentWebhookEvents.id, existing.id));
+          } else {
+            await tx.insert(paymentWebhookEvents).values({
+              publicId: webhookPublicId,
+              provider: input.provider,
+              environment: eventEnv,
+              externalEventId: verified.externalEventId,
+              eventType: verified.eventType,
+              payloadSha256,
+              attemptId: attempt.id,
+              attemptPublicId: attempt.publicId,
+              providerRef: attempt.providerRef ?? verified.providerRef,
+              providerOrderRef: attempt.providerOrderRef ?? verified.providerOrderRef,
+              providerPaymentRef: verified.providerPaymentRef,
+              status: whStatus,
+              reasonCode: whReason,
+              occurredAt: verified.occurredAt,
+              receivedAt: now,
+              processedAt: now,
             });
           }
+          return { kind: "terminal_non_paid" as const, reasonCode: whReason };
+        }
+
+        await tx
+          .update(paymentAttempts)
+          .set({
+            status: nextStatus,
+            failureReasonCode: verified.eventType.slice(0, 64),
+            version: lockedAttempt.version + 1,
+            updatedAt: now,
+          })
+          .where(and(eq(paymentAttempts.id, lockedAttempt.id), eq(paymentAttempts.version, lockedAttempt.version)));
+
+        if (nextStatus === "failed") {
+          await notifyOrderPaymentEventInTx(tx, {
+            orderPublicId: lockedAttempt.orderPublicId,
+            kind: "failed",
+            eventRef: verified.externalEventId,
+          });
         }
 
         if (existing) {
@@ -4136,10 +4337,10 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             externalEventId: verified.externalEventId,
             eventType: verified.eventType,
             payloadSha256,
-            attemptId: attempt.id,
-            attemptPublicId: attempt.publicId,
-            providerRef: attempt.providerRef ?? verified.providerRef,
-            providerOrderRef: attempt.providerOrderRef ?? verified.providerOrderRef,
+            attemptId: lockedAttempt.id,
+            attemptPublicId: lockedAttempt.publicId,
+            providerRef: lockedAttempt.providerRef ?? verified.providerRef,
+            providerOrderRef: lockedAttempt.providerOrderRef ?? verified.providerOrderRef,
             providerPaymentRef: verified.providerPaymentRef,
             status: "processed",
             reasonCode: nextStatus.toUpperCase(),
@@ -4159,11 +4360,11 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
               ? { severity: "WARN" as const, reasonCode: verified.eventType.slice(0, 64) }
               : {}),
             actor: { role: "system" },
-            resource: { type: "payment_attempt", publicId: attempt.publicId },
-            orderPublicId: attempt.orderPublicId,
+            resource: { type: "payment_attempt", publicId: lockedAttempt.publicId },
+            orderPublicId: lockedAttempt.orderPublicId,
             attributes: {
-              order_public_id: attempt.orderPublicId,
-              invoice_public_id: attempt.invoicePublicId,
+              order_public_id: lockedAttempt.orderPublicId,
+              invoice_public_id: lockedAttempt.invoicePublicId,
               provider: input.provider,
               external_event_id: verified.externalEventId,
               reason_code: verified.eventType.slice(0, 64),
@@ -4172,7 +4373,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           },
           tx,
         );
-        return { kind: "terminal_non_paid" as const, status: nextStatus };
+        return { kind: "terminal_non_paid" as const, reasonCode: nextStatus.toUpperCase() };
       }
 
       // outcomeHint === "paid": record verified webhook receipt BEFORE calling provider fetchPayment outside tx!
@@ -4308,7 +4509,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         accepted: true,
         duplicate: false,
         booked: false,
-        reasonCode: staged.status.toUpperCase(),
+        reasonCode: staged.reasonCode,
       };
     }
 
@@ -4551,27 +4752,43 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
     if (fetched.status === "open") {
       const settledWaitAt = deps.clock.now();
-      const openOutcome = await deps.db.transaction(async (tx) => {
-        const [locked] = await tx
-          .select()
-          .from(paymentAttempts)
-          .where(eq(paymentAttempts.id, attempt.id))
-          .for("update")
-          .limit(1);
+      const openOutcome = await runWithMysqlDeadlockRetry(() =>
+        deps.db.transaction(async (tx) => {
+          const ordersSvc = deps.services.orders?.orders;
+          if (ordersSvc && typeof ordersSvc.getOrderRefByPublicId === "function") {
+            await ordersSvc.getOrderRefByPublicId(attempt.orderPublicId, tx, { forUpdate: true });
+          }
+          const [locked] = await tx
+            .select()
+            .from(paymentAttempts)
+            .where(eq(paymentAttempts.id, attempt.id))
+            .for("update")
+            .limit(1);
 
-        if (locked?.status === "paid") {
-          await tx
-            .update(paymentWebhookEvents)
-            .set({
-              status: "processed",
-              reasonCode: "ALREADY_PAID",
-              processedAt: settledWaitAt,
-            })
-            .where(eq(paymentWebhookEvents.id, webhookRowId));
-          return { alreadyPaid: true, mismatchReason: null as string | null };
-        }
+          if (locked?.status === "paid") {
+            await tx
+              .update(paymentWebhookEvents)
+              .set({
+                status: "processed",
+                reasonCode: "ALREADY_PAID",
+                processedAt: settledWaitAt,
+              })
+              .where(eq(paymentWebhookEvents.id, webhookRowId));
+            return { alreadyPaid: true, alreadyTerminal: false, mismatchReason: null as string | null };
+          }
 
-        if (locked) {
+          if (!locked || (locked.status !== "created" && locked.status !== "redirected")) {
+            await tx
+              .update(paymentWebhookEvents)
+              .set({
+                status: "ignored",
+                reasonCode: "ATTEMPT_NOT_ACTIVE",
+                processedAt: settledWaitAt,
+              })
+              .where(eq(paymentWebhookEvents.id, webhookRowId));
+            return { alreadyPaid: false, alreadyTerminal: true, mismatchReason: null as string | null };
+          }
+
           const bindingCheck = checkFetchedBindingMatchesAttempt(locked, fetched);
           if (!bindingCheck.matches) {
             await tx
@@ -4585,7 +4802,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             await recordLookupMismatchInTx(tx, locked, fetched, bindingCheck.reasonCode, {
               role: "system",
             });
-            return { alreadyPaid: false, mismatchReason: bindingCheck.reasonCode };
+            return { alreadyPaid: false, alreadyTerminal: false, mismatchReason: bindingCheck.reasonCode };
           }
           await tx
             .update(paymentAttempts)
@@ -4594,44 +4811,44 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
               updatedAt: settledWaitAt,
             })
             .where(eq(paymentAttempts.id, locked.id));
-        }
 
-        await tx
-          .update(paymentWebhookEvents)
-          .set({
-            status: "awaiting_settlement",
-            reasonCode: "AWAITING_ASYNC_SETTLEMENT",
-            processedAt: settledWaitAt,
-          })
-          .where(eq(paymentWebhookEvents.id, webhookRowId));
+          await tx
+            .update(paymentWebhookEvents)
+            .set({
+              status: "awaiting_settlement",
+              reasonCode: "AWAITING_ASYNC_SETTLEMENT",
+              processedAt: settledWaitAt,
+            })
+            .where(eq(paymentWebhookEvents.id, webhookRowId));
 
-        await notifyOrderPaymentEventInTx(tx, {
-          orderPublicId: attempt.orderPublicId,
-          kind: "pending_async",
-          eventRef: verified.externalEventId,
-        });
-
-        await deps.audit.record(
-          {
-            category: "business",
-            eventName: "payments.attempt.pending_async",
-            action: "transition",
-            outcome: "completed",
-            actor: { role: "system" },
-            resource: { type: "payment_attempt", publicId: attempt.publicId },
+          await notifyOrderPaymentEventInTx(tx, {
             orderPublicId: attempt.orderPublicId,
-            attributes: {
-              order_public_id: attempt.orderPublicId,
-              invoice_public_id: attempt.invoicePublicId,
-              provider: input.provider,
-              external_event_id: verified.externalEventId,
-              payment_state: "pending_async",
+            kind: "pending_async",
+            eventRef: verified.externalEventId,
+          });
+
+          await deps.audit.record(
+            {
+              category: "business",
+              eventName: "payments.attempt.pending_async",
+              action: "transition",
+              outcome: "completed",
+              actor: { role: "system" },
+              resource: { type: "payment_attempt", publicId: attempt.publicId },
+              orderPublicId: attempt.orderPublicId,
+              attributes: {
+                order_public_id: attempt.orderPublicId,
+                invoice_public_id: attempt.invoicePublicId,
+                provider: input.provider,
+                external_event_id: verified.externalEventId,
+                payment_state: "pending_async",
+              },
             },
-          },
-          tx,
-        );
-        return { alreadyPaid: false, mismatchReason: null as string | null };
-      });
+            tx,
+          );
+          return { alreadyPaid: false, alreadyTerminal: false, mismatchReason: null as string | null };
+        }),
+      );
       if (openOutcome.mismatchReason) {
         return {
           httpStatus: 200,
@@ -4639,6 +4856,15 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           duplicate: staged.duplicate,
           booked: false,
           reasonCode: openOutcome.mismatchReason,
+        };
+      }
+      if (openOutcome.alreadyTerminal) {
+        return {
+          httpStatus: 200,
+          accepted: true,
+          duplicate: staged.duplicate,
+          booked: false,
+          reasonCode: "ATTEMPT_NOT_ACTIVE",
         };
       }
       return {
@@ -4654,27 +4880,43 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       const termStatus: PaymentAttemptStatus = fetched.status === "expired" ? "expired" : "failed";
       const termReason = `FETCH_${termStatus.toUpperCase()}`;
       const termAt = deps.clock.now();
-      const termOutcome = await deps.db.transaction(async (tx) => {
-        const [locked] = await tx
-          .select()
-          .from(paymentAttempts)
-          .where(eq(paymentAttempts.id, attempt.id))
-          .for("update")
-          .limit(1);
+      const termOutcome = await runWithMysqlDeadlockRetry(() =>
+        deps.db.transaction(async (tx) => {
+          const ordersSvc = deps.services.orders?.orders;
+          if (ordersSvc && typeof ordersSvc.getOrderRefByPublicId === "function") {
+            await ordersSvc.getOrderRefByPublicId(attempt.orderPublicId, tx, { forUpdate: true });
+          }
+          const [locked] = await tx
+            .select()
+            .from(paymentAttempts)
+            .where(eq(paymentAttempts.id, attempt.id))
+            .for("update")
+            .limit(1);
 
-        if (locked?.status === "paid") {
-          await tx
-            .update(paymentWebhookEvents)
-            .set({
-              status: "processed",
-              reasonCode: "ALREADY_PAID",
-              processedAt: termAt,
-            })
-            .where(eq(paymentWebhookEvents.id, webhookRowId));
-          return { alreadyPaid: true, mismatchReason: null as string | null };
-        }
+          if (locked?.status === "paid") {
+            await tx
+              .update(paymentWebhookEvents)
+              .set({
+                status: "processed",
+                reasonCode: "ALREADY_PAID",
+                processedAt: termAt,
+              })
+              .where(eq(paymentWebhookEvents.id, webhookRowId));
+            return { alreadyPaid: true, alreadyTerminal: false, mismatchReason: null as string | null };
+          }
 
-        if (locked) {
+          if (!locked || (locked.status !== "created" && locked.status !== "redirected")) {
+            await tx
+              .update(paymentWebhookEvents)
+              .set({
+                status: "ignored",
+                reasonCode: "ATTEMPT_NOT_ACTIVE",
+                processedAt: termAt,
+              })
+              .where(eq(paymentWebhookEvents.id, webhookRowId));
+            return { alreadyPaid: false, alreadyTerminal: true, mismatchReason: null as string | null };
+          }
+
           const bindingCheck = checkFetchedBindingMatchesAttempt(locked, fetched);
           if (!bindingCheck.matches) {
             await tx
@@ -4688,14 +4930,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             await recordLookupMismatchInTx(tx, locked, fetched, bindingCheck.reasonCode, {
               role: "system",
             });
-            return { alreadyPaid: false, mismatchReason: bindingCheck.reasonCode };
+            return { alreadyPaid: false, alreadyTerminal: false, mismatchReason: bindingCheck.reasonCode };
           }
-        }
 
-        const didTransition = Boolean(
-          locked && locked.status !== termStatus,
-        );
-        if (locked) {
           await tx
             .update(paymentAttempts)
             .set({
@@ -4706,18 +4943,17 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
               updatedAt: termAt,
             })
             .where(and(eq(paymentAttempts.id, locked.id), eq(paymentAttempts.version, locked.version)));
-        }
 
-        await tx
-          .update(paymentWebhookEvents)
-          .set({
-            status: "processed",
-            reasonCode: termReason,
-            processedAt: termAt,
-          })
-          .where(eq(paymentWebhookEvents.id, webhookRowId));
+          await tx
+            .update(paymentWebhookEvents)
+            .set({
+              status: "processed",
+              reasonCode: termReason,
+              processedAt: termAt,
+            })
+            .where(eq(paymentWebhookEvents.id, webhookRowId));
 
-        if (termStatus === "failed" && didTransition) {
+          if (termStatus === "failed") {
           await notifyOrderPaymentEventInTx(tx, {
             orderPublicId: attempt.orderPublicId,
             kind: "failed",
@@ -4746,8 +4982,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             tx,
           );
         }
-        return { alreadyPaid: false, mismatchReason: null as string | null };
-      });
+        return { alreadyPaid: false, alreadyTerminal: false, mismatchReason: null as string | null };
+      }),
+      );
       if (termOutcome.mismatchReason) {
         return {
           httpStatus: 200,
@@ -4755,6 +4992,15 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           duplicate: staged.duplicate,
           booked: false,
           reasonCode: termOutcome.mismatchReason,
+        };
+      }
+      if (termOutcome.alreadyTerminal) {
+        return {
+          httpStatus: 200,
+          accepted: true,
+          duplicate: staged.duplicate,
+          booked: false,
+          reasonCode: "ATTEMPT_NOT_ACTIVE",
         };
       }
       return {
@@ -4815,42 +5061,50 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
     if (overdue.length === 0) return;
 
-    const byEnv = new Map<PaymentEnvironmentMode, { ids: number[]; newestPaidAt: Date }>();
+    const byEnv = new Map<PaymentEnvironmentMode, number[]>();
     for (const row of overdue) {
       if (!row.paidAt) continue;
       const existing = byEnv.get(row.environment);
       if (existing) {
-        existing.ids.push(row.id);
-        if (row.paidAt.getTime() > existing.newestPaidAt.getTime()) {
-          existing.newestPaidAt = row.paidAt;
-        }
+        existing.push(row.id);
       } else {
-        byEnv.set(row.environment, { ids: [row.id], newestPaidAt: row.paidAt });
+        byEnv.set(row.environment, [row.id]);
       }
     }
 
-    for (const [env, group] of byEnv) {
-      const [verifiedSince] = await deps.db
-        .select({ id: paymentWebhookEvents.id })
-        .from(paymentWebhookEvents)
-        .where(
-          and(
-            eq(paymentWebhookEvents.provider, "stripe"),
-            eq(paymentWebhookEvents.environment, env),
-            ne(paymentWebhookEvents.eventType, "readypackets.self_test"),
-            inArray(paymentWebhookEvents.status, ["processed", "awaiting_settlement"]),
-            gte(paymentWebhookEvents.receivedAt, group.newestPaidAt),
-          ),
-        )
-        .limit(1);
+    for (const [env, candidateIds] of byEnv) {
+      await runWithMysqlDeadlockRetry(() =>
+        deps.db.transaction(async (tx) => {
+          // Recheck qualifying unmatched rows under FOR UPDATE so a late webhook that just stamped
+          // `verifiedWebhookEventId` cannot race a stale candidate into emitting a false alert, and
+          // never suppress an unmatched attempt because an unrelated webhook arrived in the same mode.
+          const lockedEligible = await tx
+            .select({ id: paymentAttempts.id })
+            .from(paymentAttempts)
+            .where(
+              and(
+                inArray(paymentAttempts.id, candidateIds),
+                eq(paymentAttempts.provider, "stripe"),
+                eq(paymentAttempts.environment, env),
+                eq(paymentAttempts.status, "paid"),
+                eq(paymentAttempts.bookingSource, "provider_lookup"),
+                isNull(paymentAttempts.verifiedWebhookEventId),
+                isNull(paymentAttempts.missingWebhookAlertedAt),
+                isNotNull(paymentAttempts.paidAt),
+                lte(paymentAttempts.paidAt, cutoff),
+              ),
+            )
+            .orderBy(asc(paymentAttempts.id))
+            .for("update");
 
-      await deps.db.transaction(async (tx) => {
-        await tx
-          .update(paymentAttempts)
-          .set({ missingWebhookAlertedAt: now, updatedAt: now })
-          .where(inArray(paymentAttempts.id, group.ids));
+          if (lockedEligible.length === 0) return;
 
-        if (!verifiedSince) {
+          const eligibleIds = lockedEligible.map((r) => r.id);
+          await tx
+            .update(paymentAttempts)
+            .set({ missingWebhookAlertedAt: now, updatedAt: now })
+            .where(inArray(paymentAttempts.id, eligibleIds));
+
           await emitPaymentOpsAlert(stripeWebhookDeliveryMissingAlert(env), tx);
           await deps.audit.record(
             {
@@ -4865,13 +5119,13 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
               attributes: {
                 provider: "stripe",
                 environment: env,
-                unwebhooked_lookup_paid_count: group.ids.length,
+                unwebhooked_lookup_paid_count: eligibleIds.length,
               },
             },
             tx,
           );
-        }
-      });
+        }),
+      );
     }
   }
 
@@ -5048,21 +5302,31 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         continue;
       }
 
-      const nonPaidOutcome = await deps.db.transaction(async (tx) => {
-        if (!(await verifyPostEgressStripeDigestInTx(tx))) {
-          return "pending" as const;
-        }
-        const [locked] = await tx
-          .select()
-          .from(paymentAttempts)
-          .where(eq(paymentAttempts.id, attempt.id))
-          .for("update")
-          .limit(1);
-        if (!locked || locked.status === "paid") {
-          return "already_paid" as const;
-        }
+      const nonPaidOutcome = await runWithMysqlDeadlockRetry(() =>
+        deps.db.transaction(async (tx) => {
+          if (!(await verifyPostEgressStripeDigestInTx(tx))) {
+            return "pending" as const;
+          }
+          const ordersSvc = deps.services.orders?.orders;
+          if (ordersSvc && typeof ordersSvc.getOrderRefByPublicId === "function") {
+            await ordersSvc.getOrderRefByPublicId(attempt.orderPublicId, tx, { forUpdate: true });
+          }
+          const [locked] = await tx
+            .select()
+            .from(paymentAttempts)
+            .where(eq(paymentAttempts.id, attempt.id))
+            .for("update")
+            .limit(1);
+          if (!locked || locked.status === "paid") {
+            return "already_paid" as const;
+          }
+          // Never overwrite or mutate terminal attempts (`cancelled`, `failed`, `expired`) on delayed
+          // worker outcomes (`expired`, `failed`, `asyncPending`, or lookup mismatch).
+          if (locked.status !== "created" && locked.status !== "redirected") {
+            return "already_terminal" as const;
+          }
 
-        const bindingCheck = checkFetchedBindingMatchesAttempt(locked, fetched);
+          const bindingCheck = checkFetchedBindingMatchesAttempt(locked, fetched);
         if (!bindingCheck.matches) {
           await recordLookupMismatchInTx(tx, locked, fetched, bindingCheck.reasonCode, {
             role: "system",
@@ -5078,7 +5342,6 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             isPastExpiry &&
             !locked.verifiedWebhookEventId)
         ) {
-          if (locked.status === "expired") return "already_terminal" as const;
           await tx
             .update(paymentAttempts)
             .set({
@@ -5092,7 +5355,6 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         }
 
         if (fetched.status === "failed") {
-          if (locked.status === "failed") return "already_terminal" as const;
           await tx
             .update(paymentAttempts)
             .set({
@@ -5143,7 +5405,8 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           })
           .where(eq(paymentAttempts.id, locked.id));
         return "pending" as const;
-      });
+      }),
+      );
 
       if (nonPaidOutcome === "expired") {
         expired += 1;
@@ -5270,9 +5533,6 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             isNull(paymentAttempts.verifiedWebhookEventId),
             isNotNull(paymentAttempts.paidAt),
             lte(paymentAttempts.paidAt, graceCutoff),
-            ...(latestStripeWebhook
-              ? [gt(paymentAttempts.paidAt, latestStripeWebhook.receivedAt)]
-              : []),
           ),
         )
         .orderBy(asc(paymentAttempts.paidAt), asc(paymentAttempts.id))
@@ -6748,8 +7008,14 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         principal,
         { type: "payment_attempt", publicId: input.attemptPublicId ?? staged.targetInvoicePublicId },
         async (tx) => {
-        const liveActor = await assertLiveActorInTx(deps, principal, tx, "payments.manage");
         const complianceSvc = requireComplianceService();
+        // Lock parent `orders -> compliance_invoices` FIRST before actor/attempt locks so lock order
+        // is dead-lock-free and post-wait reads see current committed state under MySQL RR.
+        await complianceSvc.getInvoiceForCheckout(staged.targetInvoicePublicId, {
+          tx,
+          forUpdate: true,
+        });
+        const liveActor = await assertLiveActorInTx(deps, principal, tx, "payments.manage");
         let lastReasonCode = "STILL_UNPAID";
         let primaryAttempt: PaymentAttemptRow = staged.candidates[0]!;
         let didBook = false;
@@ -6795,6 +7061,10 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             lastReasonCode = "ALREADY_PAID";
             break;
           }
+          if (locked.status !== "created" && locked.status !== "redirected") {
+            lastReasonCode = locked.status === "expired" || entry.fetched.status === "expired" ? "SESSION_EXPIRED" : "STILL_UNPAID";
+            continue;
+          }
 
           const bindingCheck = checkFetchedBindingMatchesAttempt(locked, entry.fetched);
           if (!bindingCheck.matches) {
@@ -6839,7 +7109,10 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           }
         }
 
-        const refreshedInvoice = await complianceSvc.getInvoiceForCheckout(staged.targetInvoicePublicId, { tx });
+        const refreshedInvoice = await complianceSvc.getInvoiceForCheckout(staged.targetInvoicePublicId, {
+          tx,
+          forUpdate: true,
+        });
 
         await deps.audit.record(
           {

@@ -83,6 +83,8 @@ function PaymentReturnConfirmationActive({
   const [checkError, setCheckError] = useState<string | null>(null);
   const [autoChecksCompleted, setAutoChecksCompleted] = useState(0);
 
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const manualFocusHandoffRef = useRef(false);
   const paidNotifiedRef = useRef(false);
   const initialStartedRef = useRef(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -206,6 +208,38 @@ function PaymentReturnConfirmationActive({
   }, [autoChecksCompleted, checkError, confirmMutation.isPending, result, runConfirmationCheck]);
 
   const uiState: "paid" | "processing" | "unpaid" = result?.state ?? "processing";
+
+  // WCAG 2.2 AA 2.4.3: only when the user explicitly activated `Check payment status` and focus would
+  // otherwise be lost (button disabled during loading or unmounted on state transition), move focus to
+  // the persistent actionable control; never steal focus during automatic background polling.
+  useEffect(() => {
+    if (confirmMutation.isPending) return;
+    if (!manualFocusHandoffRef.current) return;
+    if (!result && !checkError) return;
+    manualFocusHandoffRef.current = false;
+    const root = containerRef.current;
+    if (!root || typeof document === "undefined") return;
+
+    const activeEl = document.activeElement;
+    const focusWouldBeLost =
+      !activeEl ||
+      activeEl === document.body ||
+      activeEl === document.documentElement ||
+      !document.contains(activeEl) ||
+      activeEl.hasAttribute("disabled") ||
+      activeEl.getAttribute("data-manual-focus-target") === "check-status";
+    if (!focusWouldBeLost) return;
+
+    const selector =
+      uiState === "paid"
+        ? '[data-manual-focus-target="continue-order"]'
+        : '[data-manual-focus-target="check-status"], [data-manual-focus-target="continue-order"]';
+    const nextFocusEl = root.querySelector<HTMLElement>(selector);
+    if (nextFocusEl && !nextFocusEl.hasAttribute("disabled")) {
+      nextFocusEl.focus();
+    }
+  }, [checkError, confirmMutation.isPending, result, uiState]);
+
   const autoRecheckExhausted =
     uiState === "processing" &&
     !confirmMutation.isPending &&
@@ -218,6 +252,7 @@ function PaymentReturnConfirmationActive({
 
   return (
     <div
+      ref={containerRef}
       data-testid="payment-return-confirmation"
       data-payment-return-state={uiState}
       className="grid min-w-0 gap-4"
@@ -321,16 +356,20 @@ function PaymentReturnConfirmationActive({
           <div className="mt-4 flex flex-wrap items-center gap-3">
             {uiState === "paid" && continueHref ? (
               <Button asChild>
-                <Link href={continueHref}>Continue to your order</Link>
+                <Link href={continueHref} data-manual-focus-target="continue-order">
+                  Continue to your order
+                </Link>
               </Button>
             ) : null}
 
             {uiState !== "paid" ? (
               <Button
+                data-manual-focus-target="check-status"
                 variant={autoRecheckExhausted ? "secondary" : "primary"}
                 leadingIcon={<RefreshCw aria-hidden />}
                 loading={confirmMutation.isPending}
                 onClick={() => {
+                  manualFocusHandoffRef.current = true;
                   void runConfirmationCheck(true);
                 }}
               >
@@ -340,7 +379,9 @@ function PaymentReturnConfirmationActive({
 
             {uiState !== "paid" && continueHref ? (
               <Button asChild variant={autoRecheckExhausted ? "primary" : "secondary"}>
-                <Link href={continueHref}>Continue to your order</Link>
+                <Link href={continueHref} data-manual-focus-target="continue-order">
+                  Continue to your order
+                </Link>
               </Button>
             ) : null}
 
@@ -362,16 +403,20 @@ function PaymentReturnConfirmationActive({
       ) : checkError ? (
         <div className="flex flex-wrap items-center gap-3">
           <Button
+            data-manual-focus-target="check-status"
             leadingIcon={<RefreshCw aria-hidden />}
             loading={confirmMutation.isPending}
             onClick={() => {
+              manualFocusHandoffRef.current = true;
               void runConfirmationCheck(true);
             }}
           >
             Check payment status
           </Button>
           <Button asChild variant="secondary">
-            <Link href="/orders">Go to orders</Link>
+            <Link href="/orders" data-manual-focus-target="continue-order">
+              Go to orders
+            </Link>
           </Button>
           <Button asChild variant="secondary">
             <Link href="/invoices">View invoices</Link>
