@@ -28,6 +28,7 @@ export * from "../../modules/cart/schema.js";
 export * from "../../modules/payments/schema.js";
 export * from "../../modules/knowledge/schema.js";
 export * from "../../modules/promotions/schema.js";
+export * from "../../modules/billingProfile/schema.js";
 export * from "../../modules/opsAlerts/schema.js";
 export * from "../../modules/files/archivesSchema.js";
 export * from "../../security/rateLimiterSchema.js";

@@ -1755,13 +1755,15 @@ export function createReceiptsService(deps: ModuleDeps) {
   async function findLatestReceiptPublicIdForInvoice(
     dbOrTx: DbOrTx,
     invoiceId: number,
+    options?: { currentRead?: boolean },
   ): Promise<string | null> {
-    const [latest] = await dbOrTx
+    const baseQuery = dbOrTx
       .select({ publicId: compliancePaymentReceipts.publicId })
       .from(compliancePaymentReceipts)
       .where(eq(compliancePaymentReceipts.invoiceId, invoiceId))
       .orderBy(desc(compliancePaymentReceipts.id))
       .limit(1);
+    const [latest] = options?.currentRead ? await baseQuery.for("update") : await baseQuery;
     return latest?.publicId ?? null;
   }
 

@@ -22,6 +22,7 @@ import type { CatalogGroupView, CatalogProductView } from "../orders/catalog.js"
 import { readSetting } from "../platform/index.js";
 import {
   assertValidPromotionOutcome,
+  cartBillingProfilePort,
   cartCompliancePort,
   cartOrdersPort,
   cartPaymentsPort,
@@ -31,15 +32,22 @@ import {
   PROMO_SPECIFIC_REASON_CODES,
   promoNotApplicable,
   requireCartPromotionsPort,
+  type CartAddOnTarget,
   type CartPromotionContext,
 } from "./ports.js";
 import { cartItems, carts, type CartItemRow, type CartRow } from "./schema.js";
 import { CART_ABANDONED_TTL_HOURS, CART_FEATURE_FLAG } from "./settings.js";
 import {
+  addItemsInputSchema,
   billingDetailsSchema,
+  checkoutInputSchema,
+  saveDraftDetailsInputSchema,
+  setCartTargetInputSchema,
   type AdminOpenCartDetail,
   type AdminOpenCartSummary,
+  type BillingDetails,
   type BillingDetailsInput,
+  type CartAddToOrderView,
   type CartAppliedPromoView,
   type CartLineView,
   type CartModule,
@@ -54,6 +62,7 @@ import {
   type RestoreCheckoutResult,
 } from "./types.js";
 import { createCartUpsellService } from "./upsell.js";
+import type { z } from "zod";
 
 export const CART_JOB_EXPIRE_ABANDONED = "cart.abandoned.expire";
 export const CART_SCHEDULE_EXPIRE_ABANDONED = "cart.abandoned.hourly";
@@ -82,6 +91,15 @@ const staleCartVersion = () =>
 const cartFeatureDisabled = () => notFound("CART_FEATURE_DISABLED");
 
 const cartNotFound = () => notFound("CART_NOT_FOUND");
+
+function parseCartInput<S extends z.ZodTypeAny>(schema: S, raw: unknown): z.output<S> {
+  const parsed = schema.safeParse(raw);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    throw validation("VALIDATION_FAILED", first?.message ?? "Invalid checkout input.");
+  }
+  return parsed.data;
+}
 
 interface IndexedCatalogProduct {
   product: CatalogProductView;
@@ -247,7 +265,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
   const encryptBilling = (billing: BillingDetailsInput | null, cartPublicId: string): string | null =>
     billing ? deps.crypto.encrypt(JSON.stringify(billing), `carts.billing:${cartPublicId}`) : null;
 
-  const decryptBilling = (billingEnc: string | null, cartPublicId: string): BillingDetailsInput | null => {
+  const decryptBilling = (billingEnc: string | null, cartPublicId: string): BillingDetails | null => {
     if (!billingEnc) return null;
     try {
       const raw = JSON.parse(deps.crypto.decrypt(billingEnc, `carts.billing:${cartPublicId}`)) as unknown;
@@ -573,6 +591,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
           .orderBy(asc(cartItems.position), asc(cartItems.id))
       : [];
 
+    const billingProfileSvc = cartBillingProfilePort(deps.services);
     const [
       catalogGroups,
       bundleRule,
@@ -581,6 +600,8 @@ export function createCartService(deps: ModuleDeps): CartModule {
       rawPendingPolicies,
       promotionsEnabled,
       placeOrderAgreement,
+      addOnTarget,
+      savedBillingForPreview,
     ] = await Promise.all([
       ordersSvc.listActiveCatalog(tx),
       ordersSvc.getBundleRule(tx),
@@ -589,6 +610,12 @@ export function createCartService(deps: ModuleDeps): CartModule {
       complianceSvc.requiredAcceptancesFor(userId, { audience: "customer", ...(tx ? { tx } : {}) }),
       isPromotionsEnabledForCart(deps.services, dbOrTx),
       ordersSvc.getPlaceOrderAgreementStatus(principal, dbOrTx),
+      openCart?.addToOrderPublicId
+        ? ordersSvc.addOnTargetInTx(dbOrTx, userId, openCart.addToOrderPublicId)
+        : Promise.resolve(null),
+      billingProfileSvc
+        ? billingProfileSvc.getForUserInTx(dbOrTx, userId).catch(() => null)
+        : Promise.resolve(null),
     ]);
 
     // Decision D14: when `orders.agreement_gate` governs a policy at `placeOrder` with
@@ -614,12 +641,19 @@ export function createCartService(deps: ModuleDeps): CartModule {
     const hasStoredPromo = Boolean(openCart?.appliedPromoCodeEnc);
     const storedPromoCode = openCart ? decryptPromoCode(openCart.appliedPromoCodeEnc, openCart.publicId) : null;
 
+    const previewBillingCountry =
+      openCart?.billingCountry ?? billing?.country ?? savedBillingForPreview?.details.country ?? null;
+    const previewBillingRegion =
+      openCart?.billingRegion ??
+      billing?.region ??
+      (savedBillingForPreview?.details.region ? savedBillingForPreview.details.region : null);
+
     const computed = await computeLiveLinesAndTotals(
       itemRows,
       catalogMap,
       bundleRule,
-      openCart?.billingCountry ?? billing?.country ?? null,
-      openCart?.billingRegion ?? billing?.region ?? null,
+      previewBillingCountry,
+      previewBillingRegion,
       dbOrTx,
       openCart
         ? {
@@ -632,7 +666,48 @@ export function createCartService(deps: ModuleDeps): CartModule {
         : undefined,
     );
 
-    const availableLines = computed.lines.filter((l) => l.available);
+    const targetPacketSet = addOnTarget ? new Set(addOnTarget.packetNumbers) : null;
+    const annotatedLines: CartLineView[] = computed.lines.map((line) => ({
+      ...line,
+      alreadyInTargetProject: Boolean(
+        targetPacketSet && line.packetNumber !== null && targetPacketSet.has(line.packetNumber),
+      ),
+    }));
+
+    const addToOrder: CartAddToOrderView | null = !openCart?.addToOrderPublicId
+      ? null
+      : addOnTarget
+        ? (() => {
+            const conflictingItemPublicIds = annotatedLines
+              .filter((l) => l.alreadyInTargetProject)
+              .map((l) => l.itemPublicId);
+            const currencyMismatch =
+              computed.totals.currency !== null && computed.totals.currency !== addOnTarget.currency;
+            return {
+              orderPublicId: openCart.addToOrderPublicId,
+              rootPublicId: addOnTarget.rootPublicId,
+              rootReference: addOnTarget.rootReference,
+              projectName: addOnTarget.projectName,
+              currency: addOnTarget.currency,
+              packetNumbers: addOnTarget.packetNumbers,
+              targetAvailable: !currencyMismatch,
+              conflictingItemPublicIds,
+              currencyMismatch,
+            };
+          })()
+        : {
+            orderPublicId: openCart.addToOrderPublicId,
+            rootPublicId: null,
+            rootReference: null,
+            projectName: openCart.projectName ?? null,
+            currency: computed.totals.currency ?? null,
+            packetNumbers: [],
+            targetAvailable: false,
+            conflictingItemPublicIds: [],
+            currencyMismatch: false,
+          };
+
+    const availableLines = annotatedLines.filter((l) => l.available);
     const [upsells, smallTotalEvaluation] = await Promise.all([
       upsellService.computeForOpenCart({
         openCart,
@@ -642,23 +717,25 @@ export function createCartService(deps: ModuleDeps): CartModule {
         bundleRule,
         dbOrTx,
         recordImpressions: Boolean(opts?.recordImpressions && !tx),
+        ...(targetPacketSet ? { excludedPacketNumbers: targetPacketSet } : {}),
       }),
       computed.totals.currency
         ? paymentsSvc.evaluateCheckoutAmount(computed.totals.totalMinor, computed.totals.currency, dbOrTx)
         : Promise.resolve(null),
     ]);
 
-    const itemCount = computed.lines.reduce((sum, l) => sum + l.quantity, 0);
+    const itemCount = annotatedLines.reduce((sum, l) => sum + l.quantity, 0);
 
     return {
       cartPublicId: openCart?.publicId ?? null,
       version: openCart?.version ?? 1,
       status: "open",
       itemCount,
-      projectName: openCart?.projectName ?? "",
+      projectName: addOnTarget?.projectName ?? openCart?.projectName ?? "",
+      addToOrder,
       note,
       billing,
-      items: computed.lines,
+      items: annotatedLines,
       hasUnavailableItems: computed.hasUnavailableItems,
       mixedCurrency: computed.mixedCurrency,
       totals: computed.totals,
@@ -887,9 +964,11 @@ export function createCartService(deps: ModuleDeps): CartModule {
       return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
     },
 
-    async addItems(principal, input) {
+    async addItems(principal, rawInput) {
       await assertCustomerPrecheck(principal);
       await assertCartEnabled();
+
+      const input = parseCartInput(addItemsInputSchema, rawInput);
 
       // Deduplicate repeated productPublicIds in the same call
       const seenProductIds = new Set<string>();
@@ -900,7 +979,8 @@ export function createCartService(deps: ModuleDeps): CartModule {
         seenProductIds.add(item.productPublicId);
       }
 
-      const catalogGroups = await cartOrdersPort(deps.services).listActiveCatalog();
+      const ordersSvc = cartOrdersPort(deps.services);
+      const catalogGroups = await ordersSvc.listActiveCatalog();
       const catalogMap = indexCatalog(catalogGroups);
 
       // Validate every requested item against the live active catalogue on the server
@@ -929,120 +1009,179 @@ export function createCartService(deps: ModuleDeps): CartModule {
         }
       }
 
-      await deps.db.transaction(async (tx) => {
-        const liveActor = await actorCheck(principal, tx, "orders.create");
-        if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
-        await assertCartEnabled(tx);
+      let deniedTargetOrderPublicId: string | null = null;
+      try {
+        await deps.db.transaction(async (tx) => {
+          const liveActor = await actorCheck(principal, tx, "orders.create");
+          if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
+          await assertCartEnabled(tx);
 
-        const now = deps.clock.now();
-        const cart = await getOrCreateOpenCartInTx(tx, principal.userId, now);
-        const existingItems = await tx
-          .select()
-          .from(cartItems)
-          .where(eq(cartItems.cartId, cart.id))
-          .orderBy(asc(cartItems.position), asc(cartItems.id))
-          .for("update");
+          const now = deps.clock.now();
+          const cart = await getOrCreateOpenCartInTx(tx, principal.userId, now);
+          const existingItems = await tx
+            .select()
+            .from(cartItems)
+            .where(eq(cartItems.cartId, cart.id))
+            .orderBy(asc(cartItems.position), asc(cartItems.id))
+            .for("update");
 
-        // Enforce single currency across existing available items + newly added items
-        const currencies = new Set<string>();
-        for (const existing of existingItems) {
-          const live = catalogMap.get(existing.productPublicId);
-          if (live?.product.active) currencies.add(live.product.currency);
-        }
-        for (const add of resolvedAdditions) {
-          currencies.add(add.product.currency);
-        }
-        if (currencies.size > 1) {
-          throw validation("MIXED_CURRENCY", "Items priced in different currencies cannot be combined in one cart.");
-        }
-
-        let nextPosition = existingItems.reduce((maxPos, r) => Math.max(maxPos, r.position + 1), 0);
-        let projectedCount = existingItems.length;
-
-        for (const add of resolvedAdditions) {
-          const sameProduct = existingItems.find((r) => r.productPublicId === add.product.publicId);
-          if (sameProduct) {
-            const nextQty = add.product.packetNumber !== null ? 1 : Math.min(1000, sameProduct.quantity + add.quantity);
-            await tx
-              .update(cartItems)
-              .set({
-                quantity: nextQty,
-                snapshotName: add.product.name,
-                snapshotTier: add.product.tier,
-                snapshotUnitPriceMinor: add.product.priceMinor,
-                snapshotCurrency: add.product.currency,
-                updatedAt: now,
-              })
-              .where(eq(cartItems.id, sameProduct.id));
-            continue;
+          let activeTarget: CartAddOnTarget | null = null;
+          let nextAddToOrderPublicId: string | null | undefined;
+          if (input.addToOrderPublicId === null) {
+            activeTarget = null;
+            nextAddToOrderPublicId = null;
+          } else if (typeof input.addToOrderPublicId === "string") {
+            const resolved = await ordersSvc.addOnTargetInTx(tx, principal.userId, input.addToOrderPublicId);
+            if (!resolved) {
+              deniedTargetOrderPublicId = input.addToOrderPublicId;
+              throw notFound("ORDER_NOT_FOUND");
+            }
+            activeTarget = resolved;
+            nextAddToOrderPublicId = resolved.rootPublicId;
+          } else if (cart.addToOrderPublicId) {
+            const resolved = await ordersSvc.addOnTargetInTx(tx, principal.userId, cart.addToOrderPublicId);
+            if (!resolved) {
+              throw conflict("ADD_ON_TARGET_UNAVAILABLE", "Packets can no longer be added to this project.");
+            }
+            activeTarget = resolved;
+            nextAddToOrderPublicId = resolved.rootPublicId;
           }
 
-          if (add.product.packetNumber !== null) {
-            const samePacket = existingItems.find((r) => r.packetNumber === add.product.packetNumber);
-            if (samePacket) {
-              if (input.replacePacketTiers === false) {
-                throw validation("PACKET_TIER_CONFLICT", "Choose one tier per packet.");
+          if (activeTarget) {
+            const targetPackets = new Set(activeTarget.packetNumbers);
+            for (const add of resolvedAdditions) {
+              if (add.product.currency !== activeTarget.currency) {
+                throw conflict(
+                  "ADD_ON_TARGET_UNAVAILABLE",
+                  "Items priced in a different currency cannot be added to this project.",
+                );
               }
+              if (add.product.packetNumber !== null && targetPackets.has(add.product.packetNumber)) {
+                throw conflict(
+                  "PACKET_ALREADY_IN_PROJECT",
+                  "A selected packet is already part of this project. Remove it and try again.",
+                );
+              }
+            }
+          }
+
+          // Enforce single currency across existing available items + newly added items
+          const currencies = new Set<string>();
+          for (const existing of existingItems) {
+            const live = catalogMap.get(existing.productPublicId);
+            if (live?.product.active) currencies.add(live.product.currency);
+          }
+          for (const add of resolvedAdditions) {
+            currencies.add(add.product.currency);
+          }
+          if (currencies.size > 1) {
+            throw validation("MIXED_CURRENCY", "Items priced in different currencies cannot be combined in one cart.");
+          }
+
+          let nextPosition = existingItems.reduce((maxPos, r) => Math.max(maxPos, r.position + 1), 0);
+          let projectedCount = existingItems.length;
+
+          for (const add of resolvedAdditions) {
+            const sameProduct = existingItems.find((r) => r.productPublicId === add.product.publicId);
+            if (sameProduct) {
+              const nextQty = add.product.packetNumber !== null ? 1 : Math.min(1000, sameProduct.quantity + add.quantity);
               await tx
                 .update(cartItems)
                 .set({
-                  productPublicId: add.product.publicId,
-                  packetNumber: add.product.packetNumber,
-                  quantity: 1,
+                  quantity: nextQty,
                   snapshotName: add.product.name,
                   snapshotTier: add.product.tier,
                   snapshotUnitPriceMinor: add.product.priceMinor,
                   snapshotCurrency: add.product.currency,
                   updatedAt: now,
                 })
-                .where(eq(cartItems.id, samePacket.id));
+                .where(eq(cartItems.id, sameProduct.id));
               continue;
             }
+
+            if (add.product.packetNumber !== null) {
+              const samePacket = existingItems.find((r) => r.packetNumber === add.product.packetNumber);
+              if (samePacket) {
+                if (input.replacePacketTiers === false) {
+                  throw validation("PACKET_TIER_CONFLICT", "Choose one tier per packet.");
+                }
+                await tx
+                  .update(cartItems)
+                  .set({
+                    productPublicId: add.product.publicId,
+                    packetNumber: add.product.packetNumber,
+                    quantity: 1,
+                    snapshotName: add.product.name,
+                    snapshotTier: add.product.tier,
+                    snapshotUnitPriceMinor: add.product.priceMinor,
+                    snapshotCurrency: add.product.currency,
+                    updatedAt: now,
+                  })
+                  .where(eq(cartItems.id, samePacket.id));
+                continue;
+              }
+            }
+
+            projectedCount += 1;
+            if (projectedCount > MAX_CART_LINES) {
+              throw validation("CART_LIMIT_REACHED", `A cart can hold at most ${MAX_CART_LINES} line items.`);
+            }
+
+            await tx.insert(cartItems).values({
+              publicId: ulid(now.getTime()),
+              cartId: cart.id,
+              productPublicId: add.product.publicId,
+              packetNumber: add.product.packetNumber,
+              quantity: add.quantity,
+              position: nextPosition++,
+              snapshotName: add.product.name,
+              snapshotTier: add.product.tier,
+              snapshotUnitPriceMinor: add.product.priceMinor,
+              snapshotCurrency: add.product.currency,
+              createdAt: now,
+              updatedAt: now,
+            });
           }
 
-          projectedCount += 1;
-          if (projectedCount > MAX_CART_LINES) {
-            throw validation("CART_LIMIT_REACHED", `A cart can hold at most ${MAX_CART_LINES} line items.`);
+          const extraUpdates: Partial<typeof carts.$inferInsert> = {};
+          if (nextAddToOrderPublicId !== undefined) {
+            extraUpdates.addToOrderPublicId = nextAddToOrderPublicId;
           }
+          if (activeTarget) {
+            extraUpdates.projectName = activeTarget.projectName;
+          } else if (input.projectName !== undefined && input.projectName.length > 0) {
+            extraUpdates.projectName = input.projectName;
+          }
+          if (input.note !== undefined && input.note.length > 0) {
+            extraUpdates.noteEnc = encryptNote(input.note, cart.publicId);
+          }
+          await bumpCartVersionInTx(tx, cart, now, extraUpdates);
 
-          await tx.insert(cartItems).values({
-            publicId: ulid(now.getTime()),
-            cartId: cart.id,
-            productPublicId: add.product.publicId,
-            packetNumber: add.product.packetNumber,
-            quantity: add.quantity,
-            position: nextPosition++,
-            snapshotName: add.product.name,
-            snapshotTier: add.product.tier,
-            snapshotUnitPriceMinor: add.product.priceMinor,
-            snapshotCurrency: add.product.currency,
-            createdAt: now,
-            updatedAt: now,
+          await deps.audit.record(
+            {
+              category: "business",
+              eventName: "cart.item_added",
+              action: "update",
+              outcome: "completed",
+              actor: { userId: principal.userId, role: liveActor.role },
+              resource: { type: "cart", publicId: cart.publicId },
+              attributes: {
+                add_to_order_public_id: activeTarget?.rootPublicId ?? null,
+              },
+              safeCounts: { added_items: resolvedAdditions.length },
+            },
+            tx,
+          );
+        });
+      } catch (err) {
+        if (deniedTargetOrderPublicId) {
+          await denyCartAuthz(principal, "ADD_ON_TARGET_NOT_AUTHORIZED", {
+            type: "order",
+            publicId: deniedTargetOrderPublicId,
           });
         }
-
-        const extraUpdates: Partial<typeof carts.$inferInsert> = {};
-        if (input.projectName !== undefined && input.projectName.length > 0) {
-          extraUpdates.projectName = input.projectName;
-        }
-        if (input.note !== undefined && input.note.length > 0) {
-          extraUpdates.noteEnc = encryptNote(input.note, cart.publicId);
-        }
-        await bumpCartVersionInTx(tx, cart, now, extraUpdates);
-
-        await deps.audit.record(
-          {
-            category: "business",
-            eventName: "cart.item_added",
-            action: "update",
-            outcome: "completed",
-            actor: { userId: principal.userId, role: liveActor.role },
-            resource: { type: "cart", publicId: cart.publicId },
-            safeCounts: { added_items: resolvedAdditions.length },
-          },
-          tx,
-        );
-      });
+        throw err;
+      }
 
       return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
     },
@@ -1051,7 +1190,8 @@ export function createCartService(deps: ModuleDeps): CartModule {
       await assertCustomerPrecheck(principal);
       await assertCartEnabled();
 
-      const catalogGroups = await cartOrdersPort(deps.services).listActiveCatalog();
+      const ordersSvc = cartOrdersPort(deps.services);
+      const catalogGroups = await ordersSvc.listActiveCatalog();
       const catalogMap = indexCatalog(catalogGroups);
 
       await deps.db.transaction(async (tx) => {
@@ -1079,6 +1219,25 @@ export function createCartService(deps: ModuleDeps): CartModule {
         const nextQuantity = input.quantity ?? itemRow.quantity;
         if (entry.product.packetNumber !== null && nextQuantity !== 1) {
           throw validation("PACKET_QUANTITY_ONE", "Each packet can be ordered once.");
+        }
+
+        if (cart.addToOrderPublicId) {
+          const activeTarget = await ordersSvc.addOnTargetInTx(tx, principal.userId, cart.addToOrderPublicId);
+          if (!activeTarget) {
+            throw conflict("ADD_ON_TARGET_UNAVAILABLE", "Packets can no longer be added to this project.");
+          }
+          if (entry.product.currency !== activeTarget.currency) {
+            throw conflict(
+              "ADD_ON_TARGET_UNAVAILABLE",
+              "Items priced in a different currency cannot be added to this project.",
+            );
+          }
+          if (entry.product.packetNumber !== null && activeTarget.packetNumbers.includes(entry.product.packetNumber)) {
+            throw conflict(
+              "PACKET_ALREADY_IN_PROJECT",
+              "A selected packet is already part of this project. Remove it and try again.",
+            );
+          }
         }
 
         // Prevent switching to another packet that already exists on a different line in the cart
@@ -1193,6 +1352,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
         const [deleted] = await tx.delete(cartItems).where(eq(cartItems.cartId, cart.id));
 
         await bumpCartVersionInTx(tx, cart, now, {
+          addToOrderPublicId: null,
           appliedPromoCodeEnc: null,
           appliedPromoPublicId: null,
           appliedPromoLabel: null,
@@ -1216,50 +1376,147 @@ export function createCartService(deps: ModuleDeps): CartModule {
       return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
     },
 
-    async saveDraftDetails(principal, input) {
+    async setTarget(principal, rawInput) {
       await assertCustomerPrecheck(principal);
       await assertCartEnabled();
 
-      await deps.db.transaction(async (tx) => {
-        const liveActor = await actorCheck(principal, tx, "orders.create");
-        if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
-        await assertCartEnabled(tx);
+      const input = parseCartInput(setCartTargetInputSchema, rawInput);
+      const ordersSvc = cartOrdersPort(deps.services);
 
-        const now = deps.clock.now();
-        const cart = await requireOpenCartWithVersionInTx(tx, principal.userId, input.expectedVersion);
+      let deniedTargetOrderPublicId: string | null = null;
+      try {
+        await deps.db.transaction(async (tx) => {
+          const liveActor = await actorCheck(principal, tx, "orders.create");
+          if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
+          await assertCartEnabled(tx);
 
-        const billingUpdates: Partial<typeof carts.$inferInsert> =
-          input.billing === undefined
-            ? {}
-            : input.billing === null
-              ? { billingEnc: null, billingCountry: null, billingRegion: null }
-              : {
-                  billingEnc: encryptBilling(input.billing, cart.publicId),
-                  billingCountry: input.billing.country,
-                  billingRegion: input.billing.region || null,
-                };
+          const now = deps.clock.now();
+          const cart =
+            input.expectedVersion !== undefined
+              ? await requireOpenCartWithVersionInTx(tx, principal.userId, input.expectedVersion)
+              : await getOrCreateOpenCartInTx(tx, principal.userId, now);
 
-        await bumpCartVersionInTx(tx, cart, now, {
-          projectName: input.projectName || null,
-          noteEnc: encryptNote(input.note ?? "", cart.publicId),
-          ...billingUpdates,
-        });
+          let nextAddToOrderPublicId: string | null = null;
+          let resolvedTarget: CartAddOnTarget | null = null;
+          if (input.addToOrderPublicId !== null) {
+            resolvedTarget = await ordersSvc.addOnTargetInTx(tx, principal.userId, input.addToOrderPublicId);
+            if (!resolvedTarget) {
+              deniedTargetOrderPublicId = input.addToOrderPublicId;
+              throw notFound("ORDER_NOT_FOUND");
+            }
+            nextAddToOrderPublicId = resolvedTarget.rootPublicId;
+          }
 
-        await deps.audit.record(
-          {
-            category: "business",
-            eventName: "cart.details_saved",
-            action: "update",
-            outcome: "completed",
-            actor: { userId: principal.userId, role: liveActor.role },
-            resource: { type: "cart", publicId: cart.publicId },
-            attributes: {
-              has_billing: input.billing !== null && input.billing !== undefined,
+          await bumpCartVersionInTx(tx, cart, now, {
+            addToOrderPublicId: nextAddToOrderPublicId,
+            ...(resolvedTarget ? { projectName: resolvedTarget.projectName } : {}),
+          });
+
+          await deps.audit.record(
+            {
+              category: "business",
+              eventName: "cart.target_updated",
+              action: "update",
+              outcome: "completed",
+              actor: { userId: principal.userId, role: liveActor.role },
+              resource: { type: "cart", publicId: cart.publicId },
+              attributes: {
+                add_to_order_public_id: nextAddToOrderPublicId,
+              },
             },
-          },
-          tx,
-        );
-      });
+            tx,
+          );
+        });
+      } catch (err) {
+        if (deniedTargetOrderPublicId) {
+          await denyCartAuthz(principal, "ADD_ON_TARGET_NOT_AUTHORIZED", {
+            type: "order",
+            publicId: deniedTargetOrderPublicId,
+          });
+        }
+        throw err;
+      }
+
+      return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
+    },
+
+    async saveDraftDetails(principal, rawInput) {
+      await assertCustomerPrecheck(principal);
+      await assertCartEnabled();
+
+      const input = parseCartInput(saveDraftDetailsInputSchema, rawInput);
+      const ordersSvc = cartOrdersPort(deps.services);
+
+      let deniedTargetOrderPublicId: string | null = null;
+      try {
+        await deps.db.transaction(async (tx) => {
+          const liveActor = await actorCheck(principal, tx, "orders.create");
+          if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
+          await assertCartEnabled(tx);
+
+          const now = deps.clock.now();
+          const cart = await requireOpenCartWithVersionInTx(tx, principal.userId, input.expectedVersion);
+
+          let activeTarget: CartAddOnTarget | null = null;
+          let nextAddToOrderPublicId: string | null | undefined;
+          if (input.addToOrderPublicId === null) {
+            nextAddToOrderPublicId = null;
+          } else if (typeof input.addToOrderPublicId === "string") {
+            const resolved = await ordersSvc.addOnTargetInTx(tx, principal.userId, input.addToOrderPublicId);
+            if (!resolved) {
+              deniedTargetOrderPublicId = input.addToOrderPublicId;
+              throw notFound("ORDER_NOT_FOUND");
+            }
+            activeTarget = resolved;
+            nextAddToOrderPublicId = resolved.rootPublicId;
+          } else if (cart.addToOrderPublicId) {
+            activeTarget = await ordersSvc.addOnTargetInTx(tx, principal.userId, cart.addToOrderPublicId);
+          }
+
+          const billingUpdates: Partial<typeof carts.$inferInsert> =
+            input.billing === undefined
+              ? {}
+              : input.billing === null
+                ? { billingEnc: null, billingCountry: null, billingRegion: null }
+                : {
+                    billingEnc: encryptBilling(input.billing, cart.publicId),
+                    billingCountry: input.billing.country,
+                    billingRegion: input.billing.region || null,
+                  };
+
+          await bumpCartVersionInTx(tx, cart, now, {
+            projectName: activeTarget ? activeTarget.projectName : (input.projectName || null),
+            ...(nextAddToOrderPublicId !== undefined ? { addToOrderPublicId: nextAddToOrderPublicId } : {}),
+            noteEnc: encryptNote(input.note ?? "", cart.publicId),
+            ...billingUpdates,
+          });
+
+          await deps.audit.record(
+            {
+              category: "business",
+              eventName: "cart.details_saved",
+              action: "update",
+              outcome: "completed",
+              actor: { userId: principal.userId, role: liveActor.role },
+              resource: { type: "cart", publicId: cart.publicId },
+              attributes: {
+                has_billing: input.billing !== null && input.billing !== undefined,
+                add_to_order_public_id:
+                  nextAddToOrderPublicId !== undefined ? nextAddToOrderPublicId : (cart.addToOrderPublicId ?? null),
+              },
+            },
+            tx,
+          );
+        });
+      } catch (err) {
+        if (deniedTargetOrderPublicId) {
+          await denyCartAuthz(principal, "ADD_ON_TARGET_NOT_AUTHORIZED", {
+            type: "order",
+            publicId: deniedTargetOrderPublicId,
+          });
+        }
+        throw err;
+      }
 
       return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
     },
@@ -1508,13 +1765,15 @@ export function createCartService(deps: ModuleDeps): CartModule {
       return upsellService.dismissUpsell(principal, input);
     },
 
-    async checkout(principal, input) {
+    async checkout(principal, rawInput) {
       await assertCustomerPrecheck(principal);
       await assertCartEnabled();
 
+      const input = parseCartInput(checkoutInputSchema, rawInput);
       const ordersSvc = cartOrdersPort(deps.services);
       const complianceSvc = cartCompliancePort(deps.services);
       const paymentsSvc = cartPaymentsPort(deps.services);
+      const billingProfileSvc = cartBillingProfilePort(deps.services);
 
       // Fast idempotency check: if this customer already checked out with the exact idempotencyKey, resume payment start
       const [existingByIdem] = await deps.db
@@ -1557,301 +1816,489 @@ export function createCartService(deps: ModuleDeps): CartModule {
           totalMinor: existingByIdem.checkedOutTotalMinor,
         };
       } else {
+        // Pre-read open cart's `addToOrderPublicId` outside `tx` so we can lock the group root `orders` row FIRST
+        // (`orders -> users -> user_sessions -> carts`), matching `orders/actor.ts`'s canonical lock order (D3).
+        const [preCart] = await deps.db
+          .select({
+            ownerUserId: carts.ownerUserId,
+            status: carts.status,
+            addToOrderPublicId: carts.addToOrderPublicId,
+          })
+          .from(carts)
+          .where(eq(carts.publicId, input.cartPublicId))
+          .limit(1);
+        let candidateAddToOrderPublicId: string | null =
+          preCart && preCart.ownerUserId === principal.userId && preCart.status === "open"
+            ? (preCart.addToOrderPublicId ?? null)
+            : null;
+
+        const RETRY_ROOT_LOCK_SENTINEL = Symbol("RETRY_ROOT_LOCK_SENTINEL");
         let deniedOtherCustomerCart = false;
+        let deniedAddOnTargetOrderId: string | null = null;
         let hadAppliedPromoOnCart = false;
         let invalidatedPromoPublicId: string | null = null;
         let invalidatedPromoLabel: string | null = null;
+
         try {
-          committed = await deps.db.transaction(async (tx) => {
-            const liveActor = await actorCheck(principal, tx, "orders.create");
-            if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
-            await assertCartEnabled(tx);
+          let txOutcome: typeof committed | null = null;
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+              txOutcome = await deps.db.transaction(async (tx) => {
+                // 1. If this cart targets an existing project, lock the group root `orders` row BEFORE `actorCheck`
+                //    so we never invert `orders -> users -> user_sessions` with existing-order writers.
+                const prelockedRoot =
+                  candidateAddToOrderPublicId !== null
+                    ? await ordersSvc.lockAddOnRootInTx(tx, principal.userId, candidateAddToOrderPublicId)
+                    : null;
 
-            const [targetCart] = await tx
-              .select()
-              .from(carts)
-              .where(eq(carts.publicId, input.cartPublicId))
-              .for("update")
-              .limit(1);
+                // 2. Re-validate live actor (`users -> user_sessions`).
+                const liveActor = await actorCheck(principal, tx, "orders.create");
+                if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
+                await assertCartEnabled(tx);
 
-            if (!targetCart) throw cartNotFound();
-            if (targetCart.ownerUserId !== principal.userId) {
-              deniedOtherCustomerCart = true;
-              throw cartNotFound();
-            }
-            if (targetCart.status !== "open") {
-              throw conflict("CART_NOT_OPEN", "This cart has already been submitted or expired.");
-            }
-            if (targetCart.version !== input.expectedVersion) {
-              throw staleCartVersion();
-            }
-
-            hadAppliedPromoOnCart = Boolean(targetCart.appliedPromoCodeEnc);
-            invalidatedPromoPublicId = targetCart.appliedPromoPublicId ?? null;
-            invalidatedPromoLabel = targetCart.appliedPromoLabel ?? null;
-
-            const storedPromoCode = targetCart.appliedPromoCodeEnc
-              ? decryptPromoCode(targetCart.appliedPromoCodeEnc, targetCart.publicId)
-              : null;
-            if (hadAppliedPromoOnCart && !storedPromoCode) {
-              throw promoNotApplicable();
-            }
-
-            const itemsInCart = await tx
-              .select()
-              .from(cartItems)
-              .where(eq(cartItems.cartId, targetCart.id))
-              .orderBy(asc(cartItems.position), asc(cartItems.id))
-              .for("update");
-            if (itemsInCart.length === 0) {
-              throw validation("CART_EMPTY", "Add at least one packet or item to your cart before checking out.");
-            }
-
-            // Decision D14: evaluate `orders.gates.placeOrder` BEFORE inline `recordCheckoutAcceptances`
-            // when the gate requires a typed signature (`signatureMode === "typed_name"`), unless
-            // `input.policyAcceptances` already supplies a non-empty `signerName` for that policy version.
-            // This ensures customers (including stale tabs submitting a checkbox-only acceptance for a
-            // policy with document-level `requiresTypedSignature === false`, or customers who previously
-            // accepted by checkbox in the general prompt) receive `CONFLICT` / `AGREEMENT_REQUIRED` with
-            // `{ policyPublicId, signatureMode }` so `AgreementDialog` opens instead of a 400 validation error.
-            const placeOrderAgreement = await ordersSvc.getPlaceOrderAgreementStatus(principal, tx);
-            let acceptancesToRecord = input.policyAcceptances;
-            if (
-              placeOrderAgreement.required &&
-              placeOrderAgreement.signatureMode === "typed_name" &&
-              placeOrderAgreement.policyPublicId !== null
-            ) {
-              const currentlyPending = await complianceSvc.requiredAcceptancesFor(principal.userId, {
-                audience: "customer",
-                tx,
-              });
-              const gatePending = currentlyPending.find(
-                (policy) => policy.documentPublicId === placeOrderAgreement.policyPublicId,
-              );
-              if (!placeOrderAgreement.met) {
-                const hasInlineTypedSignatureForGate = gatePending
-                  ? input.policyAcceptances.some(
-                      (item) =>
-                        item.versionPublicId === gatePending.versionPublicId &&
-                        Boolean(item.signerName && item.signerName.trim().length > 0),
-                    )
-                  : input.policyAcceptances.some((item) => Boolean(item.signerName && item.signerName.trim().length > 0));
-                if (!hasInlineTypedSignatureForGate) {
-                  await ordersSvc.assertCustomerMayPlaceOrder(principal, tx);
+                // 2b. Pre-acquire `users` FOR UPDATE before `carts` whenever saved-billing read/write runs in `tx`,
+                //     preserving `orders -> users (FOR UPDATE) -> carts` and serializing `customer_billing_profiles` CAS.
+                const effectiveBillingSource = input.billingSource ?? "custom";
+                const willSaveBillingProfile =
+                  effectiveBillingSource === "custom" && input.saveAsBillingProfile === true;
+                if (billingProfileSvc && (effectiveBillingSource === "saved" || willSaveBillingProfile)) {
+                  await tx
+                    .select({ id: users.id })
+                    .from(users)
+                    .where(eq(users.id, principal.userId))
+                    .for("update");
                 }
-              } else {
-                // Gate is already satisfied (e.g. customer just signed via `AgreementDialog` and retried
-                // from a tab whose cached `pendingPolicies` still listed an unsigned entry for that policy).
-                const pendingVersionIds = new Set(currentlyPending.map((policy) => policy.versionPublicId));
-                acceptancesToRecord = input.policyAcceptances.filter(
-                  (item) =>
-                    pendingVersionIds.has(item.versionPublicId) ||
-                    Boolean(item.signerName && item.signerName.trim().length > 0),
-                );
-              }
-            }
 
-            // Record any remaining checkout policy acceptances before order creation (orders re-asserts compliance & placeOrder gate inside tx)
-            if (acceptancesToRecord.length > 0) {
-              await complianceSvc.recordCheckoutAcceptances(
-                {
+                // 3. Lock the customer's cart row.
+                const [targetCart] = await tx
+                  .select()
+                  .from(carts)
+                  .where(eq(carts.publicId, input.cartPublicId))
+                  .for("update")
+                  .limit(1);
+
+                if (!targetCart) throw cartNotFound();
+                if (targetCart.ownerUserId !== principal.userId) {
+                  deniedOtherCustomerCart = true;
+                  throw cartNotFound();
+                }
+                if (targetCart.status !== "open") {
+                  throw conflict("CART_NOT_OPEN", "This cart has already been submitted or expired.");
+                }
+                if (targetCart.version !== input.expectedVersion) {
+                  throw staleCartVersion();
+                }
+
+                // 4. Verify `addToOrderPublicId` did not change between the pre-tx read and the `carts` lock.
+                const lockedTargetOrderPublicId = targetCart.addToOrderPublicId ?? null;
+                if (lockedTargetOrderPublicId !== candidateAddToOrderPublicId) {
+                  candidateAddToOrderPublicId = lockedTargetOrderPublicId;
+                  throw RETRY_ROOT_LOCK_SENTINEL;
+                }
+
+                hadAppliedPromoOnCart = Boolean(targetCart.appliedPromoCodeEnc);
+                invalidatedPromoPublicId = targetCart.appliedPromoPublicId ?? null;
+                invalidatedPromoLabel = targetCart.appliedPromoLabel ?? null;
+
+                const storedPromoCode = targetCart.appliedPromoCodeEnc
+                  ? decryptPromoCode(targetCart.appliedPromoCodeEnc, targetCart.publicId)
+                  : null;
+                if (hadAppliedPromoOnCart && !storedPromoCode) {
+                  throw promoNotApplicable();
+                }
+
+                const itemsInCart = await tx
+                  .select()
+                  .from(cartItems)
+                  .where(eq(cartItems.cartId, targetCart.id))
+                  .orderBy(asc(cartItems.position), asc(cartItems.id))
+                  .for("update");
+                if (itemsInCart.length === 0) {
+                  throw validation("CART_EMPTY", "Add at least one packet or item to your cart before checking out.");
+                }
+
+                // Validate D3 add-on target or standalone projectName before policy/order writes.
+                let effectiveProjectName: string;
+                if (lockedTargetOrderPublicId !== null) {
+                  if (!prelockedRoot) {
+                    deniedAddOnTargetOrderId = lockedTargetOrderPublicId;
+                    throw notFound("ORDER_NOT_FOUND");
+                  }
+                  const addOnTarget = await ordersSvc.addOnTargetInTx(tx, principal.userId, lockedTargetOrderPublicId);
+                  if (!addOnTarget) {
+                    throw conflict("ADD_ON_TARGET_UNAVAILABLE", "Packets can no longer be added to this project.");
+                  }
+                  const takenPackets = new Set(addOnTarget.packetNumbers);
+                  for (const item of itemsInCart) {
+                    if (item.packetNumber !== null && takenPackets.has(item.packetNumber)) {
+                      throw conflict(
+                        "PACKET_ALREADY_IN_PROJECT",
+                        "A selected packet is already part of this project. Remove it and try again.",
+                      );
+                    }
+                  }
+                  effectiveProjectName = addOnTarget.projectName;
+                } else {
+                  const suppliedProjectName = input.projectName?.trim() ?? "";
+                  const rawProjectName =
+                    suppliedProjectName.length > 0 ? suppliedProjectName : (targetCart.projectName ?? "").trim();
+                  if (rawProjectName.length === 0) {
+                    throw validation("PROJECT_NAME_REQUIRED", "Enter a project name.");
+                  }
+                  effectiveProjectName = rawProjectName;
+                }
+
+                // Resolve D4 billing details (`saved` profile vs `custom` details) and generation tokens
+                // using a locking current read (`{ forUpdate: true }`) under `users` FOR UPDATE so InnoDB
+                // REPEATABLE READ never reads a stale pre-lock `customer_billing_profiles` snapshot.
+                let resolvedBilling: BillingDetails;
+                if (effectiveBillingSource === "saved") {
+                  if (
+                    !input.savedBillingPublicId ||
+                    input.savedBillingVersion === undefined ||
+                    input.savedBillingVersion < 1
+                  ) {
+                    throw validation(
+                      "SAVED_BILLING_TOKEN_REQUIRED",
+                      "Review your saved billing information and confirm again.",
+                    );
+                  }
+                  const savedProfile = billingProfileSvc
+                    ? await billingProfileSvc.getForUserInTx(tx, principal.userId, { forUpdate: true })
+                    : null;
+                  if (!savedProfile) {
+                    throw conflict(
+                      "SAVED_BILLING_NOT_FOUND",
+                      "Your saved billing information is no longer available. Enter your billing details to continue.",
+                    );
+                  }
+                  if (
+                    savedProfile.publicId !== input.savedBillingPublicId ||
+                    savedProfile.version !== input.savedBillingVersion
+                  ) {
+                    throw conflict(
+                      "SAVED_BILLING_CHANGED",
+                      "Your saved billing information was updated in another window. Review your billing details and confirm again.",
+                    );
+                  }
+                  resolvedBilling = savedProfile.details;
+                } else {
+                  if (!input.billing) {
+                    throw validation("BILLING_REQUIRED", "Enter your billing details to continue.");
+                  }
+                  if (willSaveBillingProfile) {
+                    if (
+                      input.savedBillingVersion === undefined ||
+                      input.savedBillingVersion < 0 ||
+                      (input.savedBillingVersion >= 1 && !input.savedBillingPublicId)
+                    ) {
+                      throw validation(
+                        "SAVED_BILLING_TOKEN_REQUIRED",
+                        "Review your billing choice and confirm again.",
+                      );
+                    }
+                  }
+                  if (willSaveBillingProfile && billingProfileSvc) {
+                    const currentProfile = await billingProfileSvc.getForUserInTx(tx, principal.userId, {
+                      forUpdate: true,
+                    });
+                    const expectedAbsent =
+                      input.savedBillingVersion === 0 || input.savedBillingPublicId === null;
+                    if (expectedAbsent) {
+                      if (currentProfile !== null) {
+                        throw conflict(
+                          "SAVED_BILLING_CHANGED",
+                          "Billing information was saved in another window. Review your billing choice and confirm again.",
+                        );
+                      }
+                    } else if (
+                      !currentProfile ||
+                      currentProfile.version !== input.savedBillingVersion ||
+                      currentProfile.publicId !== input.savedBillingPublicId
+                    ) {
+                      throw conflict(
+                        "SAVED_BILLING_CHANGED",
+                        "Your saved billing information changed in another window. Review your billing choice and confirm again.",
+                      );
+                    }
+                  }
+                  resolvedBilling = input.billing;
+                }
+
+                // Decision D14: evaluate `orders.gates.placeOrder` BEFORE inline `recordCheckoutAcceptances`
+                // when the gate requires a typed signature (`signatureMode === "typed_name"`), unless
+                // `input.policyAcceptances` already supplies a non-empty `signerName` for that policy version.
+                const placeOrderAgreement = await ordersSvc.getPlaceOrderAgreementStatus(principal, tx);
+                let acceptancesToRecord = input.policyAcceptances;
+                if (
+                  placeOrderAgreement.required &&
+                  placeOrderAgreement.signatureMode === "typed_name" &&
+                  placeOrderAgreement.policyPublicId !== null
+                ) {
+                  const currentlyPending = await complianceSvc.requiredAcceptancesFor(principal.userId, {
+                    audience: "customer",
+                    tx,
+                  });
+                  const gatePending = currentlyPending.find(
+                    (policy) => policy.documentPublicId === placeOrderAgreement.policyPublicId,
+                  );
+                  if (!placeOrderAgreement.met) {
+                    const hasInlineTypedSignatureForGate = gatePending
+                      ? input.policyAcceptances.some(
+                          (item) =>
+                            item.versionPublicId === gatePending.versionPublicId &&
+                            Boolean(item.signerName && item.signerName.trim().length > 0),
+                        )
+                      : input.policyAcceptances.some((item) => Boolean(item.signerName && item.signerName.trim().length > 0));
+                    if (!hasInlineTypedSignatureForGate) {
+                      await ordersSvc.assertCustomerMayPlaceOrder(principal, tx);
+                    }
+                  } else {
+                    const pendingVersionIds = new Set(currentlyPending.map((policy) => policy.versionPublicId));
+                    acceptancesToRecord = input.policyAcceptances.filter(
+                      (item) =>
+                        pendingVersionIds.has(item.versionPublicId) ||
+                        Boolean(item.signerName && item.signerName.trim().length > 0),
+                    );
+                  }
+                }
+
+                // Record any remaining checkout policy acceptances before order creation (orders re-asserts compliance & placeOrder gate inside tx)
+                if (acceptancesToRecord.length > 0) {
+                  await complianceSvc.recordCheckoutAcceptances(
+                    {
+                      principal,
+                      items: acceptancesToRecord,
+                    },
+                    tx,
+                  );
+                }
+
+                // Decision D14: assert `orders.gates.placeOrder` before `assertRequiredPoliciesAccepted` and before
+                // promo redemption or order/invoice creation so an unsatisfied gate always raises `AGREEMENT_REQUIRED`.
+                await ordersSvc.assertCustomerMayPlaceOrder(principal, tx);
+                await complianceSvc.assertRequiredPoliciesAccepted(principal.userId, { audience: "customer", tx });
+
+                // Recompute live catalogue prices, bundle discount & promo redemption via orders.createOrderFromCheckoutInTx
+                const createdOrder = await ordersSvc.createOrderFromCheckoutInTx(
                   principal,
-                  items: acceptancesToRecord,
-                },
-                tx,
-              );
-            }
+                  {
+                    projectName: effectiveProjectName,
+                    items: itemsInCart.map((item) => ({
+                      productPublicId: item.productPublicId,
+                      quantity: item.quantity,
+                    })),
+                    ...(input.note ? { note: input.note } : {}),
+                    ...(storedPromoCode ? { promoCode: storedPromoCode } : {}),
+                    ...(lockedTargetOrderPublicId ? { addToOrderPublicId: lockedTargetOrderPublicId } : {}),
+                    idempotencyKey: input.idempotencyKey,
+                  },
+                  tx,
+                );
 
-            // Decision D14: assert `orders.gates.placeOrder` before `assertRequiredPoliciesAccepted` and before
-            // promo redemption or order/invoice creation so an unsatisfied gate always raises `AGREEMENT_REQUIRED`.
-            await ordersSvc.assertCustomerMayPlaceOrder(principal, tx);
-            await complianceSvc.assertRequiredPoliciesAccepted(principal.userId, { audience: "customer", tx });
+                // Recompute server-side tax in minor units on subtotal after discount
+                const taxQuote = await complianceSvc.quoteTaxMinor(
+                  {
+                    subtotalAfterDiscountMinor: createdOrder.totalMinor,
+                    currency: createdOrder.currency,
+                    billingCountry: resolvedBilling.country,
+                    billingRegion: resolvedBilling.region || null,
+                  },
+                  tx,
+                );
 
-            // Recompute live catalogue prices, bundle discount & promo redemption via orders.createOrderFromCheckoutInTx
-            const createdOrder = await ordersSvc.createOrderFromCheckoutInTx(
-              principal,
-              {
-                projectName: input.projectName,
-                items: itemsInCart.map((item) => ({
-                  productPublicId: item.productPublicId,
-                  quantity: item.quantity,
-                })),
-                ...(input.note ? { note: input.note } : {}),
-                ...(storedPromoCode ? { promoCode: storedPromoCode } : {}),
-                idempotencyKey: input.idempotencyKey,
-              },
-              tx,
-            );
+                // Issue one consolidated invoice atomically in the SAME transaction
+                const issuedInvoice = await complianceSvc.issueCheckoutInvoiceInTx(
+                  {
+                    principal,
+                    orderId: createdOrder.id,
+                    orderPublicId: createdOrder.publicId,
+                    currency: createdOrder.currency,
+                    lines: createdOrder.lineItems.map((li) => ({
+                      description: li.name,
+                      quantity: li.quantity,
+                      unitAmountMinor: li.unitPriceMinor,
+                    })),
+                    discountMinor: createdOrder.discountMinor,
+                    taxMinor: taxQuote.taxMinor,
+                    memo: formatBillingMemo(resolvedBilling),
+                  },
+                  tx,
+                );
 
-            // Recompute server-side tax in minor units on subtotal after discount
-            const taxQuote = await complianceSvc.quoteTaxMinor(
-              {
-                subtotalAfterDiscountMinor: createdOrder.totalMinor,
-                currency: createdOrder.currency,
-                billingCountry: input.billing.country,
-                billingRegion: input.billing.region || null,
-              },
-              tx,
-            );
+                if (input.expectedTotalMinor !== undefined && issuedInvoice.totalMinor !== input.expectedTotalMinor) {
+                  throw new DomainError(
+                    "CONFLICT",
+                    "TOTAL_CHANGED_RECONFIRM",
+                    "Your order total has changed. Your order was not placed — please review the updated total and confirm again.",
+                    {
+                      newTotalMinor: issuedInvoice.totalMinor,
+                      currency: issuedInvoice.currency,
+                    },
+                  );
+                }
 
-            // Issue one consolidated invoice atomically in the SAME transaction
-            const issuedInvoice = await complianceSvc.issueCheckoutInvoiceInTx(
-              {
-                principal,
-                orderId: createdOrder.id,
-                orderPublicId: createdOrder.publicId,
-                currency: createdOrder.currency,
-                lines: createdOrder.lineItems.map((li) => ({
-                  description: li.name,
-                  quantity: li.quantity,
-                  unitAmountMinor: li.unitPriceMinor,
-                })),
-                discountMinor: createdOrder.discountMinor,
-                taxMinor: taxQuote.taxMinor,
-                memo: formatBillingMemo(input.billing),
-              },
-              tx,
-            );
+                // Decision D5 (`payments.small_totals`): evaluate provider minimum inside `tx` so `"block"` rolls back cleanly without orphan orders/invoices.
+                const amountEval = await paymentsSvc.evaluateCheckoutAmount(
+                  issuedInvoice.totalMinor,
+                  issuedInvoice.currency,
+                  tx,
+                );
+                if (amountEval.smallTotalAction === "block") {
+                  const minFormatted = (amountEval.minimumMinor / 100).toFixed(2);
+                  throw new DomainError(
+                    "CONFLICT",
+                    "AMOUNT_BELOW_PROVIDER_MINIMUM",
+                    `Online card payments require a minimum charge of ${issuedInvoice.currency} ${minFormatted}. Add another item or remove the discount code to continue.`,
+                    {
+                      minimumMinor: amountEval.minimumMinor,
+                      totalMinor: issuedInvoice.totalMinor,
+                      currency: issuedInvoice.currency,
+                    },
+                  );
+                }
 
-            if (input.expectedTotalMinor !== undefined && issuedInvoice.totalMinor !== input.expectedTotalMinor) {
-              throw new DomainError(
-                "CONFLICT",
-                "TOTAL_CHANGED_RECONFIRM",
-                "Your order total has changed. Your order was not placed — please review the updated total and confirm again.",
-                {
-                  newTotalMinor: issuedInvoice.totalMinor,
-                  currency: issuedInvoice.currency,
-                },
-              );
-            }
+                // Decision D4: persist billing details to `customer_billing_profiles` when requested on custom billing.
+                const shouldSaveBillingProfile =
+                  effectiveBillingSource === "custom" && input.saveAsBillingProfile === true;
+                if (shouldSaveBillingProfile && billingProfileSvc) {
+                  await billingProfileSvc.saveForUserInTx(tx, principal.userId, resolvedBilling, {
+                    userId: principal.userId,
+                    role: liveActor.role,
+                    via: "checkout",
+                  });
+                }
 
-            // Decision D5 (`payments.small_totals`): evaluate provider minimum inside `tx` so `"block"` rolls back cleanly without orphan orders/invoices.
-            const amountEval = await paymentsSvc.evaluateCheckoutAmount(
-              issuedInvoice.totalMinor,
-              issuedInvoice.currency,
-              tx,
-            );
-            if (amountEval.smallTotalAction === "block") {
-              const minFormatted = (amountEval.minimumMinor / 100).toFixed(2);
-              throw new DomainError(
-                "CONFLICT",
-                "AMOUNT_BELOW_PROVIDER_MINIMUM",
-                `Online card payments require a minimum charge of ${issuedInvoice.currency} ${minFormatted}. Add another item or remove the discount code to continue.`,
-                {
-                  minimumMinor: amountEval.minimumMinor,
-                  totalMinor: issuedInvoice.totalMinor,
-                  currency: issuedInvoice.currency,
-                },
-              );
-            }
+                const now = deps.clock.now();
 
-            const now = deps.clock.now();
+                // Persist authoritative billed snapshots onto cart_items for auditability & cancel-restoration display
+                const billedByProduct = new Map(createdOrder.lineItems.map((li) => [li.productPublicId, li]));
+                for (const row of itemsInCart) {
+                  const billed = billedByProduct.get(row.productPublicId);
+                  if (billed) {
+                    await tx
+                      .update(cartItems)
+                      .set({
+                        snapshotName: billed.name,
+                        snapshotUnitPriceMinor: billed.unitPriceMinor,
+                        snapshotCurrency: billed.currency,
+                        updatedAt: now,
+                      })
+                      .where(eq(cartItems.id, row.id));
+                  }
+                }
 
-            // Persist authoritative billed snapshots onto cart_items for auditability & cancel-restoration display
-            const billedByProduct = new Map(createdOrder.lineItems.map((li) => [li.productPublicId, li]));
-            for (const row of itemsInCart) {
-              const billed = billedByProduct.get(row.productPublicId);
-              if (billed) {
-                await tx
-                  .update(cartItems)
+                const promoDiscountMinor = createdOrder.promoDiscountMinor ?? 0;
+                const promoLabel = createdOrder.promoLabel ?? null;
+                const zeroTotal = issuedInvoice.totalMinor === 0;
+
+                const nextVersion = targetCart.version + 1;
+                const [casUpdate] = await tx
+                  .update(carts)
                   .set({
-                    snapshotName: billed.name,
-                    snapshotUnitPriceMinor: billed.unitPriceMinor,
-                    snapshotCurrency: billed.currency,
+                    activeOwnerSlot: null,
+                    // Never record a predictive waiver or checked_out state before settlement confirms in Phase 2.
+                    // Only legacy zero-total checkouts (where no Wave-2 receipt settlement step exists) finish in Phase 1.
+                    status: zeroTotal && !paymentsSvc.supportsSettledReceipts ? "checked_out" : "awaiting_payment",
+                    paymentMode: null,
+                    paymentAttemptPublicId: null,
+                    projectName: effectiveProjectName,
+                    noteEnc: encryptNote(input.note ?? "", targetCart.publicId),
+                    billingEnc: encryptBilling(resolvedBilling, targetCart.publicId),
+                    billingCountry: resolvedBilling.country,
+                    billingRegion: resolvedBilling.region || null,
+                    // Wipe raw code ciphertext post-checkout; retain public ID & customer-facing label snapshot only.
+                    appliedPromoCodeEnc: null,
+                    appliedPromoIdempotencyKey: null,
+                    checkoutIdempotencyKey: input.idempotencyKey,
+                    checkoutOrderId: createdOrder.id,
+                    checkoutOrderPublicId: createdOrder.publicId,
+                    checkoutOrderReference: createdOrder.reference,
+                    checkoutInvoiceId: issuedInvoice.invoiceId,
+                    checkoutInvoicePublicId: issuedInvoice.invoicePublicId,
+                    checkoutInvoiceNumber: issuedInvoice.invoiceNumber,
+                    checkedOutCurrency: issuedInvoice.currency,
+                    checkedOutSubtotalMinor: issuedInvoice.subtotalMinor,
+                    checkedOutDiscountMinor: issuedInvoice.discountMinor,
+                    checkedOutDiscountLabel: createdOrder.discountLabel,
+                    checkedOutPromoDiscountMinor: promoDiscountMinor,
+                    checkedOutPromoLabel: promoLabel,
+                    checkedOutTaxRateBps: taxQuote.taxRateBps,
+                    checkedOutTaxMinor: issuedInvoice.taxMinor,
+                    checkedOutTotalMinor: issuedInvoice.totalMinor,
+                    checkedOutWaivedMinor: 0,
+                    lastActivityAt: now,
+                    checkedOutAt: now,
+                    version: nextVersion,
                     updatedAt: now,
                   })
-                  .where(eq(cartItems.id, row.id));
-              }
-            }
+                  .where(and(eq(carts.id, targetCart.id), eq(carts.version, targetCart.version), eq(carts.status, "open")));
+                if (casUpdate.affectedRows !== 1) throw staleCartVersion();
 
-            const promoDiscountMinor = createdOrder.promoDiscountMinor ?? 0;
-            const promoLabel = createdOrder.promoLabel ?? null;
-            const zeroTotal = issuedInvoice.totalMinor === 0;
+                await deps.audit.record(
+                  {
+                    category: "business",
+                    eventName: "cart.checked_out",
+                    action: "transition",
+                    outcome: "completed",
+                    actor: { userId: principal.userId, role: liveActor.role },
+                    resource: { type: "cart", publicId: targetCart.publicId },
+                    attributes: {
+                      order_public_id: createdOrder.publicId,
+                      invoice_public_id: issuedInvoice.invoicePublicId,
+                      add_to_order_public_id: lockedTargetOrderPublicId,
+                      billing_source: effectiveBillingSource,
+                      saved_billing_updated: Boolean(shouldSaveBillingProfile && billingProfileSvc),
+                      ...(zeroTotal ? { payment_mode: "no_payment_due" } : {}),
+                      currency: issuedInvoice.currency,
+                      subtotal_minor: issuedInvoice.subtotalMinor,
+                      discount_minor: issuedInvoice.discountMinor,
+                      promo_public_id: promoDiscountMinor > 0 ? targetCart.appliedPromoPublicId : null,
+                      promo_discount_minor: promoDiscountMinor,
+                      tax_minor: issuedInvoice.taxMinor,
+                      total_minor: issuedInvoice.totalMinor,
+                    },
+                    safeCounts: { items: itemsInCart.length },
+                  },
+                  tx,
+                );
 
-            const nextVersion = targetCart.version + 1;
-            const [casUpdate] = await tx
-              .update(carts)
-              .set({
-                activeOwnerSlot: null,
-                // Never record a predictive waiver or checked_out state before settlement confirms in Phase 2.
-                // Only legacy zero-total checkouts (where no Wave-2 receipt settlement step exists) finish in Phase 1.
-                status: zeroTotal && !paymentsSvc.supportsSettledReceipts ? "checked_out" : "awaiting_payment",
-                paymentMode: null,
-                paymentAttemptPublicId: null,
-                projectName: input.projectName,
-                noteEnc: encryptNote(input.note ?? "", targetCart.publicId),
-                billingEnc: encryptBilling(input.billing, targetCart.publicId),
-                billingCountry: input.billing.country,
-                billingRegion: input.billing.region || null,
-                // Wipe raw code ciphertext post-checkout; retain public ID & customer-facing label snapshot only.
-                appliedPromoCodeEnc: null,
-                appliedPromoIdempotencyKey: null,
-                checkoutIdempotencyKey: input.idempotencyKey,
-                checkoutOrderId: createdOrder.id,
-                checkoutOrderPublicId: createdOrder.publicId,
-                checkoutOrderReference: createdOrder.reference,
-                checkoutInvoiceId: issuedInvoice.invoiceId,
-                checkoutInvoicePublicId: issuedInvoice.invoicePublicId,
-                checkoutInvoiceNumber: issuedInvoice.invoiceNumber,
-                checkedOutCurrency: issuedInvoice.currency,
-                checkedOutSubtotalMinor: issuedInvoice.subtotalMinor,
-                checkedOutDiscountMinor: issuedInvoice.discountMinor,
-                checkedOutDiscountLabel: createdOrder.discountLabel,
-                checkedOutPromoDiscountMinor: promoDiscountMinor,
-                checkedOutPromoLabel: promoLabel,
-                checkedOutTaxRateBps: taxQuote.taxRateBps,
-                checkedOutTaxMinor: issuedInvoice.taxMinor,
-                checkedOutTotalMinor: issuedInvoice.totalMinor,
-                checkedOutWaivedMinor: 0,
-                lastActivityAt: now,
-                checkedOutAt: now,
-                version: nextVersion,
-                updatedAt: now,
-              })
-              .where(and(eq(carts.id, targetCart.id), eq(carts.version, targetCart.version), eq(carts.status, "open")));
-            if (casUpdate.affectedRows !== 1) throw staleCartVersion();
-
-            await deps.audit.record(
-              {
-                category: "business",
-                eventName: "cart.checked_out",
-                action: "transition",
-                outcome: "completed",
-                actor: { userId: principal.userId, role: liveActor.role },
-                resource: { type: "cart", publicId: targetCart.publicId },
-                attributes: {
-                  order_public_id: createdOrder.publicId,
-                  invoice_public_id: issuedInvoice.invoicePublicId,
-                  ...(zeroTotal ? { payment_mode: "no_payment_due" } : {}),
+                return {
+                  cartId: targetCart.id,
+                  cartPublicId: targetCart.publicId,
+                  cartVersion: nextVersion,
+                  orderPublicId: createdOrder.publicId,
+                  orderReference: createdOrder.reference,
+                  invoicePublicId: issuedInvoice.invoicePublicId,
+                  invoiceNumber: issuedInvoice.invoiceNumber,
                   currency: issuedInvoice.currency,
-                  subtotal_minor: issuedInvoice.subtotalMinor,
-                  discount_minor: issuedInvoice.discountMinor,
-                  promo_public_id: promoDiscountMinor > 0 ? targetCart.appliedPromoPublicId : null,
-                  promo_discount_minor: promoDiscountMinor,
-                  tax_minor: issuedInvoice.taxMinor,
-                  total_minor: issuedInvoice.totalMinor,
-                },
-                safeCounts: { items: itemsInCart.length },
-              },
-              tx,
-            );
-
-            return {
-              cartId: targetCart.id,
-              cartPublicId: targetCart.publicId,
-              cartVersion: nextVersion,
-              orderPublicId: createdOrder.publicId,
-              orderReference: createdOrder.reference,
-              invoicePublicId: issuedInvoice.invoicePublicId,
-              invoiceNumber: issuedInvoice.invoiceNumber,
-              currency: issuedInvoice.currency,
-              totalMinor: issuedInvoice.totalMinor,
-              afterCommit: createdOrder.afterCommit,
-            };
-          });
+                  totalMinor: issuedInvoice.totalMinor,
+                  afterCommit: createdOrder.afterCommit,
+                };
+              });
+              break;
+            } catch (innerErr) {
+              if (innerErr === RETRY_ROOT_LOCK_SENTINEL) {
+                if (attempt === 1) {
+                  throw staleCartVersion();
+                }
+                continue;
+              }
+              throw innerErr;
+            }
+          }
+          if (!txOutcome) throw staleCartVersion();
+          committed = txOutcome;
         } catch (err) {
           if (deniedOtherCustomerCart) {
             await denyCartAuthz(principal, "NOT_CART_OWNER", { type: "cart", publicId: input.cartPublicId });
+            throw err;
+          }
+          if (deniedAddOnTargetOrderId) {
+            await denyCartAuthz(principal, "ADD_ON_TARGET_NOT_AUTHORIZED", {
+              type: "order",
+              publicId: deniedAddOnTargetOrderId,
+            });
             throw err;
           }
           // Decisions D3 & D5: if an applied code stopped being valid (or hit a lowered platform discount limit)
@@ -2743,6 +3190,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
 
           await bumpCartVersionInTx(tx, openCart, now, {
             projectName: openCart.projectName ?? sourceCart.projectName,
+            addToOrderPublicId: openCart.addToOrderPublicId ?? sourceCart.addToOrderPublicId,
             noteEnc: openCart.noteEnc ?? encryptNote(sourceNote, openCart.publicId),
             billingEnc: openCart.billingEnc ?? encryptBilling(sourceBilling, openCart.publicId),
             billingCountry: openCart.billingCountry ?? sourceCart.billingCountry,
@@ -2895,6 +3343,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
               customerPublicId: row.customerPublicId,
               customerRef: row.customerRef,
               projectName: row.cart.projectName,
+              addToOrderPublicId: row.cart.addToOrderPublicId ?? null,
               itemCount,
               packetSummary,
               currency: computed.totals.currency,
@@ -2984,6 +3433,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
             customerPublicId: row.customerPublicId,
             customerRef: row.customerRef,
             projectName: row.cart.projectName,
+            addToOrderPublicId: row.cart.addToOrderPublicId ?? null,
             itemCount,
             packetSummary,
             currency: computed.totals.currency,

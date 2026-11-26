@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Route } from "wouter";
 import type * as trpcModule from "@/lib/trpc";
-import { expectNoAxeViolations, renderUi } from "@/ui/testing";
+import { expectNoAxeViolations, fakeAuthApi, renderUi } from "@/ui/testing";
 import { complianceAdminNav, complianceAdminRoutes } from "./index";
 import IntakeAdminPage from "./IntakeAdminPage";
 import IntakeSubmissionsPage from "./IntakeSubmissionsPage";
@@ -859,5 +859,114 @@ describe("invoices", () => {
     expect(screen.getAllByText(projectTitle).length).toBeGreaterThanOrEqual(1);
     await expectNoAxeViolations(adminRcptDetail.container);
     adminRcptDetail.unmount();
+  });
+
+  it("renders Check with Stripe now only for admin on issued unpaid portal invoices, prompts step-up when needed, and refetches the invoice on completion", async () => {
+    const user = userEvent.setup();
+
+    // 1. Hidden for paid, draft, void, imported, and staff viewers.
+    for (const variant of [
+      { role: "admin", invoice: { ...detail, status: "paid" as const, balanceDueMinor: 0, grossPaidMinor: 10825, netPaidMinor: 10825 } },
+      { role: "admin", invoice: { ...detail, status: "draft" as const, invoiceNumber: null, issuedAt: null } },
+      { role: "admin", invoice: { ...detail, status: "void" as const, voidReason: "Cancelled", voidedAt: now } },
+      { role: "admin", invoice: { ...detail, origin: "import" as const } },
+      { role: "staff", invoice: detail },
+    ]) {
+      session.role = variant.role;
+      handlers.set("compliance.invoices.get", () => variant.invoice);
+      const view = pageByPath(`/admin/invoices/${INV}`, <InvoiceDetailPage />, "/admin/invoices/:invoiceId");
+      await screen.findByRole("heading", { name: "Order & project" });
+      expect(screen.queryByRole("button", { name: "Check with Stripe now" })).not.toBeInTheDocument();
+      view.unmount();
+    }
+
+    // 2. Visible for admin on an issued unpaid portal invoice; step-up + onUpdated refreshes invoice to Paid.
+    session.role = "admin";
+    let settled = false;
+    handlers.set("compliance.invoices.get", () =>
+      settled
+        ? {
+            ...detail,
+            status: "paid" as const,
+            balanceDueMinor: 0,
+            grossPaidMinor: 10825,
+            netPaidMinor: 10825,
+          }
+        : detail,
+    );
+
+    let checkAttempts = 0;
+    handlers.set("payments.admin.checkWithStripeNow", () => {
+      checkAttempts += 1;
+      if (checkAttempts === 1) {
+        throw {
+          data: {
+            safe: {
+              domainCode: "STEP_UP_REQUIRED",
+              reasonCode: "STEP_UP_FRESHNESS_EXPIRED",
+              safeMessage: "Step-up authentication is required.",
+              requestId: "req-stepup",
+            },
+          },
+        };
+      }
+      settled = true;
+      return {
+        invoicePublicId: INV,
+        checkedCount: 1,
+        booked: true,
+        alreadyPaid: false,
+        reasonCode: "BOOKED",
+        receiptPublicId: "01JTESTRECEIPT000000000077",
+      };
+    });
+
+    const stepUpCalls: unknown[] = [];
+    const api = fakeAuthApi({
+      assuranceState: async () => ({
+        mfaEnrolled: true,
+        recoveryCodesAcknowledged: true,
+        totpEnrolled: true,
+        passkeyCount: 0,
+        recoveryCodesRemaining: 8,
+      }),
+      stepUp: async (input) => {
+        stepUpCalls.push(input);
+        return { ok: true as const };
+      },
+    });
+
+    const view = renderUi(<Route path="/admin/invoices/:invoiceId"><InvoiceDetailPage /></Route>, {
+      path: `/admin/invoices/${INV}`,
+      api,
+    });
+
+    const checkBtn = await screen.findByRole("button", { name: "Check with Stripe now" });
+    expect(checkBtn).toBeVisible();
+    await expectNoAxeViolations(view.container);
+
+    const getCallsBefore = callsTo("compliance.invoices.get").length;
+    await user.click(checkBtn);
+
+    const stepUpDialog = await screen.findByRole("dialog", { name: "Confirm it's you" });
+    await user.type(within(stepUpDialog).getByLabelText(/^Password/), "Synthet!c-Admin-Pass-2026");
+    await user.type(within(stepUpDialog).getByLabelText(/^6-digit code/), "123456");
+    await user.click(within(stepUpDialog).getByRole("button", { name: "Verify" }));
+
+    await waitFor(() => expect(callsTo("payments.admin.checkWithStripeNow")).toHaveLength(2));
+    expect(callsTo("payments.admin.checkWithStripeNow")[1]?.input).toEqual({ invoicePublicId: INV });
+    expect(stepUpCalls).toHaveLength(1);
+
+    await waitFor(() =>
+      expect(callsTo("compliance.invoices.get").length).toBeGreaterThan(getCallsBefore),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Check with Stripe now" })).not.toBeInTheDocument(),
+    );
+    // WCAG 2.4.3: opener ("Check with Stripe now") unmounted on paid refetch; focus moves to the stable Invoice actions group.
+    await waitFor(() =>
+      expect(screen.getByRole("group", { name: "Invoice actions" })).toHaveFocus(),
+    );
+    await expectNoAxeViolations(view.container);
   });
 });

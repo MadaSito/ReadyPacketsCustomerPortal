@@ -43,8 +43,9 @@ type AttemptPurpose = typeof mailTransportAttempts.$inferSelect.purpose;
 type MailDeliveryResult = MailTransportResult | { outcome: "expired"; retryable?: never };
 export type SmtpDeliveryResult = MailTransportResult;
 type MailDeps = QueueDeps & { jobs: JobQueue };
+type MailRecipient = { email: string; status: string; emailVerified: boolean; firstName?: string | null; preferredName?: string | null };
 type DeliveryDeps = {
-  findRecipient(userId: number): Promise<{ email: string; status: string; emailVerified: boolean } | null>;
+  findRecipient(userId: number): Promise<MailRecipient | null>;
   getLegacySender(): Promise<MailSenderIdentity | null>;
 };
 
@@ -95,6 +96,14 @@ function htmlAlternative(text: string): string {
 
 const ORDER_CONTEXT_FIELDS = [["orderReference", "Order"], ["projectName", "Project"]] as const;
 const INVOICE_NOTICE_TEMPLATES = new Set(["compliance.invoice_issued", "compliance.invoice_paid"]);
+const AUTH_GREETING_TEMPLATES = new Set(["auth.verify_email", "auth.invitation"]);
+
+function withRecipientGreeting(template: PublishedMailTemplate, vars: OutboundMail["vars"], recipient: MailRecipient) {
+  const greeting = recipient.preferredName?.trim() || recipient.firstName?.trim();
+  if (!greeting) return vars;
+  const name = AUTH_GREETING_TEMPLATES.has(template.key) ? "name" : "recipient_name";
+  return template.vars.includes(name) ? { ...vars, [name]: greeting } : vars;
+}
 
 function orderContextLines(vars: OutboundMail["vars"]): string[] {
   return ORDER_CONTEXT_FIELDS.flatMap(([key, label]) => {
@@ -507,7 +516,8 @@ export class MailEngine implements Mailer {
         : !["active", "pending_activation"].includes(recipient.status))) {
         return this.#preSendFailure(job, ids, "MAIL_RECIPIENT_UNAVAILABLE", true);
       }
-      data = { ...this.#content(template, payload.vars), to: address.parse(recipient.email) };
+      const renderVars = withRecipientGreeting(template, payload.vars, recipient);
+      data = { ...this.#content(template, renderVars), to: address.parse(recipient.email) };
       const attachments = decodeMailAttachments(row.template, payload.vars, payload.to, payload.attachments);
       if (!mode && isReceipt) data = this.#customerReceiptLink(data, Boolean(attachments));
       if (!mode && attachments) data.attachments = attachments;
@@ -519,6 +529,9 @@ export class MailEngine implements Mailer {
           try {
             const masked = { ...payload.vars };
             for (const key of new Set([...(template.sensitiveVars ?? []), ...(payload.sensitiveVars ?? [])])) masked[key] = REDACTED;
+            if (renderVars !== payload.vars) {
+              masked[AUTH_GREETING_TEMPLATES.has(template.key) ? "name" : "recipient_name"] = REDACTED;
+            }
             if (isReceipt) {
               for (const [key] of ORDER_CONTEXT_FIELDS) {
                 if (Object.hasOwn(masked, key)) masked[key] = REDACTED;

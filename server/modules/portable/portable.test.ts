@@ -10,6 +10,8 @@ import { DomainError } from "../../core/errors.js";
 import { newRequestContext } from "../../core/requestContext.js";
 import type { JobResult, SessionPrincipal } from "../../core/types.js";
 import { createCallerFactory } from "../../trpc/trpc.js";
+import { createBillingProfileModule } from "../billingProfile/index.js";
+import * as billingProfileSchema from "../billingProfile/schema.js";
 import { examplePdf } from "../files/fixtures.test-support.js";
 import { createFilesModule } from "../files/index.js";
 import * as filesSchema from "../files/schema.js";
@@ -22,12 +24,12 @@ import { workflowDefinitionSchema } from "../orders/workflowTypes.js";
 import * as ordersSchema from "../orders/schema.js";
 import { copyExact, inPrivateWorkspace } from "./custody.js";
 import { buildPlan, type PortableInputRecord } from "./importPlanning.js";
-import { projectedOrder } from "./importShapes.js";
+import { customerBillingProfile, customerIdentity, groupLinkProblem, projectedOrder } from "./importShapes.js";
 import { createPortableModule } from "./index.js";
 import * as portableSchema from "./schema.js";
 import { PORTABLE_EXPORT_JOB, PORTABLE_IMPORT_JOB, PORTABLE_RETENTION_JOB } from "./transferPolicy.js";
 
-const testSchema = { ...identitySchema, ...ordersSchema, ...filesSchema, ...portableSchema };
+const testSchema = { ...identitySchema, ...ordersSchema, ...filesSchema, ...portableSchema, ...billingProfileSchema };
 const CREATED = new Date("2025-07-15T17:07:33.123Z");
 const CUSTOMER_EMAIL = "case.owner@example.test";
 const AUTH_MARKER = "source-password-hash-must-not-travel";
@@ -75,6 +77,7 @@ async function environment(t: TestDb, installationId: string) {
   h.services.jobAdmin = { isDraining: async () => false } as TestHarness["services"]["jobAdmin"];
   h.services.orders = createOrdersModule(h.deps);
   h.services.files = createFilesModule(h.deps);
+  h.services.billingProfile = createBillingProfileModule(h.deps);
   h.services.portable = createPortableModule(h.deps);
   for (const email of ["first.admin@example.test", "second.admin@example.test"]) {
     const user = await t.db.transaction((tx) => identity.auth.insertUser(tx, {
@@ -121,7 +124,7 @@ describe("portable transfer across isolated MySQL installations", () => {
       displayName: "fixture.pdf", category: "deliverable", visibility: "customer_visible", stagedObject: stage,
       destinationKey: source.storage.newKey("files"), contentType: "application/pdf", createdAt: CREATED,
     }, tx));
-  }, 20_000);
+  }, 60_000);
 
   afterAll(async () => {
     await Promise.all([sourceDb?.cleanup(), targetDb?.cleanup()]);
@@ -495,4 +498,114 @@ describe("imported order on a format-3 workflow (increment 07, no phase-workspac
       await db.cleanup();
     }
   }, 20_000);
+});
+
+describe("increment 08: name parts, saved billing profile and order groups", () => {
+  const BILLING = {
+    fullName: "Zeus Greene", company: "Ice Queen Studio", email: "billing.zeus@example.test", country: "US", region: "CA",
+    addressLine1: "1 Example Way", addressLine2: "", city: "Sampletown", postalCode: "90000", taxId: "",
+  };
+  const line = (packetNumber: number) => ({
+    sourcePublicId: ulid(), productPublicId: null, productVersion: null, name: `Packet ${packetNumber}`, description: "",
+    features: [], packetNumber, tier: "Standard" as const, outcome: "Outcome", timeline: "Five business days",
+    deliverables: [{ title: "Summary", detail: "Findings" }], unitPriceMinor: 1000, currency: "USD", quantity: 1, lineTotalMinor: 1000,
+  });
+
+  it("exports the whole group for one selected addition and imports parts, billing profile and the group link", async () => {
+    const sourceDb = await createTestDb({ schema: testSchema });
+    const targetDb = await createTestDb({ schema: testSchema });
+    try {
+      const source = await environment(sourceDb, "inc08-source");
+      const target = await environment(targetDb, "inc08-target");
+      const customer = await sourceDb.db.transaction((tx) => source.services.identity.createPendingCustomer({
+        email: "zeus.greene@example.test", name: "Zeus Greene", createdAt: CREATED,
+        nameParts: { firstName: "Zeus", lastName: "Greene", preferredName: "Zed" },
+      }, { tx }));
+      await sourceDb.db.transaction((tx) => source.services.billingProfile.saveForUserInTx(tx, customer.userId, BILLING,
+        { userId: null, role: "system", via: "portable_import" }));
+      const order = (packetNumber: number, groupRootOrderId: number | null) => sourceDb.db.transaction((tx) => source.services.orders.importOrder({
+        importId: ulid(), sourceInstallationId: "inc08-fixture", sourceOrderPublicId: ulid(), targetOwnerUserId: customer.userId,
+        projectName: "Ice Queen", statusKey: "submitted", subtotalMinor: 1000, discountMinor: 0, discountLabel: null, totalMinor: 1000,
+        promoDiscountMinor: 0, promoLabel: null, currency: "USD", createdAt: CREATED, submittedAt: CREATED, editable: false,
+        lineItems: [line(packetNumber)], statusHistory: [], groupRootOrderId,
+      }, tx));
+      const root = await order(1, null);
+      const addition = await order(2, root.id);
+
+      const admin = source.admins[0]!;
+      const started = await source.services.portable.startExport(admin, { selection: { kind: "orders", ids: [addition.publicId] }, passphrase: PASSPHRASE });
+      expect(started.counts).toMatchObject({ customers: 1, orders: 2 });
+      expect(await source.jobs.runAll(PORTABLE_EXPORT_JOB)).toEqual([expect.objectContaining({ outcome: "completed" })]);
+      const opened = await source.services.portable.openExport(admin, started.exportId);
+      const payload = Buffer.concat(await collect(opened.stream as AsyncIterable<Buffer>));
+      await opened.finish("completed");
+
+      await inPrivateWorkspace(async (dir) => {
+        const [row] = await sourceDb.db.select().from(portableSchema.portableExports);
+        if (!row?.sha256 || !row.size) throw new Error("no export receipt");
+        await copyExact(source.storage, row.storageKey, `${dir}/inc08.rpkg`, { size: row.size, sha256: row.sha256 });
+        const pkg = await openPackage({ input: `${dir}/inc08.rpkg`, passphrase: PASSPHRASE });
+        try {
+          expect((await pkg.verify()).ok).toBe(true);
+          const records = await collect(pkg.allRecords());
+          const orders = records.filter((entry) => entry.type === "orders").map((entry) => entry.record as Record<string, unknown>);
+          const exportedRoot = orders.find((entry) => entry.publicId === root.publicId);
+          expect(exportedRoot).toBeDefined();
+          expect(exportedRoot).not.toHaveProperty("groupRootOrderPublicId");
+          expect(orders.find((entry) => entry.publicId === addition.publicId)).toMatchObject({ groupRootOrderPublicId: root.publicId });
+          expect(records.find((entry) => entry.type === "customers")?.record).toMatchObject({
+            firstName: "Zeus", lastName: "Greene", preferredName: "Zed", billingProfile: BILLING,
+          });
+        } finally { await pkg.close(); }
+      });
+
+      const data = target.services.portable;
+      const targetAdmin = target.admins[0]!;
+      const uploaded = await data.upload(targetAdmin, Readable.from(payload));
+      const planned = await data.verifyAndPlan(targetAdmin, { importId: uploaded.importId, passphrase: PASSPHRASE });
+      expect(planned.plan?.counts).toMatchObject({ conflicts: 0 });
+      await data.approve(targetAdmin, { importId: uploaded.importId, planDigest: planned.planDigest! });
+      expect(await target.jobs.runAll(PORTABLE_IMPORT_JOB)).toEqual([expect.objectContaining({ outcome: "completed" })]);
+      expect((await data.getImport(targetAdmin, uploaded.importId)).reconciliation).toMatchObject({ discrepancies: 0 });
+
+      const imported = await target.services.identity.getUserByPublicId(customer.publicId);
+      if (!imported) throw new Error("customer not imported");
+      expect(imported.name).toBe("Zeus Greene");
+      expect(await target.services.identity.users.namePartsInTx(targetDb.db, imported.id))
+        .toMatchObject({ firstName: "Zeus", lastName: "Greene", preferredName: "Zed" });
+      expect((await target.services.billingProfile.getForUserInTx(targetDb.db, imported.id))?.details).toEqual(BILLING);
+      const rows = await targetDb.db.select().from(ordersSchema.orders);
+      const targetRoot = rows.find((entry) => entry.reference === root.reference);
+      const targetAddition = rows.find((entry) => entry.reference === addition.reference);
+      expect(targetRoot?.groupRootOrderId).toBeNull();
+      expect(targetAddition?.groupRootOrderId).toBe(targetRoot?.id);
+    } finally {
+      await Promise.all([sourceDb.cleanup(), targetDb.cleanup()]);
+    }
+  }, 40_000);
+
+  it("keeps older records working and refuses inconsistent group links and invalid billing profiles", () => {
+    const customerId = ulid();
+    // Increment 07 and older exports: display name in preferredName, no parts, no billing profile.
+    expect(customerIdentity({ publicId: customerId, firstName: null, lastName: null, preferredName: "Legacy Display Name" }))
+      .toEqual({ name: "Legacy Display Name" });
+    expect(customerBillingProfile({ publicId: customerId })).toBeNull();
+    expect(customerIdentity({ publicId: customerId, firstName: "Zeus", lastName: "Greene", preferredName: null }))
+      .toEqual({ name: "Zeus Greene", nameParts: { firstName: "Zeus", lastName: "Greene", preferredName: null } });
+    expect(() => customerIdentity({ publicId: customerId, firstName: "Zeus", lastName: "<b>", preferredName: null })).toThrow();
+    expect(() => customerBillingProfile({ publicId: customerId, billingProfile: { ...BILLING, country: "USA" } })).toThrow();
+
+    const rootId = ulid();
+    const root = { publicId: rootId, customerPublicId: customerId, currency: "USD" };
+    const addition = { publicId: ulid(), customerPublicId: customerId, currency: "USD", groupRootOrderPublicId: rootId };
+    const byId = (...records: Array<Record<string, unknown> & { publicId: string }>) => new Map(records.map((entry) => [entry.publicId, entry]));
+    expect(groupLinkProblem(root, byId(root, addition))).toBeNull();
+    expect(groupLinkProblem({ ...root, groupRootOrderPublicId: null }, byId(root))).toBeNull();
+    expect(groupLinkProblem(addition, byId(root, addition))).toBeNull();
+    expect(groupLinkProblem(addition, byId(addition))).toBe("PORTABLE_ORDER_GROUP_ROOT_MISSING");
+    expect(groupLinkProblem({ ...addition, groupRootOrderPublicId: addition.publicId }, byId(root, addition))).toBe("PORTABLE_ORDER_GROUP_INVALID");
+    expect(groupLinkProblem(addition, byId({ ...root, currency: "EUR" }, addition))).toBe("PORTABLE_ORDER_GROUP_INVALID");
+    expect(groupLinkProblem(addition, byId({ ...root, customerPublicId: ulid() }, addition))).toBe("PORTABLE_ORDER_GROUP_INVALID");
+    expect(groupLinkProblem(addition, byId({ ...root, groupRootOrderPublicId: ulid() }, addition))).toBe("PORTABLE_ORDER_GROUP_INVALID");
+  });
 });

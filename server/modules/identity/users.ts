@@ -7,7 +7,7 @@ import type { DbOrTx, FieldCrypto, Tx } from "../../core/types.js";
 import { conflict } from "../../core/errors.js";
 import { randomBytes } from "node:crypto";
 import type { AuthMethod, UserRole } from "../../../shared/domain.js";
-import { namePrefixes, normalizeEmail } from "./normalize.js";
+import { deriveNameParts, fullNameOf, greetingNameOf, namePrefixes, normalizeEmail, type NameParts } from "./normalize.js";
 import { customerRefReservations, users, type UserRow, type UserStatus } from "./schema.js";
 
 export interface UserView {
@@ -16,7 +16,18 @@ export interface UserView {
   role: UserRole;
   status: UserStatus;
   email: string;
+  /** Full display name ("<First> <Last>" for accounts with stored parts). Legal / billing / invoice contexts. */
   name: string;
+  /**
+   * Increment 08 (D1). Always set by identity (optional only so other modules' hand-built fixtures stay valid).
+   * Derived lazily from `name` while the parts are not stored yet (`namePartsStored` false).
+   */
+  firstName?: string;
+  lastName?: string;
+  preferredName?: string | null;
+  /** Preferred name, else first name (greetings and mail salutations). */
+  greetingName?: string;
+  namePartsStored?: boolean;
   customerRef: string | null;
   emailVerified: boolean;
   authSource: AuthMethod;
@@ -28,6 +39,9 @@ export interface UserView {
 
 export const emailAad = (publicId: string) => `users.email:${publicId}`;
 export const nameAad = (publicId: string) => `users.name:${publicId}`;
+export const firstNameAad = (publicId: string) => `users.first_name:${publicId}`;
+export const lastNameAad = (publicId: string) => `users.last_name:${publicId}`;
+export const preferredNameAad = (publicId: string) => `users.preferred_name:${publicId}`;
 
 export function emailIndexOf(crypto: FieldCrypto, email: string): string {
   return crypto.blindIndex(normalizeEmail(email), "users.email");
@@ -47,19 +61,48 @@ export function nameColumns(crypto: FieldCrypto, publicId: string, name: string)
   };
 }
 
+/** name_enc ("<First> <Last>") + search indexes + the encrypted parts (increment 08). */
+export function namePartColumns(crypto: FieldCrypto, publicId: string, parts: NameParts) {
+  return {
+    ...nameColumns(crypto, publicId, fullNameOf(parts)),
+    firstNameEnc: crypto.encrypt(parts.firstName, firstNameAad(publicId)),
+    lastNameEnc: crypto.encrypt(parts.lastName, lastNameAad(publicId)),
+    preferredNameEnc: parts.preferredName ? crypto.encrypt(parts.preferredName, preferredNameAad(publicId)) : null,
+  };
+}
+
+/** Stored parts, or the lazy derivation from name_enc for accounts from before increment 08. */
+export function namePartsOf(crypto: FieldCrypto, row: Pick<UserRow, "publicId" | "nameEnc" | "firstNameEnc" | "lastNameEnc" | "preferredNameEnc">): NameParts & { stored: boolean; name: string } {
+  const name = crypto.decrypt(row.nameEnc, nameAad(row.publicId));
+  if (row.firstNameEnc === null || row.lastNameEnc === null) return { ...deriveNameParts(name), stored: false, name };
+  return {
+    firstName: crypto.decrypt(row.firstNameEnc, firstNameAad(row.publicId)),
+    lastName: crypto.decrypt(row.lastNameEnc, lastNameAad(row.publicId)),
+    preferredName: row.preferredNameEnc ? crypto.decrypt(row.preferredNameEnc, preferredNameAad(row.publicId)) : null,
+    stored: true,
+    name,
+  };
+}
+
 export function emailColumns(crypto: FieldCrypto, publicId: string, email: string) {
   const normalized = normalizeEmail(email);
   return { emailEnc: crypto.encrypt(normalized, emailAad(publicId)), emailIndex: emailIndexOf(crypto, normalized) };
 }
 
 export function toView(crypto: FieldCrypto, row: UserRow): UserView {
+  const parts = namePartsOf(crypto, row);
   return {
     id: row.id,
     publicId: row.publicId,
     role: row.role,
     status: row.status,
     email: crypto.decrypt(row.emailEnc, emailAad(row.publicId)),
-    name: crypto.decrypt(row.nameEnc, nameAad(row.publicId)),
+    name: parts.name,
+    firstName: parts.firstName,
+    lastName: parts.lastName,
+    preferredName: parts.preferredName,
+    greetingName: greetingNameOf(parts, parts.name),
+    namePartsStored: parts.stored,
     customerRef: row.customerRef ?? null,
     emailVerified: row.emailVerifiedAt !== null,
     authSource: row.authSource,

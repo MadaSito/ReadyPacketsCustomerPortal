@@ -64,3 +64,27 @@ Every one of the 16 tables added by migration 0007 is listed in a manifest exclu
 - **Not collected (unchanged).** These tables already sat outside this export, so their new columns don't travel either: SSO configuration and requests, integration dispatches, deliveries and subscriptions, storage connections, payment webhook events, and the two new `file_access_log` columns.
 - **Known limitation.** `order_files.stage_key` is not carried in contract 3.0 (agreed with Files). Imported files land unphased (`Order files`) and must be re-filed to a phase by staff.
 - **Backups** dump every base table (all 205 after 0007), including all of the above. The increment 05 key note still applies.
+
+## Increment 08 coverage
+
+Contract 3.0 gains two OPTIONAL fields; the contract version and record types are unchanged. This is the same precedent as `promoDiscount` in increment 05. Older packages without these fields import as before.
+
+- **Name parts (`users.first_name_enc`, `last_name_enc`, `preferred_name_enc`).**
+  - Export: a customer with stored parts is exported as `firstName`, `lastName` and `preferredName` (the nickname). A customer without stored parts keeps the earlier shape: `firstName` and `lastName` null, display name in `preferredName`.
+  - Import: a record with both a first and a last name is stored with parts; the display name becomes "<First> <Last>". Any other record keeps the legacy display-name rule, and its parts are derived lazily by Identity.
+- **Saved billing profile (`customer_billing_profiles`).**
+  - Export: carried as `customers.billingProfile`, the same fields as `shared/billingDetails.ts`. The key is omitted when the customer has none.
+  - Import: the profile is re-validated with `billingDetailsSchema` during planning; an invalid one is a plan conflict, `PORTABLE_TARGET_POLICY`. It is stored with `billingProfile.saveForUserInTx` (via `portable_import`, audit `billing_profile.saved` without values) in the same transaction as the new pending customer. Reconciliation checks that the profile exists.
+- **Order groups (`orders.group_root_order_id`).**
+  - Export: carried as `orders.groupRootOrderPublicId`, a reference to `orders` checked by the reader. The key is omitted for a root. Selecting one order exports its whole group, so links always resolve inside the package; a customer or all-records export already includes every order.
+  - Planning: the root must be another order in the package, itself a root, with the same customer and currency. Otherwise the plan has a conflict: `PORTABLE_ORDER_GROUP_ROOT_MISSING` or `PORTABLE_ORDER_GROUP_INVALID`.
+  - Apply: roots are written before the orders added to them, whatever the package order. Orders then checks the root again (`IMPORT_GROUP_ROOT_INVALID`). Reconciliation checks the target link.
+- **New reference format and `orders.reference_stem`.** Imported orders keep their source reference (`orderNumber`); Orders records the stem when the reference has the new shape. The stem itself is not carried.
+- **Not transferred.**
+  - `carts.add_to_order_public_id`: carts are not collected.
+  - `payment_attempts.booking_source`, `last_customer_lookup_at` and `missing_webhook_alerted_at`: payments are under `historical-evidence`, whose reason text now names payment attempts and their booking source.
+  - `order_reference_counters`: the target allocates its own counters.
+- **Older installations.** A package with no group links and no billing profiles is still readable by an increment 07 installation. A package that has either one is refused there as `RECORD_INVALID`, because same-minor records are strict. An increment 07 importer would also take a nickname as the display name.
+- **Account data export and erasure.** These features do not exist in 08 (contract D4 as corrected). Privacy requests are handled by an administrator, and the customer can clear the saved billing profile themselves. The profile row is deleted with its user (`ON DELETE CASCADE`).
+- **Backups** dump every base table, including `customer_billing_profiles` and all new columns. The increment 05 key note still applies: the profile's encrypted details are readable only with the same field-encryption key, because the AAD is bound to the user's public id.
+

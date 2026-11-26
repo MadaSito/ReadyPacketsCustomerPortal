@@ -10,11 +10,19 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ShoppingCart } from "lucide-react";
 import { useMemo, useState, type FormEvent, type ReactNode } from "react";
-import { Link } from "wouter";
+import { Link, useSearch } from "wouter";
 import { useFeatureEnabled } from "@/lib/features";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import { Button, buttonClasses, Callout, Card, Field, Input, Select, Section } from "@/ui";
 import { useCartViewerGate } from "./viewerGate";
+
+const ULID_PATTERN = /^[0-9A-HJKMNP-TV-Z]{26}$/u;
+
+function readAddToParam(search: string): string | null {
+  const params = new URLSearchParams(search);
+  const raw = params.get("addTo")?.trim() ?? "";
+  return ULID_PATTERN.test(raw) ? raw : null;
+}
 
 export function OrderFormCartBanner({ children }: { children: ReactNode }) {
   const { pending, staffViewer } = useCartViewerGate();
@@ -31,13 +39,24 @@ export function OrderFormCartBanner({ children }: { children: ReactNode }) {
 function OrderFormQuickCartSection() {
   const trpc = useTRPC();
   const queryClient = useQueryClient();
+  const search = useSearch();
+  const addToParam = readAddToParam(search);
+
   const catalogQuery = useQuery(trpc.orders.catalog.list.queryOptions());
+  const cartQuery = useQuery(trpc.cart.get.queryOptions());
   const addMutation = useMutation(trpc.cart.addItems.mutationOptions());
+  const setTargetMutation = useMutation(trpc.cart.setTarget.mutationOptions());
 
   const [selectedProductId, setSelectedProductId] = useState("");
   const [quantityText, setQuantityText] = useState("1");
   const [statusMessage, setStatusMessage] = useState("");
   const [errorText, setErrorText] = useState<string | null>(null);
+
+  const activeAddToOrder = cartQuery.data?.addToOrder ?? null;
+  const excludedPackets = useMemo(
+    () => new Set(activeAddToOrder?.packetNumbers ?? []),
+    [activeAddToOrder?.packetNumbers],
+  );
 
   const activeProducts = useMemo(() => {
     const groups = catalogQuery.data ?? [];
@@ -45,6 +64,7 @@ function OrderFormQuickCartSection() {
     for (const group of groups) {
       for (const product of group.products) {
         if (!product.active) continue;
+        if (product.packetNumber !== null && excludedPackets.has(product.packetNumber)) continue;
         const tierSuffix = product.tier ? ` (${product.tier})` : "";
         list.push({
           publicId: product.publicId,
@@ -54,9 +74,25 @@ function OrderFormQuickCartSection() {
       }
     }
     return list;
-  }, [catalogQuery.data]);
+  }, [catalogQuery.data, excludedPackets]);
 
   const selectedProduct = activeProducts.find((item) => item.publicId === selectedProductId) ?? null;
+  const busy = addMutation.isPending || setTargetMutation.isPending;
+
+  const handleClearTarget = async () => {
+    setErrorText(null);
+    setStatusMessage("");
+    try {
+      const updated = await setTargetMutation.mutateAsync({
+        addToOrderPublicId: null,
+        ...(cartQuery.data?.cartPublicId ? { expectedVersion: cartQuery.data.version } : {}),
+      });
+      queryClient.setQueryData(trpc.cart.get.queryKey(), updated);
+      setStatusMessage("Switched your cart to start a separate project.");
+    } catch (err) {
+      setErrorText(errorMessage(err, "Could not update your cart project target."));
+    }
+  };
 
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
@@ -67,6 +103,7 @@ function OrderFormQuickCartSection() {
     try {
       const updated = await addMutation.mutateAsync({
         items: [{ productPublicId: selectedProduct.publicId, quantity: parsedQty }],
+        addToOrderPublicId: addToParam,
       });
       queryClient.setQueryData(trpc.cart.get.queryKey(), updated);
       await queryClient.invalidateQueries({ queryKey: trpc.cart.badgeCount.queryKey() });
@@ -86,6 +123,27 @@ function OrderFormQuickCartSection() {
         <div role="status" aria-live="polite" className="sr-only">
           {statusMessage}
         </div>
+        {!addToParam && activeAddToOrder ? (
+          <Callout tone="info" className="mb-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <span className="min-w-0 break-words">
+                {activeAddToOrder.projectName && activeAddToOrder.rootReference
+                  ? `Your open cart is currently adding to project ${activeAddToOrder.projectName} (${activeAddToOrder.rootReference}).`
+                  : "Your open cart is currently linked to an earlier project."}
+              </span>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                loading={setTargetMutation.isPending}
+                disabled={busy}
+                onClick={() => void handleClearTarget()}
+              >
+                Start a separate project
+              </Button>
+            </div>
+          </Callout>
+        ) : null}
         {errorText ? (
           <Callout tone="danger" className="mb-4">
             {errorText}
@@ -121,7 +179,7 @@ function OrderFormQuickCartSection() {
                   setSelectedProductId(event.target.value);
                   setQuantityText("1");
                 }}
-                disabled={addMutation.isPending}
+                disabled={busy}
               />
             </Field>
             {selectedProduct?.isAddon ? (
@@ -133,12 +191,12 @@ function OrderFormQuickCartSection() {
                   inputMode="numeric"
                   value={quantityText}
                   onChange={(event) => setQuantityText(event.target.value)}
-                  disabled={addMutation.isPending}
+                  disabled={busy}
                 />
               </Field>
             ) : null}
             <div className="flex flex-wrap items-center gap-2">
-              <Button type="submit" loading={addMutation.isPending} disabled={!selectedProduct || addMutation.isPending}>
+              <Button type="submit" loading={addMutation.isPending} disabled={!selectedProduct || busy}>
                 Add to cart
               </Button>
               <Link href="/cart" className={buttonClasses("secondary", "md")}>

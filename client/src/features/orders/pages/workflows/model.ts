@@ -382,7 +382,7 @@ export const gatePointFrom = (value: string): DraftGate["point"] => (value.start
 /** Synthetic values for the live example path (never real customer data). */
 export const FOLDER_EXAMPLE_VALUES: Record<OrderFileFolderToken, string> = {
   customer_ref: "RPCUS-A1B2C3D4E",
-  order_ref: "RP-2026-000123",
+  order_ref: "RP-JJG5-ZEUGRE-ICEQUE-001",
   order_name: "Example project",
   phase: "Intake",
   slot: "Signed contract",

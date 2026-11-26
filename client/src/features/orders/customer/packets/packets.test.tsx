@@ -109,13 +109,73 @@ describe("PacketPicker", () => {
   it("deliverables disclosures show outcome, timeline and 'Everything in …, plus:' for higher tiers", () => {
     renderUi(<Harness />);
     const card = screen.getByRole("region", { name: "Packet 1: Idea & IP Protection" });
-    const basic = within(card).getByText("Basic: outcome and deliverables").closest("details") as HTMLDetailsElement;
-    const premium = within(card).getByText("Premium: outcome and deliverables").closest("details") as HTMLDetailsElement;
-    expect(basic).not.toHaveAttribute("open");
+    const basicButton = within(card).getByRole("button", { name: "Basic: outcome and deliverables" });
+    const basic = document.getElementById(basicButton.getAttribute("aria-controls")!)!;
+    const premium = document.getElementById(within(card).getByRole("button", { name: "Premium: outcome and deliverables" }).getAttribute("aria-controls")!)!;
+    expect(basicButton).toHaveAttribute("aria-expanded", "false");
+    expect(basic).not.toBeVisible();
     expect(within(basic).queryByText(/Everything in/)).not.toBeInTheDocument();
     expect(within(basic).getByText("Basic deliverable 1")).toBeInTheDocument();
     expect(within(premium).getByText("Everything in Standard, plus:")).toBeInTheDocument();
     expect(within(premium).getByText("Premium outcome for Idea & IP Protection")).toBeInTheDocument();
+  });
+
+  it("D7: choosing a tier expands only that tier's details, keeps focus on the radio and announces it; Not included collapses all", async () => {
+    const { container } = renderUi(<Harness />);
+    const card = screen.getByRole("region", { name: "Packet 1: Idea & IP Protection" });
+    const group = within(card).getByRole("group", { name: "Tier for Idea & IP Protection" });
+    const disclosure = (tier: string) => within(card).getByRole("button", { name: `${tier}: outcome and deliverables` });
+    const expanded = () => ["Basic", "Standard", "Premium"].filter((t) => disclosure(t).getAttribute("aria-expanded") === "true");
+    const status = within(card).getByTestId("packet-1-disclosure-status");
+    expect(expanded()).toEqual([]);
+
+    const standard = within(group).getByRole("radio", { name: /^Standard/ });
+    standard.focus();
+    fireEvent.click(standard);
+    expect(expanded()).toEqual(["Standard"]);
+    expect(document.getElementById(disclosure("Standard").getAttribute("aria-controls")!)).toBeVisible();
+    expect(standard).toHaveFocus();
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(status).toHaveTextContent("Standard: outcome and deliverables shown below.");
+
+    // Manual toggling still works and does not change the selection.
+    fireEvent.click(disclosure("Basic"));
+    expect(expanded()).toEqual(["Basic", "Standard"]);
+    fireEvent.click(disclosure("Standard"));
+    expect(expanded()).toEqual(["Basic"]);
+    expect(standard).toBeChecked();
+
+    fireEvent.click(within(group).getByRole("radio", { name: /^Premium/ }));
+    expect(expanded()).toEqual(["Premium"]);
+    expect(status).toHaveTextContent("Premium: outcome and deliverables shown below.");
+
+    fireEvent.click(within(group).getByRole("radio", { name: /^Not included/ }));
+    expect(expanded()).toEqual([]);
+    expect(status).toHaveTextContent("");
+
+    // The other packet is untouched.
+    const other = screen.getByRole("region", { name: "Packet 2: Market & Product Validation" });
+    expect(within(other).queryAllByRole("button", { expanded: true })).toHaveLength(0);
+    await expectNoAxeViolations(container);
+  });
+
+  it("D3: packets already in the project are shown but offer no tier choice", async () => {
+    const onChange = vi.fn();
+    const { container } = renderUi(
+      <>
+        <h2>Choose items</h2>
+        <PacketPicker groups={GROUPS} selection={{ 1: "p1-basic" }} onChange={onChange} alreadyInProject={[1]} />
+      </>,
+    );
+    const owned = screen.getByRole("region", { name: "Packet 1: Idea & IP Protection" });
+    expect(within(owned).getByText("Already in this project")).toBeInTheDocument();
+    expect(within(owned).queryByRole("radio")).toBeNull();
+    expect(within(owned).getByRole("button", { name: "Basic: outcome and deliverables" })).toHaveAttribute("aria-expanded", "false");
+    const open = screen.getByRole("region", { name: "Packet 2: Market & Product Validation" });
+    expect(within(open).getAllByRole("radio").length).toBe(4);
+    fireEvent.click(within(open).getByRole("radio", { name: /^Basic/ }));
+    expect(onChange).toHaveBeenLastCalledWith({ 1: "p1-basic", 2: "p2-basic" });
+    await expectNoAxeViolations(container);
   });
 });
 

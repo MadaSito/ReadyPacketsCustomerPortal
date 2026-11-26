@@ -2,19 +2,21 @@
  * Workflow designer (/admin/workflows/drafts/:draftId). Owner: orders_engineer.
  * The wizard and the canvas are two views of ONE draft held here. Every save returns the server's issues; the
  * server is the only authority on validity and refuses to publish a draft with errors. Publishing needs step-up.
+ * Increment 08 (D7): a persistent Publish button in the header on every tab and step (disabled with the reasons
+ * listed next to it while the draft has errors) opens the shared PublishDraftDialog (change note, make default,
+ * step-up, confirmation naming the version and whether it is the default). The review step's Publish opens it too.
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowDown, ArrowUp, Plus, Trash2 } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { ArrowDown, ArrowUp, Plus, Trash2, Upload } from "lucide-react";
+import { useId, useMemo, useRef, useState } from "react";
 import { useLocation, useParams } from "wouter";
-import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
+import { errorMessage, useTRPC } from "@/lib/trpc";
 import {
   Badge,
   Breadcrumbs,
   Button,
   Callout,
   Card,
-  Checkbox,
   DataTable,
   ErrorState,
   Field,
@@ -24,10 +26,7 @@ import {
   PageHeader,
   Select,
   Skeleton,
-  StepUpCancelledError,
   Tabs,
-  Textarea,
-  useStepUp,
   useToast,
   Wizard,
   type FlowSelection,
@@ -65,6 +64,7 @@ import {
   type WizardStepId,
   type WorkflowIssue,
 } from "./model";
+import { PublishDraftDialog, publishBlockers, type PublishResult } from "./PublishDraftDialog";
 import { AcceptanceGatesEditor, PhasesEditor, RulesReviewSummary, StateRulesFields, StorageFolderEditor } from "./rulesFields";
 
 export default function WorkflowDesignerPage() {
@@ -96,10 +96,8 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
   const trpc = useTRPC();
   const queryClient = useQueryClient();
   const toast = useToast();
-  const stepUp = useStepUp();
   const [, navigate] = useLocation();
   const save = useMutation(trpc.orders.admin.workflows.drafts.save.mutationOptions());
-  const publish = useMutation(trpc.orders.admin.workflows.drafts.publish.mutationOptions());
 
   const [work, setWork] = useState<Editable>({ name: initial.name, definition: initial.definition, layout: initial.layout ?? { nodes: [] } });
   const [rowVersion, setRowVersion] = useState(initial.rowVersion);
@@ -113,8 +111,11 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
   const [visited, setVisited] = useState<WizardStepId[]>([]);
   const [stepBlocked, setStepBlocked] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
-  const [makeDefault, setMakeDefault] = useState(false);
-  const [changeNote, setChangeNote] = useState("");
+  const [publishOpen, setPublishOpen] = useState(false);
+  const [findingsOpen, setFindingsOpen] = useState(false);
+  const published = useRef<PublishResult | null>(null);
+  const publishButton = useRef<HTMLButtonElement>(null);
+  const publishReasonId = useId();
 
   const edit = (next: (current: Editable) => Editable) => {
     edits.current += 1;
@@ -152,37 +153,23 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
     if (result) toast.show({ tone: "success", title: "Draft saved", description: errorsOf(result).length ? `${errorsOf(result).length} problem(s) still to fix before publishing.` : "Ready to publish." });
   };
 
-  const doPublish = async () => {
+  /** Saves pending edits first; opens the publish dialog only when the saved draft has no errors. */
+  const openPublish = async () => {
     const saved = dirty ? await saveNow() : issues;
     if (!saved) return;
     if (errorsOf(saved).length) {
       setProblem("Fix the problems listed below before publishing.");
+      setFindingsOpen(true);
       return;
     }
     setProblem(null);
-    try {
-      const result = await stepUp.run(
-        () => publish.mutateAsync({ draftId: initial.publicId, expectedVersion: rowVersion, makeDefault, ...(changeNote.trim() ? { changeNote: changeNote.trim() } : {}) }),
-        { reason: "Publishing a workflow changes how new orders move." },
-      );
-      toast.show({ tone: "success", title: `Version ${result.versionNumber} published`, description: "New orders use it. Existing orders keep the version they started on." });
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: trpc.orders.admin.workflows.list.queryKey() }),
-        queryClient.invalidateQueries({ queryKey: trpc.orders.admin.workflows.drafts.list.queryKey() }),
-      ]);
-      navigate(`/admin/workflows/${result.workflowPublicId}/versions`);
-    } catch (err) {
-      if (err instanceof StepUpCancelledError) return;
-      // WORKFLOW_DRAFT_INVALID carries parallel arrays: messages, field paths and codes (all errors).
-      const details = safeError(err)?.details as { issues?: unknown; issuePaths?: unknown; issueCodes?: unknown } | undefined;
-      if (Array.isArray(details?.issues)) {
-        const paths = Array.isArray(details.issuePaths) ? details.issuePaths : [];
-        const codes = Array.isArray(details.issueCodes) ? details.issueCodes : [];
-        setIssues(details.issues.map((message, i) => ({ severity: "error" as const, message: String(message), path: String(paths[i] ?? ""), code: String(codes[i] ?? "") })));
-        setPublishable(false);
-      }
-      setProblem(errorMessage(err, "The workflow could not be published. Please try again."));
-    }
+    published.current = null;
+    setPublishOpen(true);
+  };
+  const onPublishOpenChange = (open: boolean) => {
+    setPublishOpen(open);
+    // The draft no longer exists once published: continue on the workflow's versions.
+    if (!open && published.current) navigate(`/admin/workflows/${published.current.workflowPublicId}/versions`);
   };
 
   const stepIndex = WIZARD_STEPS.findIndex((s) => s.id === step);
@@ -192,7 +179,7 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
     setStep(id);
   };
   const onNext = async () => {
-    if (step === "review") return void doPublish();
+    if (step === "review") return void openPublish();
     const result = await saveNow();
     if (!result) return;
     if (errorsOf(result.filter((issue) => stepOfIssue(issue) === step)).length) {
@@ -207,7 +194,6 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
    * Increment 06: findings jump to the field. Opens the wizard step that owns the problem, then focuses the exact
    * control (by its path id), or a control whose error text matches, or that step's problem list.
    */
-  const [findingsOpen, setFindingsOpen] = useState(false);
   const jump = (issue: WorkflowIssue) => {
     setTab("wizard");
     goTo(stepOfIssue(issue));
@@ -227,7 +213,7 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
     window.setTimeout(() => focusTarget(0), 0);
   };
 
-  const busy = save.isPending || publish.isPending;
+  const busy = save.isPending;
   const saveButton = (
     <Button variant="ghost" onClick={() => void onSaveClick()} loading={save.isPending} disabled={busy}>
       Save draft
@@ -235,6 +221,35 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
   );
   const errorCount = errorsOf(issues).length;
   const warningCount = issues.length - errorCount;
+  // Errors are known only after a save; with unsaved edits Publish saves first and re-checks.
+  const blockers = publishBlockers({ errorCount: dirty ? 0 : errorCount, busy, nameMissing: !work.name.trim() });
+  const headerActions = (
+    <div className="flex max-w-full flex-col items-stretch gap-2 sm:items-end">
+      <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+        {saveButton}
+        <Button
+          ref={publishButton}
+          leadingIcon={<Upload aria-hidden="true" />}
+          disabled={blockers.length > 0}
+          aria-describedby={blockers.length ? publishReasonId : undefined}
+          onClick={() => void openPublish()}
+          data-testid="workflow-publish"
+        >
+          Publish
+        </Button>
+      </div>
+      {blockers.length ? (
+        <div id={publishReasonId} className="max-w-xs text-sm text-body sm:text-right" data-testid="workflow-publish-reasons">
+          <p className="font-medium text-ink">Publishing is not available yet:</p>
+          <ul className="list-none">
+            {blockers.map((reason) => (
+              <li key={reason}>{reason}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  );
 
   return (
     <>
@@ -261,8 +276,23 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
             {warningCount ? <Badge tone="warning">{`${warningCount} warning${warningCount === 1 ? "" : "s"}`}</Badge> : null}
           </div>
         }
-        actions={saveButton}
+        actions={headerActions}
       />
+      {publishOpen ? (
+        <PublishDraftDialog
+          draft={{ publicId: initial.publicId, name: work.name.trim() || initial.name, rowVersion, newWorkflow: initial.workflowPublicId === null }}
+          open
+          onOpenChange={onPublishOpenChange}
+          returnFocusRef={publishButton}
+          onPublished={(result) => {
+            published.current = result;
+          }}
+          onInvalid={(next) => {
+            setIssues(next);
+            setPublishable(false);
+          }}
+        />
+      ) : null}
       <div className="flex flex-col gap-6">
         <div id="wf-findings" hidden={!findingsOpen || issues.length === 0}>
           {findingsOpen ? <IssueList issues={issues} title={`Problems in this draft (${issues.length}). Choose Show to go to each one.`} onJump={jump} /> : null}
@@ -305,11 +335,7 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
                     blocked={stepBlocked}
                     edit={edit}
                     setDefinition={setDefinition}
-                    makeDefault={makeDefault}
-                    setMakeDefault={setMakeDefault}
                     newWorkflow={initial.workflowPublicId === null}
-                    changeNote={changeNote}
-                    setChangeNote={setChangeNote}
                     publishable={publishable && !dirty}
                     dirty={dirty}
                     onJump={jump}
@@ -436,12 +462,8 @@ interface StepBodyProps {
   blocked: boolean;
   edit: (next: (current: Editable) => Editable) => void;
   setDefinition: (definition: DraftDefinition) => void;
-  makeDefault: boolean;
-  setMakeDefault: (value: boolean) => void;
   /** Increment 07.2: the draft proposes a new workflow (not a new version of a published one). */
   newWorkflow: boolean;
-  changeNote: string;
-  setChangeNote: (value: string) => void;
   publishable: boolean;
   dirty: boolean;
   onJump?: (issue: WorkflowIssue) => void;
@@ -585,26 +607,23 @@ function StepBody(props: StepBodyProps) {
   );
 }
 
-function ReviewStep({ work, issues, makeDefault, setMakeDefault, newWorkflow, changeNote, setChangeNote, publishable, dirty, onJump }: StepBodyProps) {
+function ReviewStep({ work, issues, newWorkflow, publishable, dirty, onJump }: StepBodyProps) {
   const { definition } = work;
   return (
     <>
       <IssueList issues={issues} title={errorsOf(issues).length ? "Fix these problems before publishing" : "Warnings (publishing is still allowed)"} onJump={onJump} />
       {publishable ? <Callout tone="success">The draft has no problems and is ready to publish.</Callout> : null}
       {dirty ? <Callout tone="info">You have unsaved changes. Publishing saves them first.</Callout> : null}
+      <p className="text-sm text-body">Publish opens a short dialog to add a change note and choose whether this becomes the default workflow for new orders.</p>
       <DefinitionTables definition={definition} />
       <RulesReviewSummary definition={definition} />
-      <Checkbox label="Use for new orders (default workflow)" description="If you leave this off, new orders keep using the current default." checked={makeDefault} onCheckedChange={setMakeDefault} />
       {/* Increment 07.2: say where the default lives, so it can be found later. */}
       <p className="text-sm text-body">
         {newWorkflow
-          ? "A draft must be published before it can be the default. Tick the box above to make this new workflow the default when you publish it, or publish now and choose it later."
+          ? "A draft must be published before it can be the default. You can make this new workflow the default in the publish dialog, or publish now and choose it later."
           : "A draft must be published before it can be the default."}{" "}
         You can change the default workflow any time with “Set as default” on the Workflows list.
       </p>
-      <Field label="Change note (optional)" hint="Shown in the version list, for example why the change was made.">
-        <Textarea value={changeNote} maxLength={500} rows={3} onChange={(event) => setChangeNote(event.target.value)} />
-      </Field>
     </>
   );
 }

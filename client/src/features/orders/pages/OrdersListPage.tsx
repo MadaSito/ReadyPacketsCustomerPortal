@@ -49,7 +49,9 @@ export default function OrdersListPage() {
                   <Link href={`/orders/${order.publicId}`} className="font-semibold break-words text-action underline-offset-2 hover:underline">
                     {order.projectName}
                   </Link>
-                  <span className="text-sm text-muted">{order.reference}</span>
+                  <span className="text-sm break-words text-muted">{order.reference}</span>
+                  {/* Increment 08 (D3): additions name the project's first order. */}
+                  {order.group ? <span className="text-sm break-words text-muted">Added to {order.group.rootReference}</span> : null}
                 </span>
               ),
             },

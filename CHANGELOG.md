@@ -5,7 +5,44 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See `docs/engineering/SDLC.md` for the release
 procedure.
 
-## Increment 07.2 (fixes after increment 07.1)
+## Increment 08
+
+Requested by the owner on 2026-11-26 (prompt 34). See the [session log](docs/session-logs/2026-11-26-session-02.md) and the [contract](docs/engineering/INCREMENT_08_CONTRACT.md).
+- **Database migration** `0008_increment_08`, additive only. Details are in [UPGRADE.md](docs/operations/UPGRADE.md#increment-08-and-migration-0008).
+- **PR and merge commit:** (filled at merge).
+
+### Fixed
+
+- **Payments paid on Stripe stayed "Issued"** (D5).
+  - A payment is now booked from either a verified signed webhook or an authoritative lookup that this server makes to Stripe with its own credentials. Both go through one idempotent booking function, and whichever arrives second does nothing.
+  - The lookup is triggered by the return page, by **Check payment status**, by the scheduled reconciliation job, and by an administrator's **Check with Stripe now** (step-up). The administrator check (step-up, on the invoice or the payment attempt) also repairs payments made before the upgrade. Each payment records its booking source. Square stays webhook-first.
+  - If Stripe does not deliver webhooks within 10 minutes of a paid payment, one alert per environment, "Stripe is not delivering webhooks to this server", is raised. `/admin/payments/setup` then shows the last verified webhook, recent rejections, the endpoint URL, the required events and the usual causes.
+  - This replaces decision 12 of increment 07 ("never mark paid without a signed webhook"). The browser still never tells the server that something was paid.
+
+### Added
+
+- **Customer order wizard** (D6). Opening a purchased order shows a step-by-step wizard for the current phase, with **Back** and **Next**: Review and accept, Questions, Upload documents, Record or upload audio, then Review and submit.
+  - The former tabs are under **Order details**.
+  - A waiting screen always names the next step and the single useful action.
+- **Add packets to this project** (D3). An addition is a new linked order in the same project, with its own invoice and payment. Packets the project already has are shown as "Already in this project". The project's orders are listed under **Orders in this project**.
+- **Billing information** (D4). It can be saved at registration (optional) or in account settings. At checkout, customers choose "Use my saved billing information" or "Enter different billing information".
+- **Name parts** (D1). Registration, the profile, and admin customer creation ask for **First name**, **Last name** and **Preferred name** (optional), each at most 50 characters. Greetings on the home page and in e-mails use the preferred name, while invoices keep the full name.
+- **Publish button** in the workflow designer header, and a **Publish** row action for drafts on `/admin/workflows` (D7).
+- **Go-live checklist**: [GO_LIVE_CHECKLIST.md](docs/operations/GO_LIVE_CHECKLIST.md), to run on the owner's server (D8).
+
+### Changed
+
+- **Order numbers** (D2). New orders get `RP-<C4>-<F3><L3>-<P6>-<NNN>`, for example `RP-JJG5-ZEUGRE-ICEQUE-001`. Existing orders keep their `RP-YYYY-NNNNNN` reference.
+- **Packet tiers** (D7). Choosing a packet tier expands its outcome and deliverables and collapses the others.
+
+### Accessibility
+
+The changed screens are designed and tested against WCAG 2.2 AA.
+- **Automated checks.** The lead ran the axe-core WCAG 2.0, 2.1 and 2.2 A and AA rules in Chromium, in light and dark themes, on 19 changed pages, including registration with the billing section closed and open, the order pages, cart, checkout, saved billing, workflows and payment setup. No violations were found.
+- **Widths.** No horizontal overflow at 240, 320, 390, 768, 1024 or 1440 px, after one fix to the saved-billing choice at 240 px (76e767f).
+- **Keyboard focus.** Focus moves to each wizard step heading. It also stays in place when **Clear billing information** or **Check with Stripe now** is removed from the page (472ca21).
+- **Not checked:** screen readers, physical devices, and browsers other than Chromium.
+
 
 Requested by the owner on 2026-11-26 (prompt 30). See the [session log](docs/session-logs/2026-11-26-session-01.md).
 - **No database migration.** New values use existing settings and columns.

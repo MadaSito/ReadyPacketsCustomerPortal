@@ -41,9 +41,45 @@ lands anywhere else. Any other redirect still fails the case.
 
 An explicit admin or staff case on a customer route can use `enterViaCustomerPortal: true` to exercise
 the visible Customer portal switch before checking the target path. For form states, a `steps` item may
-use an exact `label` (or `labelPrefix: true`), a role and `name` (or `namePrefix: true`), `key`
-(default `Enter`), or synthetic `text` input.
+use an exact `testId`, an exact `label` (or `labelPrefix: true`), or a role and `name` (or `namePrefix: true`).
+The operation is a `key` press (default `Enter`) or synthetic `text` input.
 Use `first: true` only when any matching control can advance the fixture, such as the first catalog item.
+
+## Increment 08 focused sweep
+
+Set `QA_SUITE=increment-08` for both runners. It checks named states at **240, 320, 390, 640, 768, 1024, 1280 and 1440 CSS px** in
+both themes. With `QA_LITERAL_ZOOM=1` the axe runner instead retains its existing native 100%/200%/400% zoom matrix.
+This focused output is not release-wide evidence. `QA_ROUTE_FILTER` can match a route ID or a state name.
+
+On a disposable instance, copy [the Increment 08 fixture template](fixtures.increment-08.example.json) beside private
+storage-state files and replace placeholders with synthetic fixtures. Run the responsive script first, then the axe script:
+
+```sh
+export QA_BASE_URL=https://qa.example.internal QA_SUITE=increment-08 QA_ROUTE_FIXTURES=/private/qa/fixtures.json
+node scripts/qa/responsive-check.mjs
+node scripts/qa/a11y-check.mjs
+```
+
+The fixture map is keyed by state name. Missing routes, session files or required setup are reported as `NOT CHECKED`.
+If a state has no built-in readiness selector, supply `ready` that proves the specific UI, not just `main h1`.
+Only supply non-submitting fixture steps. Do not buy, publish, save billing details, accept policies or upload. In particular:
+
+- **Registration and billing:** `/register` checks the name fields and the open optional billing section. `/account/billing` checks
+  customers with and without saved data; use separate customer sessions.
+- **Orders:** `/orders/new` covers tier expansion; `/orders/new?addTo=<publicId>` must show an already-purchased packet on an
+  active order owned by the fixture customer. `/orders/:orderId` checks active, awaiting payment, awaiting team, and delivered
+  for both configured phase workflows and legacy derived workflows. Seed eight customer-owned orders, one per state, with an actionable
+  step for active cases, an issued invoice with a positive balance for payment cases, and the completion action for delivered cases.
+  Do not advance past steps that save or submit data.
+- **Checkout:** `/cart` and `/cart/checkout` cover the locked add-to-project flow; `/cart/checkout` also covers saved billing
+  and custom entry with and without a saved profile. Use synthetic non-empty carts.
+  `/checkout/return` covers paid, processing, terminal unpaid, invalid and missing-target states. Use separate seeded attempt IDs
+  for paid, processing and terminal unpaid, and a known nonexistent ID for invalid. Attempt-specific states require `checkoutSandbox: true`.
+  This flag only acknowledges the safety requirement: **you must configure the server with a sandbox or
+  deterministic fake payment provider**, because opening a return page can reconcile an attempt. Never use live payment credentials.
+  `/admin/payments/setup` checks the Stripe webhook diagnostics panel without clicking a test or changing configuration.
+- **Publishing:** `/admin/workflows` and `/admin/workflows/drafts/:draftId` open Publish dialogs for a valid synthetic draft.
+  A separate invalid draft checks that Publish is blocked and explains why. Do not confirm the dialog or authorize step-up.
 
 ## Rate limits
 

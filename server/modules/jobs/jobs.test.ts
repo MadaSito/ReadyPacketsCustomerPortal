@@ -750,7 +750,9 @@ describe("MySQL transactional mail outbox", () => {
   };
   function setDelivery(f: ReturnType<typeof fixture>, outcome: SmtpDeliveryResult["outcome"], retryable?: boolean) {
     const send = vi.fn(async (_message: MailTransportMessage): Promise<SmtpDeliveryResult> => ({ outcome, retryable }));
-    const findRecipient = vi.fn(async () => ({ email: "current@example.test", status: "active", emailVerified: true }));
+    const findRecipient = vi.fn(async (): Promise<{
+      email: string; status: string; emailVerified: boolean; firstName?: string; preferredName?: string | null;
+    }> => ({ email: "current@example.test", status: "active", emailVerified: true }));
     f.mail.registerDelivery({ findRecipient, getLegacySender: async () => sender });
     f.mail.registerMailTransport({ key: "smtp", isConfigured: async () => true, send });
     f.mailer.registerTemplate({
@@ -759,6 +761,24 @@ describe("MySQL transactional mail outbox", () => {
     });
     return { send, findRecipient };
   }
+
+  it.each([
+    { key: "auth.invitation", greetingVar: "name", preferredName: " Zee & Co ", expected: "Zee & Co", html: "Zee &amp; Co" },
+    { key: "custom.greeting", greetingVar: "recipient_name", preferredName: " ", expected: "Zeus", html: "Zeus" },
+    { key: "test.billing_name", greetingVar: "name", preferredName: "Zee", expected: "Zeus Greene", html: "Zeus Greene" },
+  ])("renders the appropriate known-user name in $key", async ({ key, greetingVar, preferredName, expected, html }) => {
+    const f = fixture();
+    const { send, findRecipient } = setDelivery(f, "accepted");
+    findRecipient.mockResolvedValue({ email: "current@example.test", status: "active", emailVerified: true, firstName: "Zeus", preferredName });
+    f.mailer.registerTemplate({
+      key, vars: [greetingVar], subject: () => "Test message", text: (vars) => `Name: ${vars[greetingVar]}`,
+    });
+    await f.mailer.enqueue({ template: key, to: { userId: 22 }, vars: { [greetingVar]: "Zeus Greene" }, idempotencyKey: "greeting-test" });
+    await f.engine.execute((await f.engine.claim())!);
+    expect(send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      text: `Name: ${expected}`, html: expect.stringContaining(`Name: ${html}`),
+    }));
+  });
 
   it("deduplicates notice mail by version, user and reminder and projects safe progress states", async () => {
     const f = fixture();

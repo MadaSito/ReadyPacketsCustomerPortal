@@ -100,6 +100,9 @@ export interface VerifiedEntraClaims {
   /** Mutable, unverified hints — NEVER used for linking or authorization. */
   email: string | null;
   name: string | null;
+  /** D1: Entra `given_name` / `family_name` (optional claims) — name hints only. */
+  givenName: string | null;
+  familyName: string | null;
   /** App roles assigned in the enterprise application. */
   roles: string[];
 }
@@ -213,6 +216,8 @@ export function verifyIdToken(
     issuedAt: iat!,
     email: email && email.length <= 320 && email.includes("@") ? email.toLowerCase() : null,
     name: str(claims.name)?.slice(0, 120) ?? null,
+    givenName: str(claims.given_name)?.slice(0, 120) ?? null,
+    familyName: str(claims.family_name)?.slice(0, 120) ?? null,
     roles,
   };
 }

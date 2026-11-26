@@ -26,6 +26,7 @@ File `records/customers.jsonl` · schema `schemas/v3/records/customers.schema.js
 | `locale` | yes | string ≤35 \| null |
 | `marketingOptIn` | yes | boolean |
 | `customFields` | no | array of object |
+| `billingProfile` | no | object \| null |
 | `createdAt` | yes | UTC time \| null |
 | `updatedAt` | yes | UTC time \| null |
 
@@ -38,6 +39,7 @@ File `records/orders.jsonl` · schema `schemas/v3/records/orders.schema.json`
 | `publicId` | yes | ULID |
 | `customerPublicId` | yes | ULID |
 | `orderNumber` | yes | string ≤64 |
+| `groupRootOrderPublicId` | no | ULID \| null |
 | `projectName` | yes | string ≤500 \| null |
 | `status` | yes | string |
 | `paymentStatus` | yes | string |

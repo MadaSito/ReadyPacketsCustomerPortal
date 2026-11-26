@@ -2,7 +2,11 @@
 import { describe, expect, it } from "vitest";
 import { TRANSITION_STEPS } from "../../../shared/domain.js";
 import { decodeCursor, encodeCursor } from "./admin.js";
-import { customerRefSchema, deviceSummary, emailSchema, namePrefixes, nameSchema, normalizeEmail } from "./normalize.js";
+import {
+  customerRefSchema, deriveNameParts, deviceSummary, emailSchema, firstNameSchema, fullNameOf, greetingNameOf, namePartsFromClaims,
+  namePartsShape, namePrefixes, nameSchema, normalizeEmail, preferredNameSchema,
+} from "./normalize.js";
+import { z } from "zod";
 import { checkPassword } from "./password/policy.js";
 import { generateCustomerRef } from "./users.js";
 import { deriveSteps, type TransitionFacts } from "./transitions.js";
@@ -155,5 +159,42 @@ describe("normalization", () => {
     expect(decodeCursor(undefined)).toBeNull();
     expect(() => decodeCursor("!!!")).toThrow();
     expect(() => decodeCursor(Buffer.from("c1:-1").toString("base64url"))).toThrow();
+  });
+});
+
+describe("D1 name parts (increment 08)", () => {
+  const parts = z.strictObject(namePartsShape);
+  it("first/last required 1–50 UTF-16 units, preferred optional (blank → null); NFC + whitespace collapsed", () => {
+    expect(parts.parse({ firstName: "  Zeus ", lastName: "Greene" })).toEqual({ firstName: "Zeus", lastName: "Greene", preferredName: null });
+    expect(parts.parse({ firstName: "Zeus", lastName: "Greene", preferredName: "   " }).preferredName).toBeNull();
+    expect(parts.safeParse({ firstName: "", lastName: "Greene" }).success).toBe(false);
+    expect(parts.safeParse({ firstName: "Zeus", lastName: " " }).success).toBe(false);
+    // 50 UTF-16 code units (supplementary characters count 2).
+    expect(firstNameSchema.safeParse("𝒵".repeat(25)).success).toBe(true);
+    expect(firstNameSchema.safeParse("𝒵".repeat(26)).success).toBe(false);
+    expect(firstNameSchema.safeParse("Z".repeat(51)).success).toBe(false);
+    expect(preferredNameSchema.safeParse("Z".repeat(51)).success).toBe(false);
+  });
+  it("refuses control characters, markup brackets and bidi overrides; keeps ZWJ/ZWNJ", () => {
+    for (const bad of ["Ze\u0007us", "<b>", "Zeus\u202E", "Zeus\u2066x", "Zeus\u200F"]) expect(firstNameSchema.safeParse(bad).success).toBe(false);
+    expect(firstNameSchema.safeParse("می\u200Cخواهم").success).toBe(true);
+    expect(firstNameSchema.safeParse("a\u200Db").success).toBe(true);
+  });
+  it("full name, lazy derivation and greeting", () => {
+    expect(fullNameOf({ firstName: "Zeus", lastName: "Greene" })).toBe("Zeus Greene");
+    expect(fullNameOf({ firstName: "Zeus", lastName: "" })).toBe("Zeus");
+    expect(deriveNameParts("Zeus  Middle Greene")).toEqual({ firstName: "Zeus", lastName: "Greene", preferredName: null });
+    expect(deriveNameParts("Zeus")).toEqual({ firstName: "Zeus", lastName: "", preferredName: null });
+    expect(greetingNameOf({ firstName: "Zeus", lastName: "Greene", preferredName: "Zed" }, "Zeus Greene")).toBe("Zed");
+    expect(greetingNameOf({ firstName: "Zeus", lastName: "Greene", preferredName: null }, "Zeus Greene")).toBe("Zeus");
+    expect(greetingNameOf({ firstName: "", lastName: "", preferredName: null }, "Zeus Greene")).toBe("Zeus Greene");
+  });
+  it("SSO claims: given/family win, else display name split; stripped-to-nothing claims fall back", () => {
+    expect(namePartsFromClaims({ givenName: "Zeus", familyName: "Greene", displayName: "Other Person" })).toEqual({ firstName: "Zeus", lastName: "Greene", preferredName: null });
+    expect(namePartsFromClaims({ displayName: "Zeus Greene" })).toEqual({ firstName: "Zeus", lastName: "Greene", preferredName: null });
+    expect(namePartsFromClaims({ givenName: "<\u202E>", displayName: "Zeus Greene" })).toEqual({ firstName: "Zeus", lastName: "Greene", preferredName: null });
+    expect(namePartsFromClaims({ givenName: "Z".repeat(100) })!.firstName).toHaveLength(50);
+    expect(namePartsFromClaims({ givenName: "𝒵".repeat(26) })!.firstName).toBe("𝒵".repeat(25));
+    expect(namePartsFromClaims({ displayName: "  " })).toBeNull();
   });
 });

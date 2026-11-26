@@ -14,9 +14,13 @@ import { newRequestContext, runWithRequestContext } from "../../core/requestCont
 import type { SessionPrincipal, Tx } from "../../core/types.js";
 import { createTestDeps, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
+import { deriveNameParts } from "./normalize.js";
 import { createIdentityModule, type IdentityModule } from "./index.js";
 import { customerRefHistory, customerRefReservations, identityTokens, sessionRestrictions, signInEvents, users, userSessions } from "./schema.js";
 import { admission, ipInCidrs, parseCidr, parseIp, DEFAULT_RESTRICTIONS, type Restrictions } from "./sessionPolicy.js";
+
+/** D1: tests written with one display name use the same lazy split as legacy accounts. */
+const partsOf = (name: string) => deriveNameParts(name);
 
 const PW = "copper lantern drifts beyond quiet harbor";
 const ADMIN_IP = "203.0.113.7";
@@ -384,7 +388,7 @@ describe("session centre (MySQL)", () => {
       maintenance = { active: true, message: null, expectedEnd: "2026-11-21T03:00:00.000Z" };
       const refused = await rejects(at(ADMIN_IP, () => identity.auth.signIn({ email: customer.email, password: PW }, {})), "CUSTOMER_MAINTENANCE");
       expect(refused.details).toMatchObject({ expectedEnd: "2026-11-21T03:00:00.000Z" });
-      await rejects(identity.auth.register({ email: `m${Date.now()}@example.test`, name: "M", password: PW }, {}), "CUSTOMER_MAINTENANCE");
+      await rejects(identity.auth.register({ email: `m${Date.now()}@example.test`, nameParts: partsOf("M"), password: PW }, {}), "CUSTOMER_MAINTENANCE");
       await signIn(staff.email);
       expect((await events(customer.id)).some((e) => e.kind === "refused" && e.reasonCode === "CUSTOMER_MAINTENANCE")).toBe(true);
       expect(await liveCount(customer.id)).toBe(0);
@@ -392,18 +396,18 @@ describe("session centre (MySQL)", () => {
 
     it("attributes a referral code only for genuinely new accounts, never refusing on attribution failure", async () => {
       const email = `ref${Date.now()}@example.test`;
-      await identity.auth.register({ email, name: "Ref New", password: PW, referralCode: "abcde12345" }, {});
+      await identity.auth.register({ email, nameParts: partsOf("Ref New"), password: PW, referralCode: "abcde12345" }, {});
       const newId = (await identity.findUserIdByEmail(email))?.userId;
       expect(referral).toHaveBeenCalledTimes(1);
       expect(referral.mock.calls[0]![0]).toBe("ABCDE12345");
       expect(referral.mock.calls[0]![1]).toBe(newId);
-      await identity.auth.register({ email, name: "Again", password: PW, referralCode: "ABCDE12345" }, {});
+      await identity.auth.register({ email, nameParts: partsOf("Again"), password: PW, referralCode: "ABCDE12345" }, {});
       expect(referral).toHaveBeenCalledTimes(1);
       referral.mockRejectedValueOnce(new Error("boom"));
       const other = `ref2${Date.now()}@example.test`;
-      await identity.auth.register({ email: other, name: "Ref Fail", password: PW, referralCode: "ABCDE12345" }, {});
+      await identity.auth.register({ email: other, nameParts: partsOf("Ref Fail"), password: PW, referralCode: "ABCDE12345" }, {});
       expect(await identity.findUserIdByEmail(other)).not.toBeNull();
-      await identity.auth.register({ email: `ref3${Date.now()}@example.test`, name: "Bad code", password: PW, referralCode: "x" }, {});
+      await identity.auth.register({ email: `ref3${Date.now()}@example.test`, nameParts: partsOf("Bad code"), password: PW, referralCode: "x" }, {});
       expect(referral).toHaveBeenCalledTimes(2);
     });
   });

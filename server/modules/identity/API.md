@@ -88,6 +88,7 @@ transitions: {
 
 createPendingCustomer(input: {
   email: string; name: string; customerRef?: string | null; publicId?: string;   // publicId = preserve portable identity
+  nameParts?: { firstName: string; lastName: string; preferredName: string | null }; // D1: stored encrypted; display name "<First> <Last>"
   createdAt?: Date;                                                                 // preserve archive creation time
 }, opts: { tx: Tx }): Promise<{ userId: number; publicId: string; customerRef: string }>;
 
@@ -101,8 +102,14 @@ findUserIdByEmail(email: string, opts?: { tx?: DbOrTx }): Promise<{ userId: numb
 // blind-index exact match. For explicit portable plan decisions ONLY — never link silently by e-mail.
 
 portableCustomers(tx: DbOrTx, after: string | null, limit: number, publicIds?: readonly string[]):
-  Promise<{ publicId: string; email: string; name: string; customerRef: string | null; createdAt: Date }[]>;
+  Promise<{ publicId: string; email: string; name: string; customerRef: string | null; createdAt: Date;
+            firstName: string | null; lastName: string | null; preferredName: string | null }[]>;  // D1: stored parts only, null when not stored
 // role=customer only, ordered by publicId, `after` = last publicId, limit ≤ 500.
+
+users.namePartsInTx(tx: DbOrTx, userId: number):
+  Promise<{ firstName: string; lastName: string; preferredName: string | null; customerRef: string | null }>;
+// D1 (orders). Stored parts, else derived lazily (first token / last token; one token → lastName ""). No lock, no audit.
+// Unknown user → NOT_FOUND USER_NOT_FOUND.
 
 searchCustomers(principal: SessionPrincipal, input: { query?: string; status?: UserStatus; cursor?: string; limit?: number }):
   Promise<{ items: CustomerListItem[]; nextCursor: string | null }>;
@@ -120,7 +127,7 @@ limitation: no substring search on encrypted names.
 | Procedure | Guard | Input → Output |
 | --- | --- | --- |
 | `passwordPolicy` (query) | public | → `{ minLength, maxLength }` |
-| `register` | public (`auth_high_risk`) | `{ email, name, password }` → `{ accepted: true, previewLink? }` (uniform, never reveals existence) |
+| `register` | public (`auth_high_risk`) | `{ email, firstName, lastName, preferredName?, password, referralCode?, billing? }` → `{ accepted: true, previewLink? }` (uniform, never reveals existence). `billing` (D4, `shared/billingDetails.ts`, strict) is validated in full before any lookup and saved through `billingProfile.saveForUserInTx` in the same transaction only when a NEW account is created; a missing billing module means "skip saving" (audit `billing: skipped`) |
 | `signIn` | public (`user_login`) | `{ email, password }` → `{ nextStep: TransitionStep \| null }` + session issued via transport |
 | `verifyEmail` | public (`auth_high_risk`) | `{ token }` → `{ verified: true }` (rotates the caller's session if present) |
 | `requestPasswordReset` | public (`auth_high_risk`) | `{ email }` → `{ accepted: true }` — identical in EVERY profile, never a link. Enqueues job `identity.password_reset.dispatch` `{ emailIndex }` + `attempted` audit in one tx; the retry-safe handler locks the user, checks active + local + 60 s cooldown, issues the token and queues mail |
@@ -130,19 +137,20 @@ limitation: no substring search on encrypted names.
 | `resendVerification` | session | → `{ accepted: true, previewLink? }` (throttled; eligibility + 60 s cooldown under the users row lock; preview link is the caller's own) |
 | `changePassword` | session (only when full or nextStep = `change_password`) | `{ currentPassword, newPassword }` → `{ nextStep }` (revokes other sessions, rotates current) |
 | `signOut` | public | → `{ ok: true }` (revokes server-side session if any + transport.clear) |
-| `profile.update` | protected | `{ name }` → `{ ok }` |
+| `profile.update` | protected | `{ firstName, lastName, preferredName? }` → `{ ok }` (stores the parts; display name becomes "<First> <Last>") |
 | `sessions.list` (query) | protected | → `{ items: { sessionId, current, createdAt, lastSeenAt, expiresAt, userAgentSummary }[] }` |
 | `sessions.revoke` | protected | `{ sessionId }` → `{ ok }` (own sessions only, else NOT_FOUND) |
 | `sessions.revokeOthers` | protected | → `{ revoked: number }` |
 | `admin.customers.list` (query) | staff + `customers.read_all` | `{ query?, status?, cursor?, limit? }` → page |
 | `admin.customers.get` (query) | staff + `customers.read_all` | `{ customerId }` → detail (+ reference history) |
-| `admin.customers.create` | admin + `customers.manage` | `{ email, name, customerRef? }` → `{ customerId, previewLink? }` (invitation) |
+| `admin.customers.create` | admin + `customers.manage` | `{ email, firstName, lastName, preferredName?, customerRef? }` → `{ customerId, previewLink? }` (invitation) |
+| `admin.customers.updateName` | admin + `customers.manage` | `{ customerId, firstName, lastName, preferredName?, expectedVersion }` → `{ version }`; CONFLICT `STALE_VERSION`; audit `admin.customer.name_updated` (no values) |
 | `admin.customers.resendInvitation` | admin + `customers.manage` | `{ customerId }` → `{ previewLink? }` |
 | `admin.customers.setStatus` | admin + `customers.manage` | `{ customerId, status: "active"\|"suspended"\|"deactivated", reasonCode }` |
 | `admin.customers.changeReference` | admin + `customers.reference.change` (step-up) | `{ customerId, newReference, expectedVersion }` |
 | `admin.users.revokeSessions` | admin + `sessions.revoke_any` (step-up) | `{ userId }` → `{ revoked }` |
 | `admin.staff.list` (query) | admin + `staff.manage` | page of staff/admin users |
-| `admin.staff.create` | admin + `staff.manage` (step-up) | `{ email, name, role }` → `{ userId, previewLink? }` |
+| `admin.staff.create` | admin + `staff.manage` (step-up) | `{ email, firstName, lastName, preferredName?, role }` → `{ userId, previewLink? }` |
 | `admin.staff.changeRole` | admin + `staff.manage` (step-up) | `{ userId, role, expectedVersion }` (last-admin protection, revokes sessions) |
 
 `customerId` / `userId` / `sessionId` in API payloads are always publicIds.
@@ -438,3 +446,19 @@ refresh succeeds.
 `entra`), `identity.sso.saml_certificate_added|retired`, `identity.sso.saml_metadata_imported|refreshed|refresh_failed`,
 `identity.sso.role_mappings_updated`; security: `identity.sso.callback_refused` (`protocol: saml`), `auth.login.succeeded`
 (+ `mfa_basis: claim|entra_mode|none`).
+
+## Increment 08 — D1 names
+
+- Name parts: first and last required, preferred optional (blank → null); each NFC-normalised, whitespace-collapsed,
+  at most 50 UTF-16 code units; control characters, `<` `>` and bidi overrides/isolates/marks refused (ZWJ/ZWNJ allowed).
+  `name_enc` stays the full display name "<First> <Last>" (≤ 101 units) for search, invoices, legal and billing contexts.
+- Accounts from before 08 have no stored parts: they are derived lazily (first token / last token; one token → last "")
+  and stored at the next profile save or admin name edit.
+- Greeting (mail `vars.name` for `auth.verify_email` and `auth.invitation`, `identity.me.user.greetingName`): preferred
+  name, else first name. All identity mail is addressed `to: { userId }`; `auth.account_exists` has no name variable.
+- `identity.me.user` and `getUser()` add `firstName`, `lastName`, `preferredName`, `greetingName` (and `namePartsStored`).
+- SSO JIT: OIDC `given_name`/`family_name`, SAML `…/claims/givenname` and `…/claims/surname` when present; else the
+  display name split; else the e-mail local part as first name. Name claims never affect linking or roles.
+- Backward compatible: `register`, `profile.update`, `admin.customers.create` and `admin.staff.create` still accept the
+  pre-08 single `name` (1–120) instead of `firstName` + `lastName` (never both). The display name is then stored as
+  given and the parts are derived lazily; a legacy `profile.update` clears any stored parts.

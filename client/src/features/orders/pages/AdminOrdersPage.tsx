@@ -148,10 +148,14 @@ export default function AdminOrdersPage() {
               key: "reference",
               header: "Reference",
               primary: true,
+              // Increment 08: stem references are up to 32 characters, so they may wrap at their hyphens on narrow screens.
               cell: (order) => (
-                <Link href={`/admin/orders/${order.publicId}`} className="font-semibold whitespace-nowrap text-action underline-offset-2 hover:underline">
-                  {order.reference}
-                </Link>
+                <span className="flex min-w-0 flex-col">
+                  <Link href={`/admin/orders/${order.publicId}`} className="font-semibold break-words text-action underline-offset-2 hover:underline">
+                    {order.reference}
+                  </Link>
+                  {order.group ? <span className="text-sm break-words text-muted">Added to {order.group.rootReference}</span> : null}
+                </span>
               ),
             },
             { key: "project", header: "Project", cell: (order) => <span className="break-words">{order.projectName}</span> },

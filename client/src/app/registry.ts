@@ -29,6 +29,7 @@ import { communityFeature } from "@/features/community/routes";
 import { cartFeature } from "@/features/cart/routes";
 import { knowledgeFeature } from "@/features/knowledge/routes";
 import { promotionsFeature } from "@/features/promotions/routes";
+import { billingProfileFeature } from "@/features/billingProfile/routes";
 import { reportsFeature } from "@/features/reports/routes";
 import { doceditFeature } from "@/features/docedit/routes";
 import { opsAlertsFeature } from "@/features/opsAlerts/routes";
@@ -62,6 +63,7 @@ export const FEATURES: readonly FeatureRoutes[] = [
   cartFeature,
   knowledgeFeature,
   promotionsFeature,
+  billingProfileFeature,
   reportsFeature,
   doceditFeature,
   opsAlertsFeature,

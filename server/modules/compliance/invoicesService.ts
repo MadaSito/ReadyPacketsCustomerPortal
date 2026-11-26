@@ -695,6 +695,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
   async function computeLedgerSums(
     dbOrTx: DbOrTx,
     invoiceIds: readonly number[],
+    options?: { currentRead?: boolean },
   ): Promise<Map<number, LedgerSums>> {
     const map = new Map<number, LedgerSums>();
     if (invoiceIds.length === 0) return map;
@@ -702,25 +703,38 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       map.set(id, { ...EMPTY_LEDGER_SUMS });
     }
 
-    const [payments, refunds] = await Promise.all([
-      dbOrTx
-        .select({
-          invoiceId: complianceInvoicePayments.invoiceId,
-          method: complianceInvoicePayments.method,
-          status: complianceInvoicePayments.status,
-          amountMinor: complianceInvoicePayments.amountMinor,
-          waivedMinor: complianceInvoicePayments.waivedMinor,
-        })
-        .from(complianceInvoicePayments)
-        .where(inArray(complianceInvoicePayments.invoiceId, [...invoiceIds])),
-      dbOrTx
-        .select({
-          invoiceId: complianceInvoiceRefunds.invoiceId,
-          amountMinor: complianceInvoiceRefunds.amountMinor,
-        })
-        .from(complianceInvoiceRefunds)
-        .where(inArray(complianceInvoiceRefunds.invoiceId, [...invoiceIds])),
-    ]);
+    const paymentsQuery = dbOrTx
+      .select({
+        invoiceId: complianceInvoicePayments.invoiceId,
+        method: complianceInvoicePayments.method,
+        status: complianceInvoicePayments.status,
+        amountMinor: complianceInvoicePayments.amountMinor,
+        waivedMinor: complianceInvoicePayments.waivedMinor,
+      })
+      .from(complianceInvoicePayments)
+      .where(inArray(complianceInvoicePayments.invoiceId, [...invoiceIds]))
+      .orderBy(asc(complianceInvoicePayments.id));
+
+    const refundsQuery = dbOrTx
+      .select({
+        invoiceId: complianceInvoiceRefunds.invoiceId,
+        amountMinor: complianceInvoiceRefunds.amountMinor,
+      })
+      .from(complianceInvoiceRefunds)
+      .where(inArray(complianceInvoiceRefunds.invoiceId, [...invoiceIds]))
+      .orderBy(asc(complianceInvoiceRefunds.id));
+
+    let payments;
+    let refunds;
+    if (options?.currentRead) {
+      // Canonical lock order under parent `orders -> compliance_invoices FOR UPDATE`:
+      // lock `compliance_invoice_payments` (asc id) before `compliance_invoice_refunds` (asc id),
+      // forcing InnoDB current reads past any earlier REPEATABLE READ snapshot in `dbOrTx`.
+      payments = await paymentsQuery.for("update");
+      refunds = await refundsQuery.for("update");
+    } else {
+      [payments, refunds] = await Promise.all([paymentsQuery, refundsQuery]);
+    }
 
     for (const p of payments) {
       if (p.status === "succeeded") {
@@ -1609,7 +1623,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         return { invoicePublicId: inv.publicId, status: "void", voidedAt: inv.voidedAt };
       }
 
-      const sumsMap = await computeLedgerSums(tx, [inv.id]);
+      const sumsMap = await computeLedgerSums(tx, [inv.id], { currentRead: true });
       const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
       const netPaidMinor = sums.grossPaidMinor - sums.refundedMinor;
       if (netPaidMinor > 0) {
@@ -1750,6 +1764,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
             eq(complianceInvoicePayments.idempotencyKey, input.idempotencyKey),
           ),
         )
+        .for("update")
         .limit(1);
 
       if (existingIdem) {
@@ -1760,7 +1775,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
               settlementKind: existingIdem.method === "waiver" ? "waived_small_total" : "manual_payment",
             })
           : null;
-        const sumsMap = await computeLedgerSums(tx, [inv.id]);
+        const sumsMap = await computeLedgerSums(tx, [inv.id], { currentRead: true });
         const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
         const status = deriveInvoiceStatus({
           issuedAt: inv.issuedAt,
@@ -1789,7 +1804,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         throw validation("CURRENCY_MISMATCH", `Payment currency (${currency}) must match invoice currency (${inv.currency}).`);
       }
 
-      const sumsMap = await computeLedgerSums(tx, [inv.id]);
+      const sumsMap = await computeLedgerSums(tx, [inv.id], { currentRead: true });
       const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
       const currentNetSettled = sums.settledGrossMinor - sums.refundedMinor;
       const remainingBalance = inv.totalMinor - currentNetSettled;
@@ -2071,10 +2086,11 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
             eq(complianceInvoiceRefunds.idempotencyKey, input.idempotencyKey),
           ),
         )
+        .for("update")
         .limit(1);
 
       if (existingIdem) {
-        const sumsMap = await computeLedgerSums(tx, [inv.id]);
+        const sumsMap = await computeLedgerSums(tx, [inv.id], { currentRead: true });
         const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
         const status = deriveInvoiceStatus({
           issuedAt: inv.issuedAt,
@@ -2125,7 +2141,8 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       const priorPaymentRefunds = await tx
         .select({ amountMinor: complianceInvoiceRefunds.amountMinor })
         .from(complianceInvoiceRefunds)
-        .where(eq(complianceInvoiceRefunds.paymentId, pmt.id));
+        .where(eq(complianceInvoiceRefunds.paymentId, pmt.id))
+        .for("update");
       const alreadyRefunded = priorPaymentRefunds.reduce((sum, r) => sum + r.amountMinor, 0);
       const refundableBase = Math.max(0, pmt.amountMinor - (pmt.waivedMinor ?? 0));
 
@@ -2165,7 +2182,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         });
       }
 
-      const sumsMap = await computeLedgerSums(tx, [inv.id]);
+      const sumsMap = await computeLedgerSums(tx, [inv.id], { currentRead: true });
       const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
       const nextStatus = deriveInvoiceStatus({
         issuedAt: inv.issuedAt,
@@ -2767,7 +2784,8 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       throw notFound("INVOICE_NOT_FOUND");
     }
 
-    const sumsMap = await computeLedgerSums(dbOrTx, [inv.id]);
+    const currentRead = Boolean(opts?.tx && opts?.forUpdate);
+    const sumsMap = await computeLedgerSums(dbOrTx, [inv.id], { currentRead });
     const summary = toSummaryView(
       inv,
       orderReference,
@@ -2775,7 +2793,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     );
     const receiptPublicId =
       receiptsSvc && (summary.status === "paid" || inv.totalMinor === 0)
-        ? await receiptsSvc.findLatestReceiptPublicIdForInvoice(dbOrTx, inv.id)
+        ? await receiptsSvc.findLatestReceiptPublicIdForInvoice(dbOrTx, inv.id, { currentRead })
         : null;
 
     return {
@@ -2860,6 +2878,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           eq(complianceInvoicePayments.idempotencyKey, idempotencyKey),
         ),
       )
+      .for("update")
       .limit(1);
 
     if (existingIdem) {
@@ -2870,7 +2889,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
             settlementKind: "provider_online",
           })
         : null;
-      const sumsMap = await computeLedgerSums(tx, [inv.id]);
+      const sumsMap = await computeLedgerSums(tx, [inv.id], { currentRead: true });
       const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
       const status = deriveInvoiceStatus({
         issuedAt: inv.issuedAt,
@@ -2911,7 +2930,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       });
     }
 
-    const sumsMap = await computeLedgerSums(tx, [inv.id]);
+    const sumsMap = await computeLedgerSums(tx, [inv.id], { currentRead: true });
     const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
     const currentNetSettled = sums.settledGrossMinor - sums.refundedMinor;
     const remainingBalance = inv.totalMinor - currentNetSettled;
@@ -3169,6 +3188,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           eq(complianceInvoicePayments.idempotencyKey, idempotencyKey),
         ),
       )
+      .for("update")
       .limit(1);
 
     if (existingWaive) {
@@ -3191,7 +3211,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       };
     }
 
-    const sumsMap = await computeLedgerSums(tx, [inv.id]);
+    const sumsMap = await computeLedgerSums(tx, [inv.id], { currentRead: true });
     const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
     const remainingBalance = inv.totalMinor - (sums.settledGrossMinor - sums.refundedMinor);
     if (remainingBalance <= 0) {
@@ -3607,7 +3627,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       throw conflict("WAIVED_PAYMENT_NOT_REFUNDABLE", "Waived balances have no collected funds to refund.");
     }
 
-    const sumsMap = await computeLedgerSums(tx, [inv.id]);
+    const sumsMap = await computeLedgerSums(tx, [inv.id], { currentRead: true });
     const ledgerRefundRows = await tx
       .select({
         refundPublicId: complianceInvoiceRefunds.publicId,
@@ -3616,7 +3636,8 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         providerEventId: complianceInvoiceRefunds.providerEventId,
       })
       .from(complianceInvoiceRefunds)
-      .where(eq(complianceInvoiceRefunds.paymentId, pmt.id));
+      .where(eq(complianceInvoiceRefunds.paymentId, pmt.id))
+      .for("update");
     const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
 
     return {
@@ -3718,10 +3739,11 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           eq(complianceInvoiceRefunds.idempotencyKey, input.idempotencyKey),
         ),
       )
+      .for("update")
       .limit(1);
 
     if (existingIdem) {
-      const sumsMap = await computeLedgerSums(tx, [inv.id]);
+      const sumsMap = await computeLedgerSums(tx, [inv.id], { currentRead: true });
       const orderState = await computeOrderWorkspacePaymentState(tx, inv.orderPublicId);
       const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
       const invoiceStatus = deriveInvoiceStatus({
@@ -3760,7 +3782,8 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     const priorPaymentRefunds = await tx
       .select({ amountMinor: complianceInvoiceRefunds.amountMinor })
       .from(complianceInvoiceRefunds)
-      .where(eq(complianceInvoiceRefunds.paymentId, pmt.id));
+      .where(eq(complianceInvoiceRefunds.paymentId, pmt.id))
+      .for("update");
     const alreadyRefunded = priorPaymentRefunds.reduce((sum, r) => sum + r.amountMinor, 0);
     const capturedMinor = Math.max(0, pmt.amountMinor - (pmt.waivedMinor ?? 0));
     if (alreadyRefunded + input.amountMinor > capturedMinor) {
@@ -3800,7 +3823,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       });
     }
 
-    const sumsMap = await computeLedgerSums(tx, [inv.id]);
+    const sumsMap = await computeLedgerSums(tx, [inv.id], { currentRead: true });
     const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
     const nextStatus = deriveInvoiceStatus({
       issuedAt: inv.issuedAt,

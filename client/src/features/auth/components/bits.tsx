@@ -99,12 +99,15 @@ export function FormError({ message, focusRef }: { message: string | null; focus
   );
 }
 
-/** Focus the error container whenever a new error appears. */
-export function useFocusOnError(error: string | null) {
+/**
+ * Focus the error container whenever a new error appears. Pass `attempt` (incremented on every failed submit) so a
+ * repeated identical message still moves focus back to the summary.
+ */
+export function useFocusOnError(error: string | null, attempt = 0) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (error) ref.current?.focus();
-  }, [error]);
+  }, [error, attempt]);
   return ref;
 }
 

@@ -195,6 +195,36 @@ Existing orders keep their pinned workflow version. The start-up job `orders.inc
   - **Receipts issued before the upgrade** keep their original PDF.
 - **Default workflow.** Nothing changes by itself. To use another published workflow for new orders, choose **Set as default** in **Workflows**.
 
+## Increment 08 and migration `0008`
+
+`0008_increment_08` is additive: new tables, nullable columns or columns with defaults, and new indexes. It drops and renames nothing. Backfill runs in code, at start-up or lazily, never in SQL.
+
+- **Schema.** `migrations/0008_increment_08.sql` (commit 0485d81) has 15 statements: 1 new table, 1 widened column, 10 new nullable columns, 1 foreign key and 2 indexes.
+  - **New table** `customer_billing_profiles`: `id`, `public_id` (unique), `user_id` (unique, foreign key to `users` with `ON DELETE CASCADE`), `details_enc` (encrypted), `country`, `region`, `version`, `created_at`, `updated_at`.
+  - **Widened column:** `order_reference_counters.scope` becomes `varchar(32) NOT NULL`, so that it can hold the per-stem counters.
+  - **`users`:** `first_name_enc`, `last_name_enc`, `preferred_name_enc` (text, encrypted).
+  - **`orders`:** `group_root_order_id` (bigint unsigned) and `reference_stem` (varchar(32)).
+  - **`carts`:** `add_to_order_public_id` (char(26)).
+  - **`payment_attempts`:** `booking_source` (enum `webhook`, `provider_lookup`), `last_customer_lookup_at` and `missing_webhook_alerted_at` (datetime(3)).
+  - **Indexes:** `orders_group_root_idx` on `orders (group_root_order_id, id)`, and `pmt_att_bk_wh_idx` on `payment_attempts (provider, environment, booking_source, paid_at)`.
+  - Nothing is dropped or renamed. Existing rows keep `NULL` in the new columns.
+- **Native upgrade.** Follow sections 2–5 without `--yes`, with the same backup, fence and `BACKUP-VERIFIED` steps as for increment 07.
+  - Release validation requires the SQL file and journal entry `0008_increment_08`.
+  - Never run the SQL by hand or mark it applied.
+  - If the migration is interrupted, follow [section 6](#6-recovery-if-an-upgrade-stops-mid-way).
+- **Docker Compose.** The image build requires the same SQL and journal entry.
+- **What stays the same after the upgrade:**
+  - existing orders keep their `RP-YYYY-NNNNNN` reference;
+  - existing users keep signing in, and their name parts are filled in the next time the profile is saved;
+  - active Stripe configurations stay active;
+  - API v1 responses stay backward compatible.
+- **After the upgrade:**
+  - **Stripe.** Open `/admin/payments/setup` and check the webhook section. Payments are now booked from a signed webhook or from the server's own lookup at Stripe, which replaces increment 07 decision 12. If webhooks are not arriving, the page shows the alert "Stripe is not delivering webhooks to this server" and the usual causes.
+  - **Repairing older payments.** For an invoice that was paid on Stripe before the upgrade but still shows "Issued", open `/admin/invoices/<invoice>` (or the attempt in `/admin/payments`) and press **Check with Stripe now**. This needs `payments.manage` and a fresh two-step check. If Stripe confirms the payment, it is booked once and the check is audited.
+  - **Square** stays webhook-first: it is booked only from a verified webhook, and there is no lookup button for it.
+  - **Names and billing.** Existing users can add a preferred name and saved billing information under **Account**. Names longer than 50 characters per part must be shortened the next time the profile is saved.
+  - **Go-live checklist.** Run [GO_LIVE_CHECKLIST.md](GO_LIVE_CHECKLIST.md) before taking live payments.
+
 ## 6. Recovery if an upgrade stops mid-way
 
 Never delete `/etc/readypackets/upgrade-state` or `/etc/nginx/readypackets-maintenance` blindly. Inspect `/etc/readypackets/upgrade-state` (`sudo cat /etc/readypackets/upgrade-state` — read as data, never `source` it):

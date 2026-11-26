@@ -24,6 +24,7 @@ import {
   removeCodeInputSchema,
   removeItemInputSchema,
   saveDraftDetailsInputSchema,
+  setCartTargetInputSchema,
   updateItemInputSchema,
   type CartModule,
 } from "./types.js";
@@ -62,6 +63,11 @@ export const cartRouter = router({
     .meta({ rateLimit: "form_submission" })
     .input(clearCartInputSchema)
     .mutation(({ ctx, input }) => requireCartModule(ctx.services).clearCart(ctx.session, input)),
+
+  setTarget: protectedProcedure
+    .meta({ rateLimit: "form_submission" })
+    .input(setCartTargetInputSchema)
+    .mutation(({ ctx, input }) => requireCartModule(ctx.services).setTarget(ctx.session, input)),
 
   saveDraftDetails: protectedProcedure
     .meta({ rateLimit: "form_submission" })

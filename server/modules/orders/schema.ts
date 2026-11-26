@@ -270,6 +270,13 @@ export const orders = mysqlTable(
     /** Increment 07 (D9): payment state; existing orders are backfilled at start-up (paid / not_required). */
     paymentState: mysqlEnum("payment_state", ORDER_PAYMENT_STATES).notNull().default("not_required"),
     paidAt: utcDateTime("paid_at"),
+    /**
+     * Increment 08 (D3): order group. NULL = the order is its own root; otherwise the root order's id (always a root,
+     * never a chain). Additions share the root's project name and reference stem.
+     */
+    groupRootOrderId: refColumn("group_root_order_id"),
+    /** Increment 08 (D2): the frozen `PREFIX-C4-F3L3-P6` stem of a generated reference (NULL for older references). */
+    referenceStem: varchar("reference_stem", { length: 32 }),
     version: versionColumn(),
     createdAt: createdAtColumn(),
     updatedAt: updatedAtColumn(),
@@ -284,6 +291,8 @@ export const orders = mysqlTable(
     index("orders_created_idx").on(t.createdAt, t.id),
     /** Increment 03: order counts per workflow version (designer version list). */
     index("orders_workflow_version_idx").on(t.workflowVersionId),
+    /** Increment 08 (D3): members of an order group. */
+    index("orders_group_root_idx").on(t.groupRootOrderId, t.id),
   ],
 );
 
@@ -379,10 +388,11 @@ export const orderReferences = mysqlTable(
   (t) => [uniqueIndex("order_references_reference_uq").on(t.reference), index("order_references_order_idx").on(t.orderId)],
 );
 
-/** Monotonic per-year reference sequence. */
+/** Monotonic reference sequences: per year (`RP-2026`, older shape) and, since increment 08, per stem (`RP-C4-F3L3-P6`). */
 export const orderReferenceCounters = mysqlTable("order_reference_counters", {
   id: idColumn(),
-  scope: varchar("scope", { length: 16 }).notNull().unique(),
+  /** Increment 08: widened 16 → 32 for stems. */
+  scope: varchar("scope", { length: 32 }).notNull().unique(),
   nextValue: int("next_value", { unsigned: true }).notNull(),
 });
 

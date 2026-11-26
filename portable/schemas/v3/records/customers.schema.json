@@ -207,6 +207,81 @@
         "additionalProperties": false
       }
     },
+    "billingProfile": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "fullName": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            "company": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 160
+            },
+            "email": {
+              "type": "string",
+              "maxLength": 254,
+              "format": "email",
+              "pattern": "^(?:[A-Za-z0-9_'+\\-]+\\.)*[A-Za-z0-9_'+\\-]*[A-Za-z0-9_+-]@(?:[A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"
+            },
+            "country": {
+              "type": "string",
+              "pattern": "^[A-Z]{2}$"
+            },
+            "region": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 64
+            },
+            "addressLine1": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "addressLine2": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 200
+            },
+            "city": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 120
+            },
+            "postalCode": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "taxId": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 64
+            }
+          },
+          "required": [
+            "fullName",
+            "company",
+            "email",
+            "country",
+            "region",
+            "addressLine1",
+            "addressLine2",
+            "city",
+            "postalCode",
+            "taxId"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "createdAt": {
       "anyOf": [
         {

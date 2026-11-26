@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { MeResult } from "@/lib/authApi";
 import { clearRecoveryBatch } from "@/lib/recoveryBatch";
 import { expectNoAxeViolations, fakeAuthApi, renderUi } from "@/ui/testing";
+import { pageA11y } from "@/test/a11y";
 import { recoveryCodesText } from "./components/RecoveryCodesPanel";
 import ActivatePage from "./pages/ActivatePage";
 import ChangePasswordPage from "./pages/ChangePasswordPage";
@@ -10,7 +11,7 @@ import ForgotPasswordPage from "./pages/ForgotPasswordPage";
 import MfaChallengePage from "./pages/MfaChallengePage";
 import MfaEnrolPage, { groupKey } from "./pages/MfaEnrolPage";
 import RecoveryCodesPage from "./pages/RecoveryCodesPage";
-import RegisterPage from "./pages/RegisterPage";
+import RegisterPage, { BILLING_DISCLOSURE_LABEL } from "./pages/RegisterPage";
 import ResetPasswordPage from "./pages/ResetPasswordPage";
 import SignInPage, { SIGN_IN_FAILED } from "./pages/SignInPage";
 import VerifyEmailPage from "./pages/VerifyEmailPage";
@@ -328,5 +329,90 @@ describe("MFA", () => {
     const text = recoveryCodesText(["A", "B"], new Date("2026-01-01T00:00:00Z"));
     expect(text).toContain("2026-01-01T00:00:00.000Z");
     expect(text.split("\n")).toEqual(expect.arrayContaining(["A", "B"]));
+  });
+});
+
+describe("register — D1 names and D4 optional billing (increment 08)", () => {
+  const fillBasics = () => {
+    type(/^First name/, "  Zeus ");
+    type(/^Last name/, "Greene");
+    type(/^Email/, "zeus@example.test");
+    type(/^Password/, LONG_PASSWORD);
+    fireEvent.click(screen.getByRole("checkbox"));
+  };
+
+  it("asks for first, last and preferred name with the right autocomplete tokens; billing is collapsed", async () => {
+    renderUi(<RegisterPage />, { path: "/register", api: fakeAuthApi({}) });
+    await screen.findByRole("heading", { level: 1 });
+    expect(screen.getByLabelText(/^First name/)).toHaveAttribute("autocomplete", "given-name");
+    expect(screen.getByLabelText(/^Last name/)).toHaveAttribute("autocomplete", "family-name");
+    expect(screen.getByLabelText(/^Preferred name \(optional\)/)).toHaveAttribute("autocomplete", "nickname");
+    const toggle = screen.getByRole("button", { name: BILLING_DISCLOSURE_LABEL });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("group", { name: BILLING_DISCLOSURE_LABEL })).toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("group", { name: BILLING_DISCLOSURE_LABEL })).toBeVisible();
+  });
+
+  it("sends trimmed name parts and no billing when the section is left empty", async () => {
+    const register = vi.fn(async () => ({ accepted: true as const }));
+    renderUi(<RegisterPage />, { path: "/register", api: fakeAuthApi({ register }) });
+    await screen.findByRole("heading", { level: 1 });
+    fillBasics();
+    fireEvent.click(screen.getByRole("button", { name: "Create account" }));
+    await screen.findByRole("heading", { name: /check your email/i });
+    expect(register).toHaveBeenCalledWith({ firstName: "Zeus", lastName: "Greene", preferredName: null, email: "zeus@example.test", password: LONG_PASSWORD });
+  });
+
+  it("partly filled billing must be complete: the section opens with errors and nothing is sent", async () => {
+    const register = vi.fn(async () => ({ accepted: true as const }));
+    renderUi(<RegisterPage />, { path: "/register", api: fakeAuthApi({ register }) });
+    await screen.findByRole("heading", { level: 1 });
+    fillBasics();
+    const toggle = screen.getByRole("button", { name: BILLING_DISCLOSURE_LABEL });
+    fireEvent.click(toggle);
+    fireEvent.change(document.getElementById("register-billing-city")!, { target: { value: "Testville" } });
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole("button", { name: "Create account" }));
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-expanded", "true"));
+    expect(register).not.toHaveBeenCalled();
+    expect(document.getElementById("register-billing-fullName")).toHaveAttribute("aria-invalid", "true");
+  });
+
+  it("every failed submit moves focus back to the error summary; success focuses the new heading", async () => {
+    const register = vi.fn(async () => ({ accepted: true as const }));
+    renderUi(<RegisterPage />, { path: "/register", api: fakeAuthApi({ register }) });
+    await screen.findByRole("heading", { level: 1 });
+    const submit = screen.getByRole("button", { name: "Create account" });
+    fireEvent.click(submit);
+    const summary = await screen.findByText("Please fix the highlighted fields.");
+    await waitFor(() => expect(summary.closest("[tabindex='-1']")).toHaveFocus());
+    submit.focus();
+    type(/^First name/, "Zeus");
+    fireEvent.click(submit);
+    await waitFor(() => expect(summary.closest("[tabindex='-1']")).toHaveFocus());
+    fillBasics();
+    fireEvent.click(submit);
+    const heading = await screen.findByRole("heading", { level: 1, name: /check your email/i });
+    await waitFor(() => expect(heading).toHaveFocus());
+  });
+
+  it("missing first or last name is reported on the field", async () => {
+    const register = vi.fn(async () => ({ accepted: true as const }));
+    renderUi(<RegisterPage />, { path: "/register", api: fakeAuthApi({ register }) });
+    await screen.findByRole("heading", { level: 1 });
+    fireEvent.click(screen.getByRole("button", { name: "Create account" }));
+    await waitFor(() => expect(screen.getByLabelText(/^First name/)).toHaveAttribute("aria-invalid", "true"));
+    expect(screen.getByLabelText(/^Last name/)).toHaveAttribute("aria-invalid", "true");
+    expect(register).not.toHaveBeenCalled();
+  });
+
+  pageA11y("Register with billing expanded", async () => {
+    document.title = "Create your account · ReadyPackets";
+    renderUi(<main><RegisterPage /></main>, { path: "/register", api: fakeAuthApi({}) });
+    await screen.findByRole("heading", { level: 1 });
+    fireEvent.click(screen.getByRole("button", { name: BILLING_DISCLOSURE_LABEL }));
+    expect(screen.getByRole("group", { name: BILLING_DISCLOSURE_LABEL })).toBeVisible();
   });
 });

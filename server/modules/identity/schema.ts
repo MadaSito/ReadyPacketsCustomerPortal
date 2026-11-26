@@ -31,6 +31,14 @@ export const users = mysqlTable(
     emailVerifiedAt: utcDateTime("email_verified_at"),
     /** Encrypted display name (aad `users.name:<publicId>`). */
     nameEnc: text("name_enc").notNull(),
+    /*
+     * Increment 08 (D1): name parts, encrypted (aad `users.first_name:<publicId>` / `users.last_name:` /
+     * `users.preferred_name:`). NULL = an account from before 08 (parts derived lazily from name_enc and stored at
+     * the next profile save). name_enc stays "<First> <Last>" so every existing consumer keeps working.
+     */
+    firstNameEnc: text("first_name_enc"),
+    lastNameEnc: text("last_name_enc"),
+    preferredNameEnc: text("preferred_name_enc"),
     /* ---- identity-owned additions (not part of the seeded contract) ---- */
     /** Argon2id PHC string. NULL = no usable password (invited, imported, admin link pending). Never exported. */
     passwordHash: varchar("password_hash", { length: 255 }),

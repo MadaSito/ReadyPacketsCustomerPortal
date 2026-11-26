@@ -60,6 +60,14 @@ TLS, upgrades, and go-live checks are in the [deployment profiles](../../deploy/
   - [Company branding on invoices and receipts](#company-branding-on-invoices-and-receipts)
   - [Setting the default workflow](#setting-the-default-workflow)
   - [The "ReadyPackets was updated on the server" prompt](#the-readypackets-was-updated-on-the-server-prompt)
+- [Increment 08](#increment-08)
+  - [Names](#names-increment-08)
+  - [Order numbers](#order-numbers-increment-08)
+  - [Adding packets to a project](#adding-packets-to-a-project-increment-08)
+  - [Saved billing information](#saved-billing-information-increment-08)
+  - [Payment confirmation and repair](#payment-confirmation-and-repair-increment-08)
+  - [Customer order wizard](#customer-order-wizard-increment-08)
+  - [Publishing workflows and packet tiers](#publishing-workflows-and-packet-tiers-increment-08)
 - [Customer tasks and the order agreement](./WORKFLOW_CUSTOMER_TASKS.md)
 
 ## Increment 04 operating guides
@@ -591,6 +599,100 @@ On builds before 07.1, reloading or bookmarking a template editor whose key has 
   - the account is not suspended;
   - the feature in use is on at `/admin/settings/features`.
   Then look up the request's correlation ID in the audit centre.
+
+## Increment 08
+
+### Names (increment 08)
+
+- **Name fields.** Registration, **Account**, and the administrator forms for creating customers and staff ask for **First name**, **Last name** and **Preferred name (optional)**. Each name can be at most 50 characters (UTF-16 code units). Longer names are refused with "please shorten it" and are never cut short silently.
+- **Display name.** The full name stays "First Last", which comes to at most 101 characters. Invoices, billing names and typed signatures keep using it.
+- **Greetings.** The customer home page and e-mails sent to a user use the preferred name, or the first name if there is no preferred name. Billing names in e-mails are not changed.
+- **Older accounts.** The name parts are worked out from the existing full name when needed. If a part comes out longer than 50 characters, the profile form shows it and asks for a shorter version on the next save.
+
+### Order numbers (increment 08)
+
+New orders get a reference built from the customer and the project: `RP-<C4>-<F3><L3>-<P6>-<NNN>`, for example `RP-JJG5-ZEUGRE-ICEQUE-001` for the synthetic customer Zeus Greene (`RPCUS-A1B2CJJG5`) and the project "Ice Queen".
+
+- **The parts:**
+  - `RP` is the order reference prefix setting;
+  - `C4` is the last 4 letters or digits of the customer ID (`0000` if there is none);
+  - `F3` and `L3` are the first 3 of the first and last name;
+  - `P6` is the first 6 of the project name;
+  - `NNN` is the next unused number for that customer and project, starting at `001`. Additions to the project get `002`, `003`, and so on.
+- **Characters.** Accents are removed and only `A–Z` and `0–9` are kept. Short name and project parts are padded with `X`. A customer ID shorter than 4 characters is padded on the left with `0`.
+- **Length.** With a 2–6 letter prefix, a reference is at most 32 characters. A number that is already taken, for example by a manual or imported reference, is skipped.
+- **Imports.** An imported order keeps its reference, and the counter for that reference's stem moves past the imported number.
+- **Frozen at creation.** Renaming the customer or the project later never changes a reference.
+- **Existing orders** keep their `RP-YYYY-NNNNNN` reference. Changing a reference by hand works as before.
+
+**Privacy: references contain name fragments.** This is by the owner's requirement.
+- **What a reference reveals.** Part of the customer ID, three letters each of the first and last name, and six of the project name. Anyone who sees a reference sees these fragments.
+- **Where references appear.** Wherever they already appear:
+  - audit events (as the order's label) and their SIEM export;
+  - e-mails, invoices and receipts;
+  - P101 / P201 webhook payloads;
+  - SharePoint folder names.
+- **What the portal never does:**
+  - put references in new log fields; operational and request logs use public IDs;
+  - log the name parts or other inputs of the reference;
+  - use a reference in a URL.
+- **Before go-live,** tell customers about this in your privacy notice, and consider it before sharing references outside your team.
+
+
+### Adding packets to a project (increment 08)
+
+- **For customers.** On an order page, the customer who owns the order sees **Add packets to this project**. It is not shown to staff, people the order is shared with, or for a cancelled project. The link opens `/orders/new?addTo=<order public ID>`.
+  - The page is titled "Add packets to <project>", and the project name cannot be changed there.
+  - Packets the project already has are marked "Already in this project" and cannot be chosen. The server also refuses them with `PACKET_ALREADY_IN_PROJECT`.
+- **What gets created.** Each addition is a separate order in the same project, with its own invoice and payment. Its reference continues the project's numbering, for example `…-002`.
+- **Where it shows.** When a project has more than one order, the order page shows **Orders in this project**, with a link to each one. Order lists show "Added to <reference>". URLs use public IDs, never references.
+
+### Saved billing information (increment 08)
+
+- **Where it is kept.** Customers manage it under **Account → Billing information** (`/account/billing`). They can also add it during registration in the optional "Billing information (optional — you can add it later)" section.
+- **At checkout,** a customer with saved details chooses **Use my saved billing information** or **Enter different billing information**. With different details, ticking **Save as my billing information** replaces the saved copy.
+- **Changing or clearing it.** **Clear billing information** removes the saved copy. Changes only apply to future checkouts. Invoices and payment receipts that were already issued never change.
+- **Privacy.** The details are stored encrypted, one copy per customer, and only that customer can see them. The audit log records changes without the field values. There is no self-service account export or erasure yet; an administrator handles privacy requests.
+
+### Payment confirmation and repair (increment 08)
+
+- **What changed (D5).** This replaces increment 07 decision 12 ("never mark paid without a signed webhook"). A Stripe payment is now recorded by one idempotent booking step, triggered either by a verified signed webhook or by the server's own lookup at Stripe. Each payment records how it was booked: `webhook` or `provider_lookup`. If both arrive, the payment is booked only once. The browser never tells the server that something was paid.
+- **When the server checks Stripe:**
+  - when the customer reaches the return page; it checks again automatically for a short while, and the customer can press **Check payment status** (at most once every 3 seconds);
+  - during the scheduled reconciliation, every 5 minutes;
+  - when an administrator presses **Check with Stripe now**.
+- **Delayed payment methods** such as bank debits show as processing. They are not marked paid or failed until Stripe settles them.
+- **Missing webhooks.** If a paid Stripe payment is still without a webhook 10 minutes later, one alert, "Stripe is not delivering webhooks to this server", is raised per environment. `/admin/payments/setup` then shows:
+  - the last verified webhook;
+  - the reasons for webhook rejections in the last 24 hours;
+  - the endpoint URL and the nine required events;
+  - the usual causes.
+- **Repairing an older paid-but-unbooked invoice.** This covers an invoice that was paid on Stripe before the upgrade but still shows "Issued":
+  1. Open the invoice at `/admin/invoices/<invoice>`, or the payment attempt in `/admin/payments`.
+  2. Press **Check with Stripe now**. It needs the `payments.manage` permission and a fresh two-step check.
+  3. If Stripe confirms the payment, it is booked. Attempts marked redirected, expired, cancelled or failed are covered, as long as the portal invoice is unpaid. The check is audited as `payments.admin.stripe_checked`.
+- **Square** is unchanged in this increment. It still books only from a verified webhook (plus Square's own checks), and **Check with Stripe now** does not apply to it.
+
+### Customer order wizard (increment 08)
+
+- **What customers see.** A purchased order opens on a wizard for the current phase, headed "Phase n of m". Each step is headed, for example, "Step 2 of 4: Questions". Only the steps the workflow needs are shown, from:
+  - Review and accept;
+  - Questions;
+  - Upload documents;
+  - Record or upload audio;
+  - Review and submit.
+- **Moving through it.** **Back** and **Next** are always visible. When **Next** is unavailable, the reason is shown next to it. **Submit** asks for confirmation first. If the submission is refused, focus moves to the error summary.
+- **The former tabs** are under **Order details** on the same page. Old links to a tab, such as `/orders/<id>/files`, open the details directly.
+- **Waiting screens** say what happens next and offer the single useful action.
+
+### Publishing workflows and packet tiers (increment 08)
+
+- **Publish button.** The workflow designer has a **Publish** button that stays in its header. Drafts on `/admin/workflows` also have a **Publish** row action.
+  - Both open the same dialog, where you add a change note and choose whether the workflow becomes the default for new orders.
+  - Publishing needs a fresh two-step check and uses the same permission and validation as before. Orders already in progress keep the version they started on.
+  - After publishing, the dialog confirms the version number and whether that version is now the default for new orders.
+- **Packet tiers.** When a customer chooses a tier, its outcome and deliverables are shown and the other tiers are collapsed. Choosing "Not included" collapses them all.
+
 
 ## Increment 07.2: payments, branding and the default workflow
 

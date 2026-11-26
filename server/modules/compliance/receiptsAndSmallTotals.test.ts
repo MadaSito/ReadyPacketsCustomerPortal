@@ -1579,4 +1579,80 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
     const billingGrantedNotePdf = await h.compliance.receipts.downloadRefundNotePdf(customerBPrincipal, targetNoteId);
     expect(billingGrantedNotePdf.buffer.subarray(0, 8).toString("latin1")).toBe("%PDF-1.4");
   });
+
+  it("performs current locking reads on ledger payments, refunds, and receipts under parent locks past an earlier REPEATABLE READ snapshot", async () => {
+    const h = createHarness();
+    const order = h.seedOrder(customerAPrincipal);
+    const created = await h.compliance.invoices.admin.createDraft(adminPrincipal, {
+      orderPublicId: order.publicId,
+      currency: "USD",
+      lines: [{ description: "Ice Queen Packet", quantity: 1, unitAmountMinor: 10_000 }],
+      discountMinor: 0,
+      taxMinor: 0,
+    });
+    await h.compliance.invoices.admin.issue(adminPrincipal, {
+      invoicePublicId: created.invoicePublicId,
+    });
+
+    await tdb.db.transaction(async (tx) => {
+      // 1. Establish InnoDB REPEATABLE READ snapshot before any payment exists.
+      const preLockSnap = await h.compliance.getInvoiceForCheckout(created.invoicePublicId, { tx });
+      expect(preLockSnap).toMatchObject({
+        status: "issued",
+        balanceDueMinor: 10_000,
+        receiptPublicId: null,
+      });
+
+      // 2. Concurrent writer settles the invoice on a separate committed transaction and issues a receipt.
+      const settled = await h.compliance.invoices.admin.recordManualPayment(adminPrincipal, {
+        invoicePublicId: created.invoicePublicId,
+        method: "wire",
+        amountMinor: 10_000,
+        currency: "USD",
+        reference: "WIRE-SYNTH-RR-01",
+        receivedAt: new Date("2026-11-23T13:00:00.000Z"),
+        idempotencyKey: "idem-wire-synth-rr-01",
+      });
+      expect(settled.invoiceStatus).toBe("paid");
+      expect(settled.receiptPublicId).toBeTruthy();
+
+      // Plain read inside `tx` still sees the stale RR snapshot (`issued`, 10000 unpaid, no receipt).
+      const staleSnap = await h.compliance.getInvoiceForCheckout(created.invoicePublicId, { tx });
+      expect(staleSnap.status).toBe("issued");
+      expect(staleSnap.balanceDueMinor).toBe(10_000);
+
+      // 3. `getInvoiceForCheckout(..., { tx, forUpdate: true })` performs current reads on ledger + receipt.
+      const currentLocked = await h.compliance.getInvoiceForCheckout(created.invoicePublicId, {
+        tx,
+        forUpdate: true,
+      });
+      expect(currentLocked).toMatchObject({
+        status: "paid",
+        balanceDueMinor: 0,
+        receiptPublicId: settled.receiptPublicId,
+      });
+
+      // 4. `bookVerifiedProviderPayment` for a distinct provider attempt inside the same `tx` also performs
+      //    current ledger reads under parent locks and refuses overbooking (`PAYMENT_EXCEEDS_BALANCE_DUE`).
+      await expect(
+        h.compliance.bookVerifiedProviderPayment(
+          {
+            invoicePublicId: created.invoicePublicId,
+            attemptPublicId: "01JRRCONCURRENTATTEMPT0002",
+            provider: "stripe",
+            environment: "test",
+            providerPaymentRef: "pi_synth_rr_overbook_02",
+            idempotencyKey: "idem-rr-overbook-attempt-02",
+            amountMinor: 10_000,
+            currency: "USD",
+            paidAt: new Date("2026-11-23T13:01:00.000Z"),
+          },
+          tx,
+        ),
+      ).rejects.toMatchObject({
+        code: "CONFLICT",
+        reasonCode: "PAYMENT_EXCEEDS_BALANCE_DUE",
+      });
+    });
+  });
 });

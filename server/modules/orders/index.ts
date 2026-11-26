@@ -102,6 +102,10 @@ export interface OrdersModule extends ModuleLifecycle {
 
   /** Increment 04 (cart checkout): customer order creation inside the caller's transaction. */
   createOrderFromCheckoutInTx: OrderService["createOrderFromCheckoutInTx"];
+  /** Increment 08 (D3, trusted read): add-on target for the cart and checkout summary. */
+  addOnTargetInTx: OrderService["addOnTargetInTx"];
+  /** Increment 08 (D3): checkout calls this first (before its actor check) when the cart has an add-on target. */
+  lockAddOnRootInTx: OrderService["lockAddOnRootInTx"];
 
   /** Part B (B6): acceptance gate port — call `gates.assertCustomerMayWork` inside the protected write's tx. */
   gates: OrderGatesService;
@@ -255,6 +259,8 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     isStatusPhaseLocked: requirements.isStatusPhaseLocked,
     getFileSlotForCustody: requirements.getFileSlotForCustody,
     createOrderFromCheckoutInTx: orders.createOrderFromCheckoutInTx,
+    addOnTargetInTx: orders.addOnTargetInTx,
+    lockAddOnRootInTx: orders.lockAddOnRootInTx,
     gates,
     getOrderFileFolderRouting,
     listStatusTransitions: orders.listStatusTransitions,

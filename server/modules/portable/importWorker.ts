@@ -6,7 +6,10 @@ import type { JobResult, SessionPrincipal, Tx } from "../../core/types.js";
 import { CustodyError, decryptEscrow, digest, matchBytes, readExactObject } from "./custody.js";
 import { type ImportJob, type ImportRow, lockImport, readImport, transition } from "./importLedger.js";
 import { computePlanDigest, groupChildren, type JsonRecord, mappedRecord } from "./importPlanning.js";
-import { customerCreatedAt, customerName, fileCategory, numberField, projectedOrder, stringField, targetDate } from "./importShapes.js";
+import {
+  customerBillingProfile, customerCreatedAt, customerIdentity, fileCategory, groupRootOf, numberField, projectedOrder, stringField,
+  targetDate,
+} from "./importShapes.js";
 import {
   portableImportObjects, portableImportRecords, portableMappings, portablePackageReservations,
   type ReconciliationReport,
@@ -149,6 +152,14 @@ export function createImportWorker(deps: ModuleDeps) {
       const groups = data.map((entry) => ({ type: entry.recordType, record: entry.record }));
       const items = groupChildren(groups, "order-items");
       const history = groupChildren(groups, "order-status-history");
+      // Group roots are written before the orders added to them (and before those orders' files), whatever the
+      // package order. Planning has already refused chains, self-links and roots outside the package.
+      const additions = new Set(data.filter((entry) => entry.recordType === "orders" && groupRootOf(entry.record) !== null)
+        .map((entry) => entry.portableId));
+      const late = (entry: DecodedRow) => entry.recordType === "orders" ? additions.has(entry.portableId)
+        : entry.recordType === "file-versions" &&
+          additions.has(String(ref.get(`files:${stringField(entry.record.filePublicId)}`)?.record.orderPublicId));
+      const applyOrder = [...data.filter((entry) => !late(entry)), ...data.filter(late)];
 
       if (initial.phase === "approved") {
         for (const object of objects) {
@@ -164,7 +175,7 @@ export function createImportWorker(deps: ModuleDeps) {
       }
 
       if (initial.phase === "approved" || initial.phase === "objects-prepared") {
-        for (const entry of data) {
+        for (const entry of applyOrder) {
           if (entry.receiptAt || (entry.disposition === "create" &&
             ["order-items", "order-status-history", "files"].includes(entry.recordType))) continue;
           job.signal.throwIfAborted();
@@ -177,10 +188,15 @@ export function createImportWorker(deps: ModuleDeps) {
               await receipt(tx, row, job, entry);
             } else if (entry.recordType === "customers") {
               const customer = await deps.services.identity.createPendingCustomer({
-                email: stringField(entry.record.email), name: customerName(entry.record), publicId: entry.portableId,
+                email: stringField(entry.record.email), ...customerIdentity(entry.record), publicId: entry.portableId,
                 createdAt: customerCreatedAt(entry.record.createdAt),
                 customerRef: typeof entry.record.customerNumber === "string" ? entry.record.customerNumber : null,
               }, { tx });
+              const billing = customerBillingProfile(entry.record);
+              if (billing) {
+                await deps.services.billingProfile.saveForUserInTx(tx, customer.userId, billing,
+                  { userId: null, role: "system", via: "portable_import" });
+              }
               await receipt(tx, row, job, entry, { id: customer.userId, publicId: customer.publicId });
             } else if (entry.recordType === "orders") {
               const customer = await readMapping(tx, row, "customers", stringField(entry.record.customerPublicId));
@@ -188,9 +204,12 @@ export function createImportWorker(deps: ModuleDeps) {
               const orderItems = items.get(entry.portableId) ?? [];
               const orderHistory = history.get(entry.portableId) ?? [];
               const fields = projectedOrder(entry.record, orderItems, orderHistory);
+              const rootPortableId = groupRootOf(entry.record);
+              const root = rootPortableId ? await readMapping(tx, row, "orders", rootPortableId) : undefined;
+              if (rootPortableId && !root?.localId) throw new CustodyError();
               const imported = await deps.services.orders.importOrder({
                 ...fields, importId: row.publicId, sourceInstallationId: expected.sourceSystem, sourceOrderPublicId: entry.portableId,
-                targetOwnerUserId: customer.localId, editable: false,
+                targetOwnerUserId: customer.localId, editable: false, groupRootOrderId: root?.localId ?? null,
               }, tx);
               if (!imported.created) throw conflict("PORTABLE_ORDER_PROVENANCE_COLLISION", "The target order has changed since planning.");
               await receipt(tx, row, job, entry, imported);
@@ -274,6 +293,8 @@ export function createImportWorker(deps: ModuleDeps) {
           if (entry.recordType === "customers") {
             const user = await deps.services.identity.getUserByPublicId(mapping.localPublicId, { tx });
             const sourceDate = customerCreatedAt(entry.record.createdAt);
+            if (entry.disposition === "create" && customerBillingProfile(entry.record) && user?.id === mapping.localId &&
+              !await deps.services.billingProfile.getForUserInTx(tx, user.id)) return false;
             return user?.role === "customer" && user.id === mapping.localId &&
               (!sourceDate || user.createdAt.getTime() === sourceDate.getTime());
           }
@@ -281,6 +302,9 @@ export function createImportWorker(deps: ModuleDeps) {
             const customer = await readMapping(tx, row, "customers", stringField(entry.record.customerPublicId));
             const order = await deps.services.orders.findImportedOrder(expected.sourceSystem, entry.portableId, tx);
             const source = projectedOrder(entry.record, items.get(entry.portableId) ?? [], history.get(entry.portableId) ?? []);
+            const rootPortableId = groupRootOf(entry.record);
+            const root = rootPortableId ? await readMapping(tx, row, "orders", rootPortableId) : undefined;
+            if ((order?.groupRootOrderId ?? null) !== (rootPortableId ? root?.localId ?? -1 : null)) return false;
             return Boolean(order && order.id === mapping.localId && order.publicId === mapping.localPublicId &&
               order.ownerUserId === customer?.localId && order.lockState === "imported_read_only" &&
               order.createdAt.getTime() === source.createdAt.getTime() && order.currency === source.currency &&

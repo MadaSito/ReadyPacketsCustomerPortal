@@ -63,7 +63,7 @@ function FirstOrderGuide() {
 export default function CustomerHomePage() {
   const { me } = useSession();
   const user = me?.user;
-  const firstName = user?.name.trim().split(/\s+/)[0];
+  const firstName = user?.greetingName?.trim() || user?.name.trim().split(/\s+/)[0];
   const widgets = user ? widgetsFor(WIDGETS, "customer", user.role) : [];
   return (
     <div className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">

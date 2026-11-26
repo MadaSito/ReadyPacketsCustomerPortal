@@ -168,6 +168,60 @@ describe("CartPage", () => {
       view.unmount();
     }
   });
+
+  it("D3: renders Adding to project banner, blocks checkout on duplicate packets, and clears target order via Start a separate project", async () => {
+    const user = userEvent.setup();
+    const rootOrderId = "01JQAORDER0000000000000001";
+    let current = cart(
+      [
+        line("DUP", "Packet 1 — Foundation", {
+          packetNumber: 1,
+          alreadyInTargetProject: true,
+        }),
+      ],
+      {
+        projectName: "Ice Queen",
+        addToOrder: {
+          orderPublicId: rootOrderId,
+          rootPublicId: rootOrderId,
+          rootReference: "RP-2026-00001",
+          projectName: "Ice Queen",
+          currency: "USD",
+          packetNumbers: [1],
+          targetAvailable: true,
+          currencyMismatch: false,
+          conflictingItemPublicIds: ["DUP"],
+        },
+      },
+    );
+    handlers.set("cart.get", () => current);
+    handlers.set("cart.setTarget", () => {
+      current = cart(
+        [line("DUP", "Packet 1 — Foundation", { packetNumber: 1, alreadyInTargetProject: false })],
+        { version: 4, projectName: "Ice Queen", addToOrder: null },
+      );
+      return current;
+    });
+
+    renderUi(<CartPage />, { path: "/cart" });
+    expect(await screen.findByTestId("cart-adding-to-project")).toHaveTextContent(
+      "Adding to project Ice Queen (RP-2026-00001)",
+    );
+    expect(screen.getByText("Already in project")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Continue to checkout" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByTestId("cart-clear-target-order"));
+    await waitFor(() =>
+      expect(calls.find((c) => c.path === "cart.setTarget")?.input).toEqual({
+        expectedVersion: 3,
+        addToOrderPublicId: null,
+      }),
+    );
+    expect(await screen.findByRole("link", { name: "Continue to checkout" })).toHaveAttribute(
+      "href",
+      "/cart/checkout",
+    );
+  });
 });
 
 describe("CartBadge", () => {
@@ -210,6 +264,75 @@ describe("OrderFormCartBanner", () => {
       expect(calls.filter((c) => c.path.startsWith("cart.") || c.path === "orders.catalog.list")).toEqual([]);
       view.unmount();
     }
+  });
+
+  it("D3: clears stale target on standalone /orders/new and passes addToOrderPublicId + hides owned packets in add-on mode", async () => {
+    const user = userEvent.setup();
+    const rootOrderId = "01J00000000000000000000001";
+    handlers.set("orders.catalog.list", () => [
+      {
+        publicId: "G1",
+        name: "Packets",
+        packetNumber: 1,
+        products: [
+          { publicId: "PKT1", name: "Packet 1", packetNumber: 1, tier: "basic", priceMinor: 1000, currency: "USD", active: true },
+          { publicId: "PKT2", name: "Packet 2", packetNumber: 2, tier: "basic", priceMinor: 2000, currency: "USD", active: true },
+        ],
+      },
+    ]);
+    handlers.set("cart.get", () => cart([]));
+    handlers.set("cart.addItems", () => cart([line("B", "Packet 2", { packetNumber: 2 })], { version: 4 }));
+
+    const standalone = renderUi(
+      <OrderFormCartBanner>
+        <div>Form</div>
+      </OrderFormCartBanner>,
+      { path: "/orders/new", ...asRole("customer") },
+    );
+    await user.selectOptions(await screen.findByLabelText("Packet tier or add-on"), "PKT1");
+    await user.click(screen.getByRole("button", { name: "Add to cart" }));
+    await waitFor(() =>
+      expect(calls.find((c) => c.path === "cart.addItems")?.input).toEqual({
+        items: [{ productPublicId: "PKT1", quantity: 1 }],
+        addToOrderPublicId: null,
+      }),
+    );
+    standalone.unmount();
+
+    calls.length = 0;
+    handlers.set("cart.get", () =>
+      cart([], {
+        addToOrder: {
+          orderPublicId: rootOrderId,
+          rootPublicId: rootOrderId,
+          rootReference: "RP-2026-00001",
+          projectName: "Ice Queen",
+          currency: "USD",
+          packetNumbers: [1],
+          targetAvailable: true,
+          currencyMismatch: false,
+          conflictingItemPublicIds: [],
+        },
+      }),
+    );
+    const addOn = renderUi(
+      <OrderFormCartBanner>
+        <div>Form</div>
+      </OrderFormCartBanner>,
+      { path: `/orders/new?addTo=${rootOrderId}`, ...asRole("customer") },
+    );
+    const select = await screen.findByLabelText("Packet tier or add-on");
+    await waitFor(() => expect(select).not.toHaveTextContent("Packet 1"));
+    expect(select).toHaveTextContent("Packet 2");
+    await user.selectOptions(select, "PKT2");
+    await user.click(screen.getByRole("button", { name: "Add to cart" }));
+    await waitFor(() =>
+      expect(calls.find((c) => c.path === "cart.addItems")?.input).toEqual({
+        items: [{ productPublicId: "PKT2", quantity: 1 }],
+        addToOrderPublicId: rootOrderId,
+      }),
+    );
+    addOn.unmount();
   });
 });
 

@@ -9,7 +9,9 @@ import type { AppRouter } from "@server/trpc/root";
 import type { MeResult } from "@/lib/authApi";
 import { TRPCProvider } from "@/lib/trpc";
 import { createTestQueryClient, expectNoAxeViolations, fakeAuthApi, renderUi } from "@/ui/testing";
-import AccountPage from "./pages/AccountPage";
+import { pageA11y } from "@/test/a11y";
+import AccountPage, { initialNameValues } from "./pages/AccountPage";
+import { validateNameParts } from "./NameFields";
 import CustomerDetailPage from "./pages/CustomerDetailPage";
 import CustomersPage from "./pages/CustomersPage";
 import StaffPage from "./pages/StaffPage";
@@ -78,11 +80,16 @@ describe("Account pages", () => {
     const { calls } = renderPage(<AccountPage />, { "identity.profile.update": () => ({ ok: true }), ...noSso }, { role: "customer" });
     expect(await screen.findByRole("heading", { level: 1, name: "Your account" })).toBeInTheDocument();
     expect(await screen.findByText("RP-ABC1234")).toBeInTheDocument();
-    const name = screen.getByLabelText(/Full name/);
-    await userEvent.clear(name);
-    await userEvent.type(name, "Avery New");
+    // D1: a legacy account (no stored parts) sees its derived first/last name pre-filled.
+    expect(screen.getByLabelText(/^First name/)).toHaveValue("Avery");
+    expect(screen.getByLabelText(/^First name/)).toHaveAttribute("autocomplete", "given-name");
+    const last = screen.getByLabelText(/^Last name/);
+    expect(last).toHaveValue("Example");
+    await userEvent.clear(last);
+    await userEvent.type(last, "New");
+    await userEvent.type(screen.getByLabelText(/^Preferred name/), "Ave");
     await userEvent.click(screen.getByRole("button", { name: "Save profile" }));
-    await waitFor(() => expect(calls.find((c) => c.path === "identity.profile.update")?.input).toEqual({ name: "Avery New" }));
+    await waitFor(() => expect(calls.find((c) => c.path === "identity.profile.update")?.input).toEqual({ firstName: "Avery", lastName: "New", preferredName: "Ave" }));
     await expectNoAxeViolations();
   });
 
@@ -112,11 +119,13 @@ describe("Console customer pages", () => {
     await userEvent.click(screen.getByRole("button", { name: "New customer" }));
     const dialog = await screen.findByRole("dialog", { name: "New customer" });
     await userEvent.type(within(dialog).getByLabelText(/E-mail address/), "new@example.test");
-    await userEvent.type(within(dialog).getByLabelText(/Full name/), "New Person");
+    await userEvent.type(within(dialog).getByLabelText(/^First name/), "New");
+    await userEvent.type(within(dialog).getByLabelText(/^Last name/), "Person");
+    expect(within(dialog).getByLabelText(/^First name/)).toHaveAttribute("autocomplete", "off");
     await userEvent.click(within(dialog).getByRole("button", { name: "Create and invite" }));
     const done = await screen.findByRole("dialog", { name: "Customer created" });
     expect(within(done).getByRole("link", { name: "Open the activation link" })).toHaveAttribute("href", "/activate?token=abc");
-    expect(calls.find((c) => c.path === "identity.admin.customers.create")?.input).toEqual({ email: "new@example.test", name: "New Person" });
+    expect(calls.find((c) => c.path === "identity.admin.customers.create")?.input).toEqual({ email: "new@example.test", firstName: "New", lastName: "Person", preferredName: null });
     await expectNoAxeViolations();
   });
 
@@ -134,6 +143,28 @@ describe("Console customer pages", () => {
     expect(await screen.findByText(`Orders for ${customerId}`)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Manage account" })).toBeInTheDocument();
     await expectNoAxeViolations();
+  });
+
+  it("D1: administrators edit a customer's name parts with the current version", async () => {
+    const { calls } = renderPage(<Route path="/admin/customers/:customerId" component={CustomerDetailPage} />, {
+      "identity.admin.customers.get": () => ({
+        customer: { ...customerRow, firstName: "Cara", lastName: "Customer", preferredName: null, namePartsStored: true, mustChangePassword: false, hasPassword: true, statusReasonCode: null, statusChangedAt: date },
+        activeSessions: 0,
+        referenceHistory: [],
+      }),
+      "identity.admin.customers.updateName": () => ({ version: 4 }),
+    }, { path: `/admin/customers/${customerId}`, role: "admin" });
+    await screen.findByRole("heading", { level: 1, name: "Cara Customer" });
+    await userEvent.click(screen.getByRole("button", { name: "Manage account" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: "Edit name" }));
+    const dialog = await screen.findByRole("dialog", { name: "Edit customer name" });
+    expect(within(dialog).getByLabelText(/^First name/)).toHaveValue("Cara");
+    await userEvent.type(within(dialog).getByLabelText(/^Preferred name/), "Cee");
+    await expectNoAxeViolations();
+    await userEvent.click(within(dialog).getByRole("button", { name: "Save name" }));
+    await waitFor(() => expect(calls.find((c) => c.path === "identity.admin.customers.updateName")?.input).toEqual({
+      customerId, firstName: "Cara", lastName: "Customer", preferredName: "Cee", expectedVersion: 3,
+    }));
   });
 
   it("staff viewers see no admin-only tabs and no management actions", async () => {
@@ -168,5 +199,23 @@ describe("Console staff page", () => {
     expect(within(table).getByRole("button", { name: "Actions for Sam Staff" })).toBeInTheDocument();
     expect(within(table).getByText("Invitation pending")).toBeInTheDocument();
     await expectNoAxeViolations();
+  });
+});
+
+pageA11y("Account page with name parts", async () => {
+  document.title = "Your account · ReadyPackets";
+  renderPage(<main><AccountPage /></main>, { ...noSso }, { role: "customer" });
+  await screen.findByRole("heading", { level: 1, name: "Your account" });
+  expect(await screen.findByLabelText(/^Preferred name/)).toBeInTheDocument();
+});
+
+describe("D1 legacy names longer than 50 characters", () => {
+  it("are shown as derived and must be shortened on save (never silently truncated)", () => {
+    const long = "L".repeat(60);
+    const values = initialNameValues({ name: `Avery Middle ${long}` });
+    expect(values).toEqual({ firstName: "Avery", lastName: long, preferredName: "" });
+    const check = validateNameParts(values);
+    expect(check.ok).toBe(false);
+    if (!check.ok) expect(check.errors.lastName).toMatch(/at most 50 characters/);
   });
 });

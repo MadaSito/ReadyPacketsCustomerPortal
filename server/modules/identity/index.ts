@@ -23,7 +23,8 @@ import { createSessionService, type IssuedSession, type SessionListItem, type Se
 import { createSignInSignals, type SignInSignals } from "./signals.js";
 import { createTokenService } from "./tokens.js";
 import { createTransitionService } from "./transitions.js";
-import { createUserRepo, toView, type LoadOptions, type UserView } from "./users.js";
+import { createUserRepo, namePartsOf, toView, type LoadOptions, type UserView } from "./users.js";
+import type { NameParts } from "./normalize.js";
 
 export type { CustomerListItem, IssuedSession, Page, SessionListItem, SessionState, UserStatus, UserView };
 
@@ -92,7 +93,7 @@ export interface IdentityModule extends ModuleLifecycle {
     derive(userId: number, session?: { mfaVerifiedAt: Date | null; authMethod?: AuthMethod; tx?: DbOrTx }): Promise<TransitionStep[]>;
   };
   createPendingCustomer(
-    input: { email: string; name: string; customerRef?: string | null; publicId?: string; createdAt?: Date },
+    input: { email: string; name: string; nameParts?: NameParts; customerRef?: string | null; publicId?: string; createdAt?: Date },
     opts: { tx: Tx },
   ): Promise<{ userId: number; publicId: string; customerRef: string }>;
   findUserIdByEmail(email: string, opts?: { tx?: DbOrTx }): Promise<{ userId: number; publicId: string; role: UserRole; status: UserStatus } | null>;
@@ -101,7 +102,17 @@ export interface IdentityModule extends ModuleLifecycle {
     after: string | null,
     limit: number,
     publicIds?: readonly string[],
-  ): Promise<{ publicId: string; email: string; name: string; customerRef: string | null; createdAt: Date }[]>;
+  ): Promise<
+    {
+      publicId: string; email: string; name: string; customerRef: string | null; createdAt: Date;
+      /** D1: stored parts only; null while the account has not stored them. */
+      firstName: string | null; lastName: string | null; preferredName: string | null;
+    }[]
+  >;
+  /** D1 port (orders). Name parts (derived when not stored) + customer reference. No lock, no audit. Unknown user → NOT_FOUND USER_NOT_FOUND. */
+  users: {
+    namePartsInTx(tx: DbOrTx, userId: number): Promise<{ firstName: string; lastName: string; preferredName: string | null; customerRef: string | null }>;
+  };
   searchCustomers(
     principal: SessionPrincipal,
     input: { query?: string; status?: UserStatus; cursor?: string; limit?: number },
@@ -200,6 +211,14 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
       },
     },
     createPendingCustomer: admin.createPendingCustomer,
+    users: {
+      async namePartsInTx(tx, userId) {
+        const row = await repo.byId(userId, { tx });
+        if (!row) throw notFound("USER_NOT_FOUND");
+        const parts = namePartsOf(deps.crypto, row);
+        return { firstName: parts.firstName, lastName: parts.lastName, preferredName: parts.preferredName, customerRef: row.customerRef ?? null };
+      },
+    },
     findUserIdByEmail: admin.findUserIdByEmail,
     portableCustomers: admin.portableCustomers,
     searchCustomers: admin.searchCustomers,

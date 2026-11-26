@@ -14,7 +14,7 @@ import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
 import type { PublishedPolicyView } from "../compliance/index.js";
 import type { CatalogGroupView } from "../orders/catalog.js";
 import type { BundleRule } from "../orders/settings.js";
-import type { CartBundleQuoteView } from "./types.js";
+import type { BillingDetails, CartBundleQuoteView } from "./types.js";
 
 export interface PersistedAuthority {
   pendingSteps: readonly unknown[];
@@ -114,6 +114,15 @@ export interface CartPlaceOrderAgreementStatus {
   signatureMode: "checkbox" | "typed_name";
 }
 
+/** Increment 08 (D3): trusted read of an order group root when the cart targets an existing project. */
+export interface CartAddOnTarget {
+  rootPublicId: string;
+  rootReference: string;
+  projectName: string;
+  currency: string;
+  packetNumbers: number[];
+}
+
 export interface CartOrdersPort {
   listActiveCatalog(tx?: Tx, opts?: { forShare?: boolean }): Promise<CatalogGroupView[]>;
   getBundleRule(tx?: Tx): Promise<BundleRule>;
@@ -121,6 +130,13 @@ export interface CartOrdersPort {
   getPlaceOrderAgreementStatus(principal: SessionPrincipal, tx?: DbOrTx): Promise<CartPlaceOrderAgreementStatus>;
   /** Increment 06 (D14): early account-level order agreement (MNDA) gate check inside checkout `tx`. */
   assertCustomerMayPlaceOrder(principal: SessionPrincipal, tx: Tx): Promise<void>;
+  /** Increment 08 (D3): trusted read of add-on target root by owner userId and orderPublicId; null if not addable. */
+  addOnTargetInTx(tx: DbOrTx, ownerUserId: number, orderPublicId: string): Promise<CartAddOnTarget | null>;
+  /**
+   * Increment 08 (D3): locks the add-on target's group root `orders` row `FOR UPDATE` BEFORE `actorCheck`
+   * (`orders -> users -> user_sessions -> carts`) so checkout lock order matches `orders/actor.ts`.
+   */
+  lockAddOnRootInTx(tx: Tx, ownerUserId: number, orderPublicId: string): Promise<{ rootPublicId: string } | null>;
   createOrderFromCheckoutInTx(
     principal: SessionPrincipal,
     input: {
@@ -129,6 +145,7 @@ export interface CartOrdersPort {
       note?: string;
       idempotencyKey: string;
       promoCode?: string;
+      addToOrderPublicId?: string | null;
     },
     tx: Tx,
   ): Promise<CreatedCheckoutOrder>;
@@ -153,6 +170,12 @@ export function cartOrdersPort(services: Services): CartOrdersPort {
     gatesHolder,
     "assertCustomerMayPlaceOrder",
   );
+  const addOnTargetInTx =
+    method<CartOrdersPort["addOnTargetInTx"]>(ordersMod, "addOnTargetInTx") ??
+    method<CartOrdersPort["addOnTargetInTx"]>(innerOrdersHolder, "addOnTargetInTx");
+  const lockAddOnRootInTx =
+    method<CartOrdersPort["lockAddOnRootInTx"]>(ordersMod, "lockAddOnRootInTx") ??
+    method<CartOrdersPort["lockAddOnRootInTx"]>(innerOrdersHolder, "lockAddOnRootInTx");
   const createOrderFromCheckoutInTx =
     method<CartOrdersPort["createOrderFromCheckoutInTx"]>(ordersMod, "createOrderFromCheckoutInTx") ??
     method<CartOrdersPort["createOrderFromCheckoutInTx"]>(innerOrdersHolder, "createOrderFromCheckoutInTx");
@@ -179,11 +202,60 @@ export function cartOrdersPort(services: Services): CartOrdersPort {
         await assertGatePlaceOrder({ tx, actor: principal });
       }
     },
+    async addOnTargetInTx(tx, ownerUserId, orderPublicId) {
+      if (!addOnTargetInTx) return null;
+      return addOnTargetInTx(tx, ownerUserId, orderPublicId);
+    },
+    async lockAddOnRootInTx(tx, ownerUserId, orderPublicId) {
+      if (lockAddOnRootInTx) {
+        return lockAddOnRootInTx(tx, ownerUserId, orderPublicId);
+      }
+      // Fallback for isolated unit-test stubs that mock `addOnTargetInTx` without `lockAddOnRootInTx`.
+      if (addOnTargetInTx) {
+        const target = await addOnTargetInTx(tx, ownerUserId, orderPublicId);
+        return target ? { rootPublicId: target.rootPublicId } : null;
+      }
+      return null;
+    },
     async createOrderFromCheckoutInTx(principal, input, tx) {
       if (!createOrderFromCheckoutInTx) throw unavailable("ORDERS_CHECKOUT_PORT_UNAVAILABLE");
       return createOrderFromCheckoutInTx(principal, input, tx);
     },
   };
+}
+
+/* ---------------- Increment 08 (D4): billing profile port ---------------- */
+
+export interface CartBillingProfileRecord {
+  publicId?: string;
+  details: BillingDetails;
+  version: number;
+  updatedAt: Date;
+}
+
+export interface CartBillingProfilePort {
+  getForUserInTx(
+    tx: DbOrTx,
+    userId: number,
+    options?: { forUpdate?: boolean },
+  ): Promise<CartBillingProfileRecord | null>;
+  saveForUserInTx(
+    tx: Tx,
+    userId: number,
+    details: BillingDetails,
+    actor: { userId: number; role: SessionPrincipal["role"]; via: "account_settings" | "checkout" },
+  ): Promise<CartBillingProfileRecord>;
+}
+
+/**
+ * Increment 08 (D4): resolves `services.billingProfile` lazily at call time and tolerates its absence in unit tests.
+ */
+export function cartBillingProfilePort(services: Services): CartBillingProfilePort | null {
+  const holder: unknown = (services as unknown as Partial<Record<string, unknown>>).billingProfile;
+  const getForUserInTx = method<CartBillingProfilePort["getForUserInTx"]>(holder, "getForUserInTx");
+  const saveForUserInTx = method<CartBillingProfilePort["saveForUserInTx"]>(holder, "saveForUserInTx");
+  if (!getForUserInTx || !saveForUserInTx) return null;
+  return { getForUserInTx, saveForUserInTx };
 }
 
 /* ---------------- Increment 05 (D3 / §3): promotions port ---------------- */

@@ -21,6 +21,8 @@ resolve(input: OpsAlertIdentity, tx?: Tx): Promise<boolean>;
 
 An identical repeat returns the existing alert, preserving its state. An escalation reopens an acknowledged alert. A resolved key stays resolved; use a new incident/attempt identifier for a genuinely new failure. `resolve` returns true only on a transition, false for missing/already resolved.
 
+For Stripe missing-webhook detection, `stripeWebhookDeliveryMissingAlert("test" | "live")` builds a payment-source warning deduplicated per environment. Payments owns the verified-webhook evidence and grace window. The alert contains no customer, charge, or endpoint identifiers.
+
 ## Console
 
 `opsAlerts.{summary,list}` require `ops.alerts.read`. `list` accepts optional severity/source/state and a bounded keyset cursor. `opsAlerts.{acknowledge,resolve}` require `ops.alerts.manage` and transaction-time actor validation; writes are idempotent. No customer routes. `/admin/alerts` shows filters and state controls, and the `/admin` widget shows open counts by severity.

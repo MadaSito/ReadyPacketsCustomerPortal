@@ -6,25 +6,32 @@
  * The workspace is read again on window focus and every 30 s while the page is visible; changes made elsewhere
  * are announced politely (lead QA ruling 9).
  */
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import type { StageActionKey } from "@shared/workflowStages";
 import { safeError, useTRPC } from "@/lib/trpc";
 import { Link } from "wouter";
-import { Skeleton } from "@/ui";
+import { Skeleton, buttonClasses } from "@/ui";
 import { PhaseArchiveAction } from "../../files/archives/ArchiveAction";
 import { PhaseTeamFiles, PhaseUploadPanel, PhaseUploadedFiles } from "../../files/PhaseFiles";
+import { DerivedOrderWizard } from "./DerivedOrderWizard";
 import { PhaseWizard, type UnansweredQuestion } from "./PhaseWizard";
 import { StageQuestions } from "./StageQuestions";
 import {
-  INVOICE_PREPARING_MESSAGE, REFRESH_CODES, currentStage, describeWorkspaceChange, isWritable, wizardErrorMessage, type WizardStage, type WizardWorkspace,
+  INVOICE_PREPARING_MESSAGE, REFRESH_CODES, currentStage, describeWorkspaceChange, isWritable, wizardErrorMessage, type WaitingKind, type WizardStage, type WizardWorkspace,
 } from "./wizardModel";
 
 export const WORKSPACE_REFRESH_MS = 30_000;
 export const AUDIO_LISTED_BELOW = "Recordings are listed under Upload audio.";
 type UploadIntent = "document" | "recording" | "prerecorded_audio";
 
-export function CustomerPhaseWizard({ orderId, fallback }: { orderId: string; fallback?: ReactNode }) {
+export function CustomerPhaseWizard({ orderId, fallback, waitingAction, completion }: {
+  orderId: string; fallback?: ReactNode;
+  /** The single useful action on a waiting screen (other than payment), supplied by the page. */
+  waitingAction?: (kind: WaitingKind) => ReactNode;
+  /** Shown when every phase is complete (for example the deliverables link). */
+  completion?: ReactNode;
+}) {
   const trpc = useTRPC();
   const client = useQueryClient();
   const workspaceQuery = useQuery({
@@ -50,7 +57,12 @@ export function CustomerPhaseWizard({ orderId, fallback }: { orderId: string; fa
     return cb;
   }, []);
   const pendingUploads = useCallback(
-    (stageKey: string) => Object.entries(pending).reduce((sum, [key, n]) => (key.startsWith(`${stageKey}:`) ? sum + n : sum), 0),
+    (stageKey: string, kind?: "document" | "audio") => Object.entries(pending).reduce((sum, [key, n]) => {
+      if (!key.startsWith(`${stageKey}:`)) return sum;
+      const intent = key.slice(stageKey.length + 1);
+      const matches = !kind || (kind === "document" ? intent === "document" : intent !== "document");
+      return matches ? sum + n : sum;
+    }, 0),
     [pending],
   );
 
@@ -92,6 +104,34 @@ export function CustomerPhaseWizard({ orderId, fallback }: { orderId: string; fa
     questionsOn && stage.key === current?.key && questions.data
       ? questions.data.questions.filter((q) => q.required && !q.latestAnswer).map((q) => ({ questionId: q.questionId, prompt: q.prompt }))
       : [];
+  // Questions configured or assigned to the current phase; null while unknown (the step stays until it is known).
+  const questionCount = (stage: WizardStage): number | null =>
+    questionsOn && stage.key === current?.key && questions.data ? questions.data.questions.length : null;
+
+  // Files already uploaded in the current writable phase (same queries as "Uploaded in this phase").
+  const writableCurrent = Boolean(data && current && isWritable(data, current));
+  const docsOn = writableCurrent && Boolean(current?.actions.uploadDocuments);
+  const audioOn = writableCurrent && Boolean(current && (current.actions.recordAudio || current.actions.uploadAudio));
+  const listOptions = { getNextPageParam: (page: { nextCursor: string | null }) => page.nextCursor, retry: false } as const;
+  const docFiles = useInfiniteQuery({
+    ...trpc.files.list.infiniteQueryOptions({ orderId, stageKey: current?.key ?? "", phaseUploadKind: "document", limit: 25 }, listOptions),
+    enabled: docsOn,
+  });
+  const audioFiles = useInfiniteQuery({
+    ...trpc.files.list.infiniteQueryOptions({ orderId, stageKey: current?.key ?? "", phaseUploadKind: "audio", limit: 25 }, listOptions),
+    enabled: audioOn,
+  });
+  const countOf = (pages: readonly { items: readonly UploadedFileLike[] }[] | undefined, audio: boolean) =>
+    (pages ?? []).flatMap((p) => p.items).filter((f) => isCustomerUpload(f, audio)).length;
+  const uploadCounts = (stageKey: string) =>
+    stageKey === current?.key
+      ? { documents: countOf(docFiles.data?.pages, false), audio: countOf(audioFiles.data?.pages, true) }
+      : { documents: 0, audio: 0 };
+  // A list that failed once does not hold the steps back (they show what is known; the server checks again).
+  const settled = (q: { isPending: boolean; failureCount: number }) => !q.isPending || q.failureCount > 0;
+  const factsReady = (stage: WizardStage) =>
+    stage.key !== current?.key ||
+    ((!questionsOn || settled(questions)) && (!docsOn || settled(docFiles)) && (!audioOn || settled(audioFiles)));
 
   // A phase that waits for payment links to the first payable invoice (its page has "Pay online").
   const waitsForPayment = current?.waitingOn === "payment";
@@ -152,9 +192,33 @@ export function CustomerPhaseWizard({ orderId, fallback }: { orderId: string; fa
     }
   };
 
+  const paymentAction = payable ? (
+    // The primary action of the payment waiting screen; the invoice number sits beside it (and is in the name).
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+      <Link
+        href={`/invoices/${encodeURIComponent(payable.invoicePublicId)}`}
+        className={buttonClasses("primary")}
+        aria-label={payable.invoiceNumber ? `Pay now, invoice ${payable.invoiceNumber}` : undefined}
+      >
+        Pay now
+      </Link>
+      {payable.invoiceNumber ? <span aria-hidden="true" className="min-w-0 break-words text-sm text-muted">Invoice {payable.invoiceNumber}</span> : null}
+    </div>
+  ) : invoices.isSuccess && waitsForPayment ? <p>{INVOICE_PREPARING_MESSAGE}</p> : null;
+  // Derived workflows (formats 1/2) have no phase actions: the order-level wizard offers what the server allows.
+  const derivedKind = derivedWaitingKind(workspace);
+  const derivedBody = workspace.derived ? (
+    <DerivedOrderWizard
+      orderId={orderId}
+      waitingKind={derivedKind}
+      waitingAction={derivedKind === "payment" ? paymentAction : derivedKind === "delivered" ? completion : waitingAction?.(derivedKind)}
+    />
+  ) : undefined;
+
   return (
     <PhaseWizard
       workspace={workspace}
+      currentBody={derivedBody}
       renderAction={renderAction}
       renderStageExtras={(stage) =>
         hasFileActions(stage) ? (
@@ -166,19 +230,36 @@ export function CustomerPhaseWizard({ orderId, fallback }: { orderId: string; fa
       error={error}
       pendingUploads={pendingUploads}
       unansweredRequired={unansweredRequired}
+      questionCount={questionCount}
+      uploadCounts={uploadCounts}
+      factsReady={factsReady}
+      waitingAction={waitingAction}
+      completion={completion}
       announcement={announcement}
-      paymentAction={payable ? (
-        <Link href={`/invoices/${encodeURIComponent(payable.invoicePublicId)}`} className="inline-flex min-h-11 items-center font-semibold text-action underline underline-offset-2">
-          {payable.invoiceNumber ? `Pay invoice ${payable.invoiceNumber}` : "Pay the outstanding invoice"}
-        </Link>
-      ) : invoices.isSuccess && waitsForPayment ? <p>{INVOICE_PREPARING_MESSAGE}</p> : null}
+      paymentAction={paymentAction}
       onNext={(stage) => run(() => next.mutateAsync({ orderId, stageKey: stage.key, expectedVersion: workspace.version }))}
       onSubmit={(stage, ack) => run(() => submit.mutateAsync({ orderId, stageKey: stage.key, expectedVersion: workspace.version, ...(ack ? { ack } : {}) }))}
     />
   );
 }
 
+/** What a derived order waits for when the customer has nothing to do there. */
+export function derivedWaitingKind(workspace: WizardWorkspace): WaitingKind {
+  if (workspace.progress.canceled) return "canceled";
+  const current = currentStage(workspace);
+  if (!current) return "delivered";
+  return current.waitingOn ?? "team";
+}
+
 /** The phase ZIP is offered where the phase lists files; the server decides what it may contain. */
 export function hasFileActions(stage: WizardStage): boolean {
   return stage.actions.uploadDocuments || stage.actions.recordAudio || stage.actions.uploadAudio || stage.actions.teamFileReview;
+}
+
+interface UploadedFileLike { visibility: string; deletedAt: unknown; supersededAt: unknown; category: string; contentType: string }
+
+/** A customer's own upload in a phase list, as "Uploaded in this phase" shows it. */
+export function isCustomerUpload(file: UploadedFileLike, audio: boolean): boolean {
+  return file.visibility === "customer_visible" && !file.deletedAt && !file.supersededAt &&
+    file.category !== "deliverable" && file.contentType.startsWith("audio/") === audio;
 }

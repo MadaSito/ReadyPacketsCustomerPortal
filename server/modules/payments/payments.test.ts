@@ -1001,7 +1001,7 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
     });
   });
 
-  it("enforces Decision 12 double verification: return URL & reconcile alone never mark paid; mismatched fetch refuses; valid webhook + fetch books once and fires invoice.paid", async () => {
+  it("enforces Increment 08 D5 payment confirmation: return URL alone never marks paid; strict lookup/reconcile or verified webhook books once and fires invoice.paid", async () => {
     const h = createHarness();
     const webhookSecret = "whsec_doubleverify_secret_9999";
     await h.payments.admin.updateSettings(adminPrincipal, {
@@ -1034,21 +1034,35 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
       .where(eq(paymentAttempts.publicId, started1.attemptPublicId));
     const sessionId1 = att1Before!.providerRef!;
 
-    // 1. Provider marks session paid, BEFORE any signed webhook arrives:
-    //    reconciliation MUST NOT mark invoice paid (`awaiting_webhook`).
-    h.stripeFake.markPaid(sessionId1);
+    // 1. Increment 08 D5 (replaces Decision 12): Provider marks session paid BEFORE any signed webhook arrives:
+    //    Stripe reconciliation books it idempotently via `provider_lookup` when all strict session checks match.
+    const { invoice: invLookupRec } = await h.createIssuedInvoiceForCustomerA(32_000);
+    const startedLookupRec = await h.payments.startCheckout(
+      invLookupRec.invoicePublicId,
+      { successPath: "/checkout/return", cancelPath: "/checkout/cancel" },
+      { principal: customerAPrincipal, idempotencyKey: "idem-dv-lookup-rec" },
+    );
+    if (startedLookupRec.mode !== "redirect") throw new Error("expected redirect");
+    const [attLookupBefore] = await tdb.db
+      .select()
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, startedLookupRec.attemptPublicId));
+    h.stripeFake.markPaid(attLookupBefore!.providerRef!);
     const recBeforeWebhook = await h.payments.reconcilePendingAttempts();
-    expect(recBeforeWebhook.booked).toBe(0);
-    expect(recBeforeWebhook.stillPending).toBeGreaterThanOrEqual(1);
+    expect(recBeforeWebhook.booked).toBe(1);
 
-    const statusBeforeWebhook = await h.payments.getCheckoutStatus(customerAPrincipal, {
-      attemptPublicId: started1.attemptPublicId,
+    const statusLookupBooked = await h.payments.getCheckoutStatus(customerAPrincipal, {
+      attemptPublicId: startedLookupRec.attemptPublicId,
     });
-    expect(statusBeforeWebhook.invoiceStatus).toBe("issued");
-    expect(statusBeforeWebhook.balanceDueMinor).toBe(48_000);
-    expect(statusBeforeWebhook.attempt?.status).toBe("redirected");
+    expect(statusLookupBooked.invoiceStatus).toBe("paid");
+    expect(statusLookupBooked.balanceDueMinor).toBe(0);
+    expect(statusLookupBooked.attempt?.status).toBe("paid");
+    expect(statusLookupBooked.attempt?.bookingSource).toBe("provider_lookup");
+    h.paidListenerEvents.length = 0;
+    h.referralEvents.length = 0;
 
     // 2. Forged signature and stale timestamp (> 300s) are rejected with 400 and audited.
+    h.stripeFake.markPaid(sessionId1);
     const validEventPayload = Buffer.from(
       JSON.stringify({
         id: "evt_test_paid_001",

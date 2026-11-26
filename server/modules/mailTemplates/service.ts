@@ -30,7 +30,7 @@ import {
   type MailTemplateVariableSpec,
   type MailTemplateVersionState,
 } from "./schema.js";
-import { buildSystemTemplateMetadata, type SystemMailTemplateMetadata } from "./systemCatalogue.js";
+import { buildSystemTemplateMetadata, systemOrderReferenceSamples, type SystemMailTemplateMetadata } from "./systemCatalogue.js";
 
 const VERIFY_AUDIT_KEY = "jobs.mail.verify_audit_copy";
 const TEST_VERSION_PREFIX = "mail_templates.test_v.";
@@ -359,7 +359,7 @@ export function createMailTemplatesService(deps: ModuleDeps) {
         category: r.category,
         name: r.name,
         description: r.description,
-        declaredVars: r.declaredVarsJson,
+        declaredVars: r.kind === "system" ? systemOrderReferenceSamples(r.declaredVarsJson) : r.declaredVarsJson,
         hasPublishedOverride: r.activePublishedVersionId !== null,
         hasWorkingDraft: r.workingDraftVersionId !== null,
         activeFormat:
@@ -422,7 +422,7 @@ export function createMailTemplatesService(deps: ModuleDeps) {
       category: tpl.category,
       name: tpl.name,
       description: tpl.description,
-      declaredVars: tpl.declaredVarsJson,
+      declaredVars: tpl.kind === "system" ? systemOrderReferenceSamples(tpl.declaredVarsJson) : tpl.declaredVarsJson,
       hasPublishedOverride: activePublishedRow !== null,
       hasWorkingDraft: workingDraftRow !== null,
       activeFormat: activePublishedRow?.format ?? (tpl.kind === "system" ? "text" : "html"),
@@ -1292,7 +1292,8 @@ export function createMailTemplatesService(deps: ModuleDeps) {
         }
 
         const varsObj: Record<string, string> = {};
-        for (const spec of tpl.declaredVarsJson) {
+        const sampleSpecs = tpl.kind === "system" ? systemOrderReferenceSamples(tpl.declaredVarsJson) : tpl.declaredVarsJson;
+        for (const spec of sampleSpecs) {
           const override = input.sampleVars?.[spec.name];
           varsObj[spec.name] = override !== undefined && override !== "" ? override : spec.sampleValue;
         }

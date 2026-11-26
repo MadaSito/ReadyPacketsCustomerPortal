@@ -42,3 +42,16 @@ scripts/dev/lint.sh server/modules/portable client/src/features/portable
 - **Recovery**: The worker safe-retry contract is bounded by Jobs attempt limits and current approver authority. If attempts are exhausted or authorization/audit is unavailable, inspect the Job Console and oldest durable import checkpoint; the transfer can remain at its last checkpoint. No automatic rollback of committed rows, reservation clearance or unattended resume across expired approval. Decide how operators reauthorize or resolve held work without bypassing immutable receipts.
 - **Availability and scope**: Encryption and verification hold the initiating request open; proxy limits and scratch budgets require environment testing. Packaging compares files to the snapshot and live checks, not an object-store snapshot. No scheduled, remote-delivered, multi-part, or production-tested bulk transfer. A passphrase protects custody but does not independently prove who originally produced a package.
 - **Final acceptance**: Two distinct administrators are required across apply approval and acceptance. The accepting administrator attests separate access, lock and authorized-download checks; the automated service only verifies defined data and custody receipts. Neither legacy source compatibility nor production target acceptance was exercised by this suite.
+
+## Increment 08
+
+- **Tested (`portable.test.ts`, 12 cases, real MySQL with the 08 schema in the working tree; run under the light lock):**
+  - Setup: a customer with stored parts (Zeus Greene, preferred "Zed") and a saved billing profile, a root order and one order added to it.
+  - Export: exporting only the addition writes both orders, with `groupRootOrderPublicId` on the addition and no such key on the root. The customer record carries the parts and `billingProfile`, and the package verifies.
+  - Import into a second installation: no plan conflicts and reconciliation finds 0 discrepancies. The target customer has the display name "Zeus Greene", the stored parts and an identical billing profile, and the target addition points at the target root.
+  - Pure cases: a legacy record (display name in `preferredName`) keeps its name with no parts; a record with no billing profile gives null; invalid parts and an invalid country are refused. Group links: missing root, self-link, a root that is itself an addition, and a different currency or customer are each refused.
+  - The existing cases still pass, including the legacy-shape customer.
+- **Type-checked and linted:** full `tc.sh` shows no errors in portable paths; eslint passes on the touched files with `--max-warnings 0`. Contract tests: golden 4/4, roundtrip 8/8, legacy 13/13.
+- **Not tested:** a package where an addition comes before its root (the worker reorders; our exporter always writes roots first); an increment 07 installation reading an 08 package; a real backup and restore with `customer_billing_profiles`.
+- **Note:** the main block's `beforeAll` limit was raised from 20 s to 60 s because it timed out on the loaded 2-vCPU host.
+

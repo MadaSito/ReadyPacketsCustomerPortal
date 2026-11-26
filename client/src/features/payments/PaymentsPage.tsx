@@ -2,12 +2,18 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tansta
 import { CreditCard, RefreshCw, ShieldCheck, Wrench } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { Link } from "wouter";
-import type { ActivePaymentProvider, PaymentAttemptStatus, PaymentWebhookStatus } from "@server/modules/payments/schema";
+import type {
+  ActivePaymentProvider,
+  PaymentAttemptStatus,
+  PaymentBookingSource,
+  PaymentWebhookStatus,
+} from "@server/modules/payments/schema";
 import { errorMessage, useTRPC, useTRPCClient } from "@/lib/trpc";
 import {
   Badge, Button, Callout, Card, ConfirmDialog, DataTable, DateTime, Dialog, EmptyState, ErrorState, Field, FilterBar,
   LoadMore, Money, PageHeader, Select, Skeleton, StepUpCancelledError, Tabs, useStepUp, useToast,
 } from "@/ui";
+import { AdminCheckStripePaymentButton } from "./AdminCheckStripePaymentButton";
 import { PaymentSettings, providerLabels, type PaymentSettingsInput, type PaymentSettingsView } from "./PaymentSettings";
 
 const providers = [{ value: "", label: "All providers" }, { value: "stripe", label: "Stripe" }, { value: "square", label: "Square" }];
@@ -24,6 +30,18 @@ function options(states: Record<string, string>) {
 function attemptBadge(status: PaymentAttemptStatus) {
   return <Badge tone={status === "paid" ? "success" : status === "failed" ? "danger" :
     status === "redirected" ? "info" : "neutral"}>{attemptStates[status]}</Badge>;
+}
+const bookingSourceLabels: Record<PaymentBookingSource, string> = {
+  webhook: "Webhook",
+  provider_lookup: "Provider lookup",
+};
+function bookingSourceBadge(source: PaymentBookingSource | null | undefined) {
+  if (!source) return <span className="text-xs text-muted">Not booked</span>;
+  return (
+    <Badge tone={source === "webhook" ? "success" : "info"}>
+      {bookingSourceLabels[source]}
+    </Badge>
+  );
 }
 function webhookBadge(status: PaymentWebhookStatus) {
   return <Badge tone={status === "processed" ? "success" : status === "verification_mismatch" || status === "attention_required" ? "danger" :
@@ -139,6 +157,7 @@ function Attempts() {
         { key: "invoice", header: "Invoice ID", primary: true, cell: (row) => smallId(row.invoicePublicId) },
         { key: "provider", header: "Provider", cell: (row) => providerBadge(row.provider, row.environment) },
         { key: "status", header: "Status", cell: (row) => attemptBadge(row.status) },
+        { key: "bookingSource", header: "Booking source", hideOnMobile: true, cell: (row) => bookingSourceBadge(row.bookingSource) },
         { key: "amount", header: "Amount", align: "end", cell: (row) => <Money value={{ amountMinor: row.amountMinor, currency: row.currency }} /> },
         { key: "created", header: "Created", hideOnMobile: true, cell: (row) => <DateTime value={row.createdAt} /> },
       ]}
@@ -164,6 +183,7 @@ function AttemptDetails({ id }: { id: string }) {
       <div><dt className="font-semibold">Attempt ID</dt><dd>{smallId(attempt.attemptPublicId)}</dd></div>
       <div><dt className="font-semibold">Invoice ID</dt><dd>{smallId(attempt.invoicePublicId)}</dd></div>
       <div><dt className="font-semibold">Status</dt><dd>{attemptBadge(attempt.status)}</dd></div>
+      <div><dt className="font-semibold">Booking source</dt><dd>{bookingSourceBadge(attempt.bookingSource)}</dd></div>
       <div><dt className="font-semibold">Provider</dt><dd>{providerBadge(attempt.provider, attempt.environment)}</dd></div>
       <div><dt className="font-semibold">Amount</dt><dd><Money value={{ amountMinor: attempt.amountMinor, currency: attempt.currency }} /></dd></div>
       <div><dt className="font-semibold">Created</dt><dd><DateTime value={attempt.createdAt} /></dd></div>
@@ -171,6 +191,18 @@ function AttemptDetails({ id }: { id: string }) {
       {attempt.providerPaymentRef ? <div><dt className="font-semibold">Provider payment ID</dt><dd>{smallId(attempt.providerPaymentRef)}</dd></div> : null}
       {attempt.failureReasonCode ? <div><dt className="font-semibold">Reason code</dt><dd>{smallId(attempt.failureReasonCode)}</dd></div> : null}
     </dl>
+    {attempt.provider === "stripe" && attempt.status !== "paid" ? (
+      <div className="flex flex-wrap items-center gap-2">
+        <AdminCheckStripePaymentButton
+          invoicePublicId={attempt.invoicePublicId}
+          invoiceStatus="issued"
+          attemptPublicId={attempt.attemptPublicId}
+          onUpdated={() => {
+            void detail.refetch();
+          }}
+        />
+      </div>
+    ) : null}
     <h3 className="font-semibold">Verified receipts</h3>
     {webhooks.length ? <ul className="grid gap-2">
       {webhooks.map((row) => <li key={row.webhookPublicId} className="flex flex-wrap items-center gap-2 rounded-lg border border-line p-2">
@@ -258,7 +290,7 @@ export default function PaymentsPage() {
       attempts={<Attempts />} webhooks={<Webhooks />} />
     <ConfirmDialog title="Reconcile pending payments?" open={reconcileOpen} onOpenChange={setReconcileOpen} confirmLabel="Reconcile now" onConfirm={runReconcile}>
       <Callout tone="info" title="What reconciliation does">
-        Checks provider records for pending attempts. It can book payments backed by a verified webhook, but does not start any new charges.
+        Checks provider records for pending attempts, books verified completed Stripe payments when session binding, amount, currency, and environment match, and never starts any new charges.
       </Callout>
     </ConfirmDialog>
   </>;

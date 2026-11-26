@@ -4,7 +4,9 @@ import { useState, type FormEvent } from "react";
 import { Link } from "wouter";
 import { useRefreshSession, useSession } from "@/lib/session";
 import { errorMessage, useTRPC } from "@/lib/trpc";
-import { Button, Card, ErrorState, Field, Input, KeyValueList, PageHeader, Skeleton, useToast } from "@/ui";
+import type { MeUser } from "@/lib/authApi";
+import { Button, Card, ErrorState, KeyValueList, PageHeader, Skeleton, useToast } from "@/ui";
+import { NameFields, validateNameParts, type NameErrors, type NameValues } from "../NameFields";
 import { ROLE_LABELS, UserStatusBadge } from "../shared";
 import { SsoLinkCard } from "../sso/SsoLinkCard";
 
@@ -20,7 +22,7 @@ export default function AccountPage() {
     <>
       {header}
       <div className="grid min-w-0 gap-6 lg:grid-cols-2">
-        <ProfileCard key={me.user.publicId} name={me.user.name} />
+        <ProfileCard key={me.user.publicId} user={me.user} />
         <Card title="Account details">
           <KeyValueList
             columns={1}
@@ -42,20 +44,31 @@ export default function AccountPage() {
   );
 }
 
-function ProfileCard({ name: initial }: { name: string }) {
+/** D1: accounts from before increment 08 see their derived first/last name pre-filled; saving stores the parts. */
+export function initialNameValues(user: Pick<MeUser, "name" | "firstName" | "lastName" | "preferredName">): NameValues {
+  if (user.firstName !== undefined || user.lastName !== undefined) {
+    return { firstName: user.firstName ?? "", lastName: user.lastName ?? "", preferredName: user.preferredName ?? "" };
+  }
+  const tokens = user.name.trim().split(/\s+/).filter(Boolean);
+  return { firstName: tokens[0] ?? "", lastName: tokens.length > 1 ? tokens[tokens.length - 1]! : "", preferredName: "" };
+}
+
+function ProfileCard({ user }: { user: MeUser }) {
   const trpc = useTRPC();
   const toast = useToast();
   const refresh = useRefreshSession();
-  const [name, setName] = useState(initial);
+  const [names, setNames] = useState<NameValues>(() => initialNameValues(user));
+  const [errors, setErrors] = useState<NameErrors>({});
   const [error, setError] = useState<string>();
   const update = useMutation(trpc.identity.profile.update.mutationOptions());
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault();
-    const trimmed = name.trim();
-    if (!trimmed) return setError("Enter your name.");
+    const check = validateNameParts(names);
+    setErrors(check.ok ? {} : check.errors);
+    if (!check.ok) return;
     setError(undefined);
     try {
-      await update.mutateAsync({ name: trimmed });
+      await update.mutateAsync(check.data);
       await refresh();
       toast.show({ tone: "success", title: "Profile updated" });
     } catch (err) {
@@ -65,9 +78,8 @@ function ProfileCard({ name: initial }: { name: string }) {
   return (
     <Card title="Profile">
       <form onSubmit={onSubmit} noValidate className="flex flex-col gap-4">
-        <Field label="Full name" required error={error}>
-          <Input value={name} onChange={(e) => setName(e.target.value)} autoComplete="name" maxLength={120} />
-        </Field>
+        <NameFields value={names} onChange={setNames} errors={errors} />
+        {error ? <p role="alert" className="text-sm text-danger">{error}</p> : null}
         <div className="flex justify-end"><Button type="submit" loading={update.isPending}>Save profile</Button></div>
       </form>
     </Card>

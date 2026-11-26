@@ -76,6 +76,7 @@ export type PaymentSettingsView = Pick<
         | "reverificationReasons"
         | "lastCheckoutFailure"
         | "lastCheckoutProbe"
+        | "webhookDelivery"
       >
     >;
   square: PaymentsAdminSettingsView["square"];

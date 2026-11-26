@@ -6,8 +6,15 @@
  * prices, discounts, tax rates, or totals as authoritative values; any extra field is rejected with `BAD_INPUT`.
  */
 import { z } from "zod";
+import {
+  billingDetailsSchema,
+  type BillingDetails,
+  type BillingDetailsInput,
+} from "../../../shared/billingDetails.js";
 import type { ModuleLifecycle, SessionPrincipal, Tx } from "../../core/types.js";
 import type { PublishedPolicyView } from "../compliance/index.js";
+
+export { billingDetailsSchema, type BillingDetails, type BillingDetailsInput };
 
 const ulidSchema = z.string().regex(/^[0-9A-HJKMNP-TV-Z]{26}$/, "Identifier format is not valid.");
 const idempotencyKeySchema = z.string().regex(/^[A-Za-z0-9._:-]{8,128}$/, "Idempotency key is not valid.");
@@ -49,26 +56,6 @@ export const upsellOfferIdentifierSchema = z.union([
   z.literal(BUNDLE_COMPLETION_OFFER_KEY),
 ]);
 
-export const billingDetailsSchema = z
-  .object({
-    fullName: nfcTrim(1, 160),
-    company: nfcOptional(160).optional().default(""),
-    email: nfcTrim(3, 254).pipe(z.email("Enter a valid billing email address.")),
-    country: z
-      .string()
-      .transform((v) => v.trim().toUpperCase())
-      .pipe(z.string().regex(/^[A-Z]{2}$/, "Select a two-letter country code.")),
-    region: nfcOptional(64).optional().default(""),
-    addressLine1: nfcTrim(1, 200),
-    addressLine2: nfcOptional(200).optional().default(""),
-    city: nfcTrim(1, 120),
-    postalCode: nfcTrim(1, 32),
-    taxId: nfcOptional(64).optional().default(""),
-  })
-  .strict();
-
-export type BillingDetailsInput = z.infer<typeof billingDetailsSchema>;
-
 export const cartItemSelectionSchema = z
   .object({
     productPublicId: ulidSchema,
@@ -82,6 +69,15 @@ export const addItemsInputSchema = z
     projectName: nfcOptional(160).optional(),
     note: nfcOptional(4000).optional(),
     replacePacketTiers: z.boolean().optional().default(true),
+    /** Increment 08 (D3): optional target order public ID (`null` clears target, `string` sets/switches target). */
+    addToOrderPublicId: ulidSchema.nullable().optional(),
+  })
+  .strict();
+
+export const setCartTargetInputSchema = z
+  .object({
+    expectedVersion: z.number().int().min(1).max(1_000_000_000).optional(),
+    addToOrderPublicId: ulidSchema.nullable(),
   })
   .strict();
 
@@ -116,6 +112,7 @@ export const saveDraftDetailsInputSchema = z
     projectName: nfcOptional(160),
     note: nfcOptional(4000).optional().default(""),
     billing: billingDetailsSchema.nullable().optional(),
+    addToOrderPublicId: ulidSchema.nullable().optional(),
   })
   .strict();
 
@@ -239,19 +236,91 @@ export const policyAcceptanceInputSchema = z
   })
   .strict();
 
+export const checkoutBillingChoiceSchema = z.enum(["saved", "custom"]);
+export type CheckoutBillingChoice = z.infer<typeof checkoutBillingChoiceSchema>;
+
 export const checkoutInputSchema = z
   .object({
     cartPublicId: ulidSchema,
     expectedVersion: z.number().int().min(1).max(1_000_000_000),
     /** Optional client-observed grand total guard so price/promo changes require explicit customer re-confirmation. */
     expectedTotalMinor: z.number().int().min(0).max(1_000_000_000_000).optional(),
-    projectName: nfcTrim(1, 160),
+    /** Required (`1..160` chars) for standalone orders; optional/ignored when adding packets to an earlier order (D3). */
+    projectName: nfcOptional(160).optional().default(""),
     note: nfcOptional(4000).optional().default(""),
-    billing: billingDetailsSchema,
+    /**
+     * Increment 08 (D4):
+     * - `"saved"`: loads saved billing profile server-side inside `tx` (`billingProfile.getForUserInTx`); ignores client `billing`.
+     * - `"custom"` (default): validates `billing` and, when `saveAsBillingProfile === true`, saves it via `billingProfile.saveForUserInTx`.
+     */
+    billingSource: checkoutBillingChoiceSchema.optional(),
+    billing: billingDetailsSchema.optional(),
+    saveAsBillingProfile: z.boolean().optional().default(false),
+    /**
+     * Optimistic concurrency / generation tokens for `customer_billing_profiles` (D4):
+     * - When `savedBillingVersion === 0` (and `savedBillingPublicId` omitted or `null`), asserts no saved profile
+     *   existed when checkout rendered (prevents auto-checked save from overwriting a profile saved in another tab).
+     * - When `savedBillingVersion >= 1` + `savedBillingPublicId`, asserts the saved profile has not been edited,
+     *   cleared, or replaced (ABA protection) since checkout rendered.
+     */
+    savedBillingPublicId: z.string().trim().min(1).max(36).nullable().optional(),
+    savedBillingVersion: z.number().int().min(0).max(1_000_000_000).optional(),
     policyAcceptances: z.array(policyAcceptanceInputSchema).max(25).optional().default([]),
     idempotencyKey: idempotencyKeySchema,
   })
-  .strict();
+  .strict()
+  .superRefine((val, ctx) => {
+    const effectiveSource = val.billingSource ?? "custom";
+    if (effectiveSource === "custom" && !val.billing) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["billing"],
+        message: "Provide billing information or select your saved billing information.",
+      });
+    }
+    if (effectiveSource === "saved") {
+      if (val.savedBillingVersion === undefined || val.savedBillingVersion < 1) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["savedBillingVersion"],
+          message: "savedBillingVersion must be at least 1 when billingSource is saved.",
+        });
+      }
+      if (!val.savedBillingPublicId) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["savedBillingPublicId"],
+          message: "savedBillingPublicId is required when billingSource is saved.",
+        });
+      }
+      return;
+    }
+    if (val.saveAsBillingProfile && val.savedBillingVersion === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["savedBillingVersion"],
+        message: "savedBillingVersion is required when saveAsBillingProfile is true.",
+      });
+    }
+    if (val.savedBillingVersion !== undefined && val.savedBillingVersion >= 1 && !val.savedBillingPublicId) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["savedBillingPublicId"],
+        message: "savedBillingPublicId is required when savedBillingVersion is 1 or greater.",
+      });
+    }
+    if (
+      val.savedBillingVersion === 0 &&
+      val.savedBillingPublicId !== undefined &&
+      val.savedBillingPublicId !== null
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["savedBillingPublicId"],
+        message: "savedBillingPublicId must be null or omitted when savedBillingVersion is 0.",
+      });
+    }
+  });
 
 export const checkoutTargetInputSchema = z
   .object({
@@ -304,6 +373,8 @@ export interface CartLineView {
   lineTotalMinor: number;
   currency: string;
   available: boolean;
+  /** Increment 08 (D3): true when this item's packet is already part of the cart's target project. */
+  alreadyInTargetProject?: boolean;
 }
 
 export interface CartBundleQuoteView {
@@ -388,6 +459,23 @@ export interface CartPlaceOrderAgreementView {
   signatureMode: "checkbox" | "typed_name";
 }
 
+export interface CartAddToOrderView {
+  /** Stored target order public ID on the cart (`carts.add_to_order_public_id`). */
+  orderPublicId: string;
+  /** Resolved group root public ID (`null` when the target order can no longer accept additions). */
+  rootPublicId: string | null;
+  rootReference: string | null;
+  projectName: string | null;
+  currency: string | null;
+  packetNumbers: number[];
+  /** True when the target order is currently owned and addable by this customer. */
+  targetAvailable: boolean;
+  /** Item public IDs in the cart whose packet is already in the target project. */
+  conflictingItemPublicIds: string[];
+  /** True when cart currency differs from the target project's currency. */
+  currencyMismatch: boolean;
+}
+
 export interface CartView {
   cartPublicId: string | null;
   version: number;
@@ -395,7 +483,9 @@ export interface CartView {
   itemCount: number;
   projectName: string;
   note: string;
-  billing: BillingDetailsInput | null;
+  billing: BillingDetails | null;
+  /** Increment 08 (D3): resolved add-on target order/project when `carts.add_to_order_public_id` is set. */
+  addToOrder?: CartAddToOrderView | null;
   items: CartLineView[];
   hasUnavailableItems: boolean;
   mixedCurrency: boolean;
@@ -625,6 +715,7 @@ export interface AdminOpenCartSummary {
   customerPublicId: string;
   customerRef: string | null;
   projectName: string | null;
+  addToOrderPublicId?: string | null;
   itemCount: number;
   packetSummary: string;
   currency: string | null;
@@ -661,16 +752,17 @@ export interface CartModule extends ModuleLifecycle {
   onInvoicePaidInTx(input: CartInvoicePaidInput, tx: Tx): Promise<CartInvoicePaidResult>;
   getBadgeCount(principal: SessionPrincipal): Promise<{ enabled: boolean; itemCount: number }>;
   getMyCart(principal: SessionPrincipal): Promise<CartView>;
-  addItems(principal: SessionPrincipal, input: z.infer<typeof addItemsInputSchema>): Promise<CartView>;
+  addItems(principal: SessionPrincipal, input: z.input<typeof addItemsInputSchema>): Promise<CartView>;
   updateItem(principal: SessionPrincipal, input: z.infer<typeof updateItemInputSchema>): Promise<CartView>;
   removeItem(principal: SessionPrincipal, input: z.infer<typeof removeItemInputSchema>): Promise<CartView>;
   clearCart(principal: SessionPrincipal, input: z.infer<typeof clearCartInputSchema>): Promise<CartView>;
-  saveDraftDetails(principal: SessionPrincipal, input: z.infer<typeof saveDraftDetailsInputSchema>): Promise<CartView>;
+  setTarget(principal: SessionPrincipal, input: z.input<typeof setCartTargetInputSchema>): Promise<CartView>;
+  saveDraftDetails(principal: SessionPrincipal, input: z.input<typeof saveDraftDetailsInputSchema>): Promise<CartView>;
   applyCode(principal: SessionPrincipal, input: z.infer<typeof applyCodeInputSchema>): Promise<CartView>;
   removeCode(principal: SessionPrincipal, input?: z.infer<typeof removeCodeInputSchema>): Promise<CartView>;
   acceptUpsell(principal: SessionPrincipal, input: z.infer<typeof acceptUpsellInputSchema>): Promise<CartView>;
   dismissUpsell(principal: SessionPrincipal, input: z.infer<typeof dismissUpsellInputSchema>): Promise<CartView>;
-  checkout(principal: SessionPrincipal, input: z.infer<typeof checkoutInputSchema>): Promise<CheckoutCartResult>;
+  checkout(principal: SessionPrincipal, input: z.input<typeof checkoutInputSchema>): Promise<CheckoutCartResult>;
   getCheckoutStatus(principal: SessionPrincipal, input: z.infer<typeof checkoutTargetInputSchema>): Promise<CheckoutStatusResult>;
   restoreCheckout(principal: SessionPrincipal, input: z.infer<typeof checkoutTargetInputSchema>): Promise<RestoreCheckoutResult>;
   adminListOpen(

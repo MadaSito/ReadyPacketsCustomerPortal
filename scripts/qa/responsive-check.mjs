@@ -7,13 +7,14 @@
 // QA_WIDTHS (comma list, partial run). Never prints raw Playwright errors (they may include tokens).
 import { createQaPages, launchQaBrowser } from "./lib/browser.mjs";
 import { openQaRoute, qaRouteScenarios, QaRateLimitedError, withQaRateLimitRetry } from "./lib/routes.mjs";
+import { INCREMENT_08_WIDTHS } from "./lib/increment-08.mjs";
 
 const ALL_WIDTHS = [240, 320, 390, 768, 1024, 1440, 1920, 2560];
 const MIN_TARGET = 24;
 
-function widths() {
+function widths(suite) {
   const raw = process.env.QA_WIDTHS;
-  if (!raw) return { list: ALL_WIDTHS, partial: false };
+  if (!raw) return { list: suite ? INCREMENT_08_WIDTHS : ALL_WIDTHS, partial: false };
   const list = raw.split(",").map((value) => Number(value.trim())).filter((value) => Number.isInteger(value) && value >= 200 && value <= 4000);
   if (!list.length) throw new Error("QA_WIDTHS must be a comma-separated list of CSS pixel widths (200–4000).");
   return { list, partial: true };
@@ -76,7 +77,8 @@ async function measure(page, minTarget) {
 }
 
 async function main() {
-  const { list, partial: partialWidths } = widths();
+  const { cases, missing, partial, suite } = await qaRouteScenarios();
+  const { list, partial: partialWidths } = widths(suite);
   const { browser, baseUrl } = await launchQaBrowser();
   const reuse = process.env.QA_REUSE_CONTEXT === "1";
   const pages = createQaPages(browser, baseUrl, reuse);
@@ -86,8 +88,7 @@ async function main() {
   let rateLimited = 0;
   let unchecked = 0;
   try {
-    const { cases, missing, partial } = await qaRouteScenarios();
-    if (partial || partialWidths) console.log("Partial run: QA_ROUTE_FILTER or QA_WIDTHS was supplied. Not release-wide responsive evidence.");
+    if (partial || partialWidths) console.log(`Partial run: ${suite ?? "route or width filter"}. Not release-wide responsive evidence.`);
     for (const message of missing) console.error(`NOT CHECKED ${message}`);
     const matrix = cases.flatMap((scenario) => ["light", "dark"].flatMap((theme) =>
       list.map((width) => ({ scenario, theme, width, retry: false }))));

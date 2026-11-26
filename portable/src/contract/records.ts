@@ -53,6 +53,20 @@ export const CustomerRecord = z.strictObject({
     .array(z.strictObject({ key: Token, label: text(255).nullable(), value: text(4000).nullable() }))
     .max(200)
     .optional(),
+  /** The customer's saved billing contact and address (one per customer). Absent or null = none / unknown.
+   *  Optional in 3.0. A conforming importer validates it again before storing it. */
+  billingProfile: z.strictObject({
+    fullName: text(160, 1),
+    company: text(160),
+    email: z.email().max(254),
+    country: z.string().regex(/^[A-Z]{2}$/),
+    region: text(64),
+    addressLine1: text(200, 1),
+    addressLine2: text(200),
+    city: text(120, 1),
+    postalCode: text(32, 1),
+    taxId: text(64),
+  }).nullable().optional(),
   /** null = unknown (legacy v1/v2 packages did not carry it). */
   createdAt: UtcTime.nullable(),
   updatedAt: UtcTime.nullable(),
@@ -62,6 +76,10 @@ export const OrderRecord = z.strictObject({
   ...base,
   customerPublicId: PublicId,
   orderNumber: text(64, 1),
+  /** The first order of the same project (order group) when this order was added to it later. Absent or null =
+   *  the order is its own root. Must name another order in the same package with the same customer and currency
+   *  that is itself a root. Optional in 3.0. */
+  groupRootOrderPublicId: PublicId.nullable().optional(),
   projectName: text(500).nullable(),
   status: Token,
   paymentStatus: Token,
@@ -397,7 +415,10 @@ export interface ReferenceSpec {
 /** Reference graph. Every reference points to an earlier type in RECORD_TYPE_ORDER (topological). */
 export const REFERENCES: Record<RecordType, ReferenceSpec[]> = {
   customers: [],
-  orders: [{ field: "customerPublicId", target: "customers", nullable: false }],
+  orders: [
+    { field: "customerPublicId", target: "customers", nullable: false },
+    { field: "groupRootOrderPublicId", target: "orders", nullable: true },
+  ],
   "order-items": [{ field: "orderPublicId", target: "orders", nullable: false }],
   "order-status-history": [{ field: "orderPublicId", target: "orders", nullable: false }],
   "order-shares": [

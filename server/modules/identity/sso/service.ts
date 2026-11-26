@@ -27,6 +27,7 @@ import type { IssuedSession, SessionService } from "../sessions.js";
 import type { TransitionService } from "../transitions.js";
 import type { UserRepo } from "../users.js";
 import { toView } from "../users.js";
+import { namePartsFromClaims } from "../normalize.js";
 import { createSignInSignals } from "../signals.js";
 import { USER_ROLES, type UserRole } from "../../../../shared/domain.js";
 import {
@@ -270,6 +271,9 @@ interface StoredResult {
   authTime: number | null;
   email: string | null;
   name: string | null;
+  /** D1 (increment 08). Optional: results stored before 08 lack them. */
+  givenName?: string | null;
+  familyName?: string | null;
   roles: string[];
   /* SAML only (increment 07) */
   saml?: { multipleAuthn: boolean; authnContext: string | null; claimNames: string[] };
@@ -282,7 +286,7 @@ const SECRET_AAD = "sso_configuration.client_secret";
 
 const toStored = (claims: VerifiedEntraClaims): StoredResult => ({
   tid: claims.tenantId, oid: claims.objectId, amr: claims.amr ?? null, authTime: claims.authTime ?? null,
-  email: claims.email, name: claims.name, roles: claims.roles,
+  email: claims.email, name: claims.name, givenName: claims.givenName, familyName: claims.familyName, roles: claims.roles,
 });
 
 export interface SsoInternals {
@@ -943,7 +947,7 @@ export function createSsoService(i: SsoInternals) {
       const facts = samlMfaFacts(assertion, acceptedContextsOf(row));
       const stored: StoredResult = {
         tid: assertion.tenantId, oid: assertion.objectId, amr: null, authTime: Math.floor(assertion.authnInstantMs / 1000),
-        email: assertion.email, name: assertion.name, roles: assertion.roles,
+        email: assertion.email, name: assertion.name, givenName: assertion.givenName, familyName: assertion.familyName, roles: assertion.roles,
         saml: { multipleAuthn: facts.multipleAuthn, authnContext: assertion.authnContextClassRef, claimNames: assertion.attributeNames },
       };
       try {
@@ -1302,8 +1306,11 @@ export function createSsoService(i: SsoInternals) {
     const since = new Date(now().getTime() - 24 * 60 * 60_000);
     const [count] = await tx.select({ n: sql<number>`count(*)` }).from(ssoIdentities).where(and(eq(ssoIdentities.linkMethod, "jit"), gt(ssoIdentities.createdAt, since)));
     if (Number(count?.n ?? 0) >= config.jitDailyLimit) throw refusal("SSO_PROVISIONING_LIMIT", "JIT_DAILY_LIMIT");
-    const name = (result.name?.trim() || result.email.split("@")[0]!).slice(0, 120);
-    const created = await auth.insertUser(tx, { email: result.email, name, role, status: "active", origin: "sso_jit", passwordHash: null, emailVerifiedAt: null });
+    // D1: given/family name claims when present, else the display name split (else the e-mail local part as first name).
+    const nameParts = namePartsFromClaims({ givenName: result.givenName ?? null, familyName: result.familyName ?? null, displayName: result.name })
+      ?? namePartsFromClaims({ givenName: result.email.split("@")[0]! })
+      ?? { firstName: "Entra", lastName: "user", preferredName: null };
+    const created = await auth.insertUser(tx, { email: result.email, nameParts, role, status: "active", origin: "sso_jit", passwordHash: null, emailVerifiedAt: null });
     await tx.update(users).set({ authSource: "entra" }).where(eq(users.id, created.id));
     const t = now();
     await tx.insert(ssoIdentities).values({ userId: created.id, provider: "entra", tenantId: result.tid, objectId: result.oid, linkMethod: "jit", linkedAt: t, verifiedAt: t });

@@ -15,7 +15,8 @@ import {
   sessionProcedure,
   staffProcedure,
 } from "../../trpc/trpc.js";
-import { customerRefSchema, emailSchema, nameSchema } from "./normalize.js";
+import { customerRefSchema, emailSchema, nameInputOf, nameInputShape, namePartsShape, refineNameInput, type NameParts } from "./normalize.js";
+import { billingDetailsSchema } from "../../../shared/billingDetails.js";
 import { AUTH_METHODS } from "../../../shared/domain.js";
 import {
   COUNTRY_RULE_MODES, ENTRA_MFA_MODES, RESTRICTION_SCOPES, SIGN_IN_EVENT_KINDS, SSO_JIT_MODES, SSO_MAPPED_ROLES, SSO_PROTOCOLS, USER_STATUSES,
@@ -97,14 +98,23 @@ const restrictionsInput = z.strictObject({
 
 const statusInput = z.strictObject({ customerId: publicId, status: z.enum(["active", "suspended", "deactivated"]), reasonCode });
 
+const partsOf = (input: { firstName: string; lastName: string; preferredName: string | null }): NameParts => ({
+  firstName: input.firstName, lastName: input.lastName, preferredName: input.preferredName,
+});
+
 export const identityRouter = router({
   passwordPolicy: publicProcedure.query(() => ({ minLength: PASSWORD_POLICY.minLength, maxLength: PASSWORD_POLICY.maxLength })),
 
   register: publicProcedure
     .meta({ rateLimit: "auth_high_risk" })
-    .input(z.strictObject({ email: emailSchema, name: nameSchema, password, referralCode: z.string().trim().max(16).optional() }))
+    // D1/D4 (increment 08): name parts; optional billing information validated IN FULL here, before any account
+    // lookup, so an invalid billing section fails identically for new and existing addresses.
+    .input(z.strictObject({ email: emailSchema, ...nameInputShape, password, referralCode: z.string().trim().max(16).optional(), billing: billingDetailsSchema.nullish() }).superRefine(refineNameInput))
     .mutation(({ ctx, input }) =>
-      ctx.services.identity.auth.register(input, { ipAddress: ctx.request.ipAddress, userAgent: ctx.request.userAgent }),
+      ctx.services.identity.auth.register(
+        { email: input.email, ...nameInputOf(input), password: input.password, ...(input.referralCode !== undefined ? { referralCode: input.referralCode } : {}), billing: input.billing ?? null },
+        { ipAddress: ctx.request.ipAddress, userAgent: ctx.request.userAgent },
+      ),
     ),
 
   signIn: publicProcedure
@@ -159,7 +169,11 @@ export const identityRouter = router({
     const timing = await ctx.services.identity.sessions.timing(ctx.session.sessionId);
     if (!timing) throw new DomainError("UNAUTHENTICATED", "NO_SESSION", "Please sign in to continue.");
     return {
-      user: { publicId: user.publicId, role: user.role, name: user.name, email: user.email, customerRef: user.customerRef, status: user.status },
+      user: {
+        publicId: user.publicId, role: user.role, name: user.name, email: user.email, customerRef: user.customerRef, status: user.status,
+        // D1: greeting uses preferred, else first name; parts are derived for accounts from before 08 until saved.
+        firstName: user.firstName ?? "", lastName: user.lastName ?? "", preferredName: user.preferredName ?? null, greetingName: user.greetingName ?? user.name,
+      },
       state: ctx.session.state,
       pendingSteps: [...ctx.session.pendingSteps],
       nextStep: ctx.session.pendingSteps[0] ?? null,
@@ -185,8 +199,8 @@ export const identityRouter = router({
     }),
 
   profile: router({
-    update: protectedProcedure.input(z.strictObject({ name: nameSchema })).mutation(async ({ ctx, input }) => {
-      await ctx.services.identity.admin.updateOwnProfile(ctx.session, input);
+    update: protectedProcedure.input(z.strictObject(nameInputShape).superRefine(refineNameInput)).mutation(async ({ ctx, input }) => {
+      await ctx.services.identity.admin.updateOwnProfile(ctx.session, nameInputOf(input));
       return { ok: true as const };
     }),
   }),
@@ -326,8 +340,16 @@ export const identityRouter = router({
         .query(({ ctx, input }) => ctx.services.identity.admin.getCustomer(ctx.session, input.customerId)),
       create: adminProcedure
         .use(requireCapability("customers.manage"))
-        .input(z.strictObject({ email: emailSchema, name: nameSchema, customerRef: customerRefSchema.optional() }))
-        .mutation(({ ctx, input }) => ctx.services.identity.admin.createCustomer(ctx.session, input)),
+        .input(z.strictObject({ email: emailSchema, ...nameInputShape, customerRef: customerRefSchema.optional() }).superRefine(refineNameInput))
+        .mutation(({ ctx, input }) =>
+          ctx.services.identity.admin.createCustomer(ctx.session, { email: input.email, ...nameInputOf(input), ...(input.customerRef ? { customerRef: input.customerRef } : {}) }),
+        ),
+      updateName: adminProcedure
+        .use(requireCapability("customers.manage"))
+        .input(z.strictObject({ customerId: publicId, ...namePartsShape, expectedVersion: z.number().int().min(1) }))
+        .mutation(({ ctx, input }) =>
+          ctx.services.identity.admin.updateCustomerName(ctx.session, input.customerId, { nameParts: partsOf(input), expectedVersion: input.expectedVersion }),
+        ),
       resendInvitation: adminProcedure
         .use(requireCapability("customers.manage"))
         .input(z.strictObject({ customerId: publicId }))
@@ -356,8 +378,8 @@ export const identityRouter = router({
         .query(async ({ ctx, input }) => withSignInMethods(ctx.services, await ctx.services.identity.admin.listStaff(ctx.session, input ?? {}))),
       create: adminProcedure
         .use(requireCapability("staff.manage"))
-        .input(z.strictObject({ email: emailSchema, name: nameSchema, role: z.enum(["staff", "admin"]) }))
-        .mutation(({ ctx, input }) => ctx.services.identity.admin.createStaff(ctx.session, input)),
+        .input(z.strictObject({ email: emailSchema, ...nameInputShape, role: z.enum(["staff", "admin"]) }).superRefine(refineNameInput))
+        .mutation(({ ctx, input }) => ctx.services.identity.admin.createStaff(ctx.session, { email: input.email, ...nameInputOf(input), role: input.role })),
       resendInvitation: adminProcedure
         .use(requireCapability("staff.manage"))
         .input(z.strictObject({ userId: publicId }))

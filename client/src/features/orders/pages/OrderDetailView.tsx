@@ -4,7 +4,7 @@
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Suspense, useState, type FormEvent, type ReactNode } from "react";
-import { useParams } from "wouter";
+import { Link, useParams } from "wouter";
 import type { inferRouterOutputs } from "@trpc/server";
 import type { AppRouter } from "@server/trpc/root";
 import { FEATURES, ORDER_TABS } from "@/app/registry";
@@ -17,11 +17,13 @@ import {
 import { ConsoleActions, ReferenceHistory } from "../ConsoleActions";
 import { SharingPanel } from "../SharingPanel";
 import { WorkflowRulesPanel } from "../WorkflowRulesPanel";
+import { CustomerOrderLayout } from "../stages/CustomerOrderLayout";
 import { CustomerPhaseWizard } from "../stages/CustomerPhaseWizard";
 // ── increment 07 panel imports (other owners: one import line each, below this anchor) ──
 import { OrderPhaseConsolePanel } from "../stages/OrderPhaseConsolePanel";
 // ── end increment 07 panel imports ──
 import { ACCESS_ROLE_LABELS, LOCK_DESCRIPTIONS, LockBadge, OrderStatusBadge, money, type LockState } from "../shared";
+import { AddPacketsLink, OrderGroupPanel } from "./OrderGroupPanel";
 
 type Area = "customer" | "console";
 
@@ -83,7 +85,14 @@ export function OrderDetailView({ area }: { area: Area }) {
             ) : null}
           </span>
         }
-        actions={consoleArea ? undefined : <TransitionControl order={order} />}
+        actions={
+          consoleArea ? undefined : (
+            <span className="flex flex-wrap gap-2">
+              <AddPacketsLink orderPublicId={order.publicId} canAddPackets={order.canAddPackets} />
+              <TransitionControl order={order} />
+            </span>
+          )
+        }
       />
       {consoleArea ? (
         <div className="mb-6 flex flex-col gap-2">
@@ -92,6 +101,9 @@ export function OrderDetailView({ area }: { area: Area }) {
           <TransitionControl order={order} />
         </div>
       ) : null}
+      {/* ── increment 08 order group (orders_engineer) ── */}
+      <OrderGroupPanel group={order.group} area={area} />
+      {/* ── end increment 08 order group ── */}
       {lockState !== "none" ? (
         <div className="mb-4">
           <Callout tone={lockState === "legal_hold" ? "warning" : "info"} title={undefined}>
@@ -108,23 +120,49 @@ export function OrderDetailView({ area }: { area: Area }) {
         );
       })}
       {/* Banners (e.g. a blocking acceptance gate) come before the checklist they pause. */}
-      {/* ── increment 07 customer phase mount (audit_engineer replaces the next line only) ── */}
-      {consoleArea ? null : <CustomerPhaseWizard orderId={order.publicId} fallback={<WorkflowRulesPanel orderId={order.publicId} area={area} />} />}
-      {/* ── end increment 07 customer phase mount ── */}
-      <RouteTabs
-        idBase="order-tabs"
-        label="Order sections"
-        value={active}
-        items={tabs.map((item) => ({
-          value: item.value,
-          label: item.label,
-          href: item.value === "overview" ? `${base}/${order.publicId}` : `${base}/${order.publicId}/${item.value}`,
-          labelContent: item.labelContent,
-        }))}
-      />
-      <RouteTabPanel idBase="order-tabs" value={active} className="mt-4">
-        {tabs.find((item) => item.value === active)?.content}
-      </RouteTabPanel>
+      {/* ── increment 08 customer wizard layout (audit_engineer) ── */}
+      {(() => {
+        const sections = (
+          <>
+            <RouteTabs
+              idBase="order-tabs"
+              label="Order sections"
+              value={active}
+              items={tabs.map((item) => ({
+                value: item.value,
+                label: item.label,
+                href: item.value === "overview" ? `${base}/${order.publicId}` : `${base}/${order.publicId}/${item.value}`,
+                labelContent: item.labelContent,
+              }))}
+            />
+            <RouteTabPanel idBase="order-tabs" value={active} className="mt-4">
+              {tabs.find((item) => item.value === active)?.content}
+            </RouteTabPanel>
+          </>
+        );
+        // Customers land on the wizard; the former tabs sit behind "Order details" (a tab URL opens them).
+        if (consoleArea) return sections;
+        return (
+          <CustomerOrderLayout
+            deepLink={tab ?? null}
+            details={sections}
+            wizard={
+              <CustomerPhaseWizard
+                orderId={order.publicId}
+                fallback={<WorkflowRulesPanel orderId={order.publicId} area={area} />}
+                completion={
+                  <Callout tone="success" title="Your order is complete">
+                    <Link href={`${base}/${order.publicId}/files`} className="inline-flex min-h-11 items-center font-semibold text-action underline underline-offset-2">
+                      Download your deliverables
+                    </Link>
+                  </Callout>
+                }
+              />
+            }
+          />
+        );
+      })()}
+      {/* ── end increment 08 customer wizard layout ── */}
     </>
   );
 }

@@ -437,11 +437,17 @@ export function createStripeProvider(
 
       const externalEventId = typeof payload.id === "string" ? payload.id.trim() : "";
       const eventType = typeof payload.type === "string" ? payload.type.trim() : "";
+      const livemodeValid = typeof payload.livemode === "boolean";
       const livemode = payload.livemode === true;
-      const environmentHint = typeof payload.livemode === "boolean" ? (livemode ? "live" : "test") : "unknown";
+      const environmentHint = livemodeValid ? (livemode ? "live" : "test") : "unknown";
       const createdSec = typeof payload.created === "number" ? payload.created : parsedSig.timestamp;
 
-      if (!/^evt_[A-Za-z0-9_]{6,120}$/u.test(externalEventId) || !eventType || eventType.length > 96) {
+      if (
+        !livemodeValid ||
+        !/^evt_[A-Za-z0-9_]{6,120}$/u.test(externalEventId) ||
+        !eventType ||
+        eventType.length > 96
+      ) {
         return { ok: false, reasonCode: "INVALID_EVENT_ENVELOPE", skewSeconds, environmentHint };
       }
 
@@ -456,6 +462,9 @@ export function createStripeProvider(
         typeof metadata?.attempt_public_id === "string" && metadata.attempt_public_id.trim() !== ""
           ? metadata.attempt_public_id.trim()
           : null;
+      if (metaAttemptId && clientReferenceId && metaAttemptId !== clientReferenceId) {
+        return { ok: false, reasonCode: "INVALID_EVENT_ENVELOPE", skewSeconds, environmentHint };
+      }
       const metaInvoiceId =
         typeof metadata?.invoice_public_id === "string" && metadata.invoice_public_id.trim() !== ""
           ? metadata.invoice_public_id.trim()
@@ -642,25 +651,54 @@ export function createStripeProvider(
       }
 
       const sessionId = typeof parsed.id === "string" ? parsed.id.trim() : "";
-      const sessionStatus = typeof parsed.status === "string" ? parsed.status : "";
-      const paymentStatus = typeof parsed.payment_status === "string" ? parsed.payment_status : "";
-      const amountTotal = typeof parsed.amount_total === "number" ? parsed.amount_total : -1;
+      const sessionStatus = typeof parsed.status === "string" ? parsed.status.trim() : "";
+      const paymentStatus = typeof parsed.payment_status === "string" ? parsed.payment_status.trim() : "";
+      const amountValid =
+        typeof parsed.amount_total === "number" &&
+        Number.isSafeInteger(parsed.amount_total) &&
+        parsed.amount_total >= 0;
+      const amountMinor = amountValid ? (parsed.amount_total as number) : -1;
       const currency = typeof parsed.currency === "string" ? parsed.currency.trim().toUpperCase() : "";
+      const livemodeValid = typeof parsed.livemode === "boolean";
       const livemode = parsed.livemode === true;
       const metadata = asRecord(parsed.metadata);
       const clientReferenceId =
-        typeof parsed.client_reference_id === "string" ? parsed.client_reference_id.trim() : null;
-      const attemptPublicId =
-        typeof metadata?.attempt_public_id === "string" ? metadata.attempt_public_id.trim() : clientReferenceId;
+        typeof parsed.client_reference_id === "string" && parsed.client_reference_id.trim().length > 0
+          ? parsed.client_reference_id.trim()
+          : null;
+      const metadataAttemptPublicId =
+        typeof metadata?.attempt_public_id === "string" && metadata.attempt_public_id.trim().length > 0
+          ? metadata.attempt_public_id.trim()
+          : null;
+      const hasReferenceConflict = Boolean(
+        metadataAttemptPublicId && clientReferenceId && metadataAttemptPublicId !== clientReferenceId,
+      );
+      // Strict authoritative binding: never synthesize `attemptPublicId` from `client_reference_id`.
+      const attemptPublicId = metadataAttemptPublicId;
       const invoicePublicId =
-        typeof metadata?.invoice_public_id === "string" ? metadata.invoice_public_id.trim() : null;
+        typeof metadata?.invoice_public_id === "string" && metadata.invoice_public_id.trim().length > 0
+          ? metadata.invoice_public_id.trim()
+          : null;
+      const orderPublicId =
+        typeof metadata?.order_public_id === "string" && metadata.order_public_id.trim().length > 0
+          ? metadata.order_public_id.trim()
+          : null;
 
       const piObj = asRecord(parsed.payment_intent);
+      const piMetadata = asRecord(piObj?.metadata);
+      const paymentIntentAttemptPublicId =
+        typeof piMetadata?.attempt_public_id === "string" && piMetadata.attempt_public_id.trim().length > 0
+          ? piMetadata.attempt_public_id.trim()
+          : null;
+      const paymentIntentInvoicePublicId =
+        typeof piMetadata?.invoice_public_id === "string" && piMetadata.invoice_public_id.trim().length > 0
+          ? piMetadata.invoice_public_id.trim()
+          : null;
       const paymentIntentId =
-        typeof parsed.payment_intent === "string"
-          ? parsed.payment_intent
-          : typeof piObj?.id === "string"
-            ? piObj.id
+        typeof parsed.payment_intent === "string" && parsed.payment_intent.trim().length > 0
+          ? parsed.payment_intent.trim()
+          : typeof piObj?.id === "string" && piObj.id.trim().length > 0
+            ? piObj.id.trim()
             : null;
       const amountRefunded = typeof piObj?.amount_refunded === "number" ? piObj.amount_refunded : 0;
       const piCreated = typeof piObj?.created === "number" ? new Date(piObj.created * 1000) : null;
@@ -681,10 +719,19 @@ export function createStripeProvider(
       const rawLast4 = typeof cardDetails?.last4 === "string" ? cardDetails.last4.trim() : "";
       const paymentMethodLast4 = /^[0-9]{4}$/u.test(rawLast4) ? rawLast4 : null;
 
+      const asyncPending =
+        amountRefunded <= 0 &&
+        sessionStatus === "complete" &&
+        paymentStatus === "unpaid" &&
+        piObj?.status !== "canceled";
+
       let status: "paid" | "open" | "failed" | "expired" = "open";
       if (amountRefunded > 0) {
         status = "failed";
-      } else if (sessionStatus === "complete" && paymentStatus === "paid") {
+      } else if (
+        sessionStatus === "complete" &&
+        (paymentStatus === "paid" || paymentStatus === "no_payment_required")
+      ) {
         status = "paid";
       } else if (sessionStatus === "expired") {
         status = "expired";
@@ -693,15 +740,25 @@ export function createStripeProvider(
       }
 
       return {
-        providerRef: sessionId || input.providerRef,
+        providerRef: sessionId,
         providerOrderRef: paymentIntentId,
-        providerPaymentRef: paymentIntentId ?? sessionId,
+        providerPaymentRef: paymentIntentId ?? (sessionId || null),
         status,
-        amountMinor: Number.isSafeInteger(amountTotal) && amountTotal >= 0 ? amountTotal : 0,
+        sessionStatus: sessionStatus || null,
+        paymentStatus: paymentStatus || null,
+        asyncPending,
+        amountMinor,
+        amountValid,
         currency,
         livemode,
+        livemodeValid,
         attemptPublicId,
+        clientReferenceId,
+        hasReferenceConflict,
         invoicePublicId,
+        orderPublicId,
+        paymentIntentAttemptPublicId,
+        paymentIntentInvoicePublicId,
         paidAt: status === "paid" ? piCreated : null,
         paymentMethodBrand,
         paymentMethodLast4,

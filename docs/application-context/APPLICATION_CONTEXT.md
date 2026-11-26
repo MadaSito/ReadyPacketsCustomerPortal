@@ -287,6 +287,19 @@ This fix pack answers the owner's prompt 30 of 2026-11-26 ([session log](../sess
 - **Update prompt.** **Later** is per navigation, and nothing is applied automatically.
 - **Limits.** A real Stripe account, real mail, physical devices and screen readers were not verifiable here.
 
+## Increment 08: go-live checklist, order wizard, payment confirmation, add-on orders, billing profile, names, order numbers
+
+The owner requested this on 2026-11-26 (prompt 34). The contract is [INCREMENT_08_CONTRACT.md](../engineering/INCREMENT_08_CONTRACT.md), decisions D1–D8. Migration `0008_increment_08` is additive only.
+
+- **D1 Names.** `users` gains encrypted first, last and preferred name. The display name stays "First Last". Parts for older accounts are derived lazily. Each part is at most 50 UTF-16 units (display name ≤ 101); longer legacy parts are shown and must be shortened on save. Greetings (dashboard, mail `recipient_name`) use the preferred name, else the first name. Port: `identity.users.namePartsInTx`.
+- **D2 Order numbers.** `buildReferenceStem` in `server/modules/orders/references.ts` builds `<prefix>-<C4>-<F3><L3>-<P6>`. `NNN` is allocated under a row lock and never reused. The stem is frozen at creation (`orders.reference_stem`; per-stem rows in `order_reference_counters`, whose `scope` is widened to 32). Existing references are unchanged; imports keep theirs and bump the stem counter. References contain name fragments (THREAT_MODEL §2).
+- **D3 Order groups.** `orders.group_root_order_id` and `carts.add_to_order_public_id` support additions. An addition reuses the root's stem with the next number. A packet already in the group is refused with `PACKET_ALREADY_IN_PROJECT`. Only the customer owner of a non-cancelled project gets `canAddPackets`; the entry point is `/orders/new?addTo=<publicId>`.
+- **D4 Billing profile.** The new module `billingProfile` stores one encrypted profile per user in `customer_billing_profiles`, validated by `shared/billingDetails.ts`. It is owner only and audited without field values. The customer can clear it. There is no self-service account export or erasure yet; an administrator handles privacy requests (portable_contract_engineer).
+- **D5 Payment confirmation.** Payments are booked from a signed webhook or a provider lookup, through one idempotent function. `bookAuthoritativeAttemptPaymentInTx` records `payment_attempts.booking_source` (`webhook` / `provider_lookup`). Triggers: return page (`payments.confirmCheckoutPayment`, 3 s cooldown), reconciliation (5 min), admin step-up `payments.admin.checkWithStripeNow`. After a 10-minute grace, `STRIPE_WEBHOOK_DELIVERY_MISSING` is raised once per environment. Square stays webhook-first. This replaces increment 07 decision 12.
+- **D6 Wizard.** The customer order page opens on a stepper for the current phase, and the old tabs are under **Order details** (tab deep links open it). Steps come from `client/src/features/orders/stages/wizardModel.ts`.
+- **D7 Publish and tiers.** The designer has a persistent **Publish** button, and a **Publish** row action on `/admin/workflows` drafts (shared `PublishDraftDialog`, same procedure and step-up). Choosing a tier expands its deliverables.
+- **D8.** The go-live checklist is in `docs/operations/GO_LIVE_CHECKLIST.md`.
+
 ## Deployment profiles
 
 | Profile | Purpose | Session transport | Routing |

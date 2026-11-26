@@ -526,4 +526,35 @@ describe("production webhook payloads — row-by-row verification against P101_C
     expect(extraKeyP401.ok).toBe(false);
     expect(extraKeyP401.errors.map((e) => e.code)).toContain("P401_ORDER_SCOPE_MODE_FORBIDDEN");
   });
+
+  it("accepts a maximum-length D1 composed name (80 + 1 + 80 = 161 UTF-16 code units) in P101 payload validator", () => {
+    const maxFirstName = `${"A".repeat(78)}\u{1F31F}`; // 78 + 2 surrogate code units = 80 UTF-16 units
+    const maxLastName = `${"B".repeat(78)}\u{1F680}`; // 78 + 2 surrogate code units = 80 UTF-16 units
+    expect(maxFirstName.length).toBe(80);
+    expect(maxLastName.length).toBe(80);
+
+    const maxComposedName = `${maxFirstName} ${maxLastName}`;
+    expect(maxComposedName.length).toBe(161);
+
+    const built = buildP101Payload({
+      customerRef: "RP-CUST-000008",
+      orderReference: "RP-C000008-2608-MAXNAME",
+      canonVersion: "ReadyPackets_Production_v2.0",
+      runMode: "production",
+      clientName: maxComposedName,
+      clientEmail: "maxname@readypackets.com",
+      releaseStatus: "",
+      packets: [{ packetNumber: 1, tier: "Standard" }],
+      otherItemCount: 0,
+    });
+
+    expect(built.ok).toBe(true);
+    expect(built.errors).toEqual([]);
+    expect(built.payload?.client_name).toBe(maxComposedName);
+    expect(built.payload?.client_name.length).toBe(161);
+
+    const revalidated = validateP101(built.payload);
+    expect(revalidated.ok).toBe(true);
+    expect(revalidated.payload?.client_name).toBe(maxComposedName);
+  });
 });
