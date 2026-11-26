@@ -1,236 +1,377 @@
-# ReadyPackets go-live acceptance checklist
+# ReadyPackets go-live worksheet
 
-Run this checklist against the release candidate on the owner's server. Use an isolated, production-like copy for destructive, failure, and recovery drills; record which host and configuration each case represents. This is an unexecuted test plan, not a certification or a record of tests already run.
+This is an **unexecuted plan** for your server, not a record of a passed release. Use the actual portal and Stripe endpoint for delivery proof; use an isolated copy for backup restoration, fault simulations and upgrade rehearsals. Do not disable live webhooks to test recovery.
 
-**Run record:** Release SHA/tag: ____ | Environment alias: ____ | Run ID: ____ | Window (UTC): ____ | Release owner: ____
+## Before you start
 
-Use synthetic accounts, orders, contact details, files, and recordings. For example: Zeus Greene, preferred name Z, customer reference `RPCUS-A1B2CJJG5`, project `Ice Queen`. Use test inboxes and approved destinations. Keep evidence in an access-controlled store, not in Git. Reference redacted screenshots, reports, or logs by evidence ID; never include keys, signing secrets, passwords, codes, card or address data, private URLs, signed links, or unredacted payloads. For each case mark exactly one result and record a tester and UTC date. If a capability is out of launch scope, leave its test unmarked and document its approved exclusion plus evidence that it is disabled or unreachable. An unrun required case is not a pass.
+- **People and equipment:** Two synthetic customer accounts, one staff account, two separate admin accounts, an approved test mailbox, an enrolled authenticator, a laptop and phone, and a screen reader available on one device. Use separate browser profiles for roles. Ask your server operator to help with receipts, DNS/TLS, headers, jobs, backup and restore evidence.
+- **Test data:** Use Zeus Greene (preferred name `Z`) and a second synthetic customer. Use `Ice Queen`, synthetic packet numbers 1, 2 and 4, a harmless sample PDF, and a short recording with no personal content. The reference example assumes the synthetic customer key ends in `JJG5`; if the server assigns another key, substitute its final four characters.
+- **Payments:** Have Stripe test-mode API credentials and the endpoint’s own signing secret available securely. Use the [Stripe-documented test card](https://docs.stripe.com/testing#cards) `4242 4242 4242 4242` in test mode only, any future expiry and any three-digit CVC. Keep live Stripe credentials separate. A live charge and refund require written owner approval and an authorized operator-controlled payment method; do not use test cards in live mode.
+- **Time:** Set aside about 30–60 minutes for smoke checks and 1–2 working days for the full worksheet and operator drills. Provider delivery, settlement and the missing-webhook grace period may add waiting time. These are planning allowances, not measured runtimes.
+- **Run record:** Candidate SHA/tag: ____ | Environment alias: ____ | Run ID: ____ | UTC window: ____ | Owner: ____
+- **Evidence:** Mark exactly one of Pass or Fail after observing the expected result. Leave both unchecked if unrun or blocked and record `Blocked: <why>` in Evidence. For out-of-scope features record `Excluded: <owner decision/evidence ID>` and verify they are disabled. Use access-controlled, redacted evidence IDs; never paste credentials, sign-in/verification codes, card data, personal details, private endpoints or signed URLs. Record tester role/alias and UTC date in each row.
 
-Use the [installation guide](INSTALL.md), [administrator guide](../guides/ADMIN_GUIDE.md), [staff guide](../guides/STAFF_GUIDE.md), and [logging and audit runbook](LOGGING_AND_AUDIT.md) for exact operator actions. Record the approved launch scope and which tests require the actual owner-server edge or provider endpoint before starting.
+Paths beginning with `/` go after your portal hostname. `:id` means open the synthetic record by clicking it, not by typing that literal text. An **Operator** row has no portal button; use the linked runbook and request the stated output.
+
+## Smoke test after every upgrade
+
+Run these 15 checks, marking the results in the main worksheet below. For Stripe, run the checks against the actual mode in scope; retain separate test and live evidence on first launch or after payment configuration changes. If cards are not offered, record that exclusion and check the invoice-only path.
+
+| # | Worksheet row | Quick check |
+| --- | --- | --- |
+| 1 | SRV-01 | Web process responds. |
+| 2 | SRV-02 | Portal is ready. |
+| 3 | SRV-03 | Certificate is trusted. |
+| 4 | SRV-05 | Worker finishes a job. |
+| 5 | ACC-01 | Local admin sign-in reaches MFA. |
+| 6 | ACC-02 | MFA opens the portal. |
+| 7 | REG-01 | Registration has the three name fields. |
+| 8 | CAT-02 | A selected tier expands. |
+| 9 | ORD-04 | Historical order opens by its existing reference. |
+| 10 | BIL-05 | Checkout offers saved billing. |
+| 11 | PAY-08 or PAY-28 | Stripe Checkout event delivery is 2xx. |
+| 12 | PAY-09 or PAY-29 | Return says Payment received. |
+| 13 | PAY-10 or PAY-30 | Matching invoice is Paid. |
+| 14 | WIZ-01 | Purchased order opens the wizard. |
+| 15 | AUD-01 | Audit Center records the synthetic action. |
 
 ## Server and TLS
 
-### 01 · LIVE-01 · Native or container deployment health
-
-- **Steps:** Confirm the deployed SHA and deployment profile. Check web, worker, DB/storage connectivity, `/healthz` and `/readyz` at the edge and via the documented local check. Run one synthetic background job and review the completion event.
-- **Expected:** Correct release, healthy edge and local responses, and a worker that completes work; DB and application listeners are not directly reachable from the internet.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
-
-### 02 · LIVE-02 · DNS, certificates, and edge policy
-
-- **Steps:** Validate canonical DNS, certificate chain, expiry and renewal; test HTTP-to-HTTPS, configured alias redirects, unknown-host rejection, and TLS negotiation. Verify the maintenance fence on an isolated deployment and inspect caching of navigation HTML and `sw.js`.
-- **Expected:** Trusted canonical certificate; only TLS 1.2/1.3; aliases redirect when configured; unknown hosts rejected; fenced ingress blocks public traffic; the edge does not cache navigation HTML or `sw.js`.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| SRV-01 | Blocker | Open `/healthz` in the browser. | HTTP 200. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| SRV-02 | Blocker | Open `/readyz` on the public HTTPS portal. | HTTP 200. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| SRV-03 | Blocker | Open the portal on HTTPS. Inspect the site certificate. | Canonical host matches the trusted, unexpired certificate. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| SRV-04 | Blocker | Enter the portal address with `http://`. | Redirects to the canonical HTTPS site. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| SRV-05 | Blocker | Generate a synthetic verification email; ask the operator to inspect its background job. | Worker records completion. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| SRV-06 | Important | Operator: follow [Install checks](INSTALL.md#go-live-checklist) for certificate renewal. | Renewal dry run succeeds. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| SRV-07 | Blocker | Operator: check internet-facing listeners against the [install guide](INSTALL.md). | DB and application listeners are not directly reachable. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| SRV-08 | Blocker | Operator: inspect the edge TLS profile. | TLS 1.2 and 1.3 allowed; older versions rejected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Accounts and MFA
 
-### 03 · LIVE-03 · Local sign-in, recovery, and step-up
-
-- **Steps:** Enroll local MFA for synthetic customer and admin accounts. Sign out; verify valid password without a valid factor cannot sign in. Try authenticator, enabled passkey and one-time recovery code paths; retry the used recovery code. Revoke a test session, then cancel and complete fresh MFA on a protected admin action. Confirm a second administrator and approved recovery path exist.
-- **Expected:** No external sign-in dependency; MFA and revocation enforced; a recovery code cannot be reused; cancellation does not mutate state. If deliberately configured for launch, separately exercise managed Entra sign-in, name-claim mapping, and the local recovery path.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| ACC-01 | Blocker | `/sign-in` → **Sign in** with synthetic admin password. | Second-factor screen opens; console not yet accessible. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ACC-02 | Blocker | On the MFA screen enter the current **6-digit code** → **Verify**. | Admin console opens. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ACC-03 | Blocker | Start a new sign-in and enter a known incorrect second factor. | Console stays locked. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ACC-04 | Blocker | Sign in with one unused **Recovery code**. Repeat ACC-01 and reuse it → **Verify**. | Used code is refused. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ACC-05 | Important | `/admin/staff` → locate the backup administrator. Sign in separately as that admin. | Second admin can reach the console with their own MFA. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ACC-06 | Blocker | Trigger fresh MFA on an approved test admin change, then dismiss the dialog. | Setting does not change. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ACC-07 | Optional-if-enabled | `/sign-in` → use the configured SSO provider displayed for your organization. | Synthetic user signs in with expected mapped identity. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Registration and names
 
-### 04 · LIVE-04 · Names from registration to invoices
-
-- **Steps:** Register with first and last names, with and without a preferred name; verify email and sign in. Try blank required names and values above the limits. Edit the profile and exercise admin creation/edit and invitation. Sign in to a pre-upgrade synthetic account and save its derived names; include a single-token legacy name.
-- **Expected:** First and last are required, preferred optional; each allows at most 80 characters. Greetings and mail use preferred name or first name, while legal/billing contexts keep the full name. Legacy users can sign in; derived parts persist when the profile is saved. In DevTools confirm `given-name`, `family-name`, and `nickname` autocomplete.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| REG-01 | Blocker | Open `/register`. | First name, Last name, and Preferred name inputs appear. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| REG-02 | Blocker | `/register` → leave First name blank; fill other required fields → **Create account**. | First name is flagged; no account created. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| REG-03 | Blocker | `/register` → leave Last name blank; fill other required fields → **Create account**. | Last name is flagged; no account created. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| REG-04 | Important | `/register` → try 81 `A` characters in each name input. | No name longer than 80 is accepted. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| REG-05 | Blocker | `/register` → `Zeus`, `Greene`, `Z` → **Create account**; verify and sign in. | Customer greeting uses `Z`. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| REG-06 | Important | Register the second synthetic customer with Preferred name empty; verify and sign in. | Greeting falls back to First name. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| REG-07 | Important | `/account` → open a synthetic pre-upgrade profile and save its displayed name parts. | Derived parts persist after reload. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Catalogue and ordering
 
-### 05 · LIVE-05 · Published catalogue, tier selection, and totals
-
-- **Steps:** Verify supported tiers, prices and descriptions against approved catalogue data. Select two tiers in succession, toggle details manually, then choose Not included. Add a qualifying bundle and, if enabled, an approved synthetic discount; compare picker, cart, checkout, and invoice totals. Reload the cart and finish checkout.
-- **Expected:** Only the newly picked tier expands automatically, manual toggles work, Not included collapses all, and keyboard focus stays on the radio. Approved prices, discounts and cart contents carry through; order creation is not duplicated by retry.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| CAT-01 | Blocker | `/orders/new` → compare one approved packet and tier price against the launch price sheet. | Correct tier price for the launch currency. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| CAT-02 | Blocker | `/orders/new` → select a different tier for packet 1. | Its outcome/deliverables expand; the previous tier collapses. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| CAT-03 | Important | `/orders/new` → click **[tier]: outcome and deliverables** twice. | Details can be closed and reopened manually. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| CAT-04 | Important | `/orders/new` → choose **Not included** for packet 1. | No tier details stay expanded for that packet. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| CAT-05 | Blocker | Add a qualifying bundle in `/orders/new` and compare `/cart` and `/cart/checkout`. | The same approved bundle total appears in both. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Order numbers
 
-### 06 · LIVE-06 · Reference generation and compatibility
-
-- **Steps:** Create the first order for an unused `Ice Queen` stem with the example names and customer reference above. Repeat with short, accented and non-Latin names/projects, and test near-simultaneous order creation in isolation. Rename a project, open a pre-upgrade order, and check search, invoice/receipt references, and enabled API, production and SharePoint outputs. If in scope, verify a portable import preserves an existing reference.
-- **Expected:** With default prefix the first reference is `RP-JJG5-ZEUGRE-ICEQUE-001`; configured prefix is respected. Segments fold to uppercase ASCII alphanumerics with right `X` padding; absent customer reference uses `0000`. Same-stem sequences are unique and never reused, expand beyond three digits as needed, and fit 32 characters. Renames do not change references; existing and imported references and authorized manual reference edits remain supported.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| ORD-01 | Blocker | Place the first `Ice Queen` order on an unused stem; open it from `/orders`. | Default reference `RP-JJG5-ZEUGRE-ICEQUE-001` with matching fixture key. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ORD-02 | Important | Order a project named `Élan` using synthetic name `Li Á`. | Reference name/project parts are `LIXAXX` and `ELANXX`. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ORD-03 | Blocker | Use two authorized sessions to create orders on the same synthetic stem with distinct permitted contents. | The two references have different sequence numbers. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ORD-04 | Blocker | `/orders` → open a synthetic historical order. | Its original `RP-YYYY-NNNNNN` reference is unchanged. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ORD-05 | Important | `/admin/search` → search for the new-format reference. | Search finds the matching synthetic order. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ORD-06 | Important | Review the [administrator order-number privacy guidance](../guides/ADMIN_GUIDE.md#order-numbers-increment-08) against your notice and authorized destinations. | The notice explains that references reveal name and project fragments. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Add-on orders
 
-### 07 · LIVE-07 · Extend an existing project
-
-- **Steps:** Buy packet 1; then use Add packets to this project to buy packets 2 and 4. Review cart target, checkout summary, fresh invoice/receipt, and customer and console related-order links. Repeat against a legacy root; if staff handoff is enabled, use the documented console path.
-- **Expected:** The project name is fixed, previously purchased packets are marked and unselectable, and checkout shows the target project and root reference. A new-format root shares its frozen stem with the addition (e.g. `…-002` when available); a legacy root retains its reference. The addition has its own items, invoice, payment and workflow. Bundle eligibility is calculated for the addition alone.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
-
-### 08 · LIVE-08 · Project membership and rejection paths
-
-- **Steps:** On synthetic fixtures, try another customer's target, a cancelled or archived root, a mismatched currency, and a packet already bought in a different tier. Retarget an existing cart and review what happens to its items. Try a stale cart after the same packet was purchased in a different session.
-- **Expected:** Server refuses invalid targets or duplicates without exposing another customer's project; duplicate packet rejection is `PACKET_ALREADY_IN_PROJECT`. Cart retains one target, revalidates items without silently emptying them, and never commits rejected items.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| ADD-01 | Blocker | Open the first `Ice Queen` order → **Add packets to this project**. | `/orders/new?addTo=…` shows the fixed project name. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ADD-02 | Blocker | In that picker try choosing a different tier of packet 1. | **Already in this project**; packet 1 cannot be selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ADD-03 | Important | Select packets 2 and 4; go from `/cart` to `/cart/checkout`. | Summary identifies `Ice Queen` and the root reference. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ADD-04 | Blocker | Finish the addition; open it from `/orders`. | A distinct reference shares the root stem and uses the next unused suffix. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ADD-05 | Blocker | Compare the root and addition invoice links. | The addition has its own invoice. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ADD-06 | Blocker | In customer B’s session, open customer A’s synthetic add-on URL. | No project details exposed and no addition can be placed. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ADD-07 | Important | `/admin/orders` → open the synthetic root → open its related addition. | Console link opens the correct related order. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Billing
 
-### 09 · LIVE-09 · Optional registration and saved profile
-
-- **Steps:** Register with the billing section collapsed; repeat with valid details and with incomplete details. Repeat with an existing synthetic email and compare the generic response; confirm its profile is unchanged. In account settings save, edit, try a stale edit in a second tab, and clear. Use an approved synthetic export/erasure drill.
-- **Expected:** Registration is possible without billing, and provided values must be complete and valid. Only newly created accounts get registration billing details. Owner-only profile writes handle stale versions safely; audit records contain no billing field values. Export includes the profile and the approved erasure process removes or anonymizes it.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
-
-### 10 · LIVE-10 · Checkout saved and alternate details
-
-- **Steps:** With a saved profile, confirm its summary is the default. Enter alternate details with Save as my billing information off, then repeat with it on. Start separately without a saved profile and check checkbox default and opt-out. Check invoice copies after changing or clearing the profile.
-- **Expected:** Checkout uses the selected details for that invoice. Saving occurs only when opted in; the checkbox defaults on for accounts without a profile. Existing issued invoices retain their original billing snapshot.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| BIL-01 | Blocker | `/register` → leave the optional billing section collapsed → **Create account**. | Valid registration succeeds without a billing profile. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BIL-02 | Blocker | `/register` → enter only part of an approved synthetic billing address → **Create account**. | Missing billing fields are identified and submission is blocked. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BIL-03 | Important | `/register` → use an existing synthetic mailbox and different billing values. | Existing account’s billing profile is unchanged. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BIL-04 | Blocker | `/account/billing` → enter `Zeus Greene`, `100 Test Street`, `Testville`, `12345`, `US`.<br>Click **Save billing information**; reload. | **Current saved billing address** shows the saved address. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BIL-05 | Blocker | Sign in as a customer with saved billing and open `/cart/checkout`. | Saved billing choice is selected by default and shows its summary. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BIL-06 | Blocker | `/cart/checkout` → choose different billing details; leave save unchecked and finish checkout. | Invoice uses the new details without replacing the profile. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BIL-07 | Important | As a customer without saved billing, open `/cart/checkout` and inspect the save checkbox. | Save is initially checked; customer can uncheck it. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BIL-08 | Important | `/account/billing` → **Clear saved billing information** → **Clear billing information**. | **No saved billing information**. This clears billing only. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Stripe test mode and live mode
 
-Use [Stripe setup](../guides/ADMIN_GUIDE.md#getting-card-checkout-active-increment-072) and the exact endpoint and required events shown by the candidate at `/admin/payments/setup`. Configure and verify each endpoint in its own Stripe mode: use the signing secret for that exact endpoint and mode, never a CLI listener secret or a different endpoint's secret. Store credentials outside evidence. A portal self-test proves only local verification; it does not prove Stripe delivery. Capture the provider dashboard's event type, mode, redacted event identifier, delivery timestamp and HTTP status, and correlate with the portal's last verified event and the attempt.
+Start with **test mode** in isolation. The portal’s **Send self-test webhook** does not prove that Stripe can reach your endpoint. In Stripe Dashboard/Workbench, open the endpoint in the correct mode and inspect **Event deliveries** for the actual payment and refund. Record mode, event type, redacted event reference, time, and HTTP status. Keep **live mode** out of scope only by explicit owner decision with card checkout disabled. If live cards are in scope all live Blockers apply.
 
-### 11 · LIVE-11 · Stripe test-mode delivery and return
+### Stripe test mode
 
-- **Steps:** Configure an isolated deployment with the matching Stripe test API credential and test endpoint signing secret; run API, session creation, and webhook self-tests, then activate test checkout. Use Stripe's test payment method for an approved synthetic order. In Stripe Dashboard/Workbench **test mode → endpoint → Event deliveries**, open the actual Checkout event for that order. Follow the portal return to the order.
-- **Expected:** The actual delivery to this server shows **HTTP 2xx** and the portal records a verified webhook. `/checkout/return` shows **Payment received**, a receipt and **Continue to your order** into the wizard. Invoice and order are paid once; refresh/redelivery does not duplicate ledger, receipt, or downstream work.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| PAY-01 | Blocker | `/admin/payments/setup` → **Webhook endpoint & required events**; compare URL with Stripe test endpoint. | Exact portal HTTPS endpoint, in Stripe test mode. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-02 | Blocker | Stripe test endpoint → verify the endpoint’s **Signing secret** was entered in portal **Primary Stripe webhook signing secret**. | Secret belongs to this precise endpoint in test mode. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-03 | Blocker | `/admin/payments/setup` → **Test Stripe API** with the test credential. | API readiness check passes. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-04 | Blocker | `/admin/payments/setup` → **Verify Checkout session creation**. | Session verification passes for the current test key. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-05 | Blocker | `/admin/payments/setup` → **Send self-test webhook**. | Portal local signature check passes. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-06 | Blocker | `/admin/payments/setup` → **Activate Stripe Checkout** in test mode. | Portal marks card checkout active in test mode. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-07 | Blocker | Checkout a synthetic order and pay on Stripe with the documented test card. | Stripe completes the test Checkout session. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-08 | Blocker | Stripe Dashboard test endpoint → **Event deliveries** → open the actual Checkout event. | Delivery to this endpoint is HTTP **2xx**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-09 | Blocker | Follow Stripe’s return to `/checkout/return`. | **Payment received**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-10 | Blocker | `/invoices` → open the invoice for that order. | Invoice status is **Paid**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-11 | Blocker | `/checkout/return` → open the receipt offered after confirmation. | A receipt for that order and amount is available. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-12 | Blocker | `/checkout/return` → follow the link to the matching order. | The wizard opens with the payment gate cleared. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-13 | Blocker | Operator, isolated test mode only: disable the Stripe endpoint; pay a fresh order and return. | Lookup books the matching payment without a webhook. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-14 | Blocker | Keep PAY-13 isolated until the grace period elapses; open `/admin/alerts`. | One **Stripe is not delivering webhooks to this server** alert. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-15 | Blocker | Pay a separate test order without returning; admin opens its invoice/attempt → **Check with Stripe now** → fresh MFA. | Previously pending matching payment is booked. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-16 | Blocker | Re-enable delivery and resend PAY-13’s verified provider event from Stripe. | One payment remains; no second booking. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-17 | Important | If offered, complete a test asynchronous Checkout whose final payment is still unpaid. | Return shows processing; invoice remains unpaid. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-18 | Blocker | `/admin/orders/:id/refund` → **Prepare refund**.<br>Enter approved amount and **Refund reason** `Go-live test`.<br>Type `REFUND ORDER` → **Send refund** → fresh MFA. | **Refund history** records one matching test refund. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-19 | Blocker | Stripe test endpoint → **Event deliveries** → open the event for that refund. | Test refund delivery is HTTP **2xx**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
-### 12 · LIVE-12 · Missing webhook, pending results, and repair
+### Stripe live mode
 
-- **Steps:** On an isolated test-mode deployment with approved fixtures, defer verified delivery. Pay and use the return page and Check payment status; repeat with separate attempts for scheduled reconciliation and the admin **Check with Stripe now** action with fresh MFA. Exercise an unpaid asynchronous result and safe fixture cases for wrong session, amount, currency, mode or attempt/invoice binding. Restore normal delivery and resend the original genuine event.
-- **Expected:** Only an exact matching paid session (or `no_payment_required` for zero total) books through lookup. Pending or mismatched attempts do not book; the UI explains processing and rechecks with back-off. Checking is owner-scoped and rate-limited; diagnostics are safe. Lookup source is audited and has the same effects as webhook booking; after the grace window a missing webhook raises one deduplicated alert. Late delivery does not rebook. Verify setup reports last verified webhook and rejection reasons/counts.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+Do not reuse a test endpoint secret or intentionally interrupt live delivery. Run the live payment only with explicit approval for the small real charge and refund, and with general customer access still controlled.
 
-### 13 · LIVE-13 · Stripe test-mode refund
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| PAY-21 | Blocker | `/admin/payments/setup` → **Webhook endpoint & required events**; compare URL with Stripe’s live endpoint. | Exact portal HTTPS endpoint, in Stripe live mode. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-22 | Blocker | Stripe live endpoint → verify its **Signing secret** was entered in portal **Primary Stripe webhook signing secret**. | Secret belongs to this exact live endpoint. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-23 | Blocker | `/admin/payments/setup` → **Test Stripe API** with live credential. | Live API readiness check passes. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-24 | Blocker | `/admin/payments/setup` → **Verify Checkout session creation**. | Session verification passes for the live key. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-25 | Blocker | `/admin/payments/setup` → **Send self-test webhook**. | Portal local signature check passes for live configuration. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-26 | Blocker | `/admin/payments/setup` → **Activate Stripe Checkout**; type `ACTIVATE LIVE PAYMENTS` → **Activate live Stripe Checkout**. | Portal marks card checkout active in live mode. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-27 | Blocker | With approval, pay the synthetic order’s small supported amount on Stripe with an authorized live method. | Stripe records a real live payment for the approved amount. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-28 | Blocker | Stripe Dashboard live endpoint → **Event deliveries** → open the actual Checkout event. | Delivery to this endpoint is HTTP **2xx** in live mode. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-29 | Blocker | Follow Stripe’s return to `/checkout/return`. | **Payment received**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-30 | Blocker | `/invoices` → open the matching live order invoice. | Invoice status is **Paid**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-31 | Blocker | `/checkout/return` → open the receipt offered after live confirmation. | A receipt for that order and amount is available. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-32 | Blocker | `/checkout/return` → follow the link to the matching order. | The wizard opens with the payment gate cleared. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-33 | Blocker | `/admin/orders/:id/refund` → **Prepare refund**.<br>Enter approved amount and **Refund reason** `Go-live verification`.<br>Type `REFUND ORDER` → **Send refund** → fresh MFA. | **Refund history** records one matching live refund. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-34 | Blocker | Stripe live endpoint → **Event deliveries** → open the event for that refund. | Live refund delivery is HTTP **2xx**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-35 | Blocker | Open the refund in Stripe after processing finishes. | Live refund status and amount match the portal. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PAY-36 | Optional-if-enabled | If Square is the chosen provider, follow [its setup guide](../../server/modules/payments/providers/SQUARE.md) and make a synthetic payment in its sandbox. | Matching invoice is Paid on verified provider confirmation. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
-- **Steps:** Refund the test payment under the authorized policy with a reason and fresh MFA. Check the actual test-mode refund Event deliveries and retry an event. Compare provider and portal outcomes; verify partial/full amounts where enabled.
-- **Expected:** Refund event delivered **2xx**, one matching refund in the portal, correct amount and status, and an audit record with no secret or payment details. A retry does not refund twice.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+### Required Stripe event selection
 
-### 14 · LIVE-14 · Stripe live-mode delivery, return, and refund
+In Stripe, open **each** configured endpoint and compare its subscribed events with **Webhook endpoint & required events** in `/admin/payments/setup`. Each row represents one event in one mode. Record a redacted screenshot reference for the selection (the same evidence ID can cover multiple rows).
 
-- **Steps:** Only with explicit owner approval for an actual charge and refund, use an authorized operator-controlled payment method and a synthetic order at a supported low amount before opening general access. Confirm matching live API credential, live endpoint signing secret, required events, and activation. Complete payment and return; verify the actual Checkout delivery in Stripe Dashboard/Workbench **live mode → Event deliveries**. Issue the approved refund with fresh MFA and verify its live delivery and settlement. Never use test cards in live mode or capture payment details.
-- **Expected:** Live-mode Checkout and refund deliveries each show **HTTP 2xx** at the configured endpoint, with app-side verification. Return shows **Payment received**, receipt, and working wizard continuation. Exactly one payment/refund, with matching provider/portal states. A test-mode pass is not live-mode evidence.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| EVT-T01 | Blocker | Test endpoint: find `checkout.session.completed`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| EVT-T02 | Blocker | Test endpoint: find `checkout.session.async_payment_succeeded`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| EVT-T03 | Blocker | Test endpoint: find `checkout.session.async_payment_failed`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| EVT-T04 | Blocker | Test endpoint: find `checkout.session.expired`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| EVT-T05 | Blocker | Test endpoint: find `payment_intent.payment_failed`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| EVT-T06 | Blocker | Test endpoint: find `charge.refunded`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| EVT-T07 | Blocker | Test endpoint: find `refund.created`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| EVT-T08 | Blocker | Test endpoint: find `refund.updated`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| EVT-T09 | Blocker | Test endpoint: find `charge.refund.updated`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| EVT-L01 | Blocker | Live endpoint: find `checkout.session.completed`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| EVT-L02 | Blocker | Live endpoint: find `checkout.session.async_payment_succeeded`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| EVT-L03 | Blocker | Live endpoint: find `checkout.session.async_payment_failed`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| EVT-L04 | Blocker | Live endpoint: find `checkout.session.expired`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| EVT-L05 | Blocker | Live endpoint: find `payment_intent.payment_failed`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| EVT-L06 | Blocker | Live endpoint: find `charge.refunded`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| EVT-L07 | Blocker | Live endpoint: find `refund.created`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| EVT-L08 | Blocker | Live endpoint: find `refund.updated`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| EVT-L09 | Blocker | Live endpoint: find `charge.refund.updated`. | Selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Invoices and receipts
 
-### 15 · LIVE-15 · Invoice, receipt and document access
-
-- **Steps:** Compare an issued invoice, paid receipt and refunded invoice/payment status with the synthetic order and provider. Inspect PDF branding, order reference, full billing name, amounts, discounts and currency. Open a historical receipt and attempt access as a different customer.
-- **Expected:** Invoice starts issued, moves to paid only on authoritative confirmation and reflects refunds accurately. Documents and delivery side effects are not duplicated. Issued historical receipt PDFs are unchanged, and another customer cannot access the documents.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| INV-01 | Blocker | Place an invoice-only order; open it from `/invoices` before paying. | **Issued**, not Paid. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| INV-02 | Blocker | Open the invoice PDF; compare the total with checkout. | Same amount and currency. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| INV-03 | Important | Inspect the synthetic name printed on the invoice PDF. | Full billing name, not preferred name. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| INV-04 | Blocker | Open the invoice URL from customer A’s session in customer B’s browser profile. | Invoice and PDF are inaccessible. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| INV-05 | Important | Open a receipt issued before upgrade and compare with its archived copy. | Original receipt PDF unchanged. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Order workflow wizard and publishing
 
-### 16 · LIVE-16 · Publish a validated workflow
-
-- **Steps:** Open each designer step and find Publish. Introduce a validation error, then fix it. Test cancel and publish with a change note and fresh MFA; test Make default and the eligible drafts-table row action. Compare orders placed before and after.
-- **Expected:** Persistent control, visible validation reasons, and no publish on cancel or failed MFA. Success names the version and whether it is default. New orders use the correct default; existing orders retain their pinned version.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
-
-### 17 · LIVE-17 · Configured customer workflow
-
-- **Steps:** Open a purchased order from its list and from payment return. Work through required acknowledgement/policy, questions, documents, and audio, then review and submit. Use Back, reload mid-phase, omit a required item, and revisit Order details and a former tab deep link.
-- **Expected:** Wizard opens first. Only applicable steps appear, in order; progress and step headings stay clear, and blocked Next has a visible reason. Top errors, saved progress, first-incomplete resume, and heading focus work. Final submission locks the phase; details deep links still work.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
-
-### 18 · LIVE-18 · Older workflows and waiting/delivery states
-
-- **Steps:** Open an order on the older derived workflow with and without allowed intake, file and audio actions. Check payment pending, team processing and delivered orders, and exercise staff request-changes/reopen under the existing permissions.
-- **Expected:** Only server-permitted actions appear; older active workflows can Finish. Waiting states explain what happens next, offering Pay now or delivery downloads as appropriate. No new permission is inferred from the wizard.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| WIZ-01 | Blocker | `/orders` → open a purchased synthetic order. | Wizard is the first view, not order details. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| WIZ-02 | Blocker | Open a phase requiring acceptance; leave it unaccepted. | **Next** cannot advance and shows a visible reason. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| WIZ-03 | Blocker | Complete acceptance on a configured full phase → **Next**. | Questions follow acceptance; no unrelated step appears. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| WIZ-04 | Blocker | Save a question answer, advance and reload mid-phase. | Resumes at first incomplete step. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| WIZ-05 | Blocker | Complete the configured requirements and submit from final review. | Phase is submitted and customer edits are locked. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| WIZ-06 | Important | Open a legacy order with a permitted intake form but no configured phase actions. | The wizard offers its existing intake action. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| WIZ-07 | Blocker | Open a purchased order that is waiting on the team. | Screen explains who acts next rather than showing a dead end. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| WIZ-08 | Important | Open an existing former-tab deep link for the synthetic order. | Correct order-detail content is still reachable. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PUB-01 | Blocker | `/admin/workflows` → open a draft designer and visit each step. | **Publish** remains in the header. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PUB-02 | Blocker | With an invalid synthetic draft, inspect **Publish**. | Cannot publish; validation reason is visible. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PUB-03 | Blocker | `/admin/workflows` → valid draft row → **Publish**.<br>Set **Change note (optional)** to `Go-live exercise`.<br>Click **Publish** and complete fresh MFA. | **Workflow published** names the version and default status. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| PUB-04 | Blocker | In isolated QA, publish with **Use for new orders (default workflow)** checked; place a new order. | New order uses that default version. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Files and audio
 
-### 19 · LIVE-19 · Upload, audio and protected download
-
-- **Steps:** Upload a small synthetic document and try unsupported/oversize fixtures. Record a nonidentifying clip, deny microphone permission, and use upload as an alternative; confirm playback/processing. Download an authorized file and phase ZIP, and try download as another customer. If external copy/sync is enabled, verify delivery and a failed-copy retry using a synthetic destination.
-- **Expected:** Accessible progress, errors, fallback and playback work; processing fails safely. Authorized downloads succeed, cross-account access is denied, and protected files do not enter public caches. Enabled copies have an auditable, recoverable status.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| FIL-01 | Blocker | Purchased order → **Upload documents** step → choose the prepared synthetic PDF. | Its upload completes and appears in the phase. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| FIL-02 | Important | In that step select an unsupported synthetic file type. | Upload rejected with an understandable reason. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| FIL-03 | Blocker | `/orders/:id` → **Record or upload audio** → deny microphone permission in the browser prompt. | Audio upload remains available as an alternative. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| FIL-04 | Blocker | In the audio step, allow microphone and record a brief synthetic clip. | Saved recording can be played back. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| FIL-05 | Blocker | Open the synthetic order’s file or phase ZIP as its owner, then try with customer B. | Customer B cannot download it. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| FIL-06 | Optional-if-enabled | `/admin/sharepoint-sync` → check the synthetic order’s run and matching SharePoint destination. | One matching item in the authorized destination. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Mail
 
-### 20 · LIVE-20 · Transactional mail and queue
-
-- **Steps:** Use the configured transport to send verification, reset, invitation, receipt and required policy notices to approved synthetic inboxes. Check delivery, configured sender/domain alignment, correct canonical links, and preferred-name greeting. In isolation exercise retry after a synthetic failure.
-- **Expected:** Expected messages arrive and intended tokens work under their rules. Job status explains retry/failure without exposing links, names, or secrets in log evidence; duplicate payment does not resend a receipt.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| MAIL-01 | Blocker | `/register` → **Create account** using the test mailbox. | Verification email arrives with the canonical portal host. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-02 | Blocker | `/sign-in` → **Forgot password?**<br>Enter test **Email** → **Send reset link**. | Password reset mail arrives in the test mailbox. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-03 | Important | Complete the test payment in PAY-07; inspect the receipt mailbox. | One receipt email for the test order. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-04 | Important | `/admin/email-templates` → open a template → **Send test to me** from a test admin mailbox. | Test message reaches that mailbox. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Staff console
 
-### 21 · LIVE-21 · Least privilege and staff workflows
-
-- **Steps:** Compare customer, staff, and admin access. As authorized staff, review an order, search references, reply to a ticket, add an internal note, and use the documented handoff if enabled. Exercise approvals and sample reports/exports with least-privilege staff; test unauthorized navigation and mutation denial.
-- **Expected:** Customer and staff see only authorized views; internal notes stay private; protected operations enforce server-side permissions and fresh MFA where required. Staff handoff retains attribution, and related orders have consistent links.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| STF-01 | Blocker | Sign in as customer A and open `/admin/orders`. | Customer is denied the admin route. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| STF-02 | Blocker | Sign in as staff and open `/admin/staff`. | Staff cannot access admin staff management. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| STF-03 | Important | `/admin/tickets` → open test ticket → **Customer-visible reply**.<br>Type `Go-live reply` → **Send reply**. | Customer sees that reply in their ticket. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| STF-04 | Blocker | `/admin/tickets/:id` → type `Go-live internal` into **Internal note** → **Save internal note**. View as customer. | Internal note is not visible to the customer. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Audit, logging, and SIEM
 
-### 22 · LIVE-22 · Audit evidence and secure forwarding
-
-- **Steps:** Correlate one synthetic flow across app, edge and Audit Center by request/correlation ID; filter on action, outcome and time; verify the audit chain and retain approved checkpoint evidence off-host. For an enabled TLS syslog or OTLP HTTPS destination, verify receipt at the collector and exercise outage/recovery or dead-letter replay in isolation.
-- **Expected:** Time-aligned traceability, restricted exports, no secret/personal field values, and expected audit events for high-impact actions. Collector verifies trust/name and receives deduplicable event IDs; lag, missing events and dead letters are visible. Platform logs have protected retention and rotation; SIEM projection is not a substitute for infrastructure logs.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| AUD-01 | Blocker | After a synthetic staff action, open `/admin/audit` and filter by event/time. | Expected action and outcome are found. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| AUD-02 | Important | Operator: follow [Correlation](LOGGING_AND_AUDIT.md#2-correlation-following-one-workflow) for one synthetic request. | The same request/correlation ID connects app and edge evidence. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| AUD-03 | Blocker | `/admin/audit/integrity` → **Verify now**. | **Chain verified**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| AUD-04 | Blocker | Inspect a redacted audit record for a synthetic billing profile change. | Action is logged without the billing values. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| AUD-05 | Optional-if-enabled | `/admin/siem` → open approved TLS destination; send its test using [forwarding guidance](LOGGING_AND_AUDIT.md#6-siem--syslog-forwarding). | Approved collector receives the test event over verified TLS. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Backup and restore drill
 
-### 23 · LIVE-23 · Verified backup and isolated restore
-
-- **Steps:** Follow the [backup and recovery runbook](BACKUP_AND_RESTORE.md). Create and verify an encrypted backup, test the approved off-host copy and separate key custody, and confirm only the selected scheduler runs. Restore to clean database/storage targets with outbound integrations fenced. Measure elapsed time and recovered data point; check orders, related orders, billing/export continuity, objects, audit chain and MFA/session reconciliation.
-- **Expected:** Verified archive and isolated restore (not just a readable archive), no integrity mismatches, appropriate account quarantine/session revocation, and measured recovery within agreed RPO/RTO. No production target is overwritten or promoted by this test.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| BAK-01 | Blocker | Operator: follow [backup verification](BACKUP_AND_RESTORE.md#4-routine-operations-web-admin--cli) for a new encrypted archive. | Archive verification succeeds. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BAK-02 | Blocker | Operator: retrieve the encrypted off-host copy and compare digest. | Copy digest matches the verified archive. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BAK-03 | Blocker | Operator: follow the [isolated restore](BACKUP_AND_RESTORE.md#5-operator-cli-isolated-restore-procedure) into clean DB/storage with outbound delivery blocked. | Restore exits successfully with no integrity mismatches. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BAK-04 | Blocker | On that restored copy, open the synthetic customer’s billing profile. | Expected synthetic profile recovered without exposing it in evidence. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BAK-05 | Blocker | Operator: compare drill recovery point and completion time with agreed RPO/RTO. | Both are within the agreed limits. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Upgrade and rollback
 
-### 24 · LIVE-24 · Fenced migration and recovery rehearsal
-
-- **Steps:** Follow [upgrade guidance](UPGRADE.md) on a restored pre-08 copy. Prove drain, ingress fence, verified pre-upgrade backup, migration `0008`, health checks and controlled reopen. Rehearse failure before migration and separately during/after migration in isolation. Check existing sign-in, references, active Stripe setup, API v1 compatibility and older workflows.
-- **Expected:** No migration starts without the verified backup. Old release is recovered only when compatible; if migration may have started, traffic remains fenced until approved forward repair or isolated restoration of a compatible database/storage pair. Do not blindly reverse MySQL DDL or repoint the release symlink. Record data-loss implications before any real promotion.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| UPG-01 | Blocker | Operator: follow [Upgrade](UPGRADE.md) on a restored pre-08 copy; inspect edge after fencing. | Public app access is blocked while fenced. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| UPG-02 | Blocker | Operator: review the candidate upgrade record on the isolated copy. | Migration `0008` applied successfully after verified backup. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| UPG-03 | Blocker | Operator: rehearse stopped upgrade before migration per [recovery guidance](UPGRADE.md#6-recovery-if-an-upgrade-stops-mid-way). | Healthy old release can be recovered without changing schema. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| UPG-04 | Blocker | Operator: separately rehearse an interruption after migration may have begun. | Site stays fenced pending approved forward repair or isolated compatible restore. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Security headers and rate limits
 
-### 25 · LIVE-25 · Edge protections and authorization
-
-- **Steps:** On approved synthetic accounts/traffic, inspect HSTS, CSP, framing restrictions, cookie attributes and cache controls for authenticated data. Verify intended request/upload limits, bounded rate-limit behavior for sign-in and forms/payment checks, and that the support request ID is safe. Verify external egress rejects unapproved destinations via supported admin checks.
-- **Expected:** Configured headers and secure cookie protections are present; private data is not cached; limits return clear, safe responses and clear as designed. No raw sensitive data or exception traces are returned. Do not exercise aggressive traffic against live services.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| SEC-01 | Blocker | Operator: inspect HTTPS response headers on `/sign-in`. | `Strict-Transport-Security` present for the production HTTPS profile. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| SEC-02 | Blocker | Operator: inspect `Content-Security-Policy` on `/sign-in`. | Expected nonce policy and framing restrictions present. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| SEC-03 | Blocker | Operator: inspect authenticated response cache headers for the synthetic invoice. | Private invoice data is not cacheable. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| SEC-04 | Blocker | In isolated QA, use the agreed small sign-in limit; submit wrong synthetic credentials at `/sign-in` until limited. | Safe limit response, no diagnostic secrets. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Accessibility
 
-### 26 · LIVE-26 · WCAG 2.2 AA manual and automated checks
-
-- **Steps:** Run axe on default, loading, validation, modal, and completion states in both themes. Use keyboard only and a real screen reader on registration (including billing), checkout billing, tier selection, wizard, and Publish. Test 400% zoom from a 1280 CSS px window, reduced motion, and contrast/focus visibility. Record browser, assistive technology and versions.
-- **Expected:** Clear labels, required states and errors; wizard step is announced with `aria-current="step"` and heading focus moves on transitions. Tier changes announce expansion without moving radio focus. Publish dialog has a named purpose, usable focus and safe return. Status is not color-only, focus is not obscured, targets meet 24 CSS px or a WCAG exception applies, and essential content reflows. Document manual and automated results separately; axe alone is not conformance.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| A11-01 | Blocker | `/orders/:id` → press Tab and activate wizard **Next** using only keyboard. | Focus moves to the new step heading. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| A11-02 | Blocker | Use a screen reader on the wizard step list. | Current step is announced, not conveyed by color alone. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| A11-03 | Blocker | `/orders/new` → use arrows to select a tier with screen reader on. | Radio focus stays put and expanded content is announced. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| A11-04 | Blocker | `/admin/workflows` → open **Publish** with keyboard and dismiss it. | Focus returns to the invoking control or a sensible successor. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| A11-05 | Blocker | `/register` → submit an incomplete name/billing form with screen reader on. | Errors identify their fields and are discoverable without color. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| A11-06 | Blocker | In a laptop browser at 1280 CSS px, zoom to 400% and finish a wizard step. | Controls remain usable without two-dimensional page scrolling. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| A11-07 | Important | Operator: run `a11y-check.mjs` after the responsive check, per the [Increment 08 QA runbook](../../scripts/qa/README.md#increment-08-focused-sweep). | No WCAG 2.2 AA-tagged axe failures in tested states. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Responsive devices
 
-### 27 · LIVE-27 · Reflow, touch and installed experience
-
-- **Steps:** Test signed-out, customer and admin views at 240, 320, 375, 768, 1024 and 1440 CSS px in both themes; include physical touch devices, portrait/landscape, and an on-screen keyboard. Exercise primary forms, tables, dialogs, menus and navigation; if offered, try PWA install, offline and update/reload.
-- **Expected:** No page-wide horizontal scrolling or inaccessible actions; intrinsically wide content scrolls only in its own accessible region. PWA offline mode does not expose cached private data or hide session revocation; navigation gets the current release after reconnecting.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| RSP-01 | Blocker | Operator: run `responsive-check.mjs` with private fixtures from the [Increment 08 QA runbook](../../scripts/qa/README.md#increment-08-focused-sweep). | No page-level overflow at 240 CSS px in either theme. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| RSP-02 | Blocker | Inspect the RSP-01 results at 320/390/640/768/1024/1280/1440 CSS px in both themes. | No page-level overflow at those widths. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| RSP-03 | Important | On a phone, open `/register` and enter names with the on-screen keyboard. | Focused inputs and primary action can be reached. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| RSP-04 | Important | On a phone, rotate an order wizard between portrait and landscape. | The same step and actions remain available. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## SEO and indexing
 
-### 28 · LIVE-28 · Public discovery and private indexing boundary
-
-- **Steps:** Verify portal `/robots.txt` specifies `Disallow: /`; as a logged-out visitor try private routes without a session. If the public site is in release scope, verify canonical URLs, crawlable sitemap, titles and structured data on representative public pages and review submitted indexing coverage.
-- **Expected:** The portal asks crawlers not to crawl it, and authentication independently protects private routes. Public pages are discoverable as configured; no private routes, identities or documents appear in public sitemap or metadata. A crawler directive alone does not guarantee URL exclusion.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| SEO-01 | Blocker | Open portal `/robots.txt`. | Contains `Disallow: /`. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| SEO-02 | Important | Operator: inspect portal HTML response for `/sign-in`. | `X-Robots-Tag` includes `noindex`. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| SEO-03 | Optional-if-enabled | If public marketing is in scope, inspect that site’s public sitemap. | Approved public URLs only; no private portal links. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Analytics
 
-### 29 · LIVE-29 · PostHog and Clarity consent boundary
-
-- **Steps:** Confirm vendors off by default; if enabled for launch, configure approved project identifiers/origins and inspect network requests before consent, after opt-in, on eligible anonymous `/privacy` and `/terms`, after withdrawal, and on signed-in/private or query/fragment URLs. Check isolated vendor dashboards with synthetic visits.
-- **Expected:** No analytics before consent or on excluded routes. Only eligible pages load the approved vendor after opt-in; withdrawal stops subsequent collection. No private content, credentials, or identifying form values reach vendors.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| ANA-01 | Blocker | Operator: on `/privacy`, open a new private browser window; inspect network before accepting cookies. | No PostHog or Clarity requests. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ANA-02 | Optional-if-enabled | `/admin/integrations/analytics` → configure approved PostHog; opt in anonymously on `/privacy`. | Only approved PostHog endpoint receives the test visit. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ANA-03 | Optional-if-enabled | `/admin/integrations/analytics` → configure approved Clarity project ID; opt in anonymously on `/terms`. | Correct Clarity project receives the test visit. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ANA-04 | Blocker | After consent, sign in and open a synthetic `/orders/:id`. Inspect network. | Neither vendor loads on a private order path. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Final sign-off
 
-### 30 · LIVE-30 · Go or no-go
+| Section | Passed | Failed | Blocked | Excluded |
+| --- | --- | --- | --- | --- |
+| Server and TLS | ___ | ___ | ___ | ___ |
+| Accounts and MFA | ___ | ___ | ___ | ___ |
+| Registration and names | ___ | ___ | ___ | ___ |
+| Catalogue and ordering | ___ | ___ | ___ | ___ |
+| Order numbers | ___ | ___ | ___ | ___ |
+| Add-on orders | ___ | ___ | ___ | ___ |
+| Billing | ___ | ___ | ___ | ___ |
+| Stripe test mode and test events | ___ | ___ | ___ | ___ |
+| Stripe live mode and live events | ___ | ___ | ___ | ___ |
+| Invoices and receipts | ___ | ___ | ___ | ___ |
+| Order workflow wizard and publishing | ___ | ___ | ___ | ___ |
+| Files and audio | ___ | ___ | ___ | ___ |
+| Mail | ___ | ___ | ___ | ___ |
+| Staff console | ___ | ___ | ___ | ___ |
+| Audit, logging, and SIEM | ___ | ___ | ___ | ___ |
+| Backup and restore drill | ___ | ___ | ___ | ___ |
+| Upgrade and rollback | ___ | ___ | ___ | ___ |
+| Security headers and rate limits | ___ | ___ | ___ | ___ |
+| Accessibility | ___ | ___ | ___ | ___ |
+| Responsive devices | ___ | ___ | ___ | ___ |
+| SEO and indexing | ___ | ___ | ___ | ___ |
+| Analytics | ___ | ___ | ___ | ___ |
 
-- **Steps:** Review the exact release, evidence and scope with the release owner, operations, security/accessibility, and the payment approver when applicable. Confirm monitoring, escalation, backup, rollback ownership and handover. List exclusions, residual risks and any required retest.
-- **Expected:** **GO only** when every required case has passed with evidence for this candidate; launch exclusions are approved and verified disabled; and there is no unresolved blocker in security, privacy, accessibility, payment/accounting, or recovery. **NO-GO** for missing or failed required evidence: keep traffic fenced or the excluded capability disabled, assign an owner and retest before approval. If live card checkout is in scope, missing provider-side live 2xx, return-page, or refund proof blocks that launch; test mode and the portal self-test cannot substitute.
-- **Result:** ☐ Pass ☐ Fail | Evidence: ____ | Tester / UTC date: ____
-- **Decision:** ☐ GO ☐ NO-GO | Approver roles / UTC date: ____ | Exclusions, risks, owners and retest IDs: ____
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| GO-01 | Blocker | Release owner: review evidence against every in-scope Blocker. | All pass on the identified release and applicable environment. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| GO-02 | Blocker | Release owner: record a written decision for each failed Important row and every scope exclusion. | Each decision names an owner, mitigation, and retest or review date. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+
+**GO** only when all in-scope Blockers pass and every failed Important has a written owner decision. Treat a blocked or unrun Blocker as **NO-GO**, not a waiver. Mark an Optional-if-enabled row excluded only when the capability is verified off or not part of the deployment. If live card payments are in scope, no live GO without Stripe Dashboard 2xx delivery, return-page confirmation, Paid invoice, receipt, wizard continuation, and refund evidence. Otherwise keep the release fenced or the explicitly excluded capability off and retest.
+
+**Decision:** ☐ GO ☐ NO-GO | Candidate/environment: ____ | Release owner / UTC date: ____ | Operations: ____ | Payment approver if applicable: ____ | Security/accessibility reviewer: ____ | Evidence and issue references: ____
+
+### Not covered by this checklist
+
+- **Penetration test:** Arrange a separate authorized assessment.
+- **Load test:** Test capacity in an isolated environment with an approved plan.
+- **Legal review:** Have the owner arrange privacy, payment, tax and contractual review.
+- **Real screen-reader users:** Operator checks are not a substitute for testing with people who rely on assistive technology.
+
+### TODO for release lead: confirm final Increment 08 labels
+
+- **D1/D4:** Confirm registration billing disclosure and checkout radio and checkbox copy (BIL-01–02, BIL-05–07).
+- **D3:** Confirm final checkout project-target text and console related-orders heading (ADD-03, ADD-07).
+- **D5:** Confirm admin repair placement and return-page receipt and wizard actions (PAY-11–12, PAY-15, PAY-31–32).
+- **D6:** Confirm audio recorder control text and final submit label (WIZ-05, FIL-03–04).
