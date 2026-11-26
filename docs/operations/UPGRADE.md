@@ -185,7 +185,7 @@ Existing orders keep their pinned workflow version. The start-up job `orders.inc
 - **Reload open tabs.** Browser tabs that were open show "ReadyPackets was updated on the server". Choose **Reload**.
 - **Stripe.**
   - Open `/admin/payments/setup` and read the banner. If it says **NOT ACTIVE**, finish the missing step it names.
-  - Run **Verify Checkout session creation** once for the current key.
+  - Run **Verify Checkout session creation** once for the current key. If Stripe was already active, checkout stays active without it, and the page shows it as a recommended check. New activations and mode changes require it to pass.
   - Step-by-step: [Getting card checkout active](../guides/ADMIN_GUIDE.md#getting-card-checkout-active-increment-072).
   - If a signing secret was ever exposed (for example in a screenshot), roll it in Stripe and paste the new `whsec_…` into **Primary**. Then run **Send self-test webhook**.
 - **Branding.**

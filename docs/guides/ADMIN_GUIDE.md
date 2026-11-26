@@ -434,7 +434,7 @@ Use **Stripe setup** (`/admin/payments/setup`), described in [Hosted online paym
   - the Stripe egress preset is switched on;
   - **Test Stripe API** succeeded;
   - **Send self-test webhook** succeeded;
-  - from 07.2, the last **Verify Checkout session creation** probe for the current key has not failed.
+  - from 07.2, **Verify Checkout session creation** passed for the current key and mode. This is needed when switching to Stripe or changing the mode. A server already active on Stripe stays active after the upgrade, and the probe shows as a "Recommended check". Only a failed probe for the current key blocks it.
 - **Activating.** You then confirm in a dialog. Live mode also needs the typed words `ACTIVATE LIVE PAYMENTS`.
 - **Events.** Subscribe the nine events listed on the page.
 - **Unmatched payments.** A paid session that carries portal metadata but matches no order raises a warning alert for staff.
@@ -615,6 +615,8 @@ Card checkout is active only when the banner at the top of **Stripe setup** (`/a
 5. **Check that sessions can be created.** Select **Verify Checkout session creation**. This creates an unpaid probe session and expires it at once, at no cost. It catches:
    - a restricted key without Checkout Sessions Write;
    - a custom Checkout domain, which ReadyPackets refuses because it sends customers only to `https://checkout.stripe.com`.
+
+   A passing probe for the current key and mode is required to activate. Until then, **Missing readiness gates** lists it and **Activate Stripe Checkout** stays blocked. If the server was already active on Stripe before 07.2, checkout stays active and the probe shows as **Recommended check (online card checkout remains active)**. Only a failed probe for the current key pauses checkout.
 6. **Check the signing secret.** Select **Send self-test webhook**. This proves the portal's own signature check with the stored Primary secret. To prove that Stripe has the same endpoint and secret, also use **Send test event** in Stripe Workbench, or make a test payment.
 7. **Activate.** Select **Activate Stripe Checkout** and confirm. In live mode, type `ACTIVATE LIVE PAYMENTS`.
 
@@ -651,7 +653,9 @@ If a secret ever appears in a screenshot, e-mail or ticket, roll it in Stripe an
    - the egress preset switched off;
    - a custom Checkout domain.
 
-The customer's order and invoice are kept. The customer sees "Your order … is placed, but we could not open the secure payment page", and can select **Pay now** later, from the return page or the invoice, without placing a second order.
+The customer's order and invoice are kept, and the customer sees "Your order … is placed, but we could not open the secure payment page".
+- **Pay now** is offered only while online payment is available.
+- Otherwise the page links to the invoice, the order and the payment status, and the customer can pay later or by invoice without placing a second order.
 
 ### Company branding on invoices and receipts
 

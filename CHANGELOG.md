@@ -35,7 +35,9 @@ Requested by the owner on 2026-11-26 (prompt 30). See the [session log](docs/ses
 - **Verify Checkout session creation** on `/admin/payments/setup` (`payments.admin.verifyCheckoutSession`, step-up, audited `payments.setup.checkout_probe`) (`53786b0`).
   - It creates an unpaid probe session and expires it at once, at no cost.
   - It catches restricted keys without Checkout Sessions Write (`STRIPE_KEY_MISSING_PERMISSION`) and custom Checkout domains (`STRIPE_UNTRUSTED_REDIRECT_URL`).
-  - If it failed for the current key, activation is refused with `STRIPE_CHECKOUT_SESSION_NOT_VERIFIED`.
+  - **New activations** need a passing probe for the current key and mode (`47872b8`). This covers switching the provider to Stripe or changing the mode. Without one, the switch is refused with `STRIPE_CHECKOUT_SESSION_NOT_VERIFIED`, and **Activate Stripe Checkout** stays blocked.
+  - **Servers already active on Stripe** stay active on upgrade without a probe. There, the probe is a "Recommended check", and only a failed probe for the current key and mode blocks checkout.
+- **Pay now on the placed-order page** (`c90b183`). The page offers **Pay now** only when online payment is available. Otherwise it links to the invoice, the order and the payment status.
 - **Status banner** on `/admin/payments/setup` (`53786b0`): **Online card checkout: ACTIVE** or **NOT ACTIVE**, what customers experience right now, and the missing gates.
 - **Branded invoice, payment receipt and refund note PDFs** (`8d20507`):
   - mark, wordmark, tagline and legal name;

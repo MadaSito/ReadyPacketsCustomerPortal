@@ -384,7 +384,7 @@ Details are in `docs/session-logs/2026-11-22-session-03.md`.
 
 ## Verification for increment 07.2
 
-Fix pack for the owner's prompt 30 of 2026-11-26 ([session log](../session-logs/2026-11-26-session-01.md)). Code commits: `1be1cc2`, `4fb93be`, `8a9901b`, `fdd5583`, `c082b4e`, `8d20507`, `53786b0`. Nothing under `migrations/` changed (checked with `git diff main..HEAD --stat -- migrations`), and the upgrade commands are unchanged.
+Fix pack for the owner's prompt 30 of 2026-11-26 ([session log](../session-logs/2026-11-26-session-01.md)). Code commits: `1be1cc2`, `4fb93be`, `8a9901b`, `fdd5583`, `c082b4e`, `8d20507`, `53786b0`, `c90b183` (Pay now hidden on the placed-order page when online payment is unavailable), `47872b8` (a passing probe is required for new Stripe activations; servers already active stay active). Nothing under `migrations/` changed (checked with `git diff main..HEAD --stat -- migrations`), and the upgrade commands are unchanged.
 
 ### What changed
 

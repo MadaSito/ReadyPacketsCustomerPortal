@@ -203,7 +203,7 @@ item is missing from the portal menu, it has not landed yet.
 
 - **Placing the order.** When card payment is available, placing an order takes you to Stripe's secure payment page at `checkout.stripe.com`.
 - **If the payment page cannot open,** your order and invoice are still saved. You see "Your order … is placed, but we could not open the secure payment page".
-  - Select **Pay now** to try again later, from that page, the payment status page or the invoice.
+  - When card payment is available, **Pay now** is offered there, on the payment status page and on the invoice.
   - Or pay by invoice using the instructions on it.
   - Do not place the order again.
 - **If you leave the payment page,** the status page says whether your order is waiting for payment or whether a payment is being confirmed. If it is waiting for payment and card payment is available, **Pay now** is offered. If an earlier payment session may still be open, the page warns you not to pay twice.
