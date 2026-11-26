@@ -879,10 +879,11 @@ describe("MySQL transactional mail outbox", () => {
   });
 
   it.each([
-    { key: "compliance.invoice_issued", hasVar: false, inBody: false },
-    { key: "compliance.invoice_paid", hasVar: true, inBody: false },
-    { key: "compliance.invoice_paid", hasVar: true, inBody: true },
-  ])("keeps published $key compatible (project declared=$hasVar, rendered=$inBody)", async ({ key, hasVar, inBody }) => {
+    { key: "compliance.invoice_issued", hasVar: false, inBody: false, markup: "" },
+    { key: "compliance.invoice_paid", hasVar: true, inBody: false, markup: "" },
+    { key: "compliance.invoice_paid", hasVar: true, inBody: true, markup: "" },
+    { key: "compliance.invoice_paid", hasVar: true, inBody: true, markup: "<scr<script>ipt><<p>>" },
+  ])("keeps published $key compatible (project declared=$hasVar, rendered=$inBody, markup=$markup)", async ({ key, hasVar, inBody, markup }) => {
     const f = fixture();
     const { send } = setDelivery(f, "accepted");
     await f.h.settings.set(MAIL_RETAIN_CONTENT.key, true);
@@ -894,7 +895,7 @@ describe("MySQL transactional mail outbox", () => {
     const render = vi.fn((input: Readonly<Record<string, string | number | boolean>>) => ({
       subject: "Customized invoice",
       text: `Order: ${vars.orderReference}\n${inBody ? `Project: ${input.projectName}\n` : ""}Invoice notice.`,
-      html: `<p>Order: <strong>${vars.orderReference}</strong></p>${inBody ? `<p>Project: <strong>${String(input.projectName).replaceAll("&", "&amp;")}</strong></p>` : ""}<p>Invoice notice.</p>`,
+      html: `<p>Order: <strong>${vars.orderReference}</strong></p>${inBody ? `<p>Project: ${markup}<strong>${String(input.projectName).replaceAll("&", "&amp;")}</strong></p>` : ""}<p>Invoice notice.</p>`,
     }));
     f.mail.registerMailTemplateStore({
       resolve: async (requested) => requested === key
@@ -908,7 +909,8 @@ describe("MySQL transactional mail outbox", () => {
     expect(message.text.match(/Order: RP-2026-000116/g)).toHaveLength(1);
     expect(message.text.match(/Project: Advisory & design/g)).toHaveLength(1);
     expect(message.html.match(/Order: (?:<strong>)?RP-2026-000116/g)).toHaveLength(1);
-    expect(message.html.match(/Project: (?:<strong>)?Advisory &amp; design/g)).toHaveLength(1);
+    expect(message.html.match(/Project: /g)).toHaveLength(1);
+    expect(message.html).toContain(inBody ? `Project: ${markup}<strong>Advisory &amp; design` : "Project: Advisory &amp; design");
     if (hasVar) expect(render.mock.calls[0]).toEqual([vars]);
     else expect(render.mock.calls[0]).toEqual([expect.not.objectContaining({ projectName: vars.projectName })]);
     const [row] = await t.db.select().from(mailOutbox);

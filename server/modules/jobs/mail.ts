@@ -104,6 +104,22 @@ function orderContextLines(vars: OutboundMail["vars"]): string[] {
   });
 }
 
+/** Comparison-only projection. Never use this text to render or sanitize HTML. */
+function invoiceLabelComparisonText(html: string): string {
+  let depth = 0;
+  let text = "";
+  for (const character of html) {
+    if (character === "<") {
+      depth += 1;
+    } else if (character === ">") {
+      if (depth > 0) depth -= 1;
+    } else if (depth === 0) {
+      text += character;
+    }
+  }
+  return text.replace(/(?:&nbsp;|\s)+/gu, " ");
+}
+
 function prependOrderContext(
   rendered: ReturnType<PublishedMailTemplate["render"]>,
   lines: string[],
@@ -114,7 +130,7 @@ function prependOrderContext(
   const missingText = deduplicate ? lines.filter((line) => !textBody.includes(line)) : lines;
   const text = missingText.length ? `${missingText.join("\n")}\n\n${rendered.text}` : rendered.text;
   if (rendered.html === undefined) return { ...rendered, text };
-  const htmlBody = deduplicate ? rendered.html.replace(/<[^<>]*>/gu, "").replace(/(?:&nbsp;|\s)+/gu, " ") : "";
+  const htmlBody = deduplicate ? invoiceLabelComparisonText(rendered.html) : "";
   const missingHtml = deduplicate ? lines.filter((line) => !htmlBody.includes(escapeHtml(line))) : lines;
   if (!missingHtml.length) return { ...rendered, text };
   const block = `<p>${missingHtml.map(escapeHtml).join("<br>")}</p>`;
