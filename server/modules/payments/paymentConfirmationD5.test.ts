@@ -1530,4 +1530,227 @@ describe("Increment 08 — Package D5 Payment confirmation (authoritative bookin
     expect(settings.stripe.webhookDelivery.missingWebhookDetected).toBe(true);
     expect(settings.stripe.webhookDelivery.unwebhookedLookupPaidCount).toBeGreaterThanOrEqual(1);
   });
+
+  it("aligns customer lock hierarchy (orders -> compliance_invoices -> actor -> payment_attempts) across startCheckout, confirmCheckoutPayment, and cancelAttemptIfUnpaid without deadlocking", async () => {
+    const stack = await buildActivatedStack();
+    const { fakeStripe, paymentsMod, buyer, otherBuyer, createCustomerCheckout } = stack;
+
+    const checkout = await createCustomerCheckout();
+    // Foreign customer startCheckout and cancelAttemptIfUnpaid reject before locking foreign order/invoice
+    await expect(
+      paymentsMod.startCheckout(
+        checkout.invoicePublicId,
+        { successPath: "/checkout/return", cancelPath: "/checkout/cancel" },
+        { principal: otherBuyer.principal, idempotencyKey: `foreign-${ulid()}` },
+      ),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    await expect(
+      paymentsMod.cancelAttemptIfUnpaid(otherBuyer.principal, {
+        attemptPublicId: checkout.attemptPublicId,
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", reasonCode: "PAYMENT_ATTEMPT_NOT_FOUND" });
+
+    fakeStripe.markSessionPaid(checkout.sessionId);
+
+    // Barrier on GET /v1/checkout/sessions/:id so confirmCheckoutPayment's post-egress transaction,
+    // startCheckout's preAttempt transaction, and cancelAttemptIfUnpaid contend simultaneously on the
+    // SAME customer actor + order + invoice in canonical `orders -> compliance_invoices -> actor` order.
+    let releaseConfirm!: () => void;
+    const confirmReady = new Promise<void>((resolve) => {
+      releaseConfirm = resolve;
+    });
+    fakeStripe.setSessionGetTransform(async (sid, base) => {
+      if (sid === checkout.sessionId) {
+        releaseConfirm();
+      }
+      return base;
+    });
+
+    const confirmPromise = paymentsMod.confirmCheckoutPayment(buyer.principal, {
+      attemptPublicId: checkout.attemptPublicId,
+    });
+    await confirmReady;
+
+    const [confirmRes, startOutcome, cancelOutcome] = await Promise.allSettled([
+      confirmPromise,
+      paymentsMod.startCheckout(
+        checkout.invoicePublicId,
+        { successPath: "/checkout/return", cancelPath: "/checkout/cancel" },
+        { principal: buyer.principal, idempotencyKey: `race-start-${ulid()}` },
+      ),
+      paymentsMod.cancelAttemptIfUnpaid(buyer.principal, {
+        invoicePublicId: checkout.invoicePublicId,
+      }),
+    ]);
+    fakeStripe.setSessionGetTransform(null);
+
+    expect(confirmRes.status).toBe("fulfilled");
+    if (confirmRes.status === "fulfilled") {
+      expect(["paid", "processing"]).toContain(confirmRes.value.state);
+    }
+    // startCheckout must either succeed cleanly before confirm/cancel or reject cleanly with INVOICE_ALREADY_PAID (never deadlock)
+    if (startOutcome.status === "rejected") {
+      expect(startOutcome.reason).toMatchObject({
+        code: "CONFLICT",
+        reasonCode: "INVOICE_ALREADY_PAID",
+      });
+    }
+    expect(cancelOutcome.status).toBe("fulfilled");
+  });
+
+  it("gates worker and signed-webhook non-paid branches on locked current invoice state after admin void while retaining authentic-paid void alerting", async () => {
+    const stack = await buildActivatedStack();
+    const {
+      h,
+      fakeStripe,
+      complianceMod,
+      paymentsMod,
+      admin,
+      stripeWh,
+      createCustomerCheckout,
+      deliverSignedCompletedWebhook,
+    } = stack;
+
+    const activeCheckout = await createCustomerCheckout();
+
+    // Admin voids the issued invoice while `activeCheckout.attemptPublicId` is still `redirected`
+    await complianceMod.invoices.admin.void(admin.principal, {
+      invoicePublicId: activeCheckout.invoicePublicId,
+      reason: "Customer switched to offline wire settlement",
+    });
+
+    const [voidedBefore] = await tdb.db
+      .select()
+      .from(complianceTables.complianceInvoices)
+      .where(eq(complianceTables.complianceInvoices.publicId, activeCheckout.invoicePublicId));
+    expect(voidedBefore?.status).toBe("void");
+    expect(voidedBefore?.voidedAt).not.toBeNull();
+
+    // 1. Direct non-paid webhook branch (`outcomeHint === "expired"`): ignored as INVOICE_VOIDED, attempt stays `redirected`
+    const nowSec = Math.floor(h.clock.now().getTime() / 1000);
+    const expiredEvtId = `evt_void_exp_${ulid().toLowerCase()}`;
+    const sess = fakeStripe.sessions.get(activeCheckout.sessionId)!;
+    const expiredPayload = Buffer.from(
+      JSON.stringify({
+        id: expiredEvtId,
+        object: "event",
+        type: "checkout.session.expired",
+        created: nowSec,
+        livemode: false,
+        data: {
+          object: {
+            id: sess.id,
+            object: "checkout.session",
+            status: "expired",
+            payment_status: "unpaid",
+            payment_intent: sess.payment_intent.id,
+            metadata: sess.metadata,
+          },
+        },
+      }),
+      "utf8",
+    );
+    const directExpiredWh = await paymentsMod.handleSignedWebhook({
+      provider: "stripe",
+      rawBody: expiredPayload,
+      headers: { "stripe-signature": signStripeWebhook(expiredPayload, stripeWh, nowSec) },
+      notificationUrl: "https://portal.example.test/api/payments/webhooks/stripe",
+    });
+    expect(directExpiredWh.booked).toBe(false);
+    expect(directExpiredWh.reasonCode).toBe("INVOICE_VOIDED");
+
+    // 2. Signed `checkout.session.completed` webhook whose authoritative fetch returns `open` (`asyncPending: true`):
+    //    must NOT write `reconciliationNote = "awaiting_async_settlement"` or emit `pending_async` after void
+    fakeStripe.setSessionGetTransform(async (sid, base) => {
+      if (sid !== activeCheckout.sessionId) return base;
+      return {
+        ...base,
+        status: "complete",
+        payment_status: "unpaid",
+        payment_intent: {
+          ...(base.payment_intent as Record<string, unknown>),
+          status: "processing",
+        },
+      };
+    });
+    const openFetchWh = await deliverSignedCompletedWebhook(
+      activeCheckout.sessionId,
+      `evt_void_open_${ulid().toLowerCase()}`,
+    );
+    expect(openFetchWh.booked).toBe(false);
+    expect(openFetchWh.reasonCode).toBe("INVOICE_VOIDED");
+
+    // 3. Scheduled worker (`reconcilePendingAttempts`) on `open` (`asyncPending`), `failed`, and `expired` fetches:
+    //    must NOT write `awaiting_async_settlement`, `failed`, or `expired` onto the voided invoice's attempt
+    const workerAsync = await paymentsMod.reconcilePendingAttempts();
+    expect(workerAsync.expired).toBe(0);
+    expect(workerAsync.failed).toBe(0);
+
+    fakeStripe.setSessionGetTransform(async (sid, base) => {
+      if (sid !== activeCheckout.sessionId) return base;
+      return {
+        ...base,
+        status: "open",
+        payment_status: "unpaid",
+        payment_intent: {
+          ...(base.payment_intent as Record<string, unknown>),
+          status: "canceled",
+        },
+      };
+    });
+    const failedFetchWh = await deliverSignedCompletedWebhook(
+      activeCheckout.sessionId,
+      `evt_void_fail_${ulid().toLowerCase()}`,
+    );
+    expect(failedFetchWh.booked).toBe(false);
+    expect(failedFetchWh.reasonCode).toBe("INVOICE_VOIDED");
+
+    const workerFailed = await paymentsMod.reconcilePendingAttempts();
+    expect(workerFailed.failed).toBe(0);
+
+    fakeStripe.setSessionGetTransform(async (sid, base) => {
+      if (sid !== activeCheckout.sessionId) return base;
+      return {
+        ...base,
+        status: "expired",
+        payment_status: "unpaid",
+      };
+    });
+    const workerExpired = await paymentsMod.reconcilePendingAttempts();
+    expect(workerExpired.expired).toBe(0);
+    fakeStripe.setSessionGetTransform(null);
+
+    const [attemptAfterNonPaid] = await tdb.db
+      .select()
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, activeCheckout.attemptPublicId));
+    expect(attemptAfterNonPaid?.status).toBe("redirected");
+    expect(attemptAfterNonPaid?.reconciliationNote).toBeNull();
+    expect(attemptAfterNonPaid?.failureReasonCode).toBeNull();
+    expect(attemptAfterNonPaid?.lastReconciledAt).toBeNull();
+
+    // 4. Retain existing authentic-paid behavior on voided invoice: marks webhook INVOICE_NOT_PAYABLE without booking
+    const paidAfterVoidEvtId = `evt_void_paid_${ulid().toLowerCase()}`;
+    fakeStripe.markSessionPaid(activeCheckout.sessionId);
+    const paidAfterVoidWh = await deliverSignedCompletedWebhook(
+      activeCheckout.sessionId,
+      paidAfterVoidEvtId,
+    );
+    expect(paidAfterVoidWh.booked).toBe(false);
+    expect(paidAfterVoidWh.reasonCode).toBe("INVOICE_NOT_PAYABLE");
+
+    const [voidPaidWhRow] = await tdb.db
+      .select()
+      .from(paymentWebhookEvents)
+      .where(eq(paymentWebhookEvents.externalEventId, paidAfterVoidEvtId));
+    expect(voidPaidWhRow?.status).toBe("ignored");
+    expect(voidPaidWhRow?.reasonCode).toBe("INVOICE_NOT_PAYABLE");
+
+    const [voidedAfter] = await tdb.db
+      .select()
+      .from(complianceTables.complianceInvoices)
+      .where(eq(complianceTables.complianceInvoices.publicId, activeCheckout.invoicePublicId));
+    expect(voidedAfter?.status).toBe("void");
+  });
 });

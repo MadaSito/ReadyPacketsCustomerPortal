@@ -1610,6 +1610,18 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     if (opts?.principal && opts.principal.role === "customer" && invoice.ownerUserId !== opts.principal.userId) {
       throw notFound("INVOICE_NOT_FOUND");
     }
+    const preOrdersSvc = (deps.services as Partial<typeof deps.services>).orders;
+    if (
+      opts?.principal &&
+      opts.principal.role === "customer" &&
+      preOrdersSvc &&
+      typeof preOrdersSvc.getOrderRefById === "function"
+    ) {
+      const preOrder = await preOrdersSvc.getOrderRefById(invoice.orderId);
+      if (!preOrder || preOrder.ownerUserId !== opts.principal.userId) {
+        throw notFound("INVOICE_NOT_FOUND");
+      }
+    }
     if (invoice.origin !== "portal") {
       throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported historical invoices cannot be paid online.");
     }
@@ -1623,31 +1635,49 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     // Increment 06 D5 + D15: Zero-total invoices settle directly and issue a `zero_total` receipt
     // without touching any external payment processor.
     if (invoice.totalMinor === 0) {
-      const settledZero = await deps.db.transaction(async (tx) => {
-        if (opts?.principal) {
-          const liveActor = await assertLiveActorInTx(deps, opts.principal, tx);
-          if (liveActor.role === "customer" && invoice.ownerUserId !== liveActor.userId) {
-            throw notFound("INVOICE_NOT_FOUND");
+      const settledZero = await runWithMysqlDeadlockRetry(() =>
+        deps.db.transaction(async (tx) => {
+          // Canonical lock order: `orders -> compliance_invoices -> users(actor)` so concurrent
+          // `confirmCheckoutPayment` / `cancelAttemptIfUnpaid` on the same customer/order cannot deadlock.
+          const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+          let lockedOrderOwnerUserId: number | null = null;
+          if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
+            const lockedOrder = await ordersSvc.getOrderRefById(invoice.orderId, tx, { forUpdate: true });
+            if (!lockedOrder) throw notFound("INVOICE_NOT_FOUND");
+            lockedOrderOwnerUserId = lockedOrder.ownerUserId;
+            if (opts?.principal && opts.principal.role === "customer" && lockedOrder.ownerUserId !== opts.principal.userId) {
+              throw notFound("INVOICE_NOT_FOUND");
+            }
+            if (lockedOrder.lockState === "legal_hold" || lockedOrder.lockState === "imported_read_only") {
+              throw new DomainError("LOCKED", "ORDER_LOCKED", "Order is locked against checkout.", {
+                lockState: lockedOrder.lockState,
+              });
+            }
           }
-        }
-        const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
-        if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
-          const lockedOrder = await ordersSvc.getOrderRefById(invoice.orderId, tx, { forUpdate: true });
-          if (!lockedOrder) throw notFound("INVOICE_NOT_FOUND");
-          if (lockedOrder.lockState === "legal_hold" || lockedOrder.lockState === "imported_read_only") {
-            throw new DomainError("LOCKED", "ORDER_LOCKED", "Order is locked against checkout.", {
-              lockState: lockedOrder.lockState,
-            });
-          }
-        }
-        if (typeof complianceSvc.settleCheckoutInvoiceInTx === "function") {
-          return complianceSvc.settleCheckoutInvoiceInTx(
-            { settlementKind: "zero_total", invoicePublicId: invoice.invoicePublicId },
+          const lockedZeroInvoice = await complianceSvc.getInvoiceForCheckout(invoice.invoicePublicId, {
+            ...(opts?.principal ? { principal: opts.principal } : {}),
             tx,
-          );
-        }
-        return { receiptPublicId: null };
-      });
+            forUpdate: true,
+          });
+          if (opts?.principal) {
+            const liveActor = await assertLiveActorInTx(deps, opts.principal, tx);
+            if (
+              liveActor.role === "customer" &&
+              (lockedZeroInvoice.ownerUserId !== liveActor.userId ||
+                (lockedOrderOwnerUserId !== null && lockedOrderOwnerUserId !== liveActor.userId))
+            ) {
+              throw notFound("INVOICE_NOT_FOUND");
+            }
+          }
+          if (typeof complianceSvc.settleCheckoutInvoiceInTx === "function") {
+            return complianceSvc.settleCheckoutInvoiceInTx(
+              { settlementKind: "zero_total", invoicePublicId: lockedZeroInvoice.invoicePublicId },
+              tx,
+            );
+          }
+          return { receiptPublicId: null };
+        }),
+      );
       return {
         mode: "settled",
         settlementKind: "zero_total",
@@ -1674,35 +1704,52 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         )
         .limit(1);
       if (existingWaived) {
-        const replaySettled = await deps.db.transaction(async (tx) => {
-          if (opts?.principal) {
-            const liveActor = await assertLiveActorInTx(deps, opts.principal, tx);
-            if (liveActor.role === "customer" && invoice.ownerUserId !== liveActor.userId) {
-              throw notFound("INVOICE_NOT_FOUND");
+        const replaySettled = await runWithMysqlDeadlockRetry(() =>
+          deps.db.transaction(async (tx) => {
+            // Canonical lock order: `orders -> compliance_invoices -> users(actor)`.
+            const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+            let lockedOrderOwnerUserId: number | null = null;
+            if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
+              const lockedOrder = await ordersSvc.getOrderRefById(invoice.orderId, tx, { forUpdate: true });
+              if (!lockedOrder) throw notFound("INVOICE_NOT_FOUND");
+              lockedOrderOwnerUserId = lockedOrder.ownerUserId;
+              if (opts?.principal && opts.principal.role === "customer" && lockedOrder.ownerUserId !== opts.principal.userId) {
+                throw notFound("INVOICE_NOT_FOUND");
+              }
+              if (lockedOrder.lockState === "legal_hold" || lockedOrder.lockState === "imported_read_only") {
+                throw new DomainError("LOCKED", "ORDER_LOCKED", "Order is locked against checkout.", {
+                  lockState: lockedOrder.lockState,
+                });
+              }
             }
-          }
-          const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
-          if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
-            const lockedOrder = await ordersSvc.getOrderRefById(invoice.orderId, tx, { forUpdate: true });
-            if (!lockedOrder) throw notFound("INVOICE_NOT_FOUND");
-            if (lockedOrder.lockState === "legal_hold" || lockedOrder.lockState === "imported_read_only") {
-              throw new DomainError("LOCKED", "ORDER_LOCKED", "Order is locked against checkout.", {
-                lockState: lockedOrder.lockState,
-              });
-            }
-          }
-          if (typeof complianceSvc.settleCheckoutInvoiceInTx === "function") {
-            return complianceSvc.settleCheckoutInvoiceInTx(
-              {
-                settlementKind: "waived_small_total",
-                invoicePublicId: invoice.invoicePublicId,
-                providerMinimumMinor: 0,
-              },
+            const lockedWaivedInvoice = await complianceSvc.getInvoiceForCheckout(invoice.invoicePublicId, {
+              ...(opts?.principal ? { principal: opts.principal } : {}),
               tx,
-            );
-          }
-          return null;
-        });
+              forUpdate: true,
+            });
+            if (opts?.principal) {
+              const liveActor = await assertLiveActorInTx(deps, opts.principal, tx);
+              if (
+                liveActor.role === "customer" &&
+                (lockedWaivedInvoice.ownerUserId !== liveActor.userId ||
+                  (lockedOrderOwnerUserId !== null && lockedOrderOwnerUserId !== liveActor.userId))
+              ) {
+                throw notFound("INVOICE_NOT_FOUND");
+              }
+            }
+            if (typeof complianceSvc.settleCheckoutInvoiceInTx === "function") {
+              return complianceSvc.settleCheckoutInvoiceInTx(
+                {
+                  settlementKind: "waived_small_total",
+                  invoicePublicId: lockedWaivedInvoice.invoicePublicId,
+                  providerMinimumMinor: 0,
+                },
+                tx,
+              );
+            }
+            return null;
+          }),
+        );
         return {
           mode: "settled",
           settlementKind: "waived_small_total",
@@ -1745,41 +1792,54 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         ? rawIdem
         : `att:${invoice.invoicePublicId}:${activeProvider}:${config.mode}:${invoice.balanceDueMinor}`;
 
-    const preAttempt = await deps.db.transaction(async (tx) => {
-      if (opts?.principal) {
-        await assertLiveActorInTx(deps, opts.principal, tx);
-      }
+    const preAttempt = await runWithMysqlDeadlockRetry(() =>
+      deps.db.transaction(async (tx) => {
+        // Canonical lock order: `orders -> compliance_invoices -> users(actor) -> payment_attempts`
+        // (matching `confirmCheckoutPayment` and `cancelAttemptIfUnpaid`), plus fence against starting
+        // a provider checkout after order cancellation, ownership transfer, or concurrent invoice void/payment.
+        const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+        let lockedOrderOwnerUserId: number | null = null;
+        if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
+          const lockedOrder = await ordersSvc.getOrderRefById(invoice.orderId, tx, { forUpdate: true });
+          if (!lockedOrder) {
+            throw notFound("INVOICE_NOT_FOUND");
+          }
+          lockedOrderOwnerUserId = lockedOrder.ownerUserId;
+          if (opts?.principal && opts.principal.role === "customer" && lockedOrder.ownerUserId !== opts.principal.userId) {
+            throw notFound("INVOICE_NOT_FOUND");
+          }
+          let orderCancelled = /cancel/.test(lockedOrder.statusKey);
+          if (ordersSvc.workflows && typeof ordersSvc.workflows.byVersionId === "function") {
+            const bound = await ordersSvc.workflows.byVersionId(tx, lockedOrder.workflowVersionId);
+            const state = bound.definition.states.find((s) => s.key === lockedOrder.statusKey);
+            orderCancelled = Boolean(state && state.kind === "terminal" && /cancel/.test(state.key));
+          }
+          if (orderCancelled) {
+            throw conflict("ORDER_CANCELLED", "Cannot start payment for a cancelled order.");
+          }
+          if (lockedOrder.lockState === "legal_hold" || lockedOrder.lockState === "imported_read_only") {
+            throw new DomainError("LOCKED", "ORDER_LOCKED", "Order is locked against online checkout.", {
+              lockState: lockedOrder.lockState,
+            });
+          }
+        }
 
-      // Canonical lock order (order -> compliance_invoices -> payment_attempts) + fence against
-      // starting a provider checkout after order cancellation or concurrent invoice void/payment.
-      const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
-      if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
-        const lockedOrder = await ordersSvc.getOrderRefById(invoice.orderId, tx, { forUpdate: true });
-        if (!lockedOrder) {
-          throw notFound("INVOICE_NOT_FOUND");
+        const lockedInvoice = await complianceSvc.getInvoiceForCheckout(invoicePublicId, {
+          ...(opts?.principal ? { principal: opts.principal } : {}),
+          tx,
+          forUpdate: true,
+        });
+        if (opts?.principal) {
+          const liveActor = await assertLiveActorInTx(deps, opts.principal, tx);
+          if (
+            liveActor.role === "customer" &&
+            (lockedInvoice.ownerUserId !== liveActor.userId ||
+              (lockedOrderOwnerUserId !== null && lockedOrderOwnerUserId !== liveActor.userId))
+          ) {
+            throw notFound("INVOICE_NOT_FOUND");
+          }
         }
-        let orderCancelled = /cancel/.test(lockedOrder.statusKey);
-        if (ordersSvc.workflows && typeof ordersSvc.workflows.byVersionId === "function") {
-          const bound = await ordersSvc.workflows.byVersionId(tx, lockedOrder.workflowVersionId);
-          const state = bound.definition.states.find((s) => s.key === lockedOrder.statusKey);
-          orderCancelled = Boolean(state && state.kind === "terminal" && /cancel/.test(state.key));
-        }
-        if (orderCancelled) {
-          throw conflict("ORDER_CANCELLED", "Cannot start payment for a cancelled order.");
-        }
-        if (lockedOrder.lockState === "legal_hold" || lockedOrder.lockState === "imported_read_only") {
-          throw new DomainError("LOCKED", "ORDER_LOCKED", "Order is locked against online checkout.", {
-            lockState: lockedOrder.lockState,
-          });
-        }
-      }
-
-      const lockedInvoice = await complianceSvc.getInvoiceForCheckout(invoicePublicId, {
-        ...(opts?.principal ? { principal: opts.principal } : {}),
-        tx,
-        forUpdate: true,
-      });
-      if (lockedInvoice.origin !== "portal") {
+        if (lockedInvoice.origin !== "portal") {
         throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported historical invoices cannot be paid online.");
       }
       if (lockedInvoice.voidedAt !== null || lockedInvoice.status === "void") {
@@ -1954,7 +2014,8 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         attemptPublicId,
         amountMinor: lockedInvoice.balanceDueMinor,
       };
-    });
+    }),
+    );
 
     if (preAttempt.kind === "settled_waived") {
       return {
@@ -2455,26 +2516,47 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       throw validation("MISSING_CANCEL_TARGET", "Provide either invoicePublicId or attemptPublicId.");
     }
 
-    const run = async (tx: Tx): Promise<CancelAttemptResult> => {
-      const liveActor = await assertLiveActorInTx(deps, principal, tx);
-      const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
-      const complianceSvc = requireComplianceService();
-
-      let targetInvoicePublicId = target.invoicePublicId;
-      if (!targetInvoicePublicId) {
-        const [attRef] = await tx
-          .select({ invoicePublicId: paymentAttempts.invoicePublicId })
-          .from(paymentAttempts)
-          .where(eq(paymentAttempts.publicId, target.attemptPublicId!))
-          .limit(1);
-        if (!attRef) throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
-        targetInvoicePublicId = attRef.invoicePublicId;
+    const complianceSvc = requireComplianceService();
+    // Non-locking owner staging before acquiring `orders FOR UPDATE` so foreign customer callers
+    // never lock another customer's order/invoice row, while keeping canonical `orders -> compliance_invoices -> actor -> payment_attempts` lock order.
+    const stagedReadDb = callerTx ?? deps.db;
+    let stagedInvoicePublicId = target.invoicePublicId;
+    if (!stagedInvoicePublicId) {
+      const [attRef] = await stagedReadDb
+        .select({
+          invoicePublicId: paymentAttempts.invoicePublicId,
+          customerUserId: paymentAttempts.customerUserId,
+        })
+        .from(paymentAttempts)
+        .where(eq(paymentAttempts.publicId, target.attemptPublicId!))
+        .limit(1);
+      if (!attRef) throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+      if (principal.role === "customer" && attRef.customerUserId !== principal.userId) {
+        throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
       }
+      stagedInvoicePublicId = attRef.invoicePublicId;
+    }
 
+    try {
+      const preInvoice = await complianceSvc.getInvoiceForCheckout(stagedInvoicePublicId, {
+        principal,
+        ...(callerTx ? { tx: callerTx } : {}),
+      });
+      if (principal.role === "customer" && preInvoice.ownerUserId !== principal.userId) {
+        throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+      }
+    } catch (err) {
+      if (target.attemptPublicId && !target.invoicePublicId && err instanceof DomainError && err.code === "NOT_FOUND") {
+        throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+      }
+      throw err;
+    }
+
+    const run = async (tx: Tx): Promise<CancelAttemptResult> => {
       let invoice: Awaited<ReturnType<typeof complianceSvc.getInvoiceForCheckout>>;
       try {
-        invoice = await complianceSvc.getInvoiceForCheckout(targetInvoicePublicId, {
-          principal: livePrincipal,
+        invoice = await complianceSvc.getInvoiceForCheckout(stagedInvoicePublicId, {
+          principal,
           tx,
           forUpdate: true,
         });
@@ -2484,6 +2566,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         }
         throw err;
       }
+
+      const liveActor = await assertLiveActorInTx(deps, principal, tx);
+      const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
       if (livePrincipal.role === "customer" && invoice.ownerUserId !== liveActor.userId) {
         throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
       }
@@ -2581,7 +2666,29 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     };
 
     if (callerTx) return run(callerTx);
-    return runComplianceTx(deps, principal, { type: "payment_attempt" }, run);
+    return runWithMysqlDeadlockRetry(() =>
+      runComplianceTx(deps, principal, { type: "payment_attempt" }, run),
+    );
+  }
+
+  /**
+   * Lock `orders -> compliance_invoices -> current ledger sums` under `FOR UPDATE` for system
+   * webhook/worker paths, returning `null` only if the invoice row itself no longer exists while
+   * propagating database/deadlock errors so `runWithMysqlDeadlockRetry` can retry cleanly.
+   */
+  async function loadLockedCurrentInvoiceOrNull(tx: Tx, invoicePublicId: string) {
+    const complianceSvc = requireComplianceService();
+    try {
+      return await complianceSvc.getInvoiceForCheckout(invoicePublicId, {
+        tx,
+        forUpdate: true,
+      });
+    } catch (err) {
+      if (err instanceof DomainError && err.code === "NOT_FOUND") {
+        return null;
+      }
+      throw err;
+    }
   }
 
   /**
@@ -4264,10 +4371,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
       if (verified.outcomeHint === "expired" || verified.outcomeHint === "failed") {
         const nextStatus: PaymentAttemptStatus = verified.outcomeHint === "expired" ? "expired" : "failed";
-        const ordersSvc = deps.services.orders?.orders;
-        if (ordersSvc && typeof ordersSvc.getOrderRefByPublicId === "function") {
-          await ordersSvc.getOrderRefByPublicId(attempt.orderPublicId, tx, { forUpdate: true });
-        }
+        const currentInvoice = await loadLockedCurrentInvoiceOrNull(tx, attempt.invoicePublicId);
         const [lockedAttempt] = await tx
           .select()
           .from(paymentAttempts)
@@ -4275,9 +4379,23 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           .for("update")
           .limit(1);
 
-        if (!lockedAttempt || (lockedAttempt.status !== "created" && lockedAttempt.status !== "redirected")) {
-          const whStatus = lockedAttempt?.status === "paid" ? "processed" : "ignored";
-          const whReason = lockedAttempt?.status === "paid" ? "ALREADY_PAID" : "ATTEMPT_NOT_ACTIVE";
+        const invoicePaid = currentInvoice?.status === "paid" || lockedAttempt?.status === "paid";
+        const invoiceVoided =
+          !currentInvoice || currentInvoice.status === "void" || currentInvoice.voidedAt !== null;
+        if (
+          !lockedAttempt ||
+          invoicePaid ||
+          invoiceVoided ||
+          (lockedAttempt.status !== "created" && lockedAttempt.status !== "redirected")
+        ) {
+          const whStatus = invoicePaid ? "processed" : "ignored";
+          const whReason = invoicePaid
+            ? "ALREADY_PAID"
+            : !currentInvoice
+              ? "INVOICE_NOT_FOUND"
+              : invoiceVoided
+                ? "INVOICE_VOIDED"
+                : "ATTEMPT_NOT_ACTIVE";
           if (existing) {
             await tx
               .update(paymentWebhookEvents)
@@ -4754,10 +4872,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       const settledWaitAt = deps.clock.now();
       const openOutcome = await runWithMysqlDeadlockRetry(() =>
         deps.db.transaction(async (tx) => {
-          const ordersSvc = deps.services.orders?.orders;
-          if (ordersSvc && typeof ordersSvc.getOrderRefByPublicId === "function") {
-            await ordersSvc.getOrderRefByPublicId(attempt.orderPublicId, tx, { forUpdate: true });
-          }
+          const currentInvoice = await loadLockedCurrentInvoiceOrNull(tx, attempt.invoicePublicId);
           const [locked] = await tx
             .select()
             .from(paymentAttempts)
@@ -4765,7 +4880,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             .for("update")
             .limit(1);
 
-          if (locked?.status === "paid") {
+          if (currentInvoice?.status === "paid" || locked?.status === "paid") {
             await tx
               .update(paymentWebhookEvents)
               .set({
@@ -4774,19 +4889,26 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
                 processedAt: settledWaitAt,
               })
               .where(eq(paymentWebhookEvents.id, webhookRowId));
-            return { alreadyPaid: true, alreadyTerminal: false, mismatchReason: null as string | null };
+            return { alreadyPaid: true, ignoreReason: null as string | null, mismatchReason: null as string | null };
           }
 
-          if (!locked || (locked.status !== "created" && locked.status !== "redirected")) {
+          const invoiceVoided =
+            !currentInvoice || currentInvoice.status === "void" || currentInvoice.voidedAt !== null;
+          if (invoiceVoided || !locked || (locked.status !== "created" && locked.status !== "redirected")) {
+            const ignoreReason = !currentInvoice
+              ? "INVOICE_NOT_FOUND"
+              : invoiceVoided
+                ? "INVOICE_VOIDED"
+                : "ATTEMPT_NOT_ACTIVE";
             await tx
               .update(paymentWebhookEvents)
               .set({
                 status: "ignored",
-                reasonCode: "ATTEMPT_NOT_ACTIVE",
+                reasonCode: ignoreReason,
                 processedAt: settledWaitAt,
               })
               .where(eq(paymentWebhookEvents.id, webhookRowId));
-            return { alreadyPaid: false, alreadyTerminal: true, mismatchReason: null as string | null };
+            return { alreadyPaid: false, ignoreReason, mismatchReason: null as string | null };
           }
 
           const bindingCheck = checkFetchedBindingMatchesAttempt(locked, fetched);
@@ -4802,7 +4924,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             await recordLookupMismatchInTx(tx, locked, fetched, bindingCheck.reasonCode, {
               role: "system",
             });
-            return { alreadyPaid: false, alreadyTerminal: false, mismatchReason: bindingCheck.reasonCode };
+            return { alreadyPaid: false, ignoreReason: null as string | null, mismatchReason: bindingCheck.reasonCode };
           }
           await tx
             .update(paymentAttempts)
@@ -4846,7 +4968,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             },
             tx,
           );
-          return { alreadyPaid: false, alreadyTerminal: false, mismatchReason: null as string | null };
+          return { alreadyPaid: false, ignoreReason: null as string | null, mismatchReason: null as string | null };
         }),
       );
       if (openOutcome.mismatchReason) {
@@ -4858,13 +4980,13 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           reasonCode: openOutcome.mismatchReason,
         };
       }
-      if (openOutcome.alreadyTerminal) {
+      if (openOutcome.ignoreReason) {
         return {
           httpStatus: 200,
           accepted: true,
           duplicate: staged.duplicate,
           booked: false,
-          reasonCode: "ATTEMPT_NOT_ACTIVE",
+          reasonCode: openOutcome.ignoreReason,
         };
       }
       return {
@@ -4882,10 +5004,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       const termAt = deps.clock.now();
       const termOutcome = await runWithMysqlDeadlockRetry(() =>
         deps.db.transaction(async (tx) => {
-          const ordersSvc = deps.services.orders?.orders;
-          if (ordersSvc && typeof ordersSvc.getOrderRefByPublicId === "function") {
-            await ordersSvc.getOrderRefByPublicId(attempt.orderPublicId, tx, { forUpdate: true });
-          }
+          const currentInvoice = await loadLockedCurrentInvoiceOrNull(tx, attempt.invoicePublicId);
           const [locked] = await tx
             .select()
             .from(paymentAttempts)
@@ -4893,7 +5012,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             .for("update")
             .limit(1);
 
-          if (locked?.status === "paid") {
+          if (currentInvoice?.status === "paid" || locked?.status === "paid") {
             await tx
               .update(paymentWebhookEvents)
               .set({
@@ -4902,19 +5021,26 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
                 processedAt: termAt,
               })
               .where(eq(paymentWebhookEvents.id, webhookRowId));
-            return { alreadyPaid: true, alreadyTerminal: false, mismatchReason: null as string | null };
+            return { alreadyPaid: true, ignoreReason: null as string | null, mismatchReason: null as string | null };
           }
 
-          if (!locked || (locked.status !== "created" && locked.status !== "redirected")) {
+          const invoiceVoided =
+            !currentInvoice || currentInvoice.status === "void" || currentInvoice.voidedAt !== null;
+          if (invoiceVoided || !locked || (locked.status !== "created" && locked.status !== "redirected")) {
+            const ignoreReason = !currentInvoice
+              ? "INVOICE_NOT_FOUND"
+              : invoiceVoided
+                ? "INVOICE_VOIDED"
+                : "ATTEMPT_NOT_ACTIVE";
             await tx
               .update(paymentWebhookEvents)
               .set({
                 status: "ignored",
-                reasonCode: "ATTEMPT_NOT_ACTIVE",
+                reasonCode: ignoreReason,
                 processedAt: termAt,
               })
               .where(eq(paymentWebhookEvents.id, webhookRowId));
-            return { alreadyPaid: false, alreadyTerminal: true, mismatchReason: null as string | null };
+            return { alreadyPaid: false, ignoreReason, mismatchReason: null as string | null };
           }
 
           const bindingCheck = checkFetchedBindingMatchesAttempt(locked, fetched);
@@ -4930,7 +5056,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             await recordLookupMismatchInTx(tx, locked, fetched, bindingCheck.reasonCode, {
               role: "system",
             });
-            return { alreadyPaid: false, alreadyTerminal: false, mismatchReason: bindingCheck.reasonCode };
+            return { alreadyPaid: false, ignoreReason: null as string | null, mismatchReason: bindingCheck.reasonCode };
           }
 
           await tx
@@ -4982,7 +5108,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             tx,
           );
         }
-        return { alreadyPaid: false, alreadyTerminal: false, mismatchReason: null as string | null };
+        return { alreadyPaid: false, ignoreReason: null as string | null, mismatchReason: null as string | null };
       }),
       );
       if (termOutcome.mismatchReason) {
@@ -4994,13 +5120,13 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           reasonCode: termOutcome.mismatchReason,
         };
       }
-      if (termOutcome.alreadyTerminal) {
+      if (termOutcome.ignoreReason) {
         return {
           httpStatus: 200,
           accepted: true,
           duplicate: staged.duplicate,
           booked: false,
-          reasonCode: "ATTEMPT_NOT_ACTIVE",
+          reasonCode: termOutcome.ignoreReason,
         };
       }
       return {
@@ -5280,23 +5406,36 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             stillPending += 1;
           }
         } else {
-          await deps.db.transaction(async (tx) => {
-            const [locked] = await tx
-              .select()
-              .from(paymentAttempts)
-              .where(eq(paymentAttempts.id, attempt.id))
-              .for("update")
-              .limit(1);
-            if (!locked || locked.status === "paid") return;
-            await tx
-              .update(paymentAttempts)
-              .set({
-                reconciliationNote: "awaiting_webhook",
-                lastReconciledAt: now,
-                updatedAt: now,
-              })
-              .where(eq(paymentAttempts.id, locked.id));
-          });
+          await runWithMysqlDeadlockRetry(() =>
+            deps.db.transaction(async (tx) => {
+              const currentInvoice = await loadLockedCurrentInvoiceOrNull(tx, attempt.invoicePublicId);
+              const [locked] = await tx
+                .select()
+                .from(paymentAttempts)
+                .where(eq(paymentAttempts.id, attempt.id))
+                .for("update")
+                .limit(1);
+              if (
+                !locked ||
+                locked.status === "paid" ||
+                !currentInvoice ||
+                currentInvoice.status === "paid" ||
+                currentInvoice.status === "void" ||
+                currentInvoice.voidedAt !== null ||
+                (locked.status !== "created" && locked.status !== "redirected")
+              ) {
+                return;
+              }
+              await tx
+                .update(paymentAttempts)
+                .set({
+                  reconciliationNote: "awaiting_webhook",
+                  lastReconciledAt: now,
+                  updatedAt: now,
+                })
+                .where(eq(paymentAttempts.id, locked.id));
+            }),
+          );
           stillPending += 1;
         }
         continue;
@@ -5307,22 +5446,24 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           if (!(await verifyPostEgressStripeDigestInTx(tx))) {
             return "pending" as const;
           }
-          const ordersSvc = deps.services.orders?.orders;
-          if (ordersSvc && typeof ordersSvc.getOrderRefByPublicId === "function") {
-            await ordersSvc.getOrderRefByPublicId(attempt.orderPublicId, tx, { forUpdate: true });
-          }
+          const currentInvoice = await loadLockedCurrentInvoiceOrNull(tx, attempt.invoicePublicId);
           const [locked] = await tx
             .select()
             .from(paymentAttempts)
             .where(eq(paymentAttempts.id, attempt.id))
             .for("update")
             .limit(1);
-          if (!locked || locked.status === "paid") {
+          if (!locked || locked.status === "paid" || currentInvoice?.status === "paid") {
             return "already_paid" as const;
           }
-          // Never overwrite or mutate terminal attempts (`cancelled`, `failed`, `expired`) on delayed
-          // worker outcomes (`expired`, `failed`, `asyncPending`, or lookup mismatch).
-          if (locked.status !== "created" && locked.status !== "redirected") {
+          // Never overwrite or mutate voided invoices or terminal attempts (`cancelled`, `failed`,
+          // `expired`) on delayed worker outcomes (`expired`, `failed`, `asyncPending`, or lookup mismatch).
+          if (
+            !currentInvoice ||
+            currentInvoice.status === "void" ||
+            currentInvoice.voidedAt !== null ||
+            (locked.status !== "created" && locked.status !== "redirected")
+          ) {
             return "already_terminal" as const;
           }
 
@@ -7010,8 +7151,8 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         async (tx) => {
         const complianceSvc = requireComplianceService();
         // Lock parent `orders -> compliance_invoices` FIRST before actor/attempt locks so lock order
-        // is dead-lock-free and post-wait reads see current committed state under MySQL RR.
-        await complianceSvc.getInvoiceForCheckout(staged.targetInvoicePublicId, {
+        // is deadlock-free and post-wait reads see current committed state under MySQL RR.
+        const lockedInvoice = await complianceSvc.getInvoiceForCheckout(staged.targetInvoicePublicId, {
           tx,
           forUpdate: true,
         });
@@ -7056,10 +7197,14 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             .limit(1);
           if (!locked) continue;
           primaryAttempt = locked;
-          if (locked.status === "paid") {
+          if (lockedInvoice.status === "paid" || locked.status === "paid") {
             wasAlreadyPaid = true;
             lastReasonCode = "ALREADY_PAID";
             break;
+          }
+          if (lockedInvoice.status === "void" || lockedInvoice.voidedAt !== null) {
+            lastReasonCode = "INVOICE_VOIDED";
+            continue;
           }
           if (locked.status !== "created" && locked.status !== "redirected") {
             lastReasonCode = locked.status === "expired" || entry.fetched.status === "expired" ? "SESSION_EXPIRED" : "STILL_UNPAID";
