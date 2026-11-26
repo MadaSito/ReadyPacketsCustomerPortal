@@ -466,6 +466,30 @@ export interface CartPaymentsPort {
     currency: string;
     providerConfigured: "none" | "stripe" | "square";
     environment: "test" | "live";
+    onlinePaymentAvailable?: boolean;
+    onlinePaymentUnavailableReason?:
+      | "provider_off"
+      | "provider_not_ready"
+      | "invoice_not_payable"
+      | "order_cancelled"
+      | "order_locked"
+      | "currency_mismatch"
+      | "below_minimum"
+      | null;
+    attemptInFlight?: boolean;
+    lastAttemptFailureClass?:
+      | "configuration"
+      | "egress"
+      | "provider_auth"
+      | "provider_permission"
+      | "provider_request"
+      | "provider_transient"
+      | "provider_response"
+      | "untrusted_redirect_url"
+      | "payment_declined"
+      | "expired"
+      | "cancelled"
+      | null;
     attempt: {
       attemptPublicId: string;
       provider: "stripe" | "square";

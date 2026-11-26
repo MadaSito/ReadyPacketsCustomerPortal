@@ -7,8 +7,10 @@
 import { z } from "zod";
 import { defineSecret, defineSetting } from "../platform/index.js";
 import {
+  ACTIVE_PAYMENT_PROVIDERS,
   type ActivePaymentProvider,
   PAYMENT_ENVIRONMENT_MODES,
+  type PaymentEnvironmentMode,
   PAYMENT_PROVIDER_CHOICES,
 } from "./schema.js";
 
@@ -355,3 +357,593 @@ export function sanitizeCardLast4(raw: unknown): string | null {
   const trimmed = raw.trim();
   return /^[0-9]{4}$/u.test(trimmed) ? trimmed : null;
 }
+
+/* ------------------ Increment 07.2: credential normalization, shape validation & diagnostics */
+
+export const CREDENTIAL_FIELD_KEYS = [
+  "stripeSecretKey",
+  "stripeWebhookSecret",
+  "stripeWebhookSecretSecondary",
+  "squareAccessToken",
+  "squareWebhookSignatureKey",
+] as const;
+
+export type CredentialFieldKey = (typeof CREDENTIAL_FIELD_KEYS)[number];
+
+export type CredentialValidationReason =
+  | "publishable_key_not_used"
+  | "webhook_secret_in_api_key_field"
+  | "api_key_in_webhook_field"
+  | "webhook_endpoint_id_not_secret"
+  | "wrong_mode_test_in_live"
+  | "wrong_mode_live_in_test"
+  | "missing_api_key_prefix"
+  | "missing_whsec_prefix"
+  | "masked_value_pasted"
+  | "too_short"
+  | "too_long"
+  | "invalid_characters"
+  | "primary_webhook_secret_missing";
+
+export type CredentialValidationResult =
+  | { ok: true; normalized: string }
+  | {
+      ok: false;
+      field: CredentialFieldKey;
+      reason: CredentialValidationReason;
+      reasonCode: string;
+      safeMessage: string;
+    };
+
+const SURROUNDING_QUOTE_PAIRS: ReadonlyArray<readonly [string, string]> = [
+  ['"', '"'],
+  ["'", "'"],
+  ["`", "`"],
+  ["\u201C", "\u201D"],
+  ["\u2018", "\u2019"],
+];
+
+/**
+ * Normalizes pasted secret inputs before validation:
+ * - strips zero-width characters, BOM, and NBSP
+ * - trims outer whitespace
+ * - strips matching surrounding quotes/backticks from CLI/env pastes
+ * - strips all remaining internal whitespace/newlines from wrapped copies
+ */
+export function normalizeCredentialInput(raw: string): string {
+  let cleaned = raw.replace(/[\u200B-\u200D\u2060\uFEFF\u00A0]/gu, "").trim();
+  for (const [open, close] of SURROUNDING_QUOTE_PAIRS) {
+    if (cleaned.length >= 2 && cleaned.startsWith(open) && cleaned.endsWith(close)) {
+      cleaned = cleaned.slice(open.length, cleaned.length - close.length).trim();
+      break;
+    }
+  }
+  return cleaned.replace(/[\s\u200B-\u200D\u2060\uFEFF\u00A0]+/gu, "");
+}
+
+const MASK_CHAR_PATTERN = /[•*…\u2022\u2217]/u;
+
+/**
+ * Validates a normalized Stripe API secret/restricted key (`sk_*` / `rk_*`) for `mode`.
+ * Never echoes the rejected value or its exact length in error messages.
+ */
+export function validateStripeSecretKeyInput(
+  raw: string,
+  mode: PaymentEnvironmentMode,
+): CredentialValidationResult {
+  const normalized = normalizeCredentialInput(raw);
+  const field: CredentialFieldKey = "stripeSecretKey";
+  const label = "Stripe API secret key";
+
+  if (/^pk_(?:test_|live_)?/iu.test(normalized)) {
+    return {
+      ok: false,
+      field,
+      reason: "publishable_key_not_used",
+      reasonCode: "STRIPE_PUBLISHABLE_KEY_NOT_USED",
+      safeMessage: `${label}: This looks like a Stripe publishable key (pk_…). The portal does not need the publishable key. Paste the secret key (sk_…) or restricted key (rk_…) from Stripe Developers > API keys here.`,
+    };
+  }
+  if (/^whsec_/iu.test(normalized)) {
+    return {
+      ok: false,
+      field,
+      reason: "webhook_secret_in_api_key_field",
+      reasonCode: "INVALID_CREDENTIAL_FORMAT",
+      safeMessage: `${label}: This looks like a webhook signing secret (whsec_…) — it belongs in Primary Stripe webhook signing secret.`,
+    };
+  }
+  if (MASK_CHAR_PATTERN.test(normalized)) {
+    return {
+      ok: false,
+      field,
+      reason: "masked_value_pasted",
+      reasonCode: "INVALID_CREDENTIAL_FORMAT",
+      safeMessage: `${label}: This value contains masking characters. Select Reveal in Stripe Developers > API keys and copy the full unmasked key.`,
+    };
+  }
+  if (mode === "live" && /^(?:sk|rk)_test_/iu.test(normalized)) {
+    return {
+      ok: false,
+      field,
+      reason: "wrong_mode_test_in_live",
+      reasonCode: "STRIPE_KEY_MODE_MISMATCH",
+      safeMessage: `${label}: This looks like a test-mode key (sk_test_… / rk_test_…), while Live payments is selected. Paste a live key (sk_live_… or rk_live_…) or switch the environment to Test / sandbox.`,
+    };
+  }
+  if (mode === "test" && /^(?:sk|rk)_live_/iu.test(normalized)) {
+    return {
+      ok: false,
+      field,
+      reason: "wrong_mode_live_in_test",
+      reasonCode: "STRIPE_KEY_MODE_MISMATCH",
+      safeMessage: `${label}: This looks like a live-mode key (sk_live_… / rk_live_…), while Test / sandbox is selected. Paste a test key (sk_test_… or rk_test_…) or switch the environment to Live payments.`,
+    };
+  }
+  if (!/^(?:sk|rk)_(?:test|live)_/u.test(normalized)) {
+    return {
+      ok: false,
+      field,
+      reason: "missing_api_key_prefix",
+      reasonCode: "INVALID_CREDENTIAL_FORMAT",
+      safeMessage:
+        mode === "live"
+          ? `${label}: API keys for Live payments must start with sk_live_ or rk_live_.`
+          : `${label}: API keys for Test / sandbox must start with sk_test_ or rk_test_.`,
+    };
+  }
+  if (normalized.length < 18) {
+    return {
+      ok: false,
+      field,
+      reason: "too_short",
+      reasonCode: "INVALID_CREDENTIAL_FORMAT",
+      safeMessage: `${label}: Value is too short to be a complete Stripe API key. Copy the full key from Stripe Developers > API keys.`,
+    };
+  }
+  if (normalized.length > 208) {
+    return {
+      ok: false,
+      field,
+      reason: "too_long",
+      reasonCode: "INVALID_CREDENTIAL_FORMAT",
+      safeMessage: `${label}: Value is longer than expected for a Stripe API key. Copy only a single sk_… or rk_… key.`,
+    };
+  }
+  if (!PAYMENTS_STRIPE_SECRET_KEY.schema.safeParse(normalized).success) {
+    return {
+      ok: false,
+      field,
+      reason: "invalid_characters",
+      reasonCode: "INVALID_CREDENTIAL_FORMAT",
+      safeMessage: `${label}: Contains unexpected characters. Stripe keys use only letters, numbers, and underscores after sk_… or rk_….`,
+    };
+  }
+  return { ok: true, normalized };
+}
+
+/**
+ * Validates a normalized Stripe webhook signing secret (`whsec_*`) for primary or secondary slot.
+ * Never echoes the rejected value or its exact length in error messages.
+ */
+export function validateStripeWebhookSecretInput(
+  raw: string,
+  field: "stripeWebhookSecret" | "stripeWebhookSecretSecondary",
+): CredentialValidationResult {
+  const normalized = normalizeCredentialInput(raw);
+  const label =
+    field === "stripeWebhookSecret"
+      ? "Primary Stripe webhook signing secret"
+      : "Secondary Stripe webhook signing secret";
+
+  if (/^pk_(?:test_|live_)?/iu.test(normalized)) {
+    return {
+      ok: false,
+      field,
+      reason: "publishable_key_not_used",
+      reasonCode: "STRIPE_PUBLISHABLE_KEY_NOT_USED",
+      safeMessage: `${label}: This looks like a Stripe publishable key (pk_…). The portal does not need the publishable key. Paste the webhook signing secret that starts with whsec_ here.`,
+    };
+  }
+  if (/^(?:sk|rk)_(?:test_|live_)?/iu.test(normalized)) {
+    return {
+      ok: false,
+      field,
+      reason: "api_key_in_webhook_field",
+      reasonCode: "INVALID_CREDENTIAL_FORMAT",
+      safeMessage: `${label}: This looks like an API secret key (sk_… / rk_…) — it belongs in the first field (Stripe API secret key). Paste the webhook signing secret that starts with whsec_ here.`,
+    };
+  }
+  if (/^we_[A-Za-z0-9]/iu.test(normalized)) {
+    return {
+      ok: false,
+      field,
+      reason: "webhook_endpoint_id_not_secret",
+      reasonCode: "INVALID_CREDENTIAL_FORMAT",
+      safeMessage: `${label}: This looks like a webhook endpoint ID (we_…), not the signing secret. In Stripe Workbench > Webhooks, open the destination and select Reveal under Signing secret to copy the whsec_… value.`,
+    };
+  }
+  if (MASK_CHAR_PATTERN.test(normalized)) {
+    return {
+      ok: false,
+      field,
+      reason: "masked_value_pasted",
+      reasonCode: "INVALID_CREDENTIAL_FORMAT",
+      safeMessage: `${label}: This value contains masking characters. In Stripe Workbench > Webhooks, select Reveal under Signing secret and copy the full whsec_… value.`,
+    };
+  }
+  if (!normalized.startsWith("whsec_")) {
+    return {
+      ok: false,
+      field,
+      reason: "missing_whsec_prefix",
+      reasonCode: "INVALID_CREDENTIAL_FORMAT",
+      safeMessage: `${label}: Signing secrets start with whsec_. In Stripe Workbench > Webhooks, open the destination and select Reveal under Signing secret.`,
+    };
+  }
+  if (normalized.length < 18) {
+    return {
+      ok: false,
+      field,
+      reason: "too_short",
+      reasonCode: "INVALID_CREDENTIAL_FORMAT",
+      safeMessage: `${label}: Signing secret is too short. Copy the full whsec_… value from Stripe Workbench > Webhooks > Signing secret.`,
+    };
+  }
+  if (normalized.length > 206) {
+    return {
+      ok: false,
+      field,
+      reason: "too_long",
+      reasonCode: "INVALID_CREDENTIAL_FORMAT",
+      safeMessage: `${label}: Signing secret is longer than expected. Copy only a single whsec_… signing secret.`,
+    };
+  }
+  if (!PAYMENTS_STRIPE_WEBHOOK_SECRET.schema.safeParse(normalized).success) {
+    return {
+      ok: false,
+      field,
+      reason: "invalid_characters",
+      reasonCode: "INVALID_CREDENTIAL_FORMAT",
+      safeMessage: `${label}: Signing secrets start with whsec_ followed only by letters, numbers, or underscores.`,
+    };
+  }
+  return { ok: true, normalized };
+}
+
+export function validateSquareSecretInput(
+  raw: string,
+  field: "squareAccessToken" | "squareWebhookSignatureKey",
+): CredentialValidationResult {
+  const normalized = normalizeCredentialInput(raw);
+  const label = field === "squareAccessToken" ? "Square access token" : "Square webhook signature key";
+  const minLen = field === "squareAccessToken" ? 16 : 12;
+  if (MASK_CHAR_PATTERN.test(normalized)) {
+    return {
+      ok: false,
+      field,
+      reason: "masked_value_pasted",
+      reasonCode: "INVALID_CREDENTIAL_FORMAT",
+      safeMessage: `${label}: This value contains masking characters. Copy the full unmasked credential from Square Developer Console.`,
+    };
+  }
+  if (normalized.length < minLen) {
+    return {
+      ok: false,
+      field,
+      reason: "too_short",
+      reasonCode: "INVALID_CREDENTIAL_FORMAT",
+      safeMessage: `${label}: Value is too short to be a complete ${label.toLowerCase()}.`,
+    };
+  }
+  if (normalized.length > 256) {
+    return {
+      ok: false,
+      field,
+      reason: "too_long",
+      reasonCode: "INVALID_CREDENTIAL_FORMAT",
+      safeMessage: `${label}: Value is longer than expected.`,
+    };
+  }
+  const schema =
+    field === "squareAccessToken"
+      ? PAYMENTS_SQUARE_ACCESS_TOKEN.schema
+      : PAYMENTS_SQUARE_WEBHOOK_SIGNATURE_KEY.schema;
+  if (!schema.safeParse(normalized).success) {
+    return {
+      ok: false,
+      field,
+      reason: "invalid_characters",
+      reasonCode: "INVALID_CREDENTIAL_FORMAT",
+      safeMessage: `${label}: Value is not in the expected format.`,
+    };
+  }
+  return { ok: true, normalized };
+}
+
+export const CHECKOUT_FAILURE_CLASSES = [
+  "configuration",
+  "egress",
+  "provider_auth",
+  "provider_permission",
+  "provider_request",
+  "provider_transient",
+  "provider_response",
+  "untrusted_redirect_url",
+  "payment_declined",
+  "expired",
+  "cancelled",
+] as const;
+
+export type CheckoutFailureClass = (typeof CHECKOUT_FAILURE_CLASSES)[number];
+
+export function classifyCheckoutFailureReason(
+  reasonCode: string | null | undefined,
+  status?: string | null,
+): CheckoutFailureClass | null {
+  if (status === "expired" && !reasonCode) return "expired";
+  if (status === "cancelled" && !reasonCode) return "cancelled";
+  if (!reasonCode) return null;
+  const code = reasonCode.toUpperCase();
+  if (code === "SESSION_EXPIRED" || code === "EXPIRED") return "expired";
+  if (code === "CUSTOMER_CANCELLED" || code === "CANCELLED") return "cancelled";
+  if (
+    code === "PAYMENT_FAILED" ||
+    code === "ASYNC_PAYMENT_FAILED" ||
+    code === "PAYMENT_INTENT_FAILED"
+  ) {
+    return "payment_declined";
+  }
+  if (code.startsWith("EGRESS_") || code === "STRIPE_EGRESS_BLOCKED") return "egress";
+  if (code === "STRIPE_AUTH_INVALID_KEY") return "provider_auth";
+  if (code === "STRIPE_KEY_MISSING_PERMISSION") return "provider_permission";
+  if (
+    code === "STRIPE_INVALID_REQUEST" ||
+    code === "STRIPE_HTTP_4XX"
+  ) {
+    return "provider_request";
+  }
+  if (
+    code === "STRIPE_RATE_LIMITED" ||
+    code === "STRIPE_UPSTREAM_5XX" ||
+    code === "STRIPE_NETWORK_TIMEOUT" ||
+    code === "STRIPE_TRANSPORT_FAILED"
+  ) {
+    return "provider_transient";
+  }
+  if (
+    code === "STRIPE_INVALID_JSON" ||
+    code === "STRIPE_INVALID_SESSION_ID" ||
+    code === "SQUARE_RESPONSE_INVALID"
+  ) {
+    return "provider_response";
+  }
+  if (code === "STRIPE_UNTRUSTED_REDIRECT_URL" || code === "SQUARE_UNTRUSTED_REDIRECT_URL") {
+    return "untrusted_redirect_url";
+  }
+  if (
+    code === "PROVIDER_NOT_CONFIGURED" ||
+    code === "PAYMENT_PROVIDER_NOT_CONFIGURED" ||
+    code === "PROVIDER_VERIFICATION_STALE" ||
+    code === "STRIPE_KEY_MODE_MISMATCH" ||
+    code === "STRIPE_MODE_MISMATCH"
+  ) {
+    return "configuration";
+  }
+  return "provider_response";
+}
+
+const SECRET_LIKE_TOKEN = /(?:^(?:sk|rk|pk)_(?:test|live)?|^whsec_|bearer\b)/iu;
+
+/**
+ * Sanitizes bounded provider diagnostic tokens (`error.type`, `error.code`, `error.param`).
+ * Never accepts free-form prose or any token resembling a secret/key prefix.
+ */
+export function sanitizeStripeDiagnosticToken(
+  raw: unknown,
+  opts?: { allowBrackets?: boolean },
+): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 64) return null;
+  if (SECRET_LIKE_TOKEN.test(trimmed)) return null;
+  const pattern = opts?.allowBrackets
+    ? /^[A-Za-z0-9_.[\]-]{1,64}$/u
+    : /^[A-Za-z0-9_.-]{1,64}$/u;
+  if (!pattern.test(trimmed)) return null;
+  if (opts?.allowBrackets && /(?:secret|token|password|apikey|api_key|auth)/iu.test(trimmed)) {
+    return null;
+  }
+  return trimmed;
+}
+
+export function describeCheckoutFailureForAdmin(input: {
+  provider: ActivePaymentProvider;
+  mode: PaymentEnvironmentMode;
+  reasonCode: string;
+  upstreamStatus?: number | null;
+  stripeErrorCode?: string | null;
+}): {
+  severity: "warning" | "error";
+  title: string;
+  explanation: string;
+  nextStep: string;
+} {
+  const providerLabel = input.provider === "stripe" ? "Stripe Checkout" : "Square Payment Links";
+  const title = `Customers cannot reach ${providerLabel} (${input.mode})`;
+  const statusSuffix = input.upstreamStatus ? ` (HTTP ${input.upstreamStatus})` : "";
+  const codeSuffix = input.stripeErrorCode ? ` [${input.stripeErrorCode}]` : "";
+
+  switch (input.reasonCode) {
+    case "PROVIDER_NOT_CONFIGURED":
+    case "PAYMENT_PROVIDER_NOT_CONFIGURED":
+      return {
+        severity: "error",
+        title,
+        explanation: `${providerLabel} is selected as the active provider, but required credentials are missing.`,
+        nextStep: "Open /admin/payments/setup to stage credentials and verify connectivity, or switch back to Pay by invoice.",
+      };
+    case "PROVIDER_VERIFICATION_STALE":
+      return {
+        severity: "error",
+        title,
+        explanation: `${providerLabel} credentials or outbound allowlist settings changed after verification, so unverified checkout sessions are blocked.`,
+        nextStep: "Open /admin/payments/setup and re-run Test Stripe API and Send self-test webhook.",
+      };
+    case "STRIPE_KEY_MODE_MISMATCH":
+    case "STRIPE_MODE_MISMATCH":
+      return {
+        severity: "error",
+        title,
+        explanation: `The saved Stripe API key environment does not match ${input.mode} mode.`,
+        nextStep: `Open /admin/payments/setup, stage an ${input.mode === "live" ? "sk_live_ / rk_live_" : "sk_test_ / rk_test_"} key, and re-verify.`,
+      };
+    case "STRIPE_AUTH_INVALID_KEY":
+      return {
+        severity: "error",
+        title,
+        explanation: `Stripe rejected the API secret key${statusSuffix}${codeSuffix} as invalid, expired, or revoked.`,
+        nextStep: "Open /admin/payments/setup, stage a current Stripe secret or restricted key, and re-run verification.",
+      };
+    case "STRIPE_KEY_MISSING_PERMISSION":
+      return {
+        severity: "error",
+        title,
+        explanation: `Stripe refused Checkout Session creation${statusSuffix}${codeSuffix} because the restricted key lacks Checkout Sessions Write permission.`,
+        nextStep: "In Stripe Developers > API keys, grant Checkout Sessions Write, PaymentIntents Read, and Refunds Write, then stage and verify the updated key in /admin/payments/setup.",
+      };
+    case "STRIPE_INVALID_REQUEST":
+    case "STRIPE_HTTP_4XX":
+      return {
+        severity: "error",
+        title,
+        explanation: `Stripe rejected the Checkout Session request${statusSuffix}${codeSuffix} (check account activation and currency support).`,
+        nextStep: "Review the diagnostic code in /admin/payments/setup and confirm your Stripe account supports the configured invoice currency and live charges.",
+      };
+    case "STRIPE_UNTRUSTED_REDIRECT_URL":
+      return {
+        severity: "error",
+        title,
+        explanation: "Stripe returned a Checkout URL outside checkout.stripe.com (for example a Stripe custom checkout domain, which the portal refuses).",
+        nextStep: "Disable custom domains for Stripe-hosted Checkout in Stripe Dashboard > Settings > Branding / Custom domains so sessions use checkout.stripe.com, then run Verify Checkout session creation.",
+      };
+    case "STRIPE_RATE_LIMITED":
+    case "STRIPE_UPSTREAM_5XX":
+    case "STRIPE_NETWORK_TIMEOUT":
+    case "STRIPE_TRANSPORT_FAILED":
+      return {
+        severity: "warning",
+        title,
+        explanation: `Outbound Checkout Session creation hit a transient network or upstream error${statusSuffix}${codeSuffix}.`,
+        nextStep: "Check outbound HTTPS connectivity to api.stripe.com:443 and Stripe status; customers can retry from their invoice or checkout status page.",
+      };
+    case "STRIPE_INVALID_JSON":
+    case "STRIPE_INVALID_SESSION_ID":
+      return {
+        severity: "error",
+        title,
+        explanation: `Upstream returned a malformed or non-JSON Checkout Session response${statusSuffix}.`,
+        nextStep: "Verify no outbound proxy or TLS middlebox is intercepting api.stripe.com:443 and run Verify Checkout session creation in /admin/payments/setup.",
+      };
+    default:
+      if (input.reasonCode.startsWith("EGRESS_")) {
+        return {
+          severity: "error",
+          title,
+          explanation: `Outbound HTTPS egress to the payment provider was blocked by portal network policy (${input.reasonCode}).`,
+          nextStep: "Open /admin/payments/setup or /admin/integrations and enable the provider outbound HTTPS allowlist preset.",
+        };
+      }
+      return {
+        severity: "error",
+        title,
+        explanation: `Hosted checkout session creation failed (${input.reasonCode})${statusSuffix}.`,
+        nextStep: "Inspect /admin/payments/setup diagnostics and verify provider credentials and outbound HTTPS allowlisting.",
+      };
+  }
+}
+
+export function customerMessageForCheckoutFailure(failureClass: CheckoutFailureClass): string {
+  switch (failureClass) {
+    case "provider_transient":
+      return "We could not reach the payment provider right now. Your order and invoice are saved — please try paying online again in a moment.";
+    case "configuration":
+    case "egress":
+    case "provider_auth":
+    case "provider_permission":
+    case "provider_request":
+    case "untrusted_redirect_url":
+      return "Online card payment is temporarily unavailable while our team updates payment settings. Your order and invoice are saved — follow the payment instructions on your invoice or check back shortly.";
+    default:
+      return "Online card payment could not be started for this invoice right now. Your order and invoice are saved — please try again shortly or follow the payment instructions on your invoice.";
+  }
+}
+
+export const lastCheckoutFailureSchema = z.object({
+  occurredAt: z.string().max(64),
+  provider: z.enum(ACTIVE_PAYMENT_PROVIDERS),
+  mode: z.enum(PAYMENT_ENVIRONMENT_MODES),
+  reasonCode: z.string().max(64),
+  failureClass: z.enum(CHECKOUT_FAILURE_CLASSES),
+  upstreamStatus: z.number().int().min(100).max(599).nullable(),
+  stripeErrorType: z.string().max(64).nullable(),
+  stripeErrorCode: z.string().max(64).nullable(),
+  stripeErrorParam: z.string().max(64).nullable(),
+  attemptPublicId: z.string().max(32).nullable(),
+  invoicePublicId: z.string().max(32).nullable(),
+  orderPublicId: z.string().max(32).nullable(),
+});
+
+export type LastCheckoutFailureDiagnostic = z.infer<typeof lastCheckoutFailureSchema>;
+
+export const lastStripeCheckoutProbeSchema = z.object({
+  checkedAt: z.string().max(64),
+  mode: z.enum(PAYMENT_ENVIRONMENT_MODES),
+  apiFingerprint: z.string().max(64).nullable(),
+  ok: z.boolean(),
+  reasonCode: z.string().max(64),
+  upstreamStatus: z.number().int().min(100).max(599).nullable(),
+  stripeErrorType: z.string().max(64).nullable(),
+  stripeErrorCode: z.string().max(64).nullable(),
+  message: z.string().max(300),
+});
+
+export type LastStripeCheckoutProbeDiagnostic = z.infer<typeof lastStripeCheckoutProbeSchema>;
+
+export const paymentsDiagnosticsSchema = z.object({
+  stripeEverApiVerified: z.boolean().default(false),
+  stripeEverSelfTested: z.boolean().default(false),
+  lastCheckoutFailure: lastCheckoutFailureSchema.nullable().default(null),
+  lastStripeCheckoutProbe: lastStripeCheckoutProbeSchema.nullable().default(null),
+});
+
+export type PaymentsDiagnosticsValue = z.infer<typeof paymentsDiagnosticsSchema>;
+
+export const DEFAULT_PAYMENTS_DIAGNOSTICS: PaymentsDiagnosticsValue = {
+  stripeEverApiVerified: false,
+  stripeEverSelfTested: false,
+  lastCheckoutFailure: null,
+  lastStripeCheckoutProbe: null,
+};
+
+export function parsePaymentsDiagnosticsSetting(raw: unknown): PaymentsDiagnosticsValue {
+  if (!raw || typeof raw !== "object") return { ...DEFAULT_PAYMENTS_DIAGNOSTICS };
+  const parsed = paymentsDiagnosticsSchema.safeParse(raw);
+  return parsed.success ? parsed.data : { ...DEFAULT_PAYMENTS_DIAGNOSTICS };
+}
+
+export const PAYMENTS_DIAGNOSTICS_SETTING = defineSetting({
+  key: "payments.diagnostics",
+  owner: "payments",
+  group: "compliance",
+  label: "Payment checkout diagnostics",
+  description:
+    "Non-secret operational telemetry for the most recent checkout-session creation failure and Stripe session probe.",
+  schema: paymentsDiagnosticsSchema,
+  default: DEFAULT_PAYMENTS_DIAGNOSTICS,
+  sensitivity: "internal",
+  exportable: false,
+  writeCapability: "payments.manage",
+  managedBy: { label: "Stripe setup", href: "/admin/payments/setup" },
+});
+

@@ -674,5 +674,20 @@ export interface AcceptanceLogExportResult {
 - **D5 Trigger Context Resolvers (`server/modules/compliance/automationTriggers.ts`)**:
   - Registers context resolvers (`order_owner`, `order_assignee`, `order_reference`, `order_status`, `recipient_name`, plus safe scalar fields) for `payment.succeeded`, `payment.failed`, `payment.refunded`, `intake.submitted`, and `intake.reviewed`.
 
+---
 
+## 12. Fix Pack 07.2 — Branded PDFs, Order & Project Prominence, and WinAnsi Encoding
 
+- **Out-of-the-box branded PDFs (`server/modules/compliance/invoicePdf.ts`, `settings.ts`)**:
+  - `compliance.invoices.issuer_name` defaults to `"Ready Packets Consulting LLC"` and `compliance.invoices.issuer_logo` defaults to `{ mode: "brand", brandPath: "/brand/readypackets-approved-header-icon-light.png" }`.
+  - `loadAllowlistedBrandLogo` resolves allowlisted brand PNGs across `opts.staticDir`, `process.env.RP_STATIC_DIR`, `dist/public` (production Docker container layout), `client/public` (development/tests), and module-relative paths so brand logos load without admin configuration in both self-hosted containers and local runs.
+  - Invoice, Payment Receipt, and Refund Note PDFs render the ReadyPackets brand mark, `"ReadyPackets"` wordmark, `"Your Business, Professionally Packeted!"` tagline, `"Ready Packets Consulting LLC"` legal issuer name, brand-token header/accent/table/totals styling (`#0D1B2A` navy, `#1A7A6E` / `#135E55` teal, `#C9A84C` decorative gold rule) with high-contrast dark text on light fills, and `my.readypackets.com` with `Page X of Y` in the footer on Letter and A4 geometries.
+- **Order & Project prominence (`invoicesService.ts`, `receiptsService.ts`, `mail.ts`, client views)**:
+  - `InvoiceSummaryView`, `InvoiceDetailView`, `ReceiptSummaryView`, `ReceiptDetailView`, `ReceiptSnapshot`, and `RefundNoteSnapshot` include `projectName?: string | null` resolved from `orders.project_name` without any schema migration.
+  - All three PDFs render a prominent `"Order"` + `"Project"` banner near the top of page 1; customer and staff/admin invoice and receipt detail pages render an `"Order & project"` card and list rows show both `Order` and `Project`; `compliance.invoice_issued`, `compliance.invoice_paid`, and `payment_receipt` emails include `Order` and `Project`.
+- **WinAnsi encoding & PDF accessibility (`invoicePdf.ts`)**:
+  - `sanitizePdfTextToWinAnsi` and `escapePdfText` encode full WinAnsi (`Windows-1252` `0x80..0x9F` and `0xA0..0xFF`, including `·`, `•`, `–`, `—`, curly quotes, `™`, `€`, and accented Latin) as PDF octal escapes and transliterate non-WinAnsi Unicode (arrows, Latin Extended-A/B, math symbols, emoji) to readable ASCII/WinAnsi equivalents without emitting `"?"`.
+  - Generated PDFs include `/Lang (en)`, `/ViewerPreferences << /DisplayDocTitle true >>`, `/Info` `/Title` + `/Author`, `/Tabs /S`, `/MarkInfo << /Marked true >>`, and a `/StructTreeRoot` binding the header logo `/XObject` to `/Figure` with `/Alt (ReadyPackets company logo)` alongside real selectable text (`BT ... Tj ET`); PDF/UA conformance is not claimed because Type1 `/Helvetica` lacks embedded CID/`/ToUnicode` font programs and full `/Table` structure trees.
+- **Immutability preservation**:
+  - Invoices render PDFs on demand (`downloadPdf`), so pre-existing invoices automatically adopt the branded layout and live `projectName` (upgrading legacy default `"ReadyPackets"` `issuerNameSnapshot` values to `"Ready Packets Consulting LLC"` while keeping custom admin legal names).
+  - Stored encrypted receipt and refund-note PDFs (`pdf_enc` + `pdf_sha256`) are never rewritten; pre-existing receipts retain their exact original PDF bytes while surfacing `Order` and `Project` on screen and in resent emails via live order fallback.

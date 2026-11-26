@@ -5,6 +5,7 @@ import { conflict, DomainError, notFound, validation } from "../../core/errors.j
 import { ulid } from "../../core/ids.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { readSetting, writeSetting } from "../platform/index.js";
+import { orders } from "../orders/schema.js";
 import { sanitizeCardBrand, sanitizeCardLast4 } from "../payments/settings.js";
 import { assertLiveActorInTx, denyComplianceAuthz, runComplianceTx } from "./actorAuth.js";
 import {
@@ -84,6 +85,7 @@ export interface InvoiceSummaryView {
   invoicePublicId: string;
   orderPublicId: string;
   orderReference: string;
+  projectName?: string | null;
   invoiceNumber: string | null;
   status: InvoiceStatus;
   paymentState: InvoicePaymentState;
@@ -743,10 +745,61 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     return map;
   }
 
+  async function resolveOrderMetaMap(
+    dbOrTx: DbOrTx,
+    orderIds: readonly number[],
+  ): Promise<Map<number, { reference: string; projectName: string | null }>> {
+    const out = new Map<number, { reference: string; projectName: string | null }>();
+    const uniqueIds = [...new Set(orderIds.filter((id) => Number.isInteger(id) && id > 0))];
+    if (uniqueIds.length === 0) return out;
+
+    try {
+      const ordRows = await dbOrTx
+        .select({
+          id: orders.id,
+          reference: orders.reference,
+          projectName: orders.projectName,
+        })
+        .from(orders)
+        .where(inArray(orders.id, uniqueIds));
+      for (const row of ordRows) {
+        const trimmedProject = row.projectName?.trim() || null;
+        out.set(row.id, {
+          reference: row.reference,
+          projectName: trimmedProject,
+        });
+      }
+    } catch {
+      // Standalone compliance unit tests may run without `orders` table populated.
+    }
+
+    const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+    if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
+      for (const orderId of uniqueIds) {
+        const existing = out.get(orderId);
+        if (existing && existing.projectName) continue;
+        const ref = await ordersSvc.getOrderRefById(
+          orderId,
+          dbOrTx !== deps.db ? (dbOrTx as Tx) : undefined,
+        );
+        if (!ref) continue;
+        const candidateName =
+          typeof (ref as { name?: unknown }).name === "string" ? ref.name.trim() : "";
+        out.set(orderId, {
+          reference: existing?.reference || ref.reference,
+          projectName: existing?.projectName ?? (candidateName || null),
+        });
+      }
+    }
+
+    return out;
+  }
+
   function toSummaryView(
     inv: typeof complianceInvoices.$inferSelect,
     orderReference: string,
     sums: LedgerSums,
+    projectName: string | null = null,
   ): InvoiceSummaryView {
     const derivedStatus = deriveInvoiceStatus({
       issuedAt: inv.issuedAt,
@@ -773,6 +826,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       invoicePublicId: inv.publicId,
       orderPublicId: inv.orderPublicId,
       orderReference,
+      projectName,
       invoiceNumber: inv.invoiceNumber,
       status: derivedStatus,
       paymentState: derivedPaymentState,
@@ -860,13 +914,15 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       .orderBy(desc(complianceInvoices.id));
 
     const visibleRows = staffView ? rows : rows.filter((r) => r.issuedAt !== null);
-    const [sumsMap, onlineConfigured] = await Promise.all([
+    const [sumsMap, onlineConfigured, orderMetaMap] = await Promise.all([
       computeLedgerSums(
         deps.db,
         visibleRows.map((r) => r.id),
       ),
       isOnlinePaymentConfigured(),
+      resolveOrderMetaMap(deps.db, [orderView.id]),
     ]);
+    const projectName = orderMetaMap.get(orderView.id)?.projectName ?? null;
 
     return {
       orderPublicId: orderView.publicId,
@@ -874,7 +930,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       lockState: orderView.lockState,
       onlinePaymentConfigured: onlineConfigured,
       items: visibleRows.map((inv) =>
-        toSummaryView(inv, orderView.reference, sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS),
+        toSummaryView(inv, orderView.reference, sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS, projectName),
       ),
     };
   }
@@ -936,22 +992,20 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     const hasMore = visible.length > limit;
     const slice = hasMore ? visible.slice(0, limit) : visible;
 
-    // Resolve order references via getOrderRefById
-    const refByOrderId = new Map<number, string>();
+    // Resolve order references and project names
     const uniqueOrderIds = Array.from(new Set(slice.map((s) => s.orderId)));
-    for (const orderId of uniqueOrderIds) {
-      const ref = ordersSvc.getOrderRefById ? await ordersSvc.getOrderRefById(orderId) : null;
-      if (ref) refByOrderId.set(orderId, ref.reference);
-    }
+    const orderMetaMap = await resolveOrderMetaMap(deps.db, uniqueOrderIds);
 
     const items = slice
-      .map((inv) =>
-        toSummaryView(
+      .map((inv) => {
+        const meta = orderMetaMap.get(inv.orderId);
+        return toSummaryView(
           inv,
-          refByOrderId.get(inv.orderId) ?? inv.orderPublicId,
+          meta?.reference ?? inv.orderPublicId,
           sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS,
-        ),
-      )
+          meta?.projectName ?? null,
+        );
+      })
       .filter((view) => (input.status ? view.status === input.status : true));
 
     const last = slice[slice.length - 1];
@@ -977,7 +1031,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       throw notFound("INVOICE_NOT_FOUND");
     }
 
-    const [lines, payments, refunds, sumsMap, issuerNameFallback, issuerAddrFallback, paymentInstructions, onlineConfigured] =
+    const [lines, payments, refunds, sumsMap, issuerNameFallback, issuerAddrFallback, paymentInstructions, onlineConfigured, orderMetaMap] =
       await Promise.all([
         deps.db
           .select()
@@ -999,6 +1053,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         readSetting(deps.settings, INVOICE_ISSUER_ADDRESS),
         readSetting(deps.settings, INVOICE_PAYMENT_INSTRUCTIONS),
         isOnlinePaymentConfigured(),
+        resolveOrderMetaMap(deps.db, [inv.orderId]),
       ]);
 
     const paymentById = new Map(payments.map((p) => [p.id, p]));
@@ -1006,6 +1061,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       inv,
       orderView.reference,
       sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS,
+      orderMetaMap.get(inv.orderId)?.projectName ?? null,
     );
 
     const orderDiscountMinor = Math.max(0, orderView.discountMinor ?? 0);
@@ -1120,7 +1176,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     await assertStaffInvoiceRead(deps, principal);
     const limit = Math.min(Math.max(input.limit ?? 50, 1), 100);
     const afterId = decodeIdCursor(input.cursor);
-    const ordersSvc = requireOrdersService();
+    requireOrdersService();
 
     const conds = [];
     if (afterId !== null) conds.push(lt(complianceInvoices.id, afterId));
@@ -1141,21 +1197,19 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       slice.map((r) => r.id),
     );
 
-    const refByOrderId = new Map<number, string>();
     const uniqueOrderIds = Array.from(new Set(slice.map((s) => s.orderId)));
-    for (const orderId of uniqueOrderIds) {
-      const ref = ordersSvc.getOrderRefById ? await ordersSvc.getOrderRefById(orderId) : null;
-      if (ref) refByOrderId.set(orderId, ref.reference);
-    }
+    const orderMetaMap = await resolveOrderMetaMap(deps.db, uniqueOrderIds);
 
     return {
-      items: slice.map((inv) =>
-        toSummaryView(
+      items: slice.map((inv) => {
+        const meta = orderMetaMap.get(inv.orderId);
+        return toSummaryView(
           inv,
-          refByOrderId.get(inv.orderId) ?? inv.orderPublicId,
+          meta?.reference ?? inv.orderPublicId,
           sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS,
-        ),
-      ),
+          meta?.projectName ?? null,
+        );
+      }),
       nextCursor: hasMore && slice.length > 0 ? encodeIdCursor(slice[slice.length - 1]!.id) : null,
     };
   }
@@ -1481,6 +1535,9 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         );
       }
 
+      const issueOrderMeta = await resolveOrderMetaMap(tx, [orderView.id]);
+      const issueProjectName = issueOrderMeta.get(orderView.id)?.projectName ?? null;
+
       await deps.mailer.enqueue(
         {
           template: "compliance.invoice_issued",
@@ -1488,6 +1545,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           vars: {
             invoiceNumber,
             orderReference: orderView.reference,
+            ...(issueProjectName ? { projectName: issueProjectName } : {}),
             portalPath: `/invoices/${inv.publicId}`,
           },
           idempotencyKey: `mail:invoice-issued:${inv.publicId}`,
@@ -1843,6 +1901,8 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
             tx,
           );
         }
+        const paidOrderMeta = await resolveOrderMetaMap(tx, [orderView.id]);
+        const paidProjectName = paidOrderMeta.get(orderView.id)?.projectName ?? null;
         await deps.mailer.enqueue(
           {
             template: "compliance.invoice_paid",
@@ -1850,6 +1910,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
             vars: {
               invoiceNumber: inv.invoiceNumber ?? inv.publicId,
               orderReference: orderView.reference,
+              ...(paidProjectName ? { projectName: paidProjectName } : {}),
               portalPath: `/invoices/${inv.publicId}`,
             },
             idempotencyKey: `mail:invoice-paid:${inv.publicId}:${paymentPublicId}`,
@@ -2352,6 +2413,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       invoiceNumber: invoiceLabel,
       status: detail.status,
       orderReference: detail.orderReference,
+      projectName: detail.projectName,
       issuerName: detail.issuerName,
       issuerAddress: detail.issuerAddress,
       issuerContact,
@@ -2613,6 +2675,9 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       );
     }
 
+    const checkoutOrderMeta = await resolveOrderMetaMap(tx, [orderView.id]);
+    const checkoutProjectName = checkoutOrderMeta.get(orderView.id)?.projectName ?? null;
+
     await deps.mailer.enqueue(
       {
         template: "compliance.invoice_issued",
@@ -2620,6 +2685,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         vars: {
           invoiceNumber,
           orderReference: orderView.reference,
+          ...(checkoutProjectName ? { projectName: checkoutProjectName } : {}),
           portalPath: `/invoices/${invoicePublicId}`,
         },
         idempotencyKey: `mail:invoice-issued:${invoicePublicId}`,
@@ -2952,6 +3018,11 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         );
       }
 
+      const providerPaidMeta = await resolveOrderMetaMap(tx, [orderRef.id]);
+      const providerPaidProjectName =
+        providerPaidMeta.get(orderRef.id)?.projectName ??
+        (typeof orderRef.name === "string" && orderRef.name.trim() ? orderRef.name.trim() : null);
+
       await deps.mailer.enqueue(
         {
           template: "compliance.invoice_paid",
@@ -2959,6 +3030,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           vars: {
             invoiceNumber: inv.invoiceNumber ?? inv.publicId,
             orderReference: orderRef.reference,
+            ...(providerPaidProjectName ? { projectName: providerPaidProjectName } : {}),
             portalPath: `/invoices/${inv.publicId}`,
           },
           idempotencyKey: `mail:invoice-paid:${inv.publicId}:${paymentPublicId}`,
@@ -3983,7 +4055,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         readSetting(deps.settings, INVOICE_DEFAULT_TAX_RATE_BPS, tx),
       ]);
     return {
-      issuerName: issuerName.trim() || "ReadyPackets",
+      issuerName: issuerName.trim() || "Ready Packets Consulting LLC",
       issuerAddress: issuerAddress.trim(),
       issuerContact: issuerContact.trim(),
       issuerTaxId: issuerTaxId.trim(),

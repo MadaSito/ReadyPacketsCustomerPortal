@@ -34,9 +34,18 @@ function RestoreActions({ data, target, onChanged }: { data: CheckoutStatus; tar
     <Button asChild><Link href="/cart">Open restored cart</Link></Button>
   </Card>;
   if (!data.canRestoreToCart) return null;
+  const payNowIsPrimary =
+    (data.confirmationState === "awaiting_payment" || data.confirmationState === "failed") &&
+    data.invoiceStatus === "issued" &&
+    data.balanceDueMinor > 0 &&
+    data.onlinePaymentAvailable;
   return <Card title="Restore your cart" description="Restore items only if you no longer intend to complete this checkout.">
     {error ? <Callout title="Cart not restored" tone="danger" live="assertive">{error}</Callout> : null}
-    <div className={error ? "mt-4" : undefined}><Button onClick={() => setConfirm(true)}>Restore items to cart</Button></div>
+    <div className={error ? "mt-4" : undefined}>
+      <Button variant={payNowIsPrimary ? "secondary" : "primary"} onClick={() => setConfirm(true)}>
+        Restore items to cart
+      </Button>
+    </div>
     <ConfirmDialog open={confirm} onOpenChange={setConfirm} title="Cancel checkout and restore items?"
       description="ReadyPackets will try to cancel the unpaid attempt and put its items back in your cart. This does not refund a provider charge."
       confirmLabel="Restore items" onConfirm={restoreCart} />

@@ -662,7 +662,11 @@ describe("cross-customer isolation (assembled system)", () => {
     expect(Browser.ok(await a.browser.query<CartView>("cart.get")).items).toEqual([expect.objectContaining({ itemPublicId: owned.cartItemId, quantity: 1 })]);
     Browser.ok(await a.browser.query("cart.checkoutStatus", { attemptPublicId: owned.attemptId }));
     Browser.ok(await a.browser.query("payments.checkoutStatus", { attemptPublicId: owned.attemptId }));
-    Browser.ok(await a.browser.mutate("payments.startInvoiceCheckout", { invoicePublicId: owned.paymentInvoiceId }));
+    // 07.2: with no online provider active, the owner's own invoice resolves and the call answers with the
+    // customer-safe "online payment disabled" error (never NOT_FOUND / FORBIDDEN, which the probes below expect for others).
+    const ownCheckout = await a.browser.mutate("payments.startInvoiceCheckout", { invoicePublicId: owned.paymentInvoiceId });
+    expect(ownCheckout.status).toBe(503);
+    expect(ownCheckout.error?.safe).toMatchObject({ domainCode: "UNAVAILABLE", reasonCode: "ONLINE_PAYMENT_DISABLED" });
     Browser.ok(await admin.browser.mutate("knowledge.attachments.issueDownloadTicket", { attachmentPublicId: owned.staffAttachmentId }));
   });
 

@@ -74,6 +74,16 @@ All three actions are on the console order page in the **Administration** card. 
 | FEATURE_DISABLED on Grant access | Turn on **Console access grants**. |
 | TOO_MANY_ORDERS | A customer-wide grant covers at most 500 orders. Grant access per order instead. |
 
+## The default workflow for new orders (increment 07.2)
+
+The top of **Workflows** shows **Default workflow for new orders: name (version N)**. To change it, choose **Set as default** on another published workflow and confirm (you are asked for your password and authentication code). After that:
+
+- Orders created from then on use that workflow's latest published version. If you publish a newer version later, new orders use the newer one. This covers orders customers place, cart checkout, orders staff create for a customer, and orders created through the API.
+- Existing orders keep the workflow version they started with.
+- Workflows are not chosen per product or package, so there is nothing else to change.
+
+A draft cannot be the default until it is published. When you publish a draft for a new workflow, you can tick **Use for new orders (default workflow)**; otherwise publish it and use **Set as default** later. Every change is recorded in the audit log (`workflow.default.changed`, with the previous and the new default).
+
 ## Phases-first workflows (increment 07)
 
 New installations start with the **ReadyPackets standard workflow**: Payment, Phase 1 intake, Phase 2 synthesis, Phase 3 review, Phase 4 delivery, Delivered and Closed. On an existing installation nothing changes by itself. While the default workflow has no phases, **Workflows** shows a notice with two choices: **Add the ReadyPackets phases workflow** (a new draft) or **Convert … to phases** (a draft of the default in which its statuses are grouped into phases; an open draft without phases is converted only after you confirm). Check each phase and publish when you are ready. Orders that already exist keep the version they started with.

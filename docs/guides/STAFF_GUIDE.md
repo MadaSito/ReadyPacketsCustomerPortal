@@ -13,6 +13,7 @@ For ReadyPackets team members with the **Staff** role. Administrators have every
 - [Customers](#customers)
 - [Orders](#orders)
 - [Switching between the console and the customer portal](#switching-between-the-console-and-the-customer-portal)
+- [Invoices, receipts and online payment (increment 07.2)](#invoices-receipts-and-online-payment-increment-072)
 - [Starting Phase I and Phase II (production pipeline)](#starting-phase-i-and-phase-ii-production-pipeline)
 - [Order files](#order-files)
 - [System health](#system-health)
@@ -103,6 +104,12 @@ Staff cannot manage staff accounts, catalog imports or bundle rules, settings, t
 - **Landing page.** Opening `/` takes you to the console (`/admin`), unless you chose the customer portal in this browser tab. That choice lasts for the tab only and ends when you switch back or sign out.
 
 Switching grants nothing; the server checks every request. Details: [Admin guide — Switching between the admin and customer portals](./ADMIN_GUIDE.md#switching-between-the-admin-and-customer-portals).
+
+## Invoices, receipts and online payment (increment 07.2)
+
+- **Order and project.** Invoices, receipts and refund notes show the **Order** and **Project**, in the console, the customer portal, the PDFs and the e-mails. The PDFs carry the company branding set by an administrator under **Invoices → Company profile**.
+- **Receipts issued before 07.2** keep their original PDF file, but their pages show the order and project.
+- **Payment did not start.** If a customer says the payment page did not open, their order and invoice are saved. They can use **Pay now**. Administrators find the cause under **Stripe setup** (**Last checkout-session failure**) and in **Alerts** ("Customers cannot reach Stripe Checkout"). See [Admin guide — Troubleshooting: customers are not sent to Stripe](./ADMIN_GUIDE.md#troubleshooting-customers-are-not-sent-to-stripe).
 
 ## Starting Phase I and Phase II (production pipeline)
 

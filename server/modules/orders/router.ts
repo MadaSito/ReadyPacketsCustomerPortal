@@ -165,6 +165,11 @@ const workflowsAdmin = router({
   installStandard: adminProcedure
     .use(requireCapability("workflows.manage"))
     .mutation(({ ctx }) => ctx.services.orders.workflows.installStandard(ctx.session)),
+  /** Increment 07.2: make a published workflow the default for new orders (same gates as publish; step-up in the service). */
+  setDefault: adminProcedure
+    .use(requireCapability("workflows.manage"))
+    .input(z.strictObject({ workflowId: id }))
+    .mutation(({ ctx, input }) => ctx.services.orders.workflows.setDefault(ctx.session, input)),
   versions: adminProcedure
     .use(requireCapability("workflows.manage"))
     .input(z.strictObject({ workflowId: id }))

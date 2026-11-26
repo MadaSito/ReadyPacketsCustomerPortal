@@ -339,6 +339,23 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
         };
       }
 
+      if (opts.method === "POST" && u.pathname.startsWith("/v1/checkout/sessions/") && u.pathname.endsWith("/expire")) {
+        const sessionId = decodeURIComponent(
+          u.pathname.slice("/v1/checkout/sessions/".length, -"/expire".length),
+        );
+        const found = stripeSessions.get(sessionId);
+        if (!found) {
+          return { status: 404, headers: { "content-type": "application/json" }, body: Buffer.from("{}", "utf8") };
+        }
+        const expired = { ...found, status: "expired" as const };
+        stripeSessions.set(sessionId, expired as unknown as typeof found);
+        return {
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from(JSON.stringify(expired), "utf8"),
+        };
+      }
+
       if (opts.method === "POST" && u.pathname === "/v1/refunds") {
         const form = new URLSearchParams(typeof opts.body === "string" ? opts.body : "");
         const seq = stripeSeq++;
@@ -500,6 +517,12 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
       const selfRes = await caller.admin.sendSelfTestWebhook({ provider: "stripe" });
       if (!selfRes.ok) {
         throw new Error(`Expected sendSelfTestWebhook to succeed: ${selfRes.reasonCode ?? "unknown"}`);
+      }
+      const probeRes = await caller.admin.verifyCheckoutSession({ provider: "stripe" });
+      if (!probeRes.ok) {
+        throw new Error(
+          `Expected verifyCheckoutSession to succeed: ${probeRes.failureReasonCode ?? probeRes.detail}`,
+        );
       }
       return caller.admin.updateSettings({
         ...input,
@@ -844,7 +867,10 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
     expect(started.mode).toBe("redirect");
     if (started.mode !== "redirect") throw new Error("Expected redirect");
 
-    const sessionEntry = [...h.stripeSessions.values()][0]!;
+    const sessionEntry = [...h.stripeSessions.values()].find(
+      (s) => s.metadata.invoice_public_id === invOnline.invoicePublicId,
+    )!;
+    expect(sessionEntry).toBeDefined();
     sessionEntry.status = "complete";
     sessionEntry.payment_status = "paid";
     sessionEntry.payment_intent.status = "succeeded";
@@ -887,7 +913,10 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
 
     const lastMail = h.t.mailer.last("payment_receipt");
     expect(lastMail).toBeDefined();
-    expect(lastMail?.vars).toEqual({ receiptNumber: onlineReceipt.receiptNumber });
+    expect(lastMail?.vars).toMatchObject({
+      receiptNumber: onlineReceipt.receiptNumber,
+      orderReference: ordOnline.reference,
+    });
     expect(lastMail?.attachments?.[0]?.filename).toBe(`${onlineReceipt.receiptNumber}.pdf`);
 
     // Download original PDF and capture SHA-256 to prove immutability across refunds

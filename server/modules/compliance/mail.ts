@@ -20,11 +20,19 @@ function registerTemplateIfMissing(mailer: Mailer, template: MailTemplate): void
 export function registerComplianceMailTemplates(mailer: Mailer): void {
   registerTemplateIfMissing(mailer, {
     key: PAYMENT_RECEIPT_TEMPLATE,
-    vars: ["receiptNumber"],
+    vars: ["receiptNumber", "orderReference", "projectName"],
     sensitiveVars: ["receiptNumber"],
     subject: () => "Your ReadyPackets payment receipt",
-    text: ({ receiptNumber }) =>
-      `Thank you for your payment. Your ReadyPackets payment receipt number is ${String(receiptNumber)}.`,
+    text: ({ receiptNumber, orderReference, projectName }) => {
+      const orderRef = typeof orderReference === "string" ? orderReference.trim() : "";
+      const project = typeof projectName === "string" ? projectName.trim() : "";
+      return [
+        ...(orderRef ? [`Order: ${orderRef}`] : []),
+        ...(project ? [`Project: ${project}`] : []),
+        ...(orderRef || project ? [""] : []),
+        `Thank you for your payment. Your ReadyPackets payment receipt number is ${String(receiptNumber)}.`,
+      ].join("\n");
+    },
   });
   mailer.registerTemplate({
     key: "compliance.intake_returned",
@@ -42,27 +50,37 @@ export function registerComplianceMailTemplates(mailer: Mailer): void {
 
   mailer.registerTemplate({
     key: "compliance.invoice_issued",
-    vars: ["invoiceNumber", "orderReference", "portalPath"],
+    vars: ["invoiceNumber", "orderReference", "projectName", "portalPath"],
     subject: (vars) => `Invoice ${String(vars.invoiceNumber)} issued for order ${String(vars.orderReference)}`,
-    text: (vars) =>
-      [
+    text: (vars) => {
+      const project = typeof vars.projectName === "string" ? vars.projectName.trim() : "";
+      return [
+        `Order: ${String(vars.orderReference)}`,
+        ...(project ? [`Project: ${project}`] : []),
+        "",
         `Invoice ${String(vars.invoiceNumber)} has been issued for your ReadyPackets order ${String(vars.orderReference)}.`,
         "",
         `Sign in to view or download your invoice PDF: ${String(vars.portalPath)}`,
         "",
         "You are receiving this message because you own this order.",
-      ].join("\n"),
+      ].join("\n");
+    },
   });
 
   mailer.registerTemplate({
     key: "compliance.invoice_paid",
-    vars: ["invoiceNumber", "orderReference", "portalPath"],
+    vars: ["invoiceNumber", "orderReference", "projectName", "portalPath"],
     subject: (vars) => `Payment recorded for invoice ${String(vars.invoiceNumber)}`,
-    text: (vars) =>
-      [
+    text: (vars) => {
+      const project = typeof vars.projectName === "string" ? vars.projectName.trim() : "";
+      return [
+        `Order: ${String(vars.orderReference)}`,
+        ...(project ? [`Project: ${project}`] : []),
+        "",
         `Payment has been recorded in full for invoice ${String(vars.invoiceNumber)} (order ${String(vars.orderReference)}).`,
         "",
         `Sign in to download your updated receipt/invoice PDF: ${String(vars.portalPath)}`,
-      ].join("\n"),
+      ].join("\n");
+    },
   });
 }

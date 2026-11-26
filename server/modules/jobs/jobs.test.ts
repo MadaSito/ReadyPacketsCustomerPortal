@@ -795,8 +795,9 @@ describe("MySQL transactional mail outbox", () => {
       await enqueuePaymentReceipt(f.mailer, receiptInput, tx);
       throw new Error("receipt rollback");
     })).rejects.toThrow("receipt rollback");
-    await enqueuePaymentReceipt(f.mailer, receiptInput);
-    await enqueuePaymentReceipt(f.mailer, receiptInput);
+    const branded = { ...receiptInput, orderReference: " RP-2026-000100 ", projectName: " Project <example> & work " };
+    await enqueuePaymentReceipt(f.mailer, branded);
+    await enqueuePaymentReceipt(f.mailer, branded);
     const rows = await t.db.select().from(mailOutbox);
     expect(rows).toHaveLength(1);
     const row = rows[0]!;
@@ -809,12 +810,15 @@ describe("MySQL transactional mail outbox", () => {
       ["current@example.test", [{ filename: "RPR-2026-000032.pdf", contentType: "application/pdf", content: receiptInput.pdf }]],
       [auditTo, undefined],
     ]);
+    expect(send.mock.calls[0]?.[0].text).toContain("Order: RP-2026-000100\nProject: Project <example> & work");
+    expect(send.mock.calls[0]?.[0].html).toContain("Order: RP-2026-000100<br>Project: Project &lt;example&gt; &amp; work");
     const [sent] = await t.db.select().from(mailOutbox);
     expect(sent).toMatchObject({ state: "accepted", payloadEnc: null, captureEnc: null });
     const retained = f.h.deps.crypto.decrypt(sent!.contentEnc!, `mail_outbox.content_enc:${row.publicId}`);
-    expect(retained).not.toMatch(/attachments|PRIVATE-RECEIPT|RPR-2026-000032/);
-    expect(send.mock.calls[1]?.[0].text).not.toContain(receiptInput.receiptNumber);
-    expect(JSON.stringify(await t.db.select().from(auditEvents))).not.toMatch(/contentBase64|PRIVATE-RECEIPT|RPR-2026-000032/);
+    const privateData = /attachments|PRIVATE-RECEIPT|RPR-2026-000032|RP-2026-000100|Project <example>|Project &lt;example&gt;/;
+    expect(retained).not.toMatch(privateData);
+    expect(JSON.stringify(send.mock.calls[1]?.[0])).not.toMatch(privateData);
+    expect(JSON.stringify(await t.db.select().from(auditEvents))).not.toMatch(privateData);
     await enqueuePaymentReceipt(f.mailer, { ...receiptInput, resendRequestPublicId: reminderPublicId });
     await enqueuePaymentReceipt(f.mailer, { ...receiptInput, resendRequestPublicId: reminderPublicId });
     expect(await t.db.select().from(mailOutbox)).toHaveLength(2);
@@ -849,12 +853,15 @@ describe("MySQL transactional mail outbox", () => {
   it("sends an oversized receipt as a portal-only email with a safe link even after template customization", async () => {
     const f = fixture();
     const { send } = setDelivery(f, "accepted");
+    const renderLegacy = vi.fn(() => ({ subject: "Custom receipt", text: "Thank you.", html: "<html><body><p>Thank you.</p></body></html>" }));
     f.mail.registerMailTemplateStore({ resolve: async (key) => key === PAYMENT_RECEIPT_TEMPLATE
-      ? { key, vars: ["receiptNumber"], render: () => ({ subject: "Custom receipt", text: "Thank you.", html: "<p>Thank you.</p>" }) }
+      ? { key, vars: ["receiptNumber"], render: renderLegacy }
       : null });
     const pdf = Buffer.alloc(RECEIPT_PDF_MAX_BYTES + 1);
     receiptInput.pdf.copy(pdf);
-    await expect(enqueuePaymentReceipt(f.mailer, { ...receiptInput, pdf })).resolves.toEqual({ attachment: "omitted_too_large" });
+    await expect(enqueuePaymentReceipt(f.mailer, {
+      ...receiptInput, pdf, orderReference: "RP-2026-000112", projectName: "Advisory & design",
+    })).resolves.toEqual({ attachment: "omitted_too_large" });
     const [queued] = await t.db.select().from(mailOutbox);
     const payload = f.h.deps.crypto.decrypt(queued!.payloadEnc!, `mail_outbox.payload_enc:${queued!.publicId}`);
     expect(payload).not.toMatch(/attachments|contentBase64|PRIVATE-RECEIPT/);
@@ -866,6 +873,50 @@ describe("MySQL transactional mail outbox", () => {
       html: expect.stringContaining(`<a href="${url}">Open Receipts in ReadyPackets</a>`),
     }));
     expect(send.mock.calls[0]?.[0].attachments).toBeUndefined();
+    expect(send.mock.calls[0]?.[0].text).toMatch(/^Order: RP-2026-000112\nProject: Advisory & design\n\nThank you\./);
+    expect(send.mock.calls[0]?.[0].html).toContain("<body><p>Order: RP-2026-000112<br>Project: Advisory &amp; design</p><p>Thank you.</p>");
+    expect(renderLegacy.mock.calls).toContainEqual([{ receiptNumber: receiptInput.receiptNumber }]);
+  });
+
+  it.each([
+    { key: "compliance.invoice_issued", hasVar: false, inBody: false, markup: "" },
+    { key: "compliance.invoice_paid", hasVar: true, inBody: false, markup: "" },
+    { key: "compliance.invoice_paid", hasVar: true, inBody: true, markup: "" },
+    { key: "compliance.invoice_paid", hasVar: true, inBody: true, markup: "<scr<script>ipt><<p>>" },
+  ])("keeps published $key compatible (project declared=$hasVar, rendered=$inBody, markup=$markup)", async ({ key, hasVar, inBody, markup }) => {
+    const f = fixture();
+    const { send } = setDelivery(f, "accepted");
+    await f.h.settings.set(MAIL_RETAIN_CONTENT.key, true);
+    const vars = { invoiceNumber: "INV-2026-000016", orderReference: "RP-2026-000116", projectName: "Advisory & design", portalPath: "/invoices" };
+    const legacyVars = ["invoiceNumber", "orderReference", "portalPath"];
+    f.mailer.registerTemplate({
+      key, vars: [...legacyVars, "projectName"], subject: () => "Invoice", text: () => "Invoice notice.",
+    });
+    const render = vi.fn((input: Readonly<Record<string, string | number | boolean>>) => ({
+      subject: "Customized invoice",
+      text: `Order: ${vars.orderReference}\n${inBody ? `Project: ${input.projectName}\n` : ""}Invoice notice.`,
+      html: `<p>Order: <strong>${vars.orderReference}</strong></p>${inBody ? `<p>Project: ${markup}<strong>${String(input.projectName).replaceAll("&", "&amp;")}</strong></p>` : ""}<p>Invoice notice.</p>`,
+    }));
+    f.mail.registerMailTemplateStore({
+      resolve: async (requested) => requested === key
+        ? { key, vars: hasVar ? [...legacyVars, "projectName"] : legacyVars, render } : null,
+    });
+    await f.mailer.enqueue({ template: key, vars, to: { userId: 22 }, idempotencyKey: "invoice-project-test" });
+    await f.engine.execute((await f.engine.claim())!);
+    expect(send).toHaveBeenCalledOnce();
+    const message = send.mock.calls[0]![0];
+    expect(message.subject).toBe("Customized invoice");
+    expect(message.text.match(/Order: RP-2026-000116/g)).toHaveLength(1);
+    expect(message.text.match(/Project: Advisory & design/g)).toHaveLength(1);
+    expect(message.html.match(/Order: (?:<strong>)?RP-2026-000116/g)).toHaveLength(1);
+    expect(message.html.match(/Project: /g)).toHaveLength(1);
+    expect(message.html).toContain(inBody ? `Project: ${markup}<strong>Advisory &amp; design` : "Project: Advisory &amp; design");
+    if (hasVar) expect(render.mock.calls[0]).toEqual([vars]);
+    else expect(render.mock.calls[0]).toEqual([expect.not.objectContaining({ projectName: vars.projectName })]);
+    const [row] = await t.db.select().from(mailOutbox);
+    const retained = f.h.deps.crypto.decrypt(row!.contentEnc!, `mail_outbox.content_enc:${row!.publicId}`);
+    expect(retained).toContain("Project: ");
+    expect(retained).not.toMatch(/Advisory (&|&amp;) design/);
   });
 
   it.each([

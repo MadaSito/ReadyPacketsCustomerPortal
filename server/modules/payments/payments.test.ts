@@ -24,6 +24,7 @@ import {
   paymentWebhookEvents,
 } from "./index.js";
 import * as paymentsSchema from "./schema.js";
+import { PAYMENTS_DIAGNOSTICS_SETTING } from "./settings.js";
 
 interface FakeOrderRecord {
   id: number;
@@ -134,8 +135,10 @@ let globalStripeSeq = 1;
 
 function createFakeStripeProtocol() {
   const sessions = new Map<string, StoredStripeSession>();
+  const expiredSessionIds: string[] = [];
   const calls: Array<{ url: string; purpose: EgressPurpose; options: EgressFetchOptions }> = [];
   let nextCreateUrlOverride: string | null = null;
+  let nextCreateResponder: (() => EgressFetchResponse | Promise<EgressFetchResponse>) | null = null;
   let failNextFetch = false;
 
   const fetchPinned = async (
@@ -155,9 +158,14 @@ function createFakeStripeProtocol() {
     }
 
     if (opts.method === "POST" && u.pathname === "/v1/checkout/sessions") {
+      if (nextCreateResponder) {
+        const responder = nextCreateResponder;
+        nextCreateResponder = null;
+        return await responder();
+      }
       const form = new URLSearchParams(typeof opts.body === "string" ? opts.body : "");
       const auth = opts.headers?.authorization ?? "";
-      const livemode = auth.startsWith("Bearer sk_live_");
+      const livemode = auth.startsWith("Bearer sk_live_") || auth.startsWith("Bearer rk_live_");
       const currentSeq = globalStripeSeq++;
       const id = `cs_${livemode ? "live" : "test"}_session_${String(currentSeq).padStart(4, "0")}`;
       const piId = `pi_${livemode ? "live" : "test"}_${String(currentSeq).padStart(4, "0")}`;
@@ -193,6 +201,22 @@ function createFakeStripeProtocol() {
         status: 200,
         headers: { "content-type": "application/json" },
         body: Buffer.from(JSON.stringify(session), "utf8"),
+      };
+    }
+
+    if (opts.method === "POST" && /^\/v1\/checkout\/sessions\/[^/]+\/expire$/u.test(u.pathname)) {
+      const sessionId = decodeURIComponent(
+        u.pathname.slice("/v1/checkout/sessions/".length, -"/expire".length),
+      );
+      expiredSessionIds.push(sessionId);
+      const found = sessions.get(sessionId);
+      if (found) {
+        found.status = "expired";
+      }
+      return {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify(found ?? { id: sessionId, status: "expired" }), "utf8"),
       };
     }
 
@@ -236,10 +260,14 @@ function createFakeStripeProtocol() {
 
   return {
     sessions,
+    expiredSessionIds,
     calls,
     fetchPinned,
     setNextRedirectOverride(url: string) {
       nextCreateUrlOverride = url;
+    },
+    setNextCreateResponder(fn: (() => EgressFetchResponse | Promise<EgressFetchResponse>) | null) {
+      nextCreateResponder = fn;
     },
     setFailNextFetch(flag: boolean) {
       failNextFetch = flag;
@@ -518,6 +546,8 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
     };
     const stripeFake = createFakeStripeProtocol();
     const squareFake = createFakeSquareProtocol();
+    let stripeEgressEnabled = true;
+    const opsAlertEvents: Array<Record<string, unknown>> = [];
     const referralEvents: Array<{ invoicePublicId: string; orderPublicId: string; totalMinor: number }> = [];
     const paidListenerEvents: Array<{ invoicePublicId: string; paymentPublicId: string }> = [];
 
@@ -527,6 +557,11 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
         canonicalOrigin: "https://portal.readypackets.test",
       },
       logger: testLogger,
+      opsAlerts: {
+        async emit(alert: Record<string, unknown>) {
+          opsAlertEvents.push(alert);
+        },
+      },
       identity: {
         sessions: {
           async assertCurrent() {
@@ -541,6 +576,9 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
             if (purpose === "square") {
               return squareFake.fetchPinned(url, purpose, options);
             }
+            if (!stripeEgressEnabled) {
+              throw new DomainError("FORBIDDEN", "EGRESS_HOST_NOT_ALLOWLISTED", "Outbound Stripe preset is disabled.");
+            }
             return stripeFake.fetchPinned(url, purpose, options);
           },
           async listPresets() {
@@ -551,7 +589,7 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
                 purpose: "stripe",
                 parameterized: false,
                 hosts: ["api.stripe.com"],
-                enabled: true,
+                enabled: stripeEgressEnabled,
                 matchingRulePublicIds: [],
               },
               {
@@ -652,6 +690,10 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
       squareFake,
       referralEvents,
       paidListenerEvents,
+      opsAlertEvents,
+      setStripeEgressEnabled(enabled: boolean) {
+        stripeEgressEnabled = enabled;
+      },
       createIssuedInvoiceForPrincipal,
       createIssuedInvoiceForCustomerA,
     };
@@ -753,7 +795,7 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
       reasonCode: "STRIPE_API_NOT_VERIFIED",
     });
 
-    // Stage while keeping Pay by invoice active, verify API + self-test webhook, then activate Stripe.
+    // Stage while keeping Pay by invoice active, verify API + Checkout session probe + self-test webhook, then activate Stripe.
     await h.payments.admin.updateSettings(adminPrincipal, {
       provider: "none",
       mode: "test",
@@ -762,6 +804,17 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
       stripeWebhookSecret: "whsec_validsecret_9876",
     });
     expect((await h.payments.admin.testConnection(adminPrincipal)).ok).toBe(true);
+    await expect(
+      h.payments.admin.updateSettings(adminPrincipal, {
+        provider: "stripe",
+        mode: "test",
+        currency: "USD",
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      reasonCode: "STRIPE_CHECKOUT_SESSION_NOT_VERIFIED",
+    });
+    expect((await h.payments.admin.verifyCheckoutSession(adminPrincipal)).ok).toBe(true);
     await expect(
       h.payments.admin.updateSettings(adminPrincipal, {
         provider: "stripe",
@@ -811,6 +864,7 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
       stripeWebhookSecret: "whsec_checkout_2222",
     });
     await h.payments.admin.testConnection(adminPrincipal);
+    await h.payments.admin.verifyCheckoutSession(adminPrincipal);
     await h.payments.admin.sendSelfTestWebhook(adminPrincipal);
     await h.payments.admin.updateSettings(adminPrincipal, {
       provider: "stripe",
@@ -958,6 +1012,7 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
       stripeWebhookSecret: webhookSecret,
     });
     await h.payments.admin.testConnection(adminPrincipal);
+    await h.payments.admin.verifyCheckoutSession(adminPrincipal);
     await h.payments.admin.sendSelfTestWebhook(adminPrincipal);
     await h.payments.admin.updateSettings(adminPrincipal, {
       provider: "stripe",
@@ -1162,6 +1217,7 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
       stripeWebhookSecret: "whsec_http_route_4444",
     });
     await h.payments.admin.testConnection(adminPrincipal);
+    await h.payments.admin.verifyCheckoutSession(adminPrincipal);
     await h.payments.admin.sendSelfTestWebhook(adminPrincipal);
     await h.payments.admin.updateSettings(adminPrincipal, {
       provider: "stripe",
@@ -1463,6 +1519,564 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
         providerAttemptEver: true,
       });
     }
+  });
+
+  it("Fix Pack 07.2 Problem B — normalizes pasted secrets, rejects mis-shaped keys with per-field details, and never echoes secret content", async () => {
+    const h = createHarness();
+
+    const shapeCases: Array<{
+      patch: Record<string, unknown>;
+      mode?: "test" | "live";
+      expectedField: string;
+      expectedReason: string;
+      secretFragment: string;
+    }> = [
+      {
+        patch: { stripeSecretKey: "pk_test_fake_publishable_token_alpha9999" },
+        expectedField: "stripeSecretKey",
+        expectedReason: "publishable_key_not_used",
+        secretFragment: "alpha9999",
+      },
+      {
+        patch: { stripeSecretKey: "whsec_fake_signing_in_wrong_slot_beta8888" },
+        expectedField: "stripeSecretKey",
+        expectedReason: "webhook_secret_in_api_key_field",
+        secretFragment: "beta8888",
+      },
+      {
+        patch: { stripeWebhookSecret: "sk_test_fake_apikey_in_whsec_slot_gamma7777" },
+        expectedField: "stripeWebhookSecret",
+        expectedReason: "api_key_in_webhook_field",
+        secretFragment: "gamma7777",
+      },
+      {
+        patch: { stripeWebhookSecret: "we_1FakeEndpointIdNotSecretDelta6666" },
+        expectedField: "stripeWebhookSecret",
+        expectedReason: "webhook_endpoint_id_not_secret",
+        secretFragment: "Delta6666",
+      },
+      {
+        patch: { stripeWebhookSecretSecondary: "pk_live_fake_pub_in_secondary_eps5555" },
+        expectedField: "stripeWebhookSecretSecondary",
+        expectedReason: "publishable_key_not_used",
+        secretFragment: "eps5555",
+      },
+      {
+        patch: { stripeWebhookSecret: "whsec_••••masked_copy_zeta4444" },
+        expectedField: "stripeWebhookSecret",
+        expectedReason: "masked_value_pasted",
+        secretFragment: "zeta4444",
+      },
+      {
+        patch: { stripeWebhookSecret: "notwhsec_missing_prefix_eta3333333333" },
+        expectedField: "stripeWebhookSecret",
+        expectedReason: "missing_whsec_prefix",
+        secretFragment: "eta3333333333",
+      },
+      {
+        patch: { stripeWebhookSecret: "whsec_tiny1" },
+        expectedField: "stripeWebhookSecret",
+        expectedReason: "too_short",
+        secretFragment: "whsec_tiny1",
+      },
+    ];
+
+    for (const tc of shapeCases) {
+      let caught: DomainError | null = null;
+      try {
+        await h.payments.admin.updateSettings(adminPrincipal, {
+          provider: "none",
+          mode: tc.mode ?? "test",
+          currency: "USD",
+          ...tc.patch,
+        });
+      } catch (err) {
+        caught = err as DomainError;
+      }
+      expect(caught).toBeInstanceOf(DomainError);
+      expect(caught?.code).toBe("VALIDATION");
+      expect(caught?.details).toMatchObject({
+        field: tc.expectedField,
+        reason: tc.expectedReason,
+      });
+      expect(caught?.safeMessage).not.toContain(tc.secretFragment);
+      expect(JSON.stringify(caught?.details ?? {})).not.toContain(tc.secretFragment);
+    }
+
+    // Paste normalization: surrounding quotes/backticks, BOM/zero-width/NBSP, and wrapped internal newlines
+    const savedNormalized = await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "none",
+      mode: "test",
+      currency: "USD",
+      stripeSecretKey: '  \uFEFF"sk_test_fake_wrapped\n  _key_unit_9012"\u200B  ',
+      stripeWebhookSecret: " `\u00A0whsec_fake_wrapped\r\n_sig_unit_3456` ",
+      stripeWebhookSecretSecondary: "'whsec_fake_rollover\n_sig_unit_7890'",
+    });
+    expect(savedNormalized.stripe.secretKeyLast4).toBe("9012");
+    expect(savedNormalized.stripe.webhookSecretLast4).toBe("3456");
+    expect(savedNormalized.stripe.webhookSecretSecondaryLast4).toBe("7890");
+    expect((await h.payments.admin.sendSelfTestWebhook(adminPrincipal)).ok).toBe(true);
+  });
+
+  it("Fix Pack 07.2 Problem A — records specific failure codes, sanitized audit diagnostics, ops alerts, lastCheckoutFailure, and supports Pay now retry", async () => {
+    const h = createHarness();
+    const fakeSecretToken = "sk_test_fake_never_echo_me_1357";
+    const fakeWhsecToken = "whsec_fake_never_echo_me_2468";
+
+    await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "none",
+      mode: "test",
+      currency: "USD",
+      stripeSecretKey: fakeSecretToken,
+      stripeWebhookSecret: fakeWhsecToken,
+    });
+    expect((await h.payments.admin.testConnection(adminPrincipal)).ok).toBe(true);
+    expect((await h.payments.admin.verifyCheckoutSession(adminPrincipal)).ok).toBe(true);
+    expect((await h.payments.admin.sendSelfTestWebhook(adminPrincipal)).ok).toBe(true);
+    await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+    });
+
+    const cartId = ulid(h.clock.now().getTime() + 50_000);
+    const { invoice } = await h.createIssuedInvoiceForCustomerA(18_500);
+
+    // 1. Restricted key missing Checkout Session write permission (HTTP 403) with a secret-tainted raw error.message
+    h.stripeFake.setNextCreateResponder(() => ({
+      status: 403,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from(
+        JSON.stringify({
+          error: {
+            type: "invalid_request_error",
+            code: "permission_denied",
+            param: "line_items",
+            message: `Key ${fakeSecretToken} does not have permission rak_checkout_session_write`,
+          },
+        }),
+        "utf8",
+      ),
+    }));
+
+    let caught403: DomainError | null = null;
+    try {
+      await runWithRequestContext(newRequestContext("http"), () =>
+        h.payments.startCheckout(
+          invoice.invoicePublicId,
+          { successPath: "/checkout/return", cancelPath: "/checkout/cancel" },
+          { principal: customerAPrincipal, cartPublicId: cartId },
+        ),
+      );
+    } catch (err) {
+      caught403 = err as DomainError;
+    }
+    expect(caught403).toBeInstanceOf(DomainError);
+    expect(caught403?.reasonCode).toBe("STRIPE_KEY_MISSING_PERMISSION");
+    expect(caught403?.details).toMatchObject({
+      invoicePublicId: invoice.invoicePublicId,
+      failureClass: "provider_permission",
+      upstreamStatus: 403,
+    });
+    expect(caught403?.safeMessage).not.toContain(fakeSecretToken);
+    expect(caught403?.safeMessage).not.toContain("rak_checkout_session_write");
+
+    const failedAttemptId = String(caught403?.details?.attemptPublicId ?? "");
+    expect(failedAttemptId).toHaveLength(26);
+
+    const [failedRow] = await tdb.db
+      .select()
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, failedAttemptId));
+    expect(failedRow?.status).toBe("failed");
+    expect(failedRow?.failureReasonCode).toBe("STRIPE_KEY_MISSING_PERMISSION");
+    expect(failedRow?.cartPublicId).toBe(cartId);
+
+    // Audit event contains sanitized bounded diagnostics and NEVER raw error.message or secret values
+    const failAudit = h.audit.events.find(
+      (ev) => ev.eventName === "payments.attempt.failed" && ev.resource?.publicId === failedAttemptId,
+    );
+    expect(failAudit).toBeDefined();
+    expect(failAudit?.attributes).toMatchObject({
+      reason_code: "STRIPE_KEY_MISSING_PERMISSION",
+      failure_class: "provider_permission",
+      upstream_http_status: 403,
+      stripe_error_type: "invalid_request_error",
+      stripe_error_code: "permission_denied",
+      stripe_error_param: "line_items",
+    });
+    expect(JSON.stringify(failAudit)).not.toContain(fakeSecretToken);
+    expect(JSON.stringify(failAudit)).not.toContain("rak_checkout_session_write");
+
+    // Operational alert raised for /admin/alerts
+    expect(h.opsAlertEvents.length).toBeGreaterThanOrEqual(1);
+    const alert403 = h.opsAlertEvents[h.opsAlertEvents.length - 1]!;
+    expect(alert403).toMatchObject({
+      source: "payment",
+    });
+    expect(String(alert403.title)).toContain("Customers cannot reach Stripe Checkout");
+    expect(JSON.stringify(alert403)).not.toContain(fakeSecretToken);
+
+    // Admin settings surfaces lastCheckoutFailure in diagnostics
+    const settingsAfter403 = await h.payments.admin.getSettings(adminPrincipal);
+    expect(settingsAfter403.stripe.lastCheckoutFailure).toMatchObject({
+      reasonCode: "STRIPE_KEY_MISSING_PERMISSION",
+      failureClass: "provider_permission",
+      upstreamStatus: 403,
+      stripeErrorType: "invalid_request_error",
+      stripeErrorCode: "permission_denied",
+      stripeErrorParam: "line_items",
+      invoicePublicId: invoice.invoicePublicId,
+      attemptPublicId: failedAttemptId,
+    });
+
+    // CheckoutStatusView tells cart/return UI that online payment is available to retry and exposes failure class
+    const statusAfter403 = await h.payments.getCheckoutStatus(customerAPrincipal, {
+      invoicePublicId: invoice.invoicePublicId,
+    });
+    expect(statusAfter403.onlinePaymentAvailable).toBe(true);
+    expect(statusAfter403.onlinePaymentUnavailableReason).toBeNull();
+    expect(statusAfter403.attemptInFlight).toBe(false);
+    expect(statusAfter403.lastAttemptFailureClass).toBe("provider_permission");
+
+    // 2. Additional Stripe failure classes: 401 auth invalid, 503 upstream 5xx, invalid JSON, and custom checkout domain
+    const extraCases: Array<{
+      respond: () => EgressFetchResponse;
+      expectedReason: string;
+      expectedClass: string;
+    }> = [
+      {
+        respond: () => ({
+          status: 401,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from(JSON.stringify({ error: { type: "invalid_request_error", code: "api_key_expired" } }), "utf8"),
+        }),
+        expectedReason: "STRIPE_AUTH_INVALID_KEY",
+        expectedClass: "provider_auth",
+      },
+      {
+        respond: () => ({
+          status: 503,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from(JSON.stringify({ error: { type: "api_error" } }), "utf8"),
+        }),
+        expectedReason: "STRIPE_UPSTREAM_5XX",
+        expectedClass: "provider_transient",
+      },
+      {
+        respond: () => ({
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from("<<<not-json>>>", "utf8"),
+        }),
+        expectedReason: "STRIPE_INVALID_JSON",
+        expectedClass: "provider_response",
+      },
+    ];
+    for (const ec of extraCases) {
+      h.stripeFake.setNextCreateResponder(ec.respond);
+      await expect(
+        runWithRequestContext(newRequestContext("http"), () =>
+          h.payments.startCheckout(invoice.invoicePublicId, undefined, { principal: customerAPrincipal }),
+        ),
+      ).rejects.toMatchObject({
+        reasonCode: ec.expectedReason,
+        details: expect.objectContaining({ failureClass: ec.expectedClass }),
+      });
+    }
+
+    h.stripeFake.setNextRedirectOverride("https://pay.custom-merchant.example.test/c/pay/cs_test_custom_123456");
+    await expect(
+      runWithRequestContext(newRequestContext("http"), () =>
+        h.payments.startCheckout(invoice.invoicePublicId, undefined, { principal: customerAPrincipal }),
+      ),
+    ).rejects.toMatchObject({
+      reasonCode: "STRIPE_UNTRUSTED_REDIRECT_URL",
+      details: expect.objectContaining({ failureClass: "untrusted_redirect_url" }),
+    });
+
+    // 3. Customer "Pay now" retry via startInvoiceCheckout succeeds when Stripe recovers and preserves cartPublicId
+    const retried = await runWithRequestContext(newRequestContext("http"), () =>
+      h.payments.startInvoiceCheckout(
+        invoice.invoicePublicId,
+        { successPath: "/checkout/return", cancelPath: "/checkout/cancel" },
+        { principal: customerAPrincipal },
+      ),
+    );
+    expect(retried.mode).toBe("redirect");
+    if (retried.mode !== "redirect") throw new Error("expected redirect");
+    const [retryRow] = await tdb.db
+      .select()
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, retried.attemptPublicId));
+    expect(retryRow?.cartPublicId).toBe(cartId);
+    const statusInFlight = await h.payments.getCheckoutStatus(customerAPrincipal, {
+      invoicePublicId: invoice.invoicePublicId,
+    });
+    expect(statusInFlight.attemptInFlight).toBe(true);
+
+    // 4. When provider is switched back to "none", startInvoiceCheckout throws customer-safe ONLINE_PAYMENT_DISABLED
+    await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "none",
+      mode: "test",
+      currency: "USD",
+    });
+    const { invoice: offlineInv } = await h.createIssuedInvoiceForCustomerA(12_000);
+    await expect(
+      runWithRequestContext(newRequestContext("http"), () =>
+        h.payments.startInvoiceCheckout(offlineInv.invoicePublicId, undefined, {
+          principal: customerAPrincipal,
+        }),
+      ),
+    ).rejects.toMatchObject({
+      code: "UNAVAILABLE",
+      reasonCode: "ONLINE_PAYMENT_DISABLED",
+    });
+  });
+
+  it("Fix Pack 07.2 Problem A.3 & A.4 — verifies Checkout session creation + expire, blocks read-only restricted keys and custom domains, and pauses online checkout on key/egress drift", async () => {
+    const h = createHarness();
+    await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "none",
+      mode: "test",
+      currency: "USD",
+      stripeSecretKey: "rk_test_fake_restricted_probe_1111",
+      stripeWebhookSecret: "whsec_fake_probe_signing_2222",
+    });
+    expect((await h.payments.admin.testConnection(adminPrincipal)).ok).toBe(true);
+    expect((await h.payments.admin.sendSelfTestWebhook(adminPrincipal)).ok).toBe(true);
+
+    // 1. Read-only restricted key fails verifyCheckoutSession with HTTP 403 and blocks activation
+    h.stripeFake.setNextCreateResponder(() => ({
+      status: 403,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from(
+        JSON.stringify({ error: { type: "invalid_request_error", code: "permission_denied" } }),
+        "utf8",
+      ),
+    }));
+    const failedProbe = await h.payments.admin.verifyCheckoutSession(adminPrincipal);
+    expect(failedProbe.ok).toBe(false);
+    expect(failedProbe.failureReasonCode).toBe("STRIPE_KEY_MISSING_PERMISSION");
+    expect(failedProbe.upstreamStatus).toBe(403);
+
+    await expect(
+      h.payments.admin.updateSettings(adminPrincipal, {
+        provider: "stripe",
+        mode: "test",
+        currency: "USD",
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      reasonCode: "STRIPE_CHECKOUT_SESSION_NOT_VERIFIED",
+    });
+
+    // 2. Custom Checkout domain fails verifyCheckoutSession with STRIPE_UNTRUSTED_REDIRECT_URL AND expires probe session
+    h.stripeFake.setNextRedirectOverride("https://checkout.merchant-custom.example.test/c/pay/cs_test_probe_custom");
+    const customDomainProbe = await h.payments.admin.verifyCheckoutSession(adminPrincipal);
+    expect(customDomainProbe.ok).toBe(false);
+    expect(customDomainProbe.failureReasonCode).toBe("STRIPE_UNTRUSTED_REDIRECT_URL");
+    expect(customDomainProbe.expiredImmediately).toBe(true);
+    expect(customDomainProbe.sessionId && h.stripeFake.expiredSessionIds.includes(customDomainProbe.sessionId)).toBe(
+      true,
+    );
+
+    // 3. Valid Checkout session probe succeeds, expires immediately, and allows activation
+    const okProbe = await h.payments.admin.verifyCheckoutSession(adminPrincipal);
+    expect(okProbe.ok).toBe(true);
+    expect(okProbe.expiredImmediately).toBe(true);
+    expect(okProbe.sessionId && h.stripeFake.expiredSessionIds.includes(okProbe.sessionId)).toBe(true);
+
+    const activeView = await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+    });
+    expect(activeView.onlineEnabled).toBe(true);
+    expect(activeView.stripe.statusHeadline).toContain("ACTIVE");
+
+    // 4. Rotating primary signing secret while Stripe is active succeeds, pauses onlineEnabled, and flags reverificationNeeded
+    const rotatedView = await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+      stripeWebhookSecret: "whsec_fake_rotated_primary_3333",
+    });
+    expect(rotatedView.onlineEnabled).toBe(false);
+    expect(rotatedView.stripe.reverificationNeeded).toBe(true);
+    expect(rotatedView.stripe.missingGates).toContain("webhook_self_test");
+    expect(rotatedView.stripe.statusHeadline).toContain("NOT ACTIVE");
+
+    // Starting checkout while verification is stale records failed attempt PROVIDER_VERIFICATION_STALE + alert
+    const { invoice: staleInv } = await h.createIssuedInvoiceForCustomerA(15_000);
+    await expect(
+      runWithRequestContext(newRequestContext("http"), () =>
+        h.payments.startCheckout(staleInv.invoicePublicId, undefined, { principal: customerAPrincipal }),
+      ),
+    ).rejects.toMatchObject({
+      reasonCode: "PROVIDER_VERIFICATION_STALE",
+      details: expect.objectContaining({ failureClass: "configuration", onlinePaymentAvailable: false }),
+    });
+
+    // Re-running self-test restores onlineEnabled immediately
+    expect((await h.payments.admin.sendSelfTestWebhook(adminPrincipal)).ok).toBe(true);
+    expect((await h.payments.admin.getSettings(adminPrincipal)).onlineEnabled).toBe(true);
+
+    // Disabling outbound Stripe egress preset also pauses onlineEnabled and records EGRESS_HOST_NOT_ALLOWLISTED on checkout
+    h.setStripeEgressEnabled(false);
+    const egressOffView = await h.payments.admin.getSettings(adminPrincipal);
+    expect(egressOffView.onlineEnabled).toBe(false);
+    expect(egressOffView.stripe.missingGates).toContain("egress_allowlist");
+    await expect(
+      runWithRequestContext(newRequestContext("http"), () =>
+        h.payments.startCheckout(staleInv.invoicePublicId, undefined, { principal: customerAPrincipal }),
+      ),
+    ).rejects.toMatchObject({
+      reasonCode: "EGRESS_HOST_NOT_ALLOWLISTED",
+      details: expect.objectContaining({ failureClass: "egress", onlinePaymentAvailable: false }),
+    });
+  });
+
+  it("Fix Pack 07.2 follow-up — enforces Checkout-session probe on new/mode-switch activations while keeping upgraded already-active Stripe configs onlineEnabled without a probe", async () => {
+    const h = createHarness();
+
+    // 1. Activation without probe is refused with STRIPE_CHECKOUT_SESSION_NOT_VERIFIED + clear guidance
+    await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "none",
+      mode: "test",
+      currency: "USD",
+      stripeSecretKey: "sk_test_fake_gate_key_a_1111",
+      stripeWebhookSecret: "whsec_fake_gate_wh_a_2222",
+    });
+    expect((await h.payments.admin.testConnection(adminPrincipal)).ok).toBe(true);
+    expect((await h.payments.admin.sendSelfTestWebhook(adminPrincipal)).ok).toBe(true);
+
+    const beforeProbeSettings = await h.payments.admin.getSettings(adminPrincipal);
+    expect(beforeProbeSettings.stripe.checkoutSessionVerified).toBe(false);
+    expect(beforeProbeSettings.stripe.missingGates).toContain("checkout_session_not_verified");
+    const beforeProbeReadiness = await h.payments.admin.readiness(adminPrincipal);
+    expect(
+      beforeProbeReadiness.checklist.find((item) => item.key === "checkout_session_verified"),
+    ).toMatchObject({
+      ready: false,
+      detail: expect.stringMatching(/Required before activating Stripe Checkout/i),
+    });
+
+    await expect(
+      h.payments.admin.updateSettings(adminPrincipal, {
+        provider: "stripe",
+        mode: "test",
+        currency: "USD",
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      reasonCode: "STRIPE_CHECKOUT_SESSION_NOT_VERIFIED",
+      safeMessage: expect.stringContaining("Verify Checkout session creation"),
+    });
+
+    // 2. Stale probe after key change is refused on activation
+    const probeKeyA = await h.payments.admin.verifyCheckoutSession(adminPrincipal);
+    expect(probeKeyA.ok).toBe(true);
+
+    await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "none",
+      mode: "test",
+      currency: "USD",
+      stripeSecretKey: "sk_test_fake_gate_key_b_3333",
+    });
+    expect((await h.payments.admin.testConnection(adminPrincipal)).ok).toBe(true);
+    const staleProbeSettings = await h.payments.admin.getSettings(adminPrincipal);
+    expect(staleProbeSettings.stripe.lastCheckoutProbe).toBeNull();
+    expect(staleProbeSettings.stripe.checkoutSessionVerified).toBe(false);
+    expect(staleProbeSettings.stripe.missingGates).toContain("checkout_session_not_verified");
+
+    await expect(
+      h.payments.admin.updateSettings(adminPrincipal, {
+        provider: "stripe",
+        mode: "test",
+        currency: "USD",
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      reasonCode: "STRIPE_CHECKOUT_SESSION_NOT_VERIFIED",
+      safeMessage: expect.stringContaining("Verify Checkout session creation"),
+    });
+
+    // 3. Activation with passing probe for the current key and mode succeeds
+    const probeKeyB = await h.payments.admin.verifyCheckoutSession(adminPrincipal);
+    expect(probeKeyB.ok).toBe(true);
+    const activated = await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+    });
+    expect(activated.onlineEnabled).toBe(true);
+    expect(activated.stripe.checkoutSessionVerified).toBe(true);
+    expect(activated.stripe.missingGates).toEqual([]);
+
+    // 4. Upgraded already-active server with NO probe on record stays onlineEnabled = true (probe is recommended, not pausing checkout)
+    await h.deps.settings.set(PAYMENTS_DIAGNOSTICS_SETTING.key, {
+      stripeEverApiVerified: true,
+      stripeEverSelfTested: true,
+      lastCheckoutFailure: null,
+      lastStripeCheckoutProbe: null,
+    });
+
+    const upgradedSettings = await h.payments.admin.getSettings(adminPrincipal);
+    expect(upgradedSettings.provider).toBe("stripe");
+    expect(upgradedSettings.onlineEnabled).toBe(true);
+    expect(upgradedSettings.stripe.ready).toBe(true);
+    expect(upgradedSettings.stripe.checkoutSessionVerified).toBe(false);
+    expect(upgradedSettings.stripe.lastCheckoutProbe).toBeNull();
+    expect(upgradedSettings.stripe.missingGates).toEqual([]);
+    expect(upgradedSettings.stripe.statusHeadline).toContain("ACTIVE");
+
+    const upgradedReadiness = await h.payments.admin.readiness(adminPrincipal);
+    expect(upgradedReadiness.onlineEnabled).toBe(true);
+    expect(upgradedReadiness.missingGates).toEqual([]);
+    expect(
+      upgradedReadiness.checklist.find((item) => item.key === "checkout_session_verified"),
+    ).toMatchObject({
+      ready: true,
+      detail: expect.stringMatching(/Recommended check \(online card checkout remains active\)/i),
+    });
+    expect((await h.payments.getPublicCheckoutConfig()).onlineEnabled).toBe(true);
+
+    // Non-secret settings updates on an upgraded already-active server without a probe succeed cleanly
+    const updatedReceipts = await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+      receipts: { enabled: true, emailCustomer: true, footerText: "Thank you for your business." },
+    });
+    expect(updatedReceipts.onlineEnabled).toBe(true);
+
+    // In-place secret rotation keeps its current rules (pauses until Test Stripe API passes, then resumes onlineEnabled without requiring a probe)
+    const rotatedKeyInPlace = await h.payments.admin.updateSettings(adminPrincipal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+      stripeSecretKey: "sk_test_fake_gate_key_c_4444",
+    });
+    expect(rotatedKeyInPlace.onlineEnabled).toBe(false);
+    expect((await h.payments.admin.testConnection(adminPrincipal)).ok).toBe(true);
+    const resumedAfterKeyRotate = await h.payments.admin.getSettings(adminPrincipal);
+    expect(resumedAfterKeyRotate.onlineEnabled).toBe(true);
+    expect(resumedAfterKeyRotate.stripe.lastCheckoutProbe).toBeNull();
+
+    // 5. Switching mode (test -> live) also requires a passing probe for the live key
+    await expect(
+      h.payments.admin.updateSettings(adminPrincipal, {
+        provider: "stripe",
+        mode: "live",
+        currency: "USD",
+        stripeSecretKey: "sk_live_fake_gate_key_live_5555",
+        stripeWebhookSecret: "whsec_fake_gate_wh_live_6666",
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      reasonCode: "STRIPE_API_NOT_VERIFIED",
+    });
   });
 });
 

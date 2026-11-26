@@ -44,6 +44,13 @@ export default function InvoiceDetailPage() {
   const header = (
     <PageHeader
       title={title}
+      description={
+        inv
+          ? inv.projectName?.trim()
+            ? `Order ${inv.orderReference} · ${inv.projectName.trim()}`
+            : `Order ${inv.orderReference}`
+          : undefined
+      }
       breadcrumbs={<Breadcrumbs items={[{ label: "Invoices", href: "/admin/invoices" }, { label: title }]} />}
       meta={inv ? <InvoiceStatusBadge status={inv.status} /> : undefined}
       actions={
@@ -97,18 +104,34 @@ export default function InvoiceDetailPage() {
                 {invoice.voidReason ?? "No reason recorded."} {invoice.voidedAt ? <DateTime value={invoice.voidedAt} /> : null}
               </Callout>
             ) : null}
+            <Card title="Order & project">
+              <KeyValueList
+                columns={2}
+                items={[
+                  {
+                    label: "Order",
+                    value: (
+                      <Link href={`/admin/orders/${invoice.orderPublicId}`} className="font-mono font-semibold break-all text-action underline-offset-2 hover:underline">
+                        {invoice.orderReference}
+                      </Link>
+                    ),
+                  },
+                  {
+                    label: "Project",
+                    value: invoice.projectName?.trim() ? (
+                      <span className="font-semibold break-words">{invoice.projectName.trim()}</span>
+                    ) : (
+                      <span className="text-muted">Not specified</span>
+                    ),
+                  },
+                ]}
+              />
+            </Card>
             <div className="grid gap-6 lg:grid-cols-2">
               <Card title="Summary">
                 <KeyValueList
                   items={[
-                    {
-                      label: "Order",
-                      value: (
-                        <Link href={`/admin/orders/${invoice.orderPublicId}`} className="break-all text-action underline-offset-2 hover:underline">
-                          {invoice.orderReference}
-                        </Link>
-                      ),
-                    },
+                    { label: "Issued by", value: invoice.issuerName },
                     { label: "Issued", value: <DateTime value={invoice.issuedAt} format="date" /> },
                     { label: "Due", value: <DateTime value={invoice.dueAt} format="date" /> },
                     { label: "Created", value: <DateTime value={invoice.createdAt} /> },

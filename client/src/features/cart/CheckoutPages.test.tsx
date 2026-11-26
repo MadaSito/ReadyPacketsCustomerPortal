@@ -1,7 +1,8 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { CheckoutCartResult } from "@server/modules/cart/types";
+import { invoiceCheckoutNavigation } from "@/features/compliance/customer/InvoicePages";
 import type { MeResult, MeUser } from "@/lib/authApi";
 import type * as transport from "@/lib/trpc";
 import { pageA11y } from "@/test/a11y";
@@ -16,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   checkout: vi.fn(),
   status: vi.fn(),
   restore: vi.fn(),
+  startInvoiceCheckout: vi.fn(),
   policyMyStatus: vi.fn(),
   policyAccept: vi.fn(),
 }));
@@ -30,7 +32,18 @@ vi.mock("@/lib/trpc", async (original) => ({
       }) },
       restoreCheckout: { mutationOptions: () => ({ mutationFn: (input: unknown) => mocks.restore(input) }) },
     },
+    payments: {
+      startInvoiceCheckout: {
+        mutationOptions: () => ({ mutationFn: (input: unknown) => mocks.startInvoiceCheckout(input) }),
+      },
+    },
     compliance: {
+      invoices: {
+        pathKey: () => ["compliance.invoices"],
+      },
+      receipts: {
+        pathKey: () => ["compliance.receipts"],
+      },
       policies: {
         myStatus: {
           queryKey: () => ["compliance.policies.myStatus"],
@@ -72,11 +85,14 @@ const cart: CartViewData = {
 };
 const pending: CheckoutStatus = {
   cartPublicId: cartId, confirmationState: "pending_confirmation", paymentMode: "redirect", provider: "square",
-  attemptPublicId: attemptId, attemptStatus: "redirected", failureReasonCode: null, orderPublicId: orderId,
+  attemptPublicId: attemptId, attemptStatus: "redirected", attemptInFlight: true,
+  onlinePaymentAvailable: true, onlinePaymentUnavailableReason: null, lastAttemptFailureClass: null,
+  failureReasonCode: null, orderPublicId: orderId,
   orderReference: "RP-SYNTHETIC", invoicePublicId: invoiceId, invoiceNumber: "INV-SYNTHETIC",
   invoiceStatus: "issued", currency: "USD", subtotalMinor: 1600, discountMinor: 200, discountLabel: "Bundle savings",
   promoDiscountMinor: 0, promoLabel: null,
-  taxRateBps: 1000, taxMinor: 140, totalMinor: 1540, waivedMinor: 0, balanceDueMinor: 1540, canRestoreToCart: true, alreadyRestored: false,
+  taxRateBps: 1000, taxMinor: 140, totalMinor: 1540, waivedMinor: 0, balanceDueMinor: 1540,
+  receiptPublicId: null, canRestoreToCart: true, alreadyRestored: false,
   checkedOutAt: date,
 };
 const invoice: CheckoutCartResult = {
@@ -84,11 +100,23 @@ const invoice: CheckoutCartResult = {
   invoiceNumber: "INV-SYNTHETIC", currency: "USD", totalMinor: 1540,
 };
 
+let redirectSpy: ReturnType<typeof vi.spyOn>;
+
 beforeEach(() => {
   vi.resetAllMocks();
+  redirectSpy = vi.spyOn(invoiceCheckoutNavigation, "redirectToHostedCheckout").mockImplementation(() => {});
   mocks.cart.mockResolvedValue(cart);
   mocks.checkout.mockResolvedValue(invoice);
   mocks.status.mockResolvedValue(pending);
+  mocks.startInvoiceCheckout.mockResolvedValue({
+    mode: "redirect",
+    attemptPublicId: id(9),
+    invoicePublicId: invoiceId,
+    provider: "stripe",
+    environment: "live",
+    redirectUrl: "https://checkout.stripe.com/pay/cs_live_synthetic_retry",
+    expiresAt: new Date("2026-11-21T12:30:00Z"),
+  });
   mocks.restore.mockImplementation(async () => {
     mocks.status.mockResolvedValue({ ...pending, confirmationState: "cancelled", canRestoreToCart: false, alreadyRestored: true });
     return { restored: true, alreadyRestored: false, cart };
@@ -114,12 +142,16 @@ beforeEach(() => {
   mocks.policyAccept.mockResolvedValue({ acceptancePublicId: id(9) });
 });
 
+afterEach(() => {
+  redirectSpy.mockRestore();
+});
+
 const review = () => renderUi(<main><title>Checkout · ReadyPackets</title><CheckoutPage /></main>, { path: "/cart/checkout" });
 const returned = (search = `?attempt=${attemptId}`) => renderUi(
   <main><title>Checkout status · ReadyPackets</title><CheckoutReturnPage /></main>, { path: `/checkout/return${search}` },
 );
-const cancelled = () => renderUi(
-  <main><title>Checkout recovery · ReadyPackets</title><CheckoutCancelPage /></main>, { path: `/checkout/cancel?attempt=${attemptId}` },
+const cancelled = (search = `?attempt=${attemptId}`) => renderUi(
+  <main><title>Checkout recovery · ReadyPackets</title><CheckoutCancelPage /></main>, { path: `/checkout/cancel${search}` },
 );
 
 pageA11y("/cart/checkout review", async () => {
@@ -516,7 +548,359 @@ it("never offers to restore a paid checkout and rejects ambiguous references or 
   expect(readCheckoutTarget(`attempt=${attemptId}&cart=${cartId}`)).toBeNull();
   expect(readCheckoutTarget(`attempt=${attemptId}&attempt=${attemptId}`)).toBeNull();
   expect(isHostedCheckoutUrl("https://checkout.stripe.com/c/pay/session#token", "stripe", "test")).toBe(true);
+  expect(isHostedCheckoutUrl("https://checkout.stripe.com/pay/cs_live_synthetic", "stripe", "live")).toBe(true);
+  expect(isHostedCheckoutUrl("https://checkout.stripe.com/", "stripe", "live")).toBe(false);
+  expect(isHostedCheckoutUrl("http://checkout.stripe.com/pay/cs_live_synthetic", "stripe", "live")).toBe(false);
+  expect(isHostedCheckoutUrl("https://user:pass@checkout.stripe.com/pay/cs_live_synthetic", "stripe", "live")).toBe(false);
+  expect(isHostedCheckoutUrl("https://checkout.stripe.com:8443/pay/cs_live_synthetic", "stripe", "live")).toBe(false);
   expect(isHostedCheckoutUrl("https://checkout.stripe.com.untrusted.test/c/pay/session", "stripe", "live")).toBe(false);
   expect(isHostedCheckoutUrl("https://square.link/u/session", "square", "test")).toBe(false);
   expect(isHostedCheckoutUrl("https://sandbox.square.link/u/session", "square", "test")).toBe(true);
+});
+
+pageA11y("/cart/checkout placed-order payment handoff", async () => {
+  const user = userEvent.setup();
+  mocks.cart.mockResolvedValue({
+    ...cart,
+    pendingPolicies: [],
+    onlinePaymentEnabled: true,
+    paymentProvider: "stripe",
+    paymentEnvironment: "live",
+  });
+  mocks.checkout.mockResolvedValue({
+    mode: "payment_unavailable",
+    cartPublicId: cartId,
+    orderPublicId: orderId,
+    orderReference: "RP-SYNTHETIC",
+    invoicePublicId: invoiceId,
+    invoiceNumber: "INV-SYNTHETIC",
+    currency: "USD",
+    totalMinor: 1540,
+    onlinePaymentAvailable: true,
+    reasonCode: "STRIPE_UPSTREAM_5XX",
+    failureClass: "provider_transient",
+    safeMessage: "The payment provider could not open a checkout session right now.",
+  });
+  review();
+  await user.click(await screen.findByRole("button", { name: "Place order and continue to payment" }));
+  await screen.findByText("Your order RP-SYNTHETIC is placed, but we could not open the secure payment page");
+});
+
+pageA11y("/checkout/return awaiting payment with Pay now", async () => {
+  mocks.status.mockResolvedValue({
+    ...pending,
+    confirmationState: "awaiting_payment",
+    attemptPublicId: null,
+    attemptStatus: null,
+    attemptInFlight: false,
+    onlinePaymentAvailable: true,
+  });
+  returned(`?cart=${cartId}`);
+  await screen.findByText("Payment not completed yet — your order is placed and waiting for payment");
+});
+
+it("Fix pack 07.2: redirects valid live Stripe URLs (including /pay/...) and NEVER falls through silently on rejected redirect URLs", async () => {
+  const user = userEvent.setup();
+  mocks.cart.mockResolvedValue({
+    ...cart,
+    pendingPolicies: [],
+    onlinePaymentEnabled: true,
+    paymentProvider: "stripe",
+    paymentEnvironment: "live",
+  });
+
+  // 1. Valid Stripe live URL (`/pay/cs_live_...`, not `/c/pay/...`) redirects directly to Stripe
+  mocks.checkout.mockResolvedValueOnce({
+    mode: "redirect",
+    cartPublicId: cartId,
+    attemptPublicId: attemptId,
+    provider: "stripe",
+    environment: "live",
+    redirectUrl: "https://checkout.stripe.com/pay/cs_live_synthetic",
+    expiresAt: new Date("2026-11-21T12:30:00Z"),
+    orderPublicId: orderId,
+    orderReference: "RP-SYNTHETIC",
+    invoicePublicId: invoiceId,
+    invoiceNumber: "INV-SYNTHETIC",
+    currency: "USD",
+    totalMinor: 1540,
+  });
+
+  const okRender = review();
+  await user.click(await screen.findByRole("button", { name: "Place order and continue to payment" }));
+  await waitFor(() => {
+    expect(redirectSpy).toHaveBeenCalledWith("https://checkout.stripe.com/pay/cs_live_synthetic");
+  });
+  expect(okRender.location.history?.at(-1)).toBe("/cart/checkout");
+  okRender.unmount();
+
+  // 2. Rejected redirect URL NEVER falls through to `/checkout/return?cart=...`; focuses explicit placed-order alert with Pay now + View invoice
+  redirectSpy.mockClear();
+  mocks.checkout.mockResolvedValueOnce({
+    mode: "redirect",
+    cartPublicId: cartId,
+    attemptPublicId: attemptId,
+    provider: "stripe",
+    environment: "live",
+    redirectUrl: "https://untrusted.example.test/pay/cs_live_synthetic",
+    expiresAt: new Date("2026-11-21T12:30:00Z"),
+    orderPublicId: orderId,
+    orderReference: "RP-SYNTHETIC",
+    invoicePublicId: invoiceId,
+    invoiceNumber: "INV-SYNTHETIC",
+    currency: "USD",
+    totalMinor: 1540,
+  });
+
+  const rejectedRender = review();
+  await user.click(await screen.findByRole("button", { name: "Place order and continue to payment" }));
+
+  const alertHeading = await screen.findByText(
+    "Your order RP-SYNTHETIC is placed, but we could not open the secure payment page",
+  );
+  expect(alertHeading).toBeInTheDocument();
+  expect(redirectSpy).not.toHaveBeenCalled();
+  expect(rejectedRender.location.history?.at(-1)).toBe("/cart/checkout");
+  expect(document.activeElement).toContainElement(alertHeading);
+  expect(screen.queryByRole("button", { name: /Place order/i })).not.toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "View invoice" })).toHaveAttribute("href", `/invoices/${invoiceId}`);
+
+  // Clicking "Pay now" starts invoice checkout and redirects to the verified Stripe session
+  await user.click(screen.getByRole("button", { name: "Pay now" }));
+  await waitFor(() => {
+    expect(mocks.startInvoiceCheckout).toHaveBeenCalledWith({
+      invoicePublicId: invoiceId,
+      successPath: "/checkout/return",
+      cancelPath: "/checkout/cancel",
+    });
+    expect(redirectSpy).toHaveBeenCalledWith("https://checkout.stripe.com/pay/cs_live_synthetic_retry");
+  });
+});
+
+it("Fix pack 07.2: handles post-commit provider failure (payment_unavailable) with focus-managed placed-order handoff and never invites cart resubmission", async () => {
+  const user = userEvent.setup();
+  mocks.cart.mockResolvedValueOnce({
+    ...cart,
+    pendingPolicies: [],
+    onlinePaymentEnabled: true,
+    paymentProvider: "stripe",
+    paymentEnvironment: "live",
+  }).mockResolvedValue({
+    ...cart,
+    cartPublicId: null,
+    itemCount: 0,
+    items: [],
+  });
+  mocks.checkout.mockResolvedValueOnce({
+    mode: "payment_unavailable",
+    cartPublicId: cartId,
+    orderPublicId: orderId,
+    orderReference: "RP-SYNTHETIC-LIVE",
+    invoicePublicId: invoiceId,
+    invoiceNumber: "INV-SYNTHETIC-LIVE",
+    currency: "USD",
+    totalMinor: 120,
+    onlinePaymentAvailable: true,
+    reasonCode: "STRIPE_UPSTREAM_5XX",
+    failureClass: "provider_transient",
+    safeMessage: "The payment provider could not open a checkout session right now.",
+  });
+
+  review();
+  await user.click(await screen.findByRole("button", { name: "Place order and continue to payment" }));
+
+  const alertHeading = await screen.findByText(
+    "Your order RP-SYNTHETIC-LIVE is placed, but we could not open the secure payment page",
+  );
+  expect(document.activeElement).toContainElement(alertHeading);
+  expect(screen.queryByText("Review your cart before checking out")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /Place order/i })).not.toBeInTheDocument();
+  expect(screen.getByText(/do not submit this cart again/i)).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "View invoice" })).toHaveAttribute("href", `/invoices/${invoiceId}`);
+  expect(screen.getByRole("link", { name: "View order" })).toHaveAttribute("href", `/orders/${orderId}`);
+
+  // If clicking "Pay now" fails first, the danger callout "Could not open online payment" is shown and focused; retry succeeds
+  mocks.startInvoiceCheckout
+    .mockRejectedValueOnce(new Error("Online payment temporarily unavailable."))
+    .mockResolvedValueOnce({
+      mode: "redirect",
+      attemptPublicId: id(9),
+      invoicePublicId: invoiceId,
+      provider: "stripe",
+      environment: "live",
+      redirectUrl: "https://checkout.stripe.com/pay/cs_live_synthetic_retry",
+      expiresAt: new Date("2026-11-21T12:30:00Z"),
+    });
+
+  await user.click(screen.getByRole("button", { name: "Pay now" }));
+  expect(await screen.findByText("Could not open online payment")).toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: "Pay now" }));
+  await waitFor(() => {
+    expect(mocks.startInvoiceCheckout).toHaveBeenCalledTimes(2);
+    expect(redirectSpy).toHaveBeenCalledWith("https://checkout.stripe.com/pay/cs_live_synthetic_retry");
+  });
+});
+
+pageA11y("/cart/checkout placed-order handoff when online payment unavailable", async () => {
+  const user = userEvent.setup();
+  mocks.cart.mockResolvedValue({
+    ...cart,
+    pendingPolicies: [],
+    onlinePaymentEnabled: true,
+    paymentProvider: "stripe",
+    paymentEnvironment: "live",
+  });
+  mocks.checkout.mockResolvedValue({
+    mode: "payment_unavailable",
+    cartPublicId: cartId,
+    orderPublicId: orderId,
+    orderReference: "RP-SYNTHETIC-STALE",
+    invoicePublicId: invoiceId,
+    invoiceNumber: "INV-SYNTHETIC-STALE",
+    currency: "USD",
+    totalMinor: 120,
+    onlinePaymentAvailable: false,
+    reasonCode: "PROVIDER_VERIFICATION_STALE",
+    failureClass: "configuration",
+    safeMessage: "Online card payment is temporarily unavailable while payment settings are being updated. Your order and invoice are ready.",
+  });
+  review();
+  await user.click(await screen.findByRole("button", { name: "Place order and continue to payment" }));
+  await screen.findByText("Your order RP-SYNTHETIC-STALE is placed, but we could not open the secure payment page");
+});
+
+it("Fix pack 07.2: hides Pay now on /cart/checkout handoff when onlinePaymentAvailable is false (making View invoice primary with invoice instructions), while still showing Pay now when onlinePaymentAvailable is undefined", async () => {
+  const user = userEvent.setup();
+  const onlineCart = {
+    ...cart,
+    pendingPolicies: [],
+    onlinePaymentEnabled: true,
+    paymentProvider: "stripe" as const,
+    paymentEnvironment: "live" as const,
+  };
+
+  // 1. `onlinePaymentAvailable === false` (e.g. PROVIDER_VERIFICATION_STALE): hides Pay now, makes View invoice primary, shows invoice instructions
+  mocks.cart.mockResolvedValueOnce(onlineCart);
+  mocks.checkout.mockResolvedValueOnce({
+    mode: "payment_unavailable",
+    cartPublicId: cartId,
+    orderPublicId: orderId,
+    orderReference: "RP-SYNTHETIC-STALE",
+    invoicePublicId: invoiceId,
+    invoiceNumber: "INV-SYNTHETIC-STALE",
+    currency: "USD",
+    totalMinor: 120,
+    onlinePaymentAvailable: false,
+    reasonCode: "PROVIDER_VERIFICATION_STALE",
+    failureClass: "configuration",
+    safeMessage: "Online card payment is temporarily unavailable while payment settings are being updated. Your order and invoice are ready.",
+  });
+
+  const staleView = review();
+  await user.click(await screen.findByRole("button", { name: "Place order and continue to payment" }));
+  expect(
+    await screen.findByText("Your order RP-SYNTHETIC-STALE is placed, but we could not open the secure payment page"),
+  ).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Pay now" })).not.toBeInTheDocument();
+  expect(screen.getByText(/Open your invoice for the balance due and payment instructions/i)).toBeInTheDocument();
+  const viewInvoiceLink = screen.getByRole("link", { name: "View invoice" });
+  expect(viewInvoiceLink).toHaveAttribute("href", `/invoices/${invoiceId}`);
+  expect(viewInvoiceLink.className).toContain("bg-action");
+  staleView.unmount();
+
+  // 2. Older server payload where `onlinePaymentAvailable` is omitted/undefined still shows primary "Pay now"
+  mocks.cart.mockResolvedValueOnce(onlineCart);
+  mocks.checkout.mockResolvedValueOnce({
+    mode: "payment_unavailable",
+    cartPublicId: cartId,
+    orderPublicId: orderId,
+    orderReference: "RP-SYNTHETIC-COMPAT",
+    invoicePublicId: invoiceId,
+    invoiceNumber: "INV-SYNTHETIC-COMPAT",
+    currency: "USD",
+    totalMinor: 120,
+    reasonCode: "STRIPE_UPSTREAM_5XX",
+    failureClass: "provider_transient",
+    safeMessage: "We could not open the secure payment page right now.",
+  } as unknown as CheckoutCartResult);
+
+  const compatView = review();
+  await user.click(await screen.findByRole("button", { name: "Place order and continue to payment" }));
+  expect(
+    await screen.findByText("Your order RP-SYNTHETIC-COMPAT is placed, but we could not open the secure payment page"),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Pay now" })).toBeInTheDocument();
+  compatView.unmount();
+});
+
+it("Fix pack 07.2: distinguishes waiting-for-provider (?attempt= redirected) from awaiting_payment (?cart= / failed / no attempt) with Pay now, in-flight warning, and offline instructions fallback", async () => {
+  const user = userEvent.setup();
+
+  // 1. `/checkout/return?cart=...` with unpaid order & online payment available -> "Payment not completed yet..." + primary "Pay now"
+  mocks.status.mockResolvedValueOnce({
+    ...pending,
+    confirmationState: "awaiting_payment",
+    provider: "stripe",
+    attemptPublicId: null,
+    attemptStatus: null,
+    attemptInFlight: false,
+    onlinePaymentAvailable: true,
+    totalMinor: 120,
+    balanceDueMinor: 120,
+  });
+  const returnCartView = returned(`?cart=${cartId}`);
+  expect(
+    await screen.findByText("Payment not completed yet — your order is placed and waiting for payment"),
+  ).toBeInTheDocument();
+  expect(screen.queryByText("Waiting for payment confirmation")).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Pay now" }));
+  await waitFor(() => {
+    expect(mocks.startInvoiceCheckout).toHaveBeenCalledWith({
+      invoicePublicId: invoiceId,
+      successPath: "/checkout/return",
+      cancelPath: "/checkout/cancel",
+    });
+    expect(redirectSpy).toHaveBeenCalledWith("https://checkout.stripe.com/pay/cs_live_synthetic_retry");
+  });
+  returnCartView.unmount();
+
+  // 2. Duplicate-payment warning is shown when an earlier attempt is genuinely in flight (`attemptInFlight: true`)
+  mocks.status.mockResolvedValueOnce({
+    ...pending,
+    confirmationState: "awaiting_payment",
+    provider: "stripe",
+    attemptStatus: "redirected",
+    attemptInFlight: true,
+    onlinePaymentAvailable: true,
+  });
+  const inFlightView = returned(`?cart=${cartId}`);
+  expect(
+    await screen.findByText("Payment not completed yet — your order is placed and waiting for payment"),
+  ).toBeInTheDocument();
+  expect(screen.getByText(/avoid submitting a duplicate payment/i)).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Check payment status" })).toBeInTheDocument();
+  inFlightView.unmount();
+
+  // 3. `/checkout/cancel?cart=...` when online payment is NOT available -> shows invoice payment instructions without "Pay now"
+  mocks.status.mockResolvedValueOnce({
+    ...pending,
+    confirmationState: "awaiting_payment",
+    provider: "stripe",
+    attemptPublicId: null,
+    attemptStatus: null,
+    attemptInFlight: false,
+    onlinePaymentAvailable: false,
+    onlinePaymentUnavailableReason: "provider_misconfigured",
+  });
+  const offlineCancelView = cancelled(`?cart=${cartId}`);
+  expect(
+    await screen.findByText("Payment not completed yet — your order is placed and waiting for payment"),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText(/Open your invoice for the balance due and payment instructions/i),
+  ).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Pay now" })).not.toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "View invoice" })).toHaveAttribute("href", `/invoices/${invoiceId}`);
+  offlineCancelView.unmount();
 });

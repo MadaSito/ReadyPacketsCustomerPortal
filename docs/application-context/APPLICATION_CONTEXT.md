@@ -265,6 +265,28 @@ This is a fix pack (PR #19), mostly client-side, for the owner's prompts 28 and 
   - The axe incompletes, mainly contrast, were not reviewed by hand.
   - 16 route states without a fixture were not checked.
 
+## Increment 07.2: payments diagnostics, branded documents, default workflow
+
+This fix pack answers the owner's prompt 30 of 2026-11-26 ([session log](../session-logs/2026-11-26-session-01.md)). There is no migration, and the upgrade commands are unchanged. Verification is in [STATUS.md](STATUS.md#verification-for-increment-072).
+
+- **Online payment is explicit.**
+  - **Checkout.** `cart.checkout` commits the order and invoice, then starts payment. If starting payment fails, it returns `payment_unavailable` (audit `cart.checkout_payment_start_failed`), never a silent fall-through.
+  - **Recording failures.** Payments gives every Checkout Session failure a reason code and marks the attempt `failed`. It writes `payments.attempt.failed` with sanitised diagnostics (no keys, no Stripe wording) and raises the alert "Customers cannot reach Stripe Checkout".
+  - **Visibility for admins.** `/admin/payments/setup` shows **Online card checkout: ACTIVE / NOT ACTIVE**, what customers experience, the missing gates, and **Last checkout-session failure**.
+  - **Probe.** **Verify Checkout session creation** (`payments.admin.verifyCheckoutSession`) creates and expires an unpaid session. New activations (switching the provider to Stripe or changing the mode) need a passing probe for the current key and mode (`47872b8`). Servers already active on Stripe stay active without one, and only a failed probe for the current key blocks them.
+  - **Pay online with no online provider.** The customer API `payments.startInvoiceCheckout` answers 503 `UNAVAILABLE` / `ONLINE_PAYMENT_DISABLED` when no online provider is active. Before, it returned mode `invoice`, and **Pay online** did nothing. The internal `startCheckout` used by cart checkout still returns mode `invoice` (`dd5ddfa`).
+  - **Redirect target.** Customers are sent only to `https://checkout.stripe.com`; the browser and server allowlists match.
+- **Secrets are normalised and checked per field.** Primary holds the endpoint's `whsec_…`; Secondary is only for a rollover. Errors never echo the value. Rotating the key or the Primary secret, or changing the mode or the egress preset, pauses online checkout until the matching check is run again.
+- **Branded documents.**
+  - **What is branded.** Invoice, receipt and refund note PDFs are branded and show Order and Project; the pages, lists and e-mails show them too.
+  - **Issuer settings.** `compliance.invoices.issuer_name` defaults to "Ready Packets Consulting LLC", and `compliance.invoices.issuer_logo` defaults to the header mark. These are edited at `/admin/invoices` → **Company profile**. The receipt footer note is at `/admin/payments`.
+  - **Existing documents.** Invoices render on demand. Stored receipt and refund note PDFs (`pdf_enc` + `pdf_sha256`) are never rewritten.
+  - **No schema change.** `projectName` is read from `orders.project_name`.
+  - **PDF/UA** is not claimed.
+- **Default workflow.** `orders.admin.workflows.setDefault` (admin with `workflows.manage`, fresh step-up) switches the single default (`order_workflows.is_default`) in one locked transaction, and is audited as `workflow.default.changed`. Every create path binds new orders to the default's current version.
+- **Update prompt.** **Later** is per navigation, and nothing is applied automatically.
+- **Limits.** A real Stripe account, real mail, physical devices and screen readers were not verifiable here.
+
 ## Deployment profiles
 
 | Profile | Purpose | Session transport | Routing |

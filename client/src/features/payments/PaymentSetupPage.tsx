@@ -1,6 +1,6 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { KeyRound, Play, PlugZap, ShieldAlert, Terminal, Webhook } from "lucide-react";
-import { useState, type FormEvent } from "react";
+import { Activity, CreditCard, KeyRound, Play, PlugZap, ShieldAlert, Terminal, Webhook } from "lucide-react";
+import { useId, useRef, useState, type FormEvent } from "react";
 import { Link } from "wouter";
 import type { ActivePaymentProvider } from "@server/modules/payments/schema";
 import { errorMessage, useTRPC, useTRPCClient } from "@/lib/trpc";
@@ -21,7 +21,6 @@ import {
   ErrorState,
   Field,
   FilterBar,
-  Input,
   KeyValueList,
   LoadMore,
   PageHeader,
@@ -33,6 +32,14 @@ import {
   useToast,
   type ChecklistItem,
 } from "@/ui";
+import {
+  type CredentialFieldKey,
+  extractServerCredentialFieldError,
+  isLikelyValidWhsec,
+  SecretCredentialField,
+  validateStripeSecretKeyField,
+  validateStripeWebhookSecretField,
+} from "./stripeCredentialValidation";
 
 const DEFAULT_STRIPE_EVENTS = [
   "checkout.session.completed",
@@ -97,10 +104,26 @@ const providerFilterOptions = [
   { value: "square", label: "Square" },
 ];
 
+const failureClassLabels: Record<string, string> = {
+  configuration: "Provider credentials, mode, or verification stale",
+  egress: "Outbound HTTPS allowlist blocked",
+  provider_auth: "Invalid or revoked API key (HTTP 401)",
+  provider_permission: "Restricted key missing permission (HTTP 403)",
+  provider_request: "Stripe rejected request parameters (HTTP 400)",
+  provider_transient: "Stripe rate limit, 5xx, or network timeout",
+  provider_response: "Malformed Stripe API response",
+  untrusted_redirect_url: "Untrusted or custom Stripe Checkout domain",
+  payment_declined: "Payment method declined",
+  expired: "Checkout session expired",
+  cancelled: "Cancelled by customer",
+};
+
+type StagedStripeField = "stripeSecretKey" | "stripeWebhookSecret" | "stripeWebhookSecretSecondary";
+
 function keyStatusHint(last4: string | null) {
   return last4
-    ? `Configured (ending in ${last4}). Leave blank to keep the saved key.`
-    : "Not configured yet. Keys are encrypted at rest and never returned after saving.";
+    ? `Configured (ending in ${last4}). Leave blank to keep the saved value.`
+    : "Not configured yet. Encrypted at rest and never returned after saving.";
 }
 
 function WebhookRejectionsCard() {
@@ -178,9 +201,9 @@ function WebhookRejectionsCard() {
                 rejectionReasons[row.reasonCode] ||
                 row.reasonCode;
               return (
-                <div className="flex flex-wrap items-center gap-2">
+                <div className="flex min-w-0 flex-wrap items-center gap-2">
                   <Badge tone="danger">{humanLabel}</Badge>
-                  <span className="font-mono text-xs text-muted">
+                  <span className="font-mono text-xs break-words [overflow-wrap:anywhere] text-muted">
                     {row.reasonCode} · HTTP {row.httpStatus}
                   </span>
                 </div>
@@ -195,7 +218,11 @@ function WebhookRejectionsCard() {
           {
             key: "detail",
             header: "Diagnostic summary",
-            cell: (row) => row.detail ?? "No additional detail",
+            cell: (row) => (
+              <span className="break-words [overflow-wrap:anywhere]">
+                {row.detail ?? "No additional detail"}
+              </span>
+            ),
           },
           {
             key: "receivedAt",
@@ -227,12 +254,15 @@ export default function PaymentSetupPage() {
   const egressPresetsQuery = useQuery(trpc.integrations.admin.egress.presets.queryOptions());
   const setEgressPreset = useMutation(trpc.integrations.admin.egress.setPreset.mutationOptions());
   const testConnection = useMutation(trpc.payments.admin.testConnection.mutationOptions());
+  const verifyCheckoutSession = useMutation(trpc.payments.admin.verifyCheckoutSession.mutationOptions());
   const sendSelfTest = useMutation(trpc.payments.admin.sendSelfTestWebhook.mutationOptions());
 
   const [modeDraft, setModeDraft] = useState<"test" | "live" | null>(null);
+  const [secretResetSeq, setSecretResetSeq] = useState(0);
   const [secretKey, setSecretKey] = useState("");
   const [webhookSecret, setWebhookSecret] = useState("");
   const [webhookSecretSecondary, setWebhookSecretSecondary] = useState("");
+  const [fieldErrors, setFieldErrors] = useState<Partial<Record<StagedStripeField, string>>>({});
   const [clearSecondary, setClearSecondary] = useState(false);
   const [savingKeys, setSavingKeys] = useState(false);
   const [activating, setActivating] = useState(false);
@@ -240,10 +270,35 @@ export default function PaymentSetupPage() {
   const [confirmActivateOpen, setConfirmActivateOpen] = useState(false);
   const [confirmDeactivateOpen, setConfirmDeactivateOpen] = useState(false);
   const [formNotice, setFormNotice] = useState<string | null>(null);
+  const [signingSecretRotatedKind, setSigningSecretRotatedKind] = useState<"primary" | "secondary" | null>(null);
   const [connectionCheckResult, setConnectionCheckResult] = useState<{
     ok: boolean;
     message: string;
   } | null>(null);
+  const [checkoutProbeResult, setCheckoutProbeResult] = useState<{
+    ok: boolean;
+    message: string;
+    reasonCode: string;
+  } | null>(null);
+
+  const fieldRefs = useRef<Partial<Record<StagedStripeField, HTMLInputElement | null>>>({});
+  const missingGatesListId = useId();
+  const activateDescId = useId();
+
+  const focusField = (field: StagedStripeField) => {
+    queueMicrotask(() => {
+      fieldRefs.current[field]?.focus();
+    });
+  };
+
+  const clearFieldError = (field: StagedStripeField) => {
+    setFieldErrors((previous) => {
+      if (!previous[field]) return previous;
+      const copy = { ...previous };
+      delete copy[field];
+      return copy;
+    });
+  };
 
   const refreshAll = async () => {
     await Promise.all([
@@ -280,13 +335,86 @@ export default function PaymentSetupPage() {
   const requiredEvents = settings.stripe.requiredEvents ?? DEFAULT_STRIPE_EVENTS;
   const apiVerified = Boolean(settings.stripe.lastApiVerifiedAt);
   const selfTestVerified = Boolean(settings.stripe.lastSelfTestWebhookAt);
+
+  const isAlreadyActiveStripe = settings.provider === "stripe";
+  const persistedProbe = settings.stripe.lastCheckoutProbe ?? null;
+  const effectiveProbeOk =
+    checkoutProbeResult !== null
+      ? checkoutProbeResult.ok
+      : persistedProbe !== null
+        ? persistedProbe.ok
+        : settings.stripe.checkoutSessionVerified
+          ? true
+          : null;
+  const checkoutProbeFailed = effectiveProbeOk === false;
+  const checkoutProbeVerified = effectiveProbeOk === true;
+
   const stripePrereqsReady =
     egressAllowlisted &&
     settings.stripe.secretKeyConfigured &&
     settings.stripe.webhookSecretConfigured &&
     apiVerified &&
-    selfTestVerified;
-  const stripeActiveAndReady = settings.provider === "stripe" && settings.onlineEnabled;
+    selfTestVerified &&
+    !checkoutProbeFailed &&
+    (isAlreadyActiveStripe || checkoutProbeVerified);
+  const stripeActiveAndReady = isAlreadyActiveStripe && settings.onlineEnabled && !checkoutProbeFailed;
+
+  const computedMissingGates: string[] = [];
+  if (!egressAllowlisted) {
+    computedMissingGates.push("Outbound HTTPS allowlist for api.stripe.com:443 is disabled.");
+  }
+  if (!settings.stripe.secretKeyConfigured) {
+    computedMissingGates.push(`Stripe API secret key (${settings.mode}) is not saved.`);
+  }
+  if (!settings.stripe.webhookSecretConfigured) {
+    computedMissingGates.push(`Primary Stripe webhook signing secret (${settings.mode}) is not saved.`);
+  }
+  if (!apiVerified) {
+    computedMissingGates.push("Stripe API connection check has not been verified for the current key, mode, and allowlist.");
+  }
+  if (checkoutProbeFailed) {
+    computedMissingGates.push(
+      `Checkout session creation check failed (${checkoutProbeResult?.reasonCode ?? persistedProbe?.reasonCode ?? "STRIPE_CHECKOUT_PROBE_FAILED"}).`,
+    );
+  } else if (!isAlreadyActiveStripe && !checkoutProbeVerified) {
+    computedMissingGates.push(
+      'Checkout session creation has not been verified for the current API key and mode (run "Verify Checkout session creation").',
+    );
+  }
+  if (!selfTestVerified) {
+    computedMissingGates.push("Signed webhook self-test has not passed for the current primary signing secret.");
+  }
+  if (settings.provider !== "stripe") {
+    computedMissingGates.push(
+      `Stripe Checkout is not activated yet (active provider: ${settings.provider === "none" ? "Pay by invoice" : "Square"}).`,
+    );
+  }
+  const missingGates = computedMissingGates;
+  const reverificationReasons = settings.stripe.reverificationReasons ?? [];
+  const reverificationNeeded = Boolean(settings.stripe.reverificationNeeded) || reverificationReasons.length > 0;
+  const lastCheckoutFailure = settings.stripe.lastCheckoutFailure ?? null;
+
+  const showSecondaryRolloverCallout =
+    sameMode &&
+    settings.stripe.webhookSecretConfigured &&
+    !webhookSecret.trim() &&
+    isLikelyValidWhsec(webhookSecretSecondary);
+
+  const statusHeadline =
+    settings.stripe.statusHeadline ??
+    (stripeActiveAndReady
+      ? `Online card checkout: ACTIVE — Customers are sent to Stripe Checkout (${settings.mode})`
+      : settings.provider === "stripe"
+        ? `Online card checkout: NOT ACTIVE — Stripe Checkout (${settings.mode}) is paused pending verification; customers receive an unpaid invoice`
+        : "Online card checkout: NOT ACTIVE — Customers get pay-by-invoice; no card payment is collected");
+
+  const customerExperienceSummary =
+    settings.stripe.customerExperienceSummary ??
+    (stripeActiveAndReady
+      ? `Customer cart checkouts and unpaid issued invoices redirect buyers to hosted Stripe Checkout (${settings.mode} mode), and verified webhooks settle invoices automatically.`
+      : settings.provider === "stripe"
+        ? "Stripe is selected as provider, but online card redirect stays paused until every missing gate below is satisfied. Customer orders still complete with an issued invoice so buyers never lose their cart."
+        : "Customers submit orders with an issued invoice and no online card redirect occurs. You can stage keys, allow api.stripe.com:443, and run every verification check below before activating Stripe Checkout.");
 
   async function toggleStripeEgress(nextEnabled: boolean) {
     try {
@@ -295,6 +423,7 @@ export default function PaymentSetupPage() {
         { reason: "Updating outbound network presets requires a recent identity check." },
       );
       setConnectionCheckResult(null);
+      setCheckoutProbeResult(null);
       await refreshAll();
       toast.show({
         title: nextEnabled ? "Stripe outbound HTTPS enabled" : "Stripe outbound HTTPS disabled",
@@ -333,12 +462,41 @@ export default function PaymentSetupPage() {
     }
   }
 
+  async function handleVerifyCheckoutSession() {
+    try {
+      const res = await stepUp.run(
+        () => verifyCheckoutSession.mutateAsync({ provider: "stripe" }),
+        { reason: "Verifying Stripe Checkout session creation requires a recent identity check." },
+      );
+      setCheckoutProbeResult({
+        ok: res.ok,
+        message: res.message,
+        reasonCode: res.failureReasonCode ?? (res.ok ? "CHECKOUT_SESSION_VERIFIED" : "STRIPE_CHECKOUT_PROBE_FAILED"),
+      });
+      await refreshAll();
+      toast.show({
+        title: res.ok ? "Checkout session creation verified" : "Checkout session creation failed",
+        tone: res.ok ? "success" : "danger",
+        description: res.message,
+      });
+    } catch (error) {
+      if (!(error instanceof StepUpCancelledError)) {
+        const msg = errorMessage(error, "Checkout session creation check failed.");
+        setCheckoutProbeResult({ ok: false, message: msg, reasonCode: "STRIPE_CHECKOUT_PROBE_FAILED" });
+        toast.show({ title: "Checkout session creation failed", tone: "danger", description: msg });
+      }
+    }
+  }
+
   async function handleSendSelfTest() {
     try {
       const res = await stepUp.run(
         () => sendSelfTest.mutateAsync({ provider: "stripe" }),
         { reason: "Running a signed webhook self-test requires a recent identity check." },
       );
+      if (res.ok) {
+        setSigningSecretRotatedKind(null);
+      }
       await refreshAll();
       toast.show({
         title: res.ok ? "Self-test webhook verified" : "Self-test webhook rejected",
@@ -359,13 +517,58 @@ export default function PaymentSetupPage() {
   async function submitStagedCredentials(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setFormNotice(null);
-    const trimmedSk = secretKey.trim();
-    const trimmedWh = webhookSecret.trim();
-    const trimmedWhSecondary = webhookSecretSecondary.trim();
-    if (!trimmedSk && !trimmedWh && !trimmedWhSecondary && !clearSecondary && sameMode) {
+    setFieldErrors({});
+    setSigningSecretRotatedKind(null);
+
+    const rawSk = secretKey;
+    const rawWh = webhookSecret;
+    const rawWhSecondary = webhookSecretSecondary;
+
+    if (!rawSk.trim() && !rawWh.trim() && !rawWhSecondary.trim() && !clearSecondary && sameMode) {
       setFormNotice("Enter at least one Stripe key or change the target environment before saving.");
       return;
     }
+
+    const nextFieldErrors: Partial<Record<StagedStripeField, string>> = {};
+    let normalizedSk: string | undefined;
+    let normalizedWh: string | undefined;
+    let normalizedWhSecondary: string | undefined;
+
+    if (rawSk.trim()) {
+      const res = validateStripeSecretKeyField(rawSk, activeMode);
+      if (!res.ok) nextFieldErrors.stripeSecretKey = res.error;
+      else normalizedSk = res.normalized;
+    }
+    if (rawWh.trim()) {
+      const res = validateStripeWebhookSecretField(rawWh, "stripeWebhookSecret");
+      if (!res.ok) nextFieldErrors.stripeWebhookSecret = res.error;
+      else normalizedWh = res.normalized;
+    }
+    if (rawWhSecondary.trim()) {
+      const res = validateStripeWebhookSecretField(rawWhSecondary, "stripeWebhookSecretSecondary");
+      if (!res.ok) nextFieldErrors.stripeWebhookSecretSecondary = res.error;
+      else normalizedWhSecondary = res.normalized;
+    }
+
+    const orderedFields: StagedStripeField[] = [
+      "stripeSecretKey",
+      "stripeWebhookSecret",
+      "stripeWebhookSecretSecondary",
+    ];
+    const firstInvalid = orderedFields.find((f) => Boolean(nextFieldErrors[f]));
+    if (firstInvalid) {
+      setFieldErrors(nextFieldErrors);
+      setFormNotice(nextFieldErrors[firstInvalid] ?? "Correct the highlighted field before saving.");
+      focusField(firstInvalid);
+      return;
+    }
+
+    const rotatedKind: "primary" | "secondary" | null = normalizedWh
+      ? "primary"
+      : normalizedWhSecondary
+        ? "secondary"
+        : null;
+
     setSavingKeys(true);
     try {
       await stepUp.run(
@@ -378,10 +581,10 @@ export default function PaymentSetupPage() {
             cancelPath: settings.cancelPath,
             webhookToleranceSeconds: settings.webhookToleranceSeconds,
             squareLocationId: settings.square.locationId,
-            ...(trimmedSk ? { stripeSecretKey: trimmedSk } : {}),
-            ...(trimmedWh ? { stripeWebhookSecret: trimmedWh } : {}),
-            ...(trimmedWhSecondary ? { stripeWebhookSecretSecondary: trimmedWhSecondary } : {}),
-            ...(clearSecondary && !trimmedWhSecondary
+            ...(normalizedSk ? { stripeSecretKey: normalizedSk } : {}),
+            ...(normalizedWh ? { stripeWebhookSecret: normalizedWh } : {}),
+            ...(normalizedWhSecondary ? { stripeWebhookSecretSecondary: normalizedWhSecondary } : {}),
+            ...(clearSecondary && !normalizedWhSecondary
               ? { clearStripeWebhookSecretSecondary: true }
               : {}),
           }),
@@ -390,10 +593,13 @@ export default function PaymentSetupPage() {
       setSecretKey("");
       setWebhookSecret("");
       setWebhookSecretSecondary("");
+      setSecretResetSeq((n) => n + 1);
       setClearSecondary(false);
       setModeDraft(null);
-      if (trimmedSk || !sameMode) {
+      setSigningSecretRotatedKind(rotatedKind);
+      if (normalizedSk || !sameMode) {
         setConnectionCheckResult(null);
+        setCheckoutProbeResult(null);
       }
       await refreshAll();
       toast.show({
@@ -405,6 +611,16 @@ export default function PaymentSetupPage() {
       });
     } catch (error) {
       if (!(error instanceof StepUpCancelledError)) {
+        const extracted = extractServerCredentialFieldError(error, "Stripe credentials could not be saved.");
+        if (
+          extracted.field === "stripeSecretKey" ||
+          extracted.field === "stripeWebhookSecret" ||
+          extracted.field === "stripeWebhookSecretSecondary"
+        ) {
+          const targetField: StagedStripeField = extracted.field;
+          setFieldErrors({ [targetField]: extracted.message });
+          focusField(targetField);
+        }
         setFormNotice(errorMessage(error, "Stripe credentials could not be saved."));
       }
     } finally {
@@ -474,12 +690,21 @@ export default function PaymentSetupPage() {
     }
   }
 
+  const activateDescribedBy = !stripePrereqsReady
+    ? !stripeActiveAndReady && missingGates.length > 0
+      ? `${missingGatesListId} ${activateDescId}`
+      : activateDescId
+    : undefined;
+
   const checklistItems: ChecklistItem[] = [
     {
       key: "egress",
-      label: "Outbound HTTPS allowlist for api.stripe.com:443",
-      description:
-        "Required for creating Checkout Sessions, expanding PaymentIntent details, and verifying refunds over pinned TLS.",
+      label: <span className="[overflow-wrap:anywhere]">Outbound HTTPS allowlist for api.stripe.com:443</span>,
+      description: (
+        <span className="[overflow-wrap:anywhere]">
+          Required for creating Checkout Sessions, expanding PaymentIntent details, and verifying refunds over pinned TLS.
+        </span>
+      ),
       state: egressAllowlisted ? "done" : "todo",
       action: (
         <Switch
@@ -494,25 +719,40 @@ export default function PaymentSetupPage() {
     },
     {
       key: "inbound",
-      label: "Inbound country allow-list exemption for /api/payments/webhooks/stripe",
-      description:
-        "Signed Stripe webhook deliveries bypass country filtering before geo checks while keeping rate limits, the 256 KB body limit, and HMAC verification active.",
+      label: (
+        <span className="[overflow-wrap:anywhere]">
+          Inbound country allow-list exemption for /api/payments/webhooks/stripe
+        </span>
+      ),
+      description: (
+        <span className="[overflow-wrap:anywhere]">
+          Signed Stripe webhook deliveries bypass country filtering before geo checks while keeping rate limits, the 256 KB body limit, and HMAC verification active.
+        </span>
+      ),
       state: "done",
     },
     {
       key: "secretKey",
       label: `Stripe API secret key (${settings.mode})`,
-      description: settings.stripe.secretKeyLast4
-        ? `Saved (ending in ${settings.stripe.secretKeyLast4}).`
-        : "Stage an sk_test_, sk_live_, rk_test_, or rk_live_ key below.",
+      description: (
+        <span className="[overflow-wrap:anywhere]">
+          {settings.stripe.secretKeyLast4
+            ? `Saved (ending in ${settings.stripe.secretKeyLast4}).`
+            : "Stage an sk_test_, sk_live_, rk_test_, or rk_live_ key below."}
+        </span>
+      ),
       state: settings.stripe.secretKeyConfigured ? "done" : "todo",
     },
     {
       key: "webhookSecret",
       label: `Primary Stripe webhook signing secret (${settings.mode})`,
-      description: settings.stripe.webhookSecretLast4
-        ? `Saved (ending in ${settings.stripe.webhookSecretLast4}).`
-        : "Stage the whsec_ endpoint secret from your Stripe webhook configuration.",
+      description: (
+        <span className="[overflow-wrap:anywhere]">
+          {settings.stripe.webhookSecretLast4
+            ? `Saved (ending in ${settings.stripe.webhookSecretLast4}).`
+            : "Stage the whsec_ endpoint secret from your Stripe webhook configuration."}
+        </span>
+      ),
       state: settings.stripe.webhookSecretConfigured ? "done" : "todo",
     },
     {
@@ -520,14 +760,16 @@ export default function PaymentSetupPage() {
       label: "Verify outbound Stripe API connectivity",
       description:
         connectionCheckResult && !connectionCheckResult.ok ? (
-          connectionCheckResult.message
+          <span className="[overflow-wrap:anywhere]">{connectionCheckResult.message}</span>
         ) : settings.stripe.lastApiVerifiedAt ? (
-          <span>
+          <span className="[overflow-wrap:anywhere]">
             Verified <DateTime value={settings.stripe.lastApiVerifiedAt} />
             {connectionCheckResult?.ok ? ` — ${connectionCheckResult.message}` : "."}
           </span>
         ) : (
-          "Calls GET /v1/checkout/sessions?limit=1 over the pinned outbound allowlist and confirms key environment alignment. Required for the current staged key, mode, and allowlist."
+          <span className="[overflow-wrap:anywhere]">
+            Calls GET /v1/checkout/sessions?limit=1 over the pinned outbound allowlist and confirms key environment alignment. Required for the current staged key, mode, and allowlist.
+          </span>
         ),
       state: apiVerified ? "done" : "todo",
       action: (
@@ -546,14 +788,52 @@ export default function PaymentSetupPage() {
       ),
     },
     {
+      key: "checkoutSessionProbe",
+      label: "Verify Checkout session creation",
+      description:
+        checkoutProbeResult !== null ? (
+          <span className="[overflow-wrap:anywhere]">{checkoutProbeResult.message}</span>
+        ) : persistedProbe !== null ? (
+          <span className="[overflow-wrap:anywhere]">
+            {persistedProbe.ok ? "Verified " : `Failed (${persistedProbe.reasonCode}) `}
+            <DateTime value={persistedProbe.checkedAt} />.
+          </span>
+        ) : isAlreadyActiveStripe ? (
+          <span className="[overflow-wrap:anywhere]">
+            Recommended check (online card checkout remains active): creates an unpaid Checkout Session over pinned HTTPS and expires it immediately at zero cost to confirm Checkout Sessions write permission and redirect domain.
+          </span>
+        ) : (
+          <span className="[overflow-wrap:anywhere]">
+            Required before activating Stripe Checkout: creates an unpaid Checkout Session over pinned HTTPS and expires it immediately at zero cost. Catches restricted keys missing Checkout Sessions write permission and custom Checkout domains before customers try to pay.
+          </span>
+        ),
+      state: effectiveProbeOk === true ? "done" : effectiveProbeOk === false ? "blocked" : "todo",
+      action: (
+        <Button
+          variant="secondary"
+          size="sm"
+          leadingIcon={<CreditCard aria-hidden />}
+          loading={verifyCheckoutSession.isPending}
+          disabled={!egressAllowlisted || !settings.stripe.secretKeyConfigured}
+          onClick={() => {
+            void handleVerifyCheckoutSession();
+          }}
+        >
+          Verify Checkout session creation
+        </Button>
+      ),
+    },
+    {
       key: "selfTest",
       label: "Verify signed webhook pipeline with self-test event",
       description: settings.stripe.lastSelfTestWebhookAt ? (
-        <span>
-          Last self-test verified <DateTime value={settings.stripe.lastSelfTestWebhookAt} />.
+        <span className="[overflow-wrap:anywhere]">
+          Last self-test verified <DateTime value={settings.stripe.lastSelfTestWebhookAt} />. Confirms local signature verification; also send a test event from Stripe Workbench to verify live endpoint delivery.
         </span>
       ) : (
-        "Signs a synthetic event with the saved signing secret and runs it through signature verification without booking any invoice."
+        <span className="[overflow-wrap:anywhere]">
+          Signs a synthetic event with the saved primary signing secret and runs it through signature verification without booking any invoice.
+        </span>
       ),
       state: selfTestVerified ? "done" : "todo",
       action: (
@@ -574,11 +854,15 @@ export default function PaymentSetupPage() {
     {
       key: "activate",
       label: "Activate Stripe Checkout for customer invoices and cart checkout",
-      description: stripeActiveAndReady
-        ? `Active in ${settings.mode} mode.`
-        : settings.provider === "stripe"
-          ? "Stripe is selected as provider, but online checkout stays on invoice fallback until every prerequisite above is verified."
-          : `Current active provider: ${settings.provider === "none" ? "Pay by invoice" : "Square"}.`,
+      description: (
+        <span id={activateDescId} className="[overflow-wrap:anywhere]">
+          {stripeActiveAndReady
+            ? `Active in ${settings.mode} mode.`
+            : settings.provider === "stripe"
+              ? "Stripe is selected as provider, but online checkout stays on invoice fallback until every prerequisite above is verified."
+              : `Current active provider: ${settings.provider === "none" ? "Pay by invoice" : "Square"}.`}
+        </span>
+      ),
       state: stripeActiveAndReady ? "done" : stripePrereqsReady ? "todo" : "blocked",
       action:
         settings.provider === "stripe" ? (
@@ -608,6 +892,7 @@ export default function PaymentSetupPage() {
             size="sm"
             loading={activating}
             disabled={!stripePrereqsReady || activating}
+            aria-describedby={activateDescribedBy}
             onClick={() => setConfirmActivateOpen(true)}
           >
             Activate Stripe Checkout
@@ -621,6 +906,13 @@ export default function PaymentSetupPage() {
     "stripe trigger checkout.session.completed",
   ].join("\n");
 
+  const CredentialFieldKeyGuard: Record<StagedStripeField, CredentialFieldKey> = {
+    stripeSecretKey: "stripeSecretKey",
+    stripeWebhookSecret: "stripeWebhookSecret",
+    stripeWebhookSecretSecondary: "stripeWebhookSecretSecondary",
+  };
+  void CredentialFieldKeyGuard;
+
   return (
     <div className="grid min-w-0 grid-cols-1 gap-6">
       <PageHeader
@@ -633,7 +925,7 @@ export default function PaymentSetupPage() {
           />
         }
         title="Stripe setup"
-        description="Complete outbound allowlisting, stage credentials safely, verify signed webhooks, and inspect delivery diagnostics."
+        description="Complete outbound allowlisting, stage credentials safely, verify Checkout session creation and signed webhooks, and inspect delivery diagnostics."
         actions={
           <Button asChild variant="secondary">
             <Link href="/admin/payments">Back to Payments</Link>
@@ -642,19 +934,70 @@ export default function PaymentSetupPage() {
       />
 
       <Callout
-        tone={stripeActiveAndReady ? "success" : "warning"}
-        title={
-          stripeActiveAndReady
-            ? `Stripe Checkout is active (${settings.mode} mode)`
-            : stripePrereqsReady
-              ? "Stripe prerequisites are ready — activate when ready"
-              : "Complete the checklist below before enabling Stripe Checkout"
-        }
+        tone={stripeActiveAndReady ? "success" : settings.provider === "stripe" ? "danger" : "warning"}
+        title={<span className="[overflow-wrap:anywhere]">{statusHeadline}</span>}
       >
-        {stripeActiveAndReady
-          ? "Customer cart checkouts and unpaid issued invoices can start hosted Stripe Checkout sessions, and verified webhooks settle invoices automatically."
-          : "You can stage credentials, allow outbound access to api.stripe.com:443, and run both connection checks while keeping Pay by invoice active."}
+        <div className="flex min-w-0 flex-1 flex-col gap-2 [overflow-wrap:anywhere]">
+          <p className="[overflow-wrap:anywhere]">{customerExperienceSummary}</p>
+          {stripeActiveAndReady && !checkoutProbeVerified ? (
+            <p className="text-muted [overflow-wrap:anywhere]">
+              Recommended check (online card checkout remains active): run{" "}
+              <span className="font-medium text-fg">Verify Checkout session creation</span>{" "}
+              in the checklist below to confirm Checkout Sessions write permission and redirect domain.
+            </p>
+          ) : null}
+          {!stripeActiveAndReady && missingGates.length > 0 ? (
+            <div className="min-w-0">
+              <p className="font-semibold [overflow-wrap:anywhere]">Missing readiness gates:</p>
+              <ul id={missingGatesListId} className="mt-1 min-w-0 list-disc space-y-1 pl-5">
+                {missingGates.map((gate) => (
+                  <li key={gate} className="min-w-0 break-words [overflow-wrap:anywhere]">
+                    {gate}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </div>
       </Callout>
+
+      {reverificationNeeded ? (
+        <Callout
+          tone="warning"
+          title={<span className="[overflow-wrap:anywhere]">Credentials or outbound allowlist changed after verification</span>}
+          live="polite"
+        >
+          <div className="min-w-0 flex-1 [overflow-wrap:anywhere]">
+            <p className="mb-1.5 [overflow-wrap:anywhere]">
+              Online card redirect is paused while verification is stale so customers never hit an unverified configuration. Meanwhile, customer orders still submit cleanly and issue an unpaid invoice without losing cart items.
+            </p>
+            {reverificationReasons.length > 0 ? (
+              <ul className="min-w-0 list-disc space-y-1 pl-5">
+                {reverificationReasons.map((reason) => (
+                  <li key={reason} className="min-w-0 break-words [overflow-wrap:anywhere]">
+                    {reason}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+        </Callout>
+      ) : null}
+
+      {signingSecretRotatedKind ? (
+        <Callout
+          tone="warning"
+          title={<span className="[overflow-wrap:anywhere]">Re-run webhook verification after changing a signing secret</span>}
+          live="polite"
+        >
+          <p className="min-w-0 flex-1 [overflow-wrap:anywhere]">
+            {signingSecretRotatedKind === "primary"
+              ? "You saved a new Primary Stripe webhook signing secret. Click Send self-test webhook in the checklist below so online card checkout can resume. "
+              : "You saved a Secondary rollover signing secret. "}
+            Important: the portal self-test only proves ReadyPackets&apos; local signature check against the secret stored here — confirm real end-to-end delivery from Stripe Workbench &gt; Webhooks &gt; Send test event (or a real payment) to verify Stripe has the matching endpoint URL and signing secret.
+          </p>
+        </Callout>
+      ) : null}
 
       <Checklist title="Stripe readiness checklist" items={checklistItems} />
 
@@ -665,7 +1008,7 @@ export default function PaymentSetupPage() {
             Stage Stripe credentials
           </span>
         }
-        description="Save or rotate Stripe keys for the selected environment. Saving here keeps your current active provider unchanged until you activate Stripe Checkout."
+        description="Save or rotate Stripe keys for the selected environment. Saving here keeps your current active provider unchanged until you activate Stripe Checkout; rotating an active key pauses online card redirect until re-verified."
       >
         <form className="grid min-w-0 grid-cols-1 gap-4" onSubmit={(event) => void submitStagedCredentials(event)}>
           <div className="grid min-w-0 grid-cols-1 gap-4 sm:grid-cols-2">
@@ -679,57 +1022,68 @@ export default function PaymentSetupPage() {
                   setSecretKey("");
                   setWebhookSecret("");
                   setWebhookSecretSecondary("");
+                  setSecretResetSeq((n) => n + 1);
+                  setFieldErrors({});
                   setClearSecondary(false);
                 }}
               />
             </Field>
           </div>
-          <Field
+          <SecretCredentialField
+            key={`sk-${secretResetSeq}`}
             label="Stripe API secret key"
-            hint={sameMode ? keyStatusHint(settings.stripe.secretKeyLast4) : "Enter a key matching the selected environment."}
-          >
-            <Input
-              type="password"
-              value={secretKey}
-              autoComplete="new-password"
-              spellCheck={false}
-              maxLength={256}
-              disabled={savingKeys}
-              onChange={(event) => setSecretKey(event.target.value)}
-            />
-          </Field>
-          <Field
+            hint={`${sameMode ? keyStatusHint(settings.stripe.secretKeyLast4) : "Enter a key matching the selected environment."} Where to find it: Stripe Dashboard > Developers > API keys > Secret key (sk_${activeMode}_…) or Restricted keys (rk_${activeMode}_… with Checkout Sessions: Write, Payment Intents: Read, and Charges: Read/Write for refunds). Publishable keys (pk_…) are not used.`}
+            error={fieldErrors.stripeSecretKey}
+            value={secretKey}
+            disabled={savingKeys}
+            inputRef={(el) => {
+              fieldRefs.current.stripeSecretKey = el;
+            }}
+            onChange={(next) => {
+              setSecretKey(next);
+              clearFieldError("stripeSecretKey");
+            }}
+          />
+          <SecretCredentialField
+            key={`wh1-${secretResetSeq}`}
             label="Primary Stripe webhook signing secret"
-            hint={sameMode ? keyStatusHint(settings.stripe.webhookSecretLast4) : "Enter the whsec_ secret for the selected environment."}
-          >
-            <Input
-              type="password"
-              value={webhookSecret}
-              autoComplete="new-password"
-              spellCheck={false}
-              maxLength={256}
-              disabled={savingKeys}
-              onChange={(event) => setWebhookSecret(event.target.value)}
-            />
-          </Field>
-          <Field
+            hint={`${sameMode ? keyStatusHint(settings.stripe.webhookSecretLast4) : "Enter the whsec_ secret for the selected environment."} Where to find it: Stripe Dashboard > Developers > Webhooks (or Workbench > Webhooks) > select your endpoint > Signing secret > Reveal (whsec_…). Do not paste the endpoint ID (we_…) or an API key (sk_… / rk_…).`}
+            error={fieldErrors.stripeWebhookSecret}
+            value={webhookSecret}
+            disabled={savingKeys}
+            inputRef={(el) => {
+              fieldRefs.current.stripeWebhookSecret = el;
+            }}
+            onChange={(next) => {
+              setWebhookSecret(next);
+              clearFieldError("stripeWebhookSecret");
+            }}
+          />
+          <SecretCredentialField
+            key={`wh2-${secretResetSeq}`}
             label="Secondary Stripe webhook signing secret (optional rollover)"
-            hint={
-              sameMode
-                ? keyStatusHint(settings.stripe.webhookSecretSecondaryLast4 ?? null)
-                : "Optional rollover secret accepted alongside the primary secret during zero-downtime key rotation."
-            }
-          >
-            <Input
-              type="password"
-              value={webhookSecretSecondary}
-              autoComplete="new-password"
-              spellCheck={false}
-              maxLength={256}
-              disabled={savingKeys}
-              onChange={(event) => setWebhookSecretSecondary(event.target.value)}
-            />
-          </Field>
+            hint={`${sameMode ? keyStatusHint(settings.stripe.webhookSecretSecondaryLast4 ?? null) : "Leave empty during normal setup."} Optional rollover slot accepted alongside Primary only while rotating secrets with zero downtime. Leave empty during normal setup. To replace the saved signing secret, paste the new whsec_… value into Primary Stripe webhook signing secret above.`}
+            error={fieldErrors.stripeWebhookSecretSecondary}
+            value={webhookSecretSecondary}
+            disabled={savingKeys}
+            inputRef={(el) => {
+              fieldRefs.current.stripeWebhookSecretSecondary = el;
+            }}
+            onChange={(next) => {
+              setWebhookSecretSecondary(next);
+              clearFieldError("stripeWebhookSecretSecondary");
+            }}
+          />
+          {showSecondaryRolloverCallout ? (
+            <Callout
+              tone="info"
+              title={<span className="[overflow-wrap:anywhere]">Saving Secondary keeps your existing Primary signing secret</span>}
+            >
+              <div className="min-w-0 flex-1 [overflow-wrap:anywhere]">
+                You entered a <code>whsec_…</code> secret in <strong>Secondary Stripe webhook signing secret</strong> while leaving Primary blank. Secondary is used only during zero-downtime rollover while Stripe signs events with two secrets simultaneously, and <strong>Send self-test webhook</strong> tests Primary. If you meant to replace your saved signing secret, paste it into <strong>Primary Stripe webhook signing secret</strong> instead.
+              </div>
+            </Callout>
+          ) : null}
           {sameMode && settings.stripe.webhookSecretSecondaryConfigured ? (
             <Checkbox
               label="Retire secondary signing secret"
@@ -740,8 +1094,12 @@ export default function PaymentSetupPage() {
             />
           ) : null}
           {formNotice ? (
-            <Callout tone="danger" title="Credentials were not saved" live="assertive">
-              {formNotice}
+            <Callout
+              tone="danger"
+              title={<span className="[overflow-wrap:anywhere]">Credentials were not saved</span>}
+              live="assertive"
+            >
+              <div className="min-w-0 flex-1 [overflow-wrap:anywhere]">{formNotice}</div>
             </Callout>
           ) : null}
           <div>
@@ -750,6 +1108,92 @@ export default function PaymentSetupPage() {
             </Button>
           </div>
         </form>
+      </Card>
+
+      <Card
+        title={
+          <span className="inline-flex items-center gap-2">
+            <Activity className="size-4" aria-hidden />
+            Checkout session diagnostics
+          </span>
+        }
+        description="Safe summary of the most recent Checkout Session creation failure and setup probe. Raw provider error strings and secret values are never stored or displayed."
+      >
+        {lastCheckoutFailure ? (
+          <div className="grid min-w-0 grid-cols-1 gap-4">
+            <Callout
+              tone="danger"
+              title={<span className="[overflow-wrap:anywhere]">Last checkout-session failure</span>}
+            >
+              <div className="min-w-0 flex-1 [overflow-wrap:anywhere]">
+                Customers could not be redirected to Stripe Checkout during an order or invoice payment attempt. An operational alert was also posted to <Link href="/admin/alerts" className="font-semibold underline underline-offset-2">/admin/alerts</Link>.
+              </div>
+            </Callout>
+            <KeyValueList
+              columns={3}
+              items={[
+                {
+                  label: "Occurred at",
+                  value: <DateTime value={lastCheckoutFailure.occurredAt} />,
+                },
+                {
+                  label: "Failure class",
+                  value: (
+                    <span className="break-words [overflow-wrap:anywhere]">
+                      {failureClassLabels[lastCheckoutFailure.failureClass] ??
+                        lastCheckoutFailure.failureClass}
+                    </span>
+                  ),
+                },
+                {
+                  label: "Reason code",
+                  value: (
+                    <span className="font-mono text-xs break-all [overflow-wrap:anywhere]">
+                      {lastCheckoutFailure.reasonCode}
+                    </span>
+                  ),
+                },
+                {
+                  label: "Upstream HTTP status",
+                  value: (
+                    <span className="break-words [overflow-wrap:anywhere]">
+                      {lastCheckoutFailure.upstreamStatus !== null
+                        ? `HTTP ${lastCheckoutFailure.upstreamStatus}`
+                        : "Not applicable (blocked before upstream response)"}
+                    </span>
+                  ),
+                },
+                {
+                  label: "Stripe error code",
+                  value: lastCheckoutFailure.stripeErrorCode ? (
+                    <span className="font-mono text-xs break-all [overflow-wrap:anywhere]">
+                      {lastCheckoutFailure.stripeErrorCode}
+                    </span>
+                  ) : (
+                    "None reported"
+                  ),
+                },
+                {
+                  label: "Stripe error type / param",
+                  value:
+                    lastCheckoutFailure.stripeErrorType || lastCheckoutFailure.stripeErrorParam ? (
+                      <span className="font-mono text-xs break-all [overflow-wrap:anywhere]">
+                        {[lastCheckoutFailure.stripeErrorType, lastCheckoutFailure.stripeErrorParam]
+                          .filter(Boolean)
+                          .join(" · ")}
+                      </span>
+                    ) : (
+                      "None reported"
+                    ),
+                },
+              ]}
+            />
+          </div>
+        ) : (
+          <p className="text-sm text-muted">
+            No failed Stripe Checkout session creations have been recorded.
+          </p>
+        )}
       </Card>
 
       <Card
@@ -779,7 +1223,7 @@ export default function PaymentSetupPage() {
           <ul className="flex min-w-0 max-w-full flex-wrap gap-2" aria-label="Required Stripe webhook event names">
             {requiredEvents.map((eventName) => (
               <li key={eventName} className="min-w-0 max-w-full">
-                <code className="inline-block max-w-full rounded-full border border-line bg-surface-sunken px-2.5 py-0.5 font-mono text-xs font-semibold break-all text-ink">
+                <code className="inline-block max-w-full rounded-full border border-line bg-surface-sunken px-2.5 py-0.5 font-mono text-xs font-semibold break-all [overflow-wrap:anywhere] text-ink">
                   {eventName}
                 </code>
               </li>
@@ -799,7 +1243,9 @@ export default function PaymentSetupPage() {
               {
                 label: "Last verified event type",
                 value: settings.stripe.lastVerifiedWebhookEventType ? (
-                  <span className="break-all font-mono text-xs">{settings.stripe.lastVerifiedWebhookEventType}</span>
+                  <span className="font-mono text-xs break-all [overflow-wrap:anywhere]">
+                    {settings.stripe.lastVerifiedWebhookEventType}
+                  </span>
                 ) : (
                   "Not applicable"
                 ),

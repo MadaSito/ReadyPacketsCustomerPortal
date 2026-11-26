@@ -460,6 +460,42 @@ export interface AdminCartUpsellsListResult {
   catalogProducts: AdminCartUpsellCatalogProductView[];
 }
 
+export type CheckoutPaymentFailureClass =
+  | "configuration"
+  | "egress"
+  | "provider_auth"
+  | "provider_permission"
+  | "provider_request"
+  | "provider_transient"
+  | "provider_response"
+  | "untrusted_redirect_url"
+  | "below_minimum"
+  | "currency_mismatch"
+  | "order_locked"
+  | "unknown";
+
+export type CheckoutAttemptFailureClass =
+  | "configuration"
+  | "egress"
+  | "provider_auth"
+  | "provider_permission"
+  | "provider_request"
+  | "provider_transient"
+  | "provider_response"
+  | "untrusted_redirect_url"
+  | "payment_declined"
+  | "expired"
+  | "cancelled";
+
+export type CheckoutOnlinePaymentUnavailableReason =
+  | "provider_off"
+  | "provider_not_ready"
+  | "invoice_not_payable"
+  | "order_cancelled"
+  | "order_locked"
+  | "currency_mismatch"
+  | "below_minimum";
+
 export type CheckoutCartResult =
   | {
       mode: "no_payment_due";
@@ -485,6 +521,17 @@ export type CheckoutCartResult =
       receiptPublicId?: string | null;
     }
   | {
+      mode: "paid";
+      cartPublicId: string;
+      orderPublicId: string;
+      orderReference: string;
+      invoicePublicId: string;
+      invoiceNumber: string;
+      currency: string;
+      totalMinor: number;
+      receiptPublicId?: string | null;
+    }
+  | {
       mode: "invoice";
       cartPublicId: string;
       orderPublicId: string;
@@ -507,10 +554,26 @@ export type CheckoutCartResult =
       redirectUrl: string;
       currency: string;
       totalMinor: number;
+    }
+  | {
+      mode: "payment_unavailable";
+      cartPublicId: string;
+      orderPublicId: string;
+      orderReference: string;
+      invoicePublicId: string;
+      invoiceNumber: string;
+      attemptPublicId: string | null;
+      currency: string;
+      totalMinor: number;
+      onlinePaymentAvailable: boolean;
+      reasonCode: string;
+      failureClass: CheckoutPaymentFailureClass;
+      safeMessage: string;
     };
 
 export type CheckoutConfirmationState =
   | "pending_confirmation"
+  | "awaiting_payment"
   | "paid"
   | "no_payment_due"
   | "invoice_issued"
@@ -524,6 +587,10 @@ export interface CheckoutStatusResult {
   provider: "none" | "stripe" | "square";
   attemptPublicId: string | null;
   attemptStatus: "created" | "redirected" | "paid" | "failed" | "expired" | "cancelled" | null;
+  attemptInFlight: boolean;
+  onlinePaymentAvailable: boolean;
+  onlinePaymentUnavailableReason: CheckoutOnlinePaymentUnavailableReason | null;
+  lastAttemptFailureClass: CheckoutAttemptFailureClass | null;
   failureReasonCode: string | null;
   orderPublicId: string;
   orderReference: string;

@@ -178,6 +178,23 @@ Existing orders keep their pinned workflow version. The start-up job `orders.inc
 
 ---
 
+## Fix packs 07.1 and 07.2 (no migration)
+
+07.1 and 07.2 add no migration, and sections 2–5 are unchanged. After upgrading to 07.2:
+
+- **Reload open tabs.** Browser tabs that were open show "ReadyPackets was updated on the server". Choose **Reload**.
+- **Stripe.**
+  - Open `/admin/payments/setup` and read the banner. If it says **NOT ACTIVE**, finish the missing step it names.
+  - Run **Verify Checkout session creation** once for the current key. If Stripe was already active, checkout stays active without it, and the page shows it as a recommended check. New activations and mode changes require it to pass.
+  - Step-by-step: [Getting card checkout active](../guides/ADMIN_GUIDE.md#getting-card-checkout-active-increment-072).
+  - If a signing secret was ever exposed (for example in a screenshot), roll it in Stripe and paste the new `whsec_…` into **Primary**. Then run **Send self-test webhook**.
+- **Branding.**
+  - **Legal name.** If you never set a legal company name, invoices and receipts now say "Ready Packets Consulting LLC". Invoices that carried the old default "ReadyPackets" show the new name.
+  - **Logo.** If you never chose a logo, the PDFs use the ReadyPackets header mark.
+  - **Your own values.** Check **Invoices → Company profile**. Values you set yourself are kept.
+  - **Receipts issued before the upgrade** keep their original PDF.
+- **Default workflow.** Nothing changes by itself. To use another published workflow for new orders, choose **Set as default** in **Workflows**.
+
 ## 6. Recovery if an upgrade stops mid-way
 
 Never delete `/etc/readypackets/upgrade-state` or `/etc/nginx/readypackets-maintenance` blindly. Inspect `/etc/readypackets/upgrade-state` (`sudo cat /etc/readypackets/upgrade-state` — read as data, never `source` it):

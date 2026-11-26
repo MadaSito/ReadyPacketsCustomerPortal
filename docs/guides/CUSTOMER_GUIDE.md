@@ -194,9 +194,20 @@ item is missing from the portal menu, it has not landed yet.
 | Support tickets | **Support** (`/support`, `/support/new`, `/support/:ticketId`) | Open, reply to, close and reopen your own tickets |
 | Policies | **Policies** (`/policies`), public **Legal Policies** (`/legal`), and a required-policies notice on Home; required policies must be accepted before **New order** | View published policies; accept the exact required version |
 | Order intake | **Intake** tab on each order | Save a draft, submit, and see the review result |
-| Invoices | **Invoices** (`/invoices`, `/invoices/:invoiceId`) and an **Invoices** tab on each order | Issued, paid and void invoices with payment history |
+| Invoices | **Invoices** (`/invoices`, `/invoices/:invoiceId`) and an **Invoices** tab on each order | Issued, paid and void invoices with payment history; each invoice and receipt shows its **Order** and **Project**, also in the PDF and e-mail |
 | Notifications and search | **Notifications** (`/notifications`), **Search** (`/search`) | See below |
 | Online card payment | — | **Disabled in this release**; staff record offline payments |
+
+
+### Paying online
+
+- **Placing the order.** When card payment is available, placing an order takes you to Stripe's secure payment page at `checkout.stripe.com`.
+- **If the payment page cannot open,** your order and invoice are still saved. You see "Your order … is placed, but we could not open the secure payment page".
+  - When card payment is available, **Pay now** is offered there, on the payment status page and on the invoice.
+  - Or pay by invoice using the instructions on it.
+  - Do not place the order again.
+- **If you leave the payment page,** the status page says whether your order is waiting for payment or whether a payment is being confirmed. If it is waiting for payment and card payment is available, **Pay now** is offered. If an earlier payment session may still be open, the page warns you not to pay twice.
+- **More help.** See [Online payment](../../server/modules/payments/HELP_ARTICLE.md).
 
 ## Notifications and search
 
@@ -216,8 +227,14 @@ item is missing from the portal menu, it has not landed yet.
 - **iPhone or iPad (Safari)**: **Share** → **Add to Home Screen**.
 
 The installed app always loads live data. Without a connection it shows an offline page; it does not keep your orders
-or files offline. When a new version is available you are prompted to reload. These flows have not yet been checked
-in real browsers.
+or files offline.
+
+**"ReadyPackets was updated on the server".** You see this when ReadyPackets has been updated but your open tab still runs the previous version.
+- **Reload** switches to the new version. You stay signed in, but anything you typed on that page and did not save is lost.
+- **Later** keeps the previous version until you move to another page. The message then appears again.
+- The portal never reloads by itself.
+
+These flows have not yet been checked in real browsers or on physical devices.
 
 ## Privacy and analytics
 

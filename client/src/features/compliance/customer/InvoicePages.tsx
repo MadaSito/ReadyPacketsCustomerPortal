@@ -17,6 +17,27 @@ export const invoiceCheckoutNavigation = {
   },
 };
 
+export function isHostedCheckoutUrl(
+  raw: string,
+  provider: "stripe" | "square",
+  environment: "test" | "live",
+): boolean {
+  if (!raw || raw.length > 2048 || /[\s"'<>\\]/u.test(raw)) return false;
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:" || url.username || url.password || url.port) return false;
+    if (provider === "stripe") return url.hostname === "checkout.stripe.com" && url.pathname.length > 1;
+    if (url.hash) return false;
+    if (environment === "live" && url.hostname === "checkout.square.site") return url.pathname.startsWith("/merchant/");
+    return (
+      url.hostname === (environment === "live" ? "square.link" : "sandbox.square.link") &&
+      /^\/u\/[A-Za-z0-9_-]{1,160}$/u.test(url.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
 function Amount({ minor, currency }: { minor: number; currency: string }) {
   return <Money value={{ amountMinor: minor, currency }} />;
 }
@@ -155,15 +176,25 @@ function InvoicePaymentReturnBanner({ currentInvoiceId }: { currentInvoiceId?: s
   );
 }
 
-function InvoiceOnlinePayAction({
-  invoice,
-  variant = "primary",
-  onCheckoutError,
-}: {
-  invoice: InvoiceDetailView;
+export interface InvoiceOnlinePayActionProps {
+  invoicePublicId: string;
+  label?: string;
   variant?: "primary" | "secondary";
+  successPath?: string;
+  cancelPath?: string;
   onCheckoutError: (message: string | null) => void;
-}) {
+  onSettled?: () => void | Promise<void>;
+}
+
+export function InvoiceOnlinePayAction({
+  invoicePublicId,
+  label = "Pay online",
+  variant = "primary",
+  successPath,
+  cancelPath,
+  onCheckoutError,
+  onSettled,
+}: InvoiceOnlinePayActionProps) {
   const trpc = useTRPC();
   const queryClient = useQueryClient();
   const startCheckout = useMutation(trpc.payments.startInvoiceCheckout.mutationOptions());
@@ -171,13 +202,21 @@ function InvoiceOnlinePayAction({
   async function payOnline() {
     onCheckoutError(null);
     try {
-      const invoicePath = `/invoices/${invoice.invoicePublicId}`;
+      const defaultPath = `/invoices/${invoicePublicId}`;
       const res = await startCheckout.mutateAsync({
-        invoicePublicId: invoice.invoicePublicId,
-        successPath: invoicePath,
-        cancelPath: invoicePath,
+        invoicePublicId,
+        successPath: successPath ?? defaultPath,
+        cancelPath: cancelPath ?? defaultPath,
       });
       if (res.mode === "redirect") {
+        const environment =
+          "environment" in res && (res.environment === "live" || res.environment === "test")
+            ? res.environment
+            : "test";
+        if (!isHostedCheckoutUrl(res.redirectUrl, res.provider, environment)) {
+          onCheckoutError("We couldn't verify the payment provider link. Please try again or contact us.");
+          return;
+        }
         invoiceCheckoutNavigation.redirectToHostedCheckout(res.redirectUrl);
         return;
       }
@@ -185,6 +224,7 @@ function InvoiceOnlinePayAction({
         queryClient.invalidateQueries({ queryKey: trpc.compliance.invoices.pathKey() }),
         queryClient.invalidateQueries({ queryKey: trpc.compliance.receipts.pathKey() }),
       ]);
+      await onSettled?.();
     } catch (error) {
       onCheckoutError(errorMessage(error, "Online checkout could not be started for this invoice."));
     }
@@ -199,7 +239,7 @@ function InvoiceOnlinePayAction({
         void payOnline();
       }}
     >
-      Pay online
+      {label}
     </Button>
   );
 }
@@ -221,6 +261,7 @@ function InvoiceList({
     return <EmptyState icon={ReceiptText} title="No invoices yet" description={emptyDescription} action={emptyAction} />;
   }
   const baseHref = area === "console" ? "/admin/invoices" : "/invoices";
+  const orderBaseHref = area === "console" ? "/admin/orders" : "/orders";
   const fallbackLabel = area === "console" ? "Draft invoice" : "View invoice";
   return <ul className="grid gap-3">
     {items.map((invoice) => (
@@ -229,7 +270,20 @@ function InvoiceList({
           {invoice.invoiceNumber ?? fallbackLabel}
         </Link>} actions={<InvoiceStatusBadge status={invoice.status} />}>
           <KeyValueList columns={3} items={[
-            ...(showOrder ? [{ label: "Order", value: invoice.orderReference }] : []),
+            ...(showOrder ? [{
+              label: "Order",
+              value: (
+                <Link
+                  href={`${orderBaseHref}/${encodeURIComponent(invoice.orderPublicId)}`}
+                  className="font-mono break-all text-action underline underline-offset-2"
+                >
+                  {invoice.orderReference}
+                </Link>
+              ),
+            }] : []),
+            ...(showOrder && invoice.projectName?.trim()
+              ? [{ label: "Project", value: <span className="break-words">{invoice.projectName.trim()}</span> }]
+              : []),
             { label: "Due date", value: <DueDate date={invoice.dueAt} /> },
             { label: "Total", value: <Amount minor={invoice.totalMinor} currency={invoice.currency} /> },
             { label: "Outstanding balance", value: invoice.status === "void" ? "Not payable" : <Amount minor={invoice.balanceDueMinor} currency={invoice.currency} /> },
@@ -366,14 +420,18 @@ function InvoiceDetail({ invoice }: { invoice: InvoiceDetailView }) {
   }
   const amount = (minor: number) => <Amount minor={minor} currency={invoice.currency} />;
   const canPayOnline = invoice.onlinePaymentConfigured && invoice.status === "issued" && invoice.balanceDueMinor > 0;
+  const projectLabel = invoice.projectName?.trim() || null;
   return (
     <div className="space-y-6">
       <PageHeader breadcrumbs={<Breadcrumbs items={[{ href: "/invoices", label: "Invoices" }, { label: invoice.invoiceNumber ?? "Invoice details" }]} />}
-        title={invoice.invoiceNumber ?? "Invoice details"} description={`Order ${invoice.orderReference}`}
+        title={invoice.invoiceNumber ?? "Invoice details"}
+        description={projectLabel ? `Order ${invoice.orderReference} · ${projectLabel}` : `Order ${invoice.orderReference}`}
         meta={<InvoiceStatusBadge status={invoice.status} />}
         actions={
           <div className="flex flex-wrap items-center gap-2">
-            {canPayOnline ? <InvoiceOnlinePayAction invoice={invoice} onCheckoutError={setCheckoutError} /> : null}
+            {canPayOnline ? (
+              <InvoiceOnlinePayAction invoicePublicId={invoice.invoicePublicId} onCheckoutError={setCheckoutError} />
+            ) : null}
             <Button leadingIcon={<Download aria-hidden="true" />} variant="secondary" loading={downloading} onClick={() => void download()}>
               Download PDF
             </Button>
@@ -382,6 +440,29 @@ function InvoiceDetail({ invoice }: { invoice: InvoiceDetailView }) {
       <InvoicePaymentReturnBanner currentInvoiceId={invoice.invoicePublicId} />
       {downloadError ? <Callout tone="danger" live="assertive">We couldn’t download this PDF. Try again or contact us if the problem continues.</Callout> : null}
       {checkoutError ? <Callout tone="danger" title="Could not start online payment" live="assertive">{checkoutError}</Callout> : null}
+      <Card title="Order & project">
+        <KeyValueList columns={2} items={[
+          {
+            label: "Order",
+            value: (
+              <Link
+                href={`/orders/${encodeURIComponent(invoice.orderPublicId)}`}
+                className="font-mono font-semibold break-all text-action underline underline-offset-2"
+              >
+                {invoice.orderReference}
+              </Link>
+            ),
+          },
+          {
+            label: "Project",
+            value: projectLabel ? (
+              <span className="font-semibold break-words">{projectLabel}</span>
+            ) : (
+              <span className="text-muted">Not specified</span>
+            ),
+          },
+        ]} />
+      </Card>
       <Card title="Invoice summary">
         <KeyValueList columns={3} items={[
           { label: "Issued by", value: invoice.issuerName },

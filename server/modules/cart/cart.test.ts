@@ -67,6 +67,8 @@ class FakePayments implements CartPaymentsPort {
   startCalls = 0;
   statusCalls = 0;
   cancelCalls = 0;
+  nextStartError: Error | null = null;
+  onlinePaymentAvailableOverride: boolean | null = null;
 
   constructor(private readonly db: TestDb["db"]) {}
 
@@ -88,6 +90,11 @@ class FakePayments implements CartPaymentsPort {
     ctx?: { principal?: SessionPrincipal; cartPublicId?: string; idempotencyKey?: string },
   ) {
     this.startCalls += 1;
+    if (this.nextStartError) {
+      const err = this.nextStartError;
+      this.nextStartError = null;
+      throw err;
+    }
     if (this.provider === "none") {
       return { mode: "invoice" as const, invoicePublicId };
     }
@@ -177,6 +184,9 @@ class FakePayments implements CartPaymentsPort {
         currency: state.currency,
         providerConfigured: this.provider,
         environment: state.environment,
+        ...(this.onlinePaymentAvailableOverride !== null
+          ? { onlinePaymentAvailable: this.onlinePaymentAvailableOverride }
+          : {}),
         attempt: {
           attemptPublicId: state.attemptPublicId,
           provider: state.provider,
@@ -218,6 +228,9 @@ class FakePayments implements CartPaymentsPort {
         currency: inv.currency,
         providerConfigured: this.provider,
         environment: this.environment,
+        ...(this.onlinePaymentAvailableOverride !== null
+          ? { onlinePaymentAvailable: this.onlinePaymentAvailableOverride }
+          : {}),
         attempt: null,
       };
     }
@@ -456,6 +469,8 @@ beforeEach(() => {
   h.audit.failRecords = false;
   h.audit.clear();
   paymentsFake.provider = "none";
+  paymentsFake.nextStartError = null;
+  paymentsFake.onlinePaymentAvailableOverride = null;
 });
 
 describe("cart module — feature gate, authorization matrix, and worker registration", () => {
@@ -881,5 +896,151 @@ describe("cart module — atomic checkout, policy enforcement, Decision 12 retur
     const aliceAfter = await callerFor(alice.principal).cart.get();
     expect(aliceAfter.cartPublicId).toBe(aliceCart.cartPublicId);
     expect(aliceAfter.items).toHaveLength(1);
+  });
+
+  it("Fix pack 07.2: handles post-commit startCheckout failures as payment_unavailable, distinguishes ?attempt= vs ?cart= status, and resolves retry invoice attempts", async () => {
+    h.settings.flags.add(CART_FEATURE_FLAG.flag);
+    paymentsFake.provider = "stripe";
+    paymentsFake.environment = "live";
+
+    // Ensure Alice has a clean open cart with required policy accepted
+    const existingAliceCart = await callerFor(alice.principal).cart.get();
+    if (existingAliceCart.cartPublicId) {
+      await callerFor(alice.principal).cart.clear({ expectedVersion: existingAliceCart.version });
+    }
+    await complianceMod.policies.accept(alice.principal, {
+      versionPublicId: publishedPolicyVersionId,
+      contentHash: publishedPolicyHash,
+    });
+    const draft = await callerFor(alice.principal).cart.addItems({
+      items: [{ productPublicId: addonRush, quantity: 1 }],
+    });
+    const billing = {
+      fullName: "Synthetic Alice",
+      company: "Synthetic Org",
+      email: "alice@example.test",
+      country: "US",
+      region: "NY",
+      addressLine1: "500 Synthetic Ave",
+      addressLine2: "",
+      city: "New York",
+      postalCode: "10001",
+      taxId: "",
+    };
+
+    // Simulate Stripe session creation throwing AFTER Phase 1 commits the order + invoice
+    const failedAttemptId = ulid();
+    paymentsFake.nextStartError = new DomainError(
+      "UNAVAILABLE",
+      "STRIPE_UPSTREAM_5XX",
+      "The payment provider could not open a checkout session right now.",
+      {
+        attemptPublicId: failedAttemptId,
+        failureClass: "provider_transient",
+        onlinePaymentAvailable: true,
+      },
+    );
+
+    const checkoutRes = await callerFor(alice.principal).cart.checkout({
+      cartPublicId: draft.cartPublicId!,
+      expectedVersion: draft.version,
+      projectName: "Live Stripe Recovery Order",
+      note: "Do not resubmit cart on provider failure",
+      billing,
+      policyAcceptances: [],
+      idempotencyKey: "idem-07-2-post-commit-provider-fail",
+    });
+
+    expect(checkoutRes).toMatchObject({
+      mode: "payment_unavailable",
+      cartPublicId: draft.cartPublicId,
+      onlinePaymentAvailable: true,
+      reasonCode: "STRIPE_UPSTREAM_5XX",
+      failureClass: "provider_transient",
+    });
+    if (checkoutRes.mode !== "payment_unavailable") {
+      throw new Error("Expected payment_unavailable result");
+    }
+    expect(checkoutRes.orderReference).toMatch(/^RP-/u);
+    expect(checkoutRes.invoiceNumber).toBeTruthy();
+
+    // Audit records `cart.checkout_payment_start_failed` without leaking secrets
+    const failAudit = h.audit.named("cart.checkout_payment_start_failed");
+    expect(failAudit).toHaveLength(1);
+    expect(failAudit[0]?.reasonCode).toBe("STRIPE_UPSTREAM_5XX");
+    expect(failAudit[0]?.attributes).toMatchObject({
+      order_public_id: checkoutRes.orderPublicId,
+      invoice_public_id: checkoutRes.invoicePublicId,
+      attempt_public_id: failedAttemptId,
+      failure_class: "provider_transient",
+      online_payment_available: true,
+    });
+
+    // Arriving at `/checkout/return?cart=<id>` reports `awaiting_payment` (NEVER `pending_confirmation`),
+    // `onlinePaymentAvailable: true`, `attemptInFlight: false`, and `canRestoreToCart: true`!
+    const statusByCart = await callerFor(alice.principal).cart.checkoutStatus({
+      cartPublicId: checkoutRes.cartPublicId,
+    });
+    expect(statusByCart.confirmationState).toBe("awaiting_payment");
+    expect(statusByCart.invoiceStatus).toBe("issued");
+    expect(statusByCart.balanceDueMinor).toBe(checkoutRes.totalMinor);
+    expect(statusByCart.onlinePaymentAvailable).toBe(true);
+    expect(statusByCart.attemptInFlight).toBe(false);
+    expect(statusByCart.canRestoreToCart).toBe(true);
+
+    // When online payment is unavailable (e.g. misconfigured provider), `onlinePaymentAvailable` is false
+    paymentsFake.onlinePaymentAvailableOverride = false;
+    const statusOffline = await callerFor(alice.principal).cart.checkoutStatus({
+      cartPublicId: checkoutRes.cartPublicId,
+    });
+    expect(statusOffline.confirmationState).toBe("awaiting_payment");
+    expect(statusOffline.onlinePaymentAvailable).toBe(false);
+    paymentsFake.onlinePaymentAvailableOverride = null;
+
+    // Now customer clicks "Pay now" on the return/handoff page, which calls `payments.startInvoiceCheckout`
+    // and creates a NEW retry attempt for `checkoutRes.invoicePublicId` (not stored in `carts.paymentAttemptPublicId`)!
+    const retryStart = await paymentsFake.startCheckout(
+      checkoutRes.invoicePublicId,
+      { successPath: "/checkout/return", cancelPath: "/checkout/cancel" },
+      { principal: alice.principal },
+    );
+    if (retryStart.mode !== "redirect") throw new Error("Expected redirect retry");
+    expect(retryStart.attemptPublicId).not.toBe(failedAttemptId);
+
+    // Returning from Stripe with `?attempt=<retryAttemptId>` reports `pending_confirmation` + `attemptInFlight: true`
+    const statusByRetryAttempt = await callerFor(alice.principal).cart.checkoutStatus({
+      attemptPublicId: retryStart.attemptPublicId,
+    });
+    expect(statusByRetryAttempt.confirmationState).toBe("pending_confirmation");
+    expect(statusByRetryAttempt.attemptPublicId).toBe(retryStart.attemptPublicId);
+    expect(statusByRetryAttempt.attemptInFlight).toBe(true);
+    expect(statusByRetryAttempt.cartPublicId).toBe(checkoutRes.cartPublicId);
+
+    // Meanwhile, opening `/checkout/return?cart=<id>` while that retry attempt is redirected still reports
+    // `awaiting_payment` with `attemptInFlight: true` so the duplicate-payment warning is shown alongside "Pay now"!
+    const statusByCartWhileInFlight = await callerFor(alice.principal).cart.checkoutStatus({
+      cartPublicId: checkoutRes.cartPublicId,
+    });
+    expect(statusByCartWhileInFlight.confirmationState).toBe("awaiting_payment");
+    expect(statusByCartWhileInFlight.attemptInFlight).toBe(true);
+    expect(statusByCartWhileInFlight.onlinePaymentAvailable).toBe(true);
+
+    // Cross-customer isolation on retry attempt IDs fails closed with `NOT_FOUND:CART_NOT_FOUND`
+    await expectDomainError(
+      cartMod.getCheckoutStatus(bob.principal, { attemptPublicId: retryStart.attemptPublicId }),
+      "NOT_FOUND:CART_NOT_FOUND",
+    );
+    await expectDomainError(
+      cartMod.restoreCheckout(bob.principal, { attemptPublicId: retryStart.attemptPublicId }),
+      "NOT_FOUND:CART_NOT_FOUND",
+    );
+
+    // Restoring by the retry `attemptPublicId` cancels the retry attempt and restores Alice's cart cleanly
+    const restoredViaRetry = await callerFor(alice.principal).cart.restoreCheckout({
+      attemptPublicId: retryStart.attemptPublicId,
+    });
+    expect(restoredViaRetry.restored).toBe(true);
+    expect(restoredViaRetry.cart.items).toHaveLength(1);
+    expect(paymentsFake.attemptsById.get(retryStart.attemptPublicId)?.status).toBe("cancelled");
   });
 });

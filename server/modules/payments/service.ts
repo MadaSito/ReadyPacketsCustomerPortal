@@ -63,15 +63,27 @@ import {
   type PaymentWebhookStatus,
 } from "./schema.js";
 import {
+  type CheckoutFailureClass,
+  classifyCheckoutFailureReason,
+  type CredentialFieldKey,
+  customerMessageForCheckoutFailure,
+  DEFAULT_PAYMENTS_DIAGNOSTICS,
   DEFAULT_PAYMENTS_RECEIPTS,
   DEFAULT_PAYMENTS_SMALL_TOTALS,
   DEFAULT_PROVIDER_MINIMUMS_MINOR,
+  describeCheckoutFailureForAdmin,
   isSafePortalReturnPath,
+  type LastCheckoutFailureDiagnostic,
+  type LastStripeCheckoutProbeDiagnostic,
   maskLast4,
+  normalizeCredentialInput,
+  parsePaymentsDiagnosticsSetting,
   parsePaymentsReceiptsSetting,
   parsePaymentsSmallTotals,
   PAYMENTS_CONFIG_SETTING,
   type PaymentsConfigValue,
+  PAYMENTS_DIAGNOSTICS_SETTING,
+  type PaymentsDiagnosticsValue,
   PAYMENTS_RECEIPTS_SETTING,
   type PaymentsReceiptsValue,
   PAYMENTS_SMALL_TOTALS_SETTING,
@@ -84,6 +96,10 @@ import {
   resolveProviderMinimumMinor,
   sanitizeCardBrand,
   sanitizeCardLast4,
+  sanitizeStripeDiagnosticToken,
+  validateSquareSecretInput,
+  validateStripeSecretKeyInput,
+  validateStripeWebhookSecretInput,
 } from "./settings.js";
 
 export interface CheckoutReturnPaths {
@@ -134,6 +150,26 @@ export interface PaymentsPublicConfigView {
   onlineEnabled: boolean;
 }
 
+export type OnlinePaymentUnavailableReason =
+  | "provider_off"
+  | "provider_not_ready"
+  | "invoice_not_payable"
+  | "order_cancelled"
+  | "order_locked"
+  | "currency_mismatch"
+  | "below_minimum";
+
+export type StripeMissingGateKey =
+  | "secret_key"
+  | "secret_key_mode"
+  | "webhook_secret"
+  | "egress_allowlist"
+  | "api_verified"
+  | "checkout_session_not_verified"
+  | "checkout_session_failed"
+  | "webhook_self_test"
+  | "provider_activated";
+
 export interface CheckoutStatusView {
   invoicePublicId: string;
   invoiceNumber: string | null;
@@ -145,6 +181,10 @@ export interface CheckoutStatusView {
   currency: string;
   providerConfigured: PaymentProviderChoice;
   environment: PaymentEnvironmentMode;
+  onlinePaymentAvailable: boolean;
+  onlinePaymentUnavailableReason: OnlinePaymentUnavailableReason | null;
+  attemptInFlight: boolean;
+  lastAttemptFailureClass: CheckoutFailureClass | null;
   attempt: {
     attemptPublicId: string;
     provider: ActivePaymentProvider;
@@ -192,6 +232,7 @@ export interface PaymentsAdminSettingsView
   stripe: {
     secretKeyConfigured: boolean;
     secretKeyLast4: string | null;
+    secretKeyModeMatches: boolean;
     webhookSecretConfigured: boolean;
     webhookSecretLast4: string | null;
     webhookSecretSecondaryConfigured: boolean;
@@ -199,12 +240,23 @@ export interface PaymentsAdminSettingsView
     lastApiVerifiedAt: string | null;
     lastSelfTestAt: string | null;
     lastSelfTestWebhookAt: string | null;
+    apiVerified: boolean;
+    selfTestVerified: boolean;
+    checkoutSessionVerified: boolean;
+    lastCheckoutSessionVerifiedAt: string | null;
     lastVerifiedWebhookAt: string | null;
     lastVerifiedWebhookEventType: string | null;
     lastVerifiedWebhookStatus: PaymentWebhookStatus | null;
     inboundCountryAllowlistExempt: true;
     requiredEvents: readonly string[];
     ready: boolean;
+    statusHeadline: string;
+    customerExperienceSummary: string;
+    reverificationNeeded: boolean;
+    reverificationReasons: string[];
+    missingGates: StripeMissingGateKey[];
+    lastCheckoutFailure: LastCheckoutFailureDiagnostic | null;
+    lastCheckoutProbe: LastStripeCheckoutProbeDiagnostic | null;
     webhookUrl: string;
     returnUrlPattern: string;
     egressHost: "api.stripe.com";
@@ -220,6 +272,9 @@ export interface PaymentsAdminSettingsView
     returnUrlPattern: string;
     egressHost: "connect.squareup.com" | "connect.squareupsandbox.com";
     egressAllowlisted: boolean;
+  };
+  diagnostics: {
+    lastCheckoutFailure: LastCheckoutFailureDiagnostic | null;
   };
   smallTotals: PaymentsSmallTotalsValue;
   defaultProviderMinimumsMinor: Readonly<Record<ActivePaymentProvider, Readonly<Record<string, number>>>>;
@@ -255,6 +310,7 @@ export interface PaymentsReadinessChecklistItem {
     | "stripe_secret_key"
     | "stripe_webhook_secret"
     | "api_connection_verified"
+    | "checkout_session_verified"
     | "self_test_webhook_verified"
     | "provider_activated";
   label: string;
@@ -267,6 +323,13 @@ export interface PaymentsReadinessView {
   mode: PaymentEnvironmentMode;
   currency: string;
   onlineEnabled: boolean;
+  statusHeadline: string;
+  customerExperienceSummary: string;
+  reverificationNeeded: boolean;
+  reverificationReasons: string[];
+  missingGates: StripeMissingGateKey[];
+  lastCheckoutFailure: LastCheckoutFailureDiagnostic | null;
+  lastCheckoutProbe: LastStripeCheckoutProbeDiagnostic | null;
   webhookUrl: string;
   requiredWebhookEvents: string[];
   egress: {
@@ -293,6 +356,8 @@ export interface PaymentsReadinessView {
   verification: {
     lastApiVerifiedAt: string | null;
     lastSelfTestAt: string | null;
+    checkoutSessionVerified: boolean;
+    lastCheckoutSessionVerifiedAt: string | null;
     lastVerifiedWebhookAt: string | null;
     lastVerifiedWebhookEventType: string | null;
     attentionRequiredWebhookCount: number;
@@ -309,6 +374,23 @@ export interface TestStripeConnectionResult {
   accountRef: string | null;
   verifiedAt: string | null;
   failureReasonCode: string | null;
+  detail: string;
+  message: string;
+}
+
+export interface VerifyStripeCheckoutSessionResult {
+  ok: boolean;
+  provider: "stripe";
+  mode: PaymentEnvironmentMode;
+  livemode: boolean | null;
+  sessionId: string | null;
+  expiredImmediately: boolean;
+  verifiedAt: string | null;
+  failureReasonCode: string | null;
+  upstreamStatus: number | null;
+  stripeErrorType: string | null;
+  stripeErrorCode: string | null;
+  stripeErrorParam: string | null;
   detail: string;
   message: string;
 }
@@ -819,6 +901,33 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     }
   }
 
+  async function loadDiagnostics(tx?: Tx): Promise<PaymentsDiagnosticsValue> {
+    try {
+      const raw = await deps.settings.get(
+        PAYMENTS_DIAGNOSTICS_SETTING.key,
+        parsePaymentsDiagnosticsSetting,
+        DEFAULT_PAYMENTS_DIAGNOSTICS,
+        tx,
+      );
+      return parsePaymentsDiagnosticsSetting(raw);
+    } catch {
+      return { ...DEFAULT_PAYMENTS_DIAGNOSTICS };
+    }
+  }
+
+  async function updateDiagnosticsBestEffort(
+    mutator: (prev: PaymentsDiagnosticsValue) => PaymentsDiagnosticsValue,
+    tx?: Tx,
+  ): Promise<void> {
+    try {
+      const prev = await loadDiagnostics(tx);
+      const next = mutator(prev);
+      await writeSetting(deps.settings, PAYMENTS_DIAGNOSTICS_SETTING, next, tx);
+    } catch {
+      // Best-effort non-secret telemetry; never fail core ledger/audit persistence in minimal test harnesses.
+    }
+  }
+
   async function evaluateCheckoutAmount(
     amountMinor: number,
     currency: string,
@@ -1057,6 +1166,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
   ): {
     egressOk: boolean;
     secretKeyModeMatches: boolean;
+    expectedApiFp: string | null;
     apiVerified: boolean;
     selfTestVerified: boolean;
     effectiveLastApiVerifiedAt: string | null;
@@ -1066,13 +1176,15 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     const egressOk = !egress.wired || egress.stripeAllowlisted;
     const expectedPrefix = config.mode === "live" ? /^(?:sk|rk)_live_/u : /^(?:sk|rk)_test_/u;
     const secretKeyModeMatches = Boolean(stripeKey && expectedPrefix.test(stripeKey));
+    const expectedApiFp =
+      stripeKey && secretKeyModeMatches
+        ? computeStripeApiFingerprint(config.mode, stripeKey, egress.stripeEgressStamp)
+        : null;
     const apiVerified = Boolean(
-      stripeKey &&
-        secretKeyModeMatches &&
+      expectedApiFp &&
         egressOk &&
         config.stripeLastApiVerifiedAt &&
-        config.stripeApiVerifiedFingerprint ===
-          computeStripeApiFingerprint(config.mode, stripeKey, egress.stripeEgressStamp),
+        config.stripeApiVerifiedFingerprint === expectedApiFp,
     );
     const selfTestVerified = Boolean(
       stripeWh &&
@@ -1085,11 +1197,116 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     return {
       egressOk,
       secretKeyModeMatches,
+      expectedApiFp,
       apiVerified,
       selfTestVerified,
       effectiveLastApiVerifiedAt: apiVerified ? config.stripeLastApiVerifiedAt : null,
       effectiveLastSelfTestAt: selfTestVerified ? config.stripeLastSelfTestAt : null,
       ready,
+    };
+  }
+
+  function computeStripeGateSummary(input: {
+    config: PaymentsConfigValue;
+    stripeKeySet: boolean;
+    stripeWhSet: boolean;
+    stripeState: ReturnType<typeof resolveStripeVerificationState>;
+    diagnostics: PaymentsDiagnosticsValue;
+  }): {
+    statusHeadline: string;
+    customerExperienceSummary: string;
+    missingGates: StripeMissingGateKey[];
+    reverificationNeeded: boolean;
+    reverificationReasons: string[];
+  } {
+    const { config, stripeKeySet, stripeWhSet, stripeState, diagnostics } = input;
+    const missingGates: StripeMissingGateKey[] = [];
+    if (!stripeKeySet) {
+      missingGates.push("secret_key");
+    } else if (!stripeState.secretKeyModeMatches) {
+      missingGates.push("secret_key_mode");
+    }
+    if (!stripeWhSet) {
+      missingGates.push("webhook_secret");
+    }
+    if (!stripeState.egressOk) {
+      missingGates.push("egress_allowlist");
+    }
+    if (!stripeState.apiVerified) {
+      missingGates.push("api_verified");
+    }
+    if (!stripeState.selfTestVerified) {
+      missingGates.push("webhook_self_test");
+    }
+    if (config.provider !== "stripe") {
+      missingGates.push("provider_activated");
+    }
+
+    const reverificationReasons: string[] = [];
+    const hadPriorSetup =
+      config.provider === "stripe" ||
+      diagnostics.stripeEverApiVerified ||
+      diagnostics.stripeEverSelfTested;
+
+    if (hadPriorSetup) {
+      if (!stripeState.egressOk) {
+        reverificationReasons.push(
+          "Stripe outbound HTTPS allowlist preset was disabled or changed after setup — re-enable api.stripe.com:443 and run Test Stripe API.",
+        );
+      } else if (stripeKeySet && !stripeState.secretKeyModeMatches) {
+        reverificationReasons.push(
+          `Saved Stripe API secret key does not match ${config.mode} mode — stage a matching key and run Test Stripe API.`,
+        );
+      } else if (
+        stripeKeySet &&
+        !stripeState.apiVerified &&
+        (config.provider === "stripe" || diagnostics.stripeEverApiVerified)
+      ) {
+        reverificationReasons.push(
+          config.provider === "stripe"
+            ? "Stripe API secret key or outbound allowlist changed after verification — run Test Stripe API to resume checkout (and Verify Checkout session creation as a recommended permission check)."
+            : "Stripe API secret key or outbound allowlist changed after verification — run Test Stripe API and Verify Checkout session creation again before activating Stripe Checkout.",
+        );
+      }
+      if (
+        stripeWhSet &&
+        !stripeState.selfTestVerified &&
+        (config.provider === "stripe" || diagnostics.stripeEverSelfTested)
+      ) {
+        reverificationReasons.push(
+          "Primary Stripe webhook signing secret changed after verification — run Send self-test webhook again, then confirm real Stripe delivery from Stripe Workbench.",
+        );
+      }
+    }
+
+    const reverificationNeeded =
+      (config.provider === "stripe" && !stripeState.ready) || reverificationReasons.length > 0;
+
+    let statusHeadline: string;
+    let customerExperienceSummary: string;
+    if (config.provider === "stripe" && stripeState.ready) {
+      statusHeadline = `Online card checkout: ACTIVE (${config.mode})`;
+      customerExperienceSummary = `Customers are sent to Stripe Checkout (${config.mode}) when placing an order or clicking Pay now.`;
+    } else if (config.provider === "stripe") {
+      statusHeadline = `Online card checkout: NOT ACTIVE (paused pending verification)`;
+      customerExperienceSummary =
+        "Stripe is selected, but one or more verification gates below are incomplete or stale. New customer orders still place and issue an invoice, but card payment cannot open until re-verified.";
+    } else if (config.provider === "square") {
+      statusHeadline = `Online card checkout: Square (${config.mode}) selected`;
+      customerExperienceSummary =
+        "Square Payment Links is selected as the active provider. Stripe Checkout is not active.";
+    } else {
+      statusHeadline = "Online card checkout: NOT ACTIVE (Pay by invoice)";
+      customerExperienceSummary =
+        "Customers get pay-by-invoice; no card payment is collected online until you complete the Stripe checklist and activate Stripe Checkout.";
+    }
+
+    return {
+      statusHeadline,
+      customerExperienceSummary,
+      missingGates,
+      reverificationNeeded,
+      reverificationReasons,
     };
   }
 
@@ -1102,12 +1319,28 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       ? { wired: false, stripeAllowlisted: true, squareAllowlisted: true, stripeEgressStamp: "unwired" }
       : await checkEgressPresets(config.mode);
     if (config.provider === "stripe") {
-      const [stripeKey, stripeWh] = await Promise.all([
+      const [stripeKey, stripeWh, diagnostics] = await Promise.all([
         readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx),
         readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx),
+        loadDiagnostics(tx),
       ]);
       const state = resolveStripeVerificationState(config, stripeKey, stripeWh, egress);
-      if (!egress.wired && config.stripeApiVerifiedFingerprint === null && config.stripeSelfTestedFingerprint === null) {
+      const probe = diagnostics.lastStripeCheckoutProbe;
+      const probeFailed = Boolean(
+        probe &&
+          state.expectedApiFp &&
+          probe.apiFingerprint === state.expectedApiFp &&
+          probe.mode === config.mode &&
+          !probe.ok,
+      );
+      if (probeFailed) return false;
+      if (
+        !egress.wired &&
+        config.stripeApiVerifiedFingerprint === null &&
+        config.stripeSelfTestedFingerprint === null &&
+        !diagnostics.stripeEverApiVerified &&
+        !diagnostics.stripeEverSelfTested
+      ) {
         // Legacy pre-Increment-07 raw settings seeded in isolated unit harnesses without wired egress.
         return Boolean(stripeKey && state.secretKeyModeMatches && stripeWh);
       }
@@ -1331,7 +1564,6 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     }
 
     const activeProvider: ActivePaymentProvider = config.provider;
-    const { credentials } = await loadProviderCredentials(activeProvider, config);
 
     if (invoice.currency.toUpperCase() !== config.currency.toUpperCase()) {
       throw validation(
@@ -1345,6 +1577,8 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     if (!isSafePortalReturnPath(successPath) || !isSafePortalReturnPath(cancelPath)) {
       throw validation("INVALID_RETURN_PATH", "Checkout return path must be an allowlisted internal portal path.");
     }
+
+    const providerReadyBeforeTx = await isProviderCredentialsReady(config);
 
     const now = deps.clock.now();
     const rawIdem = opts?.idempotencyKey?.trim();
@@ -1400,62 +1634,64 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         throw conflict("INVOICE_ALREADY_PAID", "This invoice is already paid in full.");
       }
 
-      // Increment 06 D5: Re-verify provider minimum under canonical row locks (order -> invoice -> attempts).
-      const smallTotals = await loadSmallTotals(tx);
-      const minimumMinor = resolveProviderMinimumMinor(activeProvider, lockedInvoice.currency, smallTotals);
-      if (lockedInvoice.balanceDueMinor > 0 && lockedInvoice.balanceDueMinor < minimumMinor) {
-        if (smallTotals.belowProviderMinimum === "block") {
-          const minFormatted = (minimumMinor / 100).toFixed(2);
-          throw new DomainError(
-            "CONFLICT",
-            "AMOUNT_BELOW_PROVIDER_MINIMUM",
-            `Online card payments require a minimum charge of ${lockedInvoice.currency.toUpperCase()} ${minFormatted}. Adjust your order or contact support.`,
-            {
-              minimumMinor,
-              balanceDueMinor: lockedInvoice.balanceDueMinor,
-              currency: lockedInvoice.currency.toUpperCase(),
-            },
-          );
-        }
+      // Increment 06 D5: Re-verify provider minimum under canonical row locks when provider is ready.
+      if (providerReadyBeforeTx) {
+        const smallTotals = await loadSmallTotals(tx);
+        const minimumMinor = resolveProviderMinimumMinor(activeProvider, lockedInvoice.currency, smallTotals);
+        if (lockedInvoice.balanceDueMinor > 0 && lockedInvoice.balanceDueMinor < minimumMinor) {
+          if (smallTotals.belowProviderMinimum === "block") {
+            const minFormatted = (minimumMinor / 100).toFixed(2);
+            throw new DomainError(
+              "CONFLICT",
+              "AMOUNT_BELOW_PROVIDER_MINIMUM",
+              `Online card payments require a minimum charge of ${lockedInvoice.currency.toUpperCase()} ${minFormatted}. Adjust your order or contact support.`,
+              {
+                minimumMinor,
+                balanceDueMinor: lockedInvoice.balanceDueMinor,
+                currency: lockedInvoice.currency.toUpperCase(),
+              },
+            );
+          }
 
-        // Fail closed: ANY previously committed `payment_attempts` row on this invoice (including
-        // ref-less `failed` rows from ambiguous provider dispatches or locally expired rows) blocks
-        // automatic small-balance waiver so we never issue a waiver receipt while external exposure may exist.
-        const priorAttempts = await tx
-          .select({
-            publicId: paymentAttempts.publicId,
-            status: paymentAttempts.status,
-          })
-          .from(paymentAttempts)
-          .where(eq(paymentAttempts.invoiceId, lockedInvoice.invoiceId))
-          .for("update");
-        if (priorAttempts.length > 0) {
-          const blockingAttempt = priorAttempts[0]!;
-          throw new DomainError(
-            "CONFLICT",
-            "PAYMENT_ATTEMPT_OUTSTANDING",
-            "Cannot waive small balance when a prior payment attempt has been recorded for this invoice.",
-            {
-              attemptPublicId: blockingAttempt.publicId,
-              attemptStatus: blockingAttempt.status,
-            },
-          );
-        }
+          // Fail closed: ANY previously committed `payment_attempts` row on this invoice (including
+          // ref-less `failed` rows from ambiguous provider dispatches or locally expired rows) blocks
+          // automatic small-balance waiver so we never issue a waiver receipt while external exposure may exist.
+          const priorAttempts = await tx
+            .select({
+              publicId: paymentAttempts.publicId,
+              status: paymentAttempts.status,
+            })
+            .from(paymentAttempts)
+            .where(eq(paymentAttempts.invoiceId, lockedInvoice.invoiceId))
+            .for("update");
+          if (priorAttempts.length > 0) {
+            const blockingAttempt = priorAttempts[0]!;
+            throw new DomainError(
+              "CONFLICT",
+              "PAYMENT_ATTEMPT_OUTSTANDING",
+              "Cannot waive small balance when a prior payment attempt has been recorded for this invoice.",
+              {
+                attemptPublicId: blockingAttempt.publicId,
+                attemptStatus: blockingAttempt.status,
+              },
+            );
+          }
 
-        if (typeof complianceSvc.settleCheckoutInvoiceInTx === "function") {
-          const settledWaive = await complianceSvc.settleCheckoutInvoiceInTx(
-            {
-              settlementKind: "waived_small_total",
-              invoicePublicId: lockedInvoice.invoicePublicId,
-              providerMinimumMinor: minimumMinor,
-            },
-            tx,
-          );
-          return {
-            kind: "settled_waived" as const,
-            waivedMinor: settledWaive.waivedMinor,
-            receiptPublicId: settledWaive.receiptPublicId,
-          };
+          if (typeof complianceSvc.settleCheckoutInvoiceInTx === "function") {
+            const settledWaive = await complianceSvc.settleCheckoutInvoiceInTx(
+              {
+                settlementKind: "waived_small_total",
+                invoicePublicId: lockedInvoice.invoicePublicId,
+                providerMinimumMinor: minimumMinor,
+              },
+              tx,
+            );
+            return {
+              kind: "settled_waived" as const,
+              waivedMinor: settledWaive.waivedMinor,
+              receiptPublicId: settledWaive.receiptPublicId,
+            };
+          }
         }
       }
 
@@ -1497,6 +1733,19 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         }
       }
 
+      let resolvedCartPublicId = opts?.cartPublicId ?? existing?.cartPublicId ?? null;
+      if (!resolvedCartPublicId) {
+        const [priorCartAttempt] = await tx
+          .select({ cartPublicId: paymentAttempts.cartPublicId })
+          .from(paymentAttempts)
+          .where(eq(paymentAttempts.invoiceId, lockedInvoice.invoiceId))
+          .orderBy(desc(paymentAttempts.id))
+          .limit(5);
+        if (priorCartAttempt?.cartPublicId) {
+          resolvedCartPublicId = priorCartAttempt.cartPublicId;
+        }
+      }
+
       const effectiveIdem = existing ? `${idempotencyKey}:${ulid(now.getTime()).slice(-10)}`.slice(0, 128) : idempotencyKey;
       const attemptPublicId = ulid(now.getTime());
       const [ins] = await tx.insert(paymentAttempts).values({
@@ -1504,7 +1753,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         invoiceId: lockedInvoice.invoiceId,
         invoicePublicId: lockedInvoice.invoicePublicId,
         orderPublicId: lockedInvoice.orderPublicId,
-        cartPublicId: opts?.cartPublicId ?? null,
+        cartPublicId: resolvedCartPublicId,
         customerUserId: lockedInvoice.ownerUserId,
         provider: activeProvider,
         environment: config.mode,
@@ -1579,6 +1828,67 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     const adapter = adapters[activeProvider];
 
     try {
+      let credentials: ProviderCredentials;
+      if (activeProvider === "stripe") {
+        const [stripeKey, stripeWh, egress, diagState] = await Promise.all([
+          readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY),
+          readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET),
+          checkEgressPresets(config.mode),
+          loadDiagnostics(),
+        ]);
+        if (!stripeKey || !stripeWh) {
+          throw new DomainError(
+            "UNAVAILABLE",
+            "PROVIDER_NOT_CONFIGURED",
+            "Stripe credentials are not configured.",
+          );
+        }
+        const expectedPrefix = config.mode === "live" ? /^(?:sk|rk)_live_/u : /^(?:sk|rk)_test_/u;
+        if (!expectedPrefix.test(stripeKey)) {
+          throw new DomainError(
+            "UNAVAILABLE",
+            "STRIPE_KEY_MODE_MISMATCH",
+            `Stripe API key prefix does not match configured ${config.mode} environment.`,
+          );
+        }
+        if (egress.wired && !egress.stripeAllowlisted) {
+          throw new DomainError(
+            "FORBIDDEN",
+            "EGRESS_HOST_NOT_ALLOWLISTED",
+            "Stripe outbound HTTPS allowlist preset is disabled.",
+          );
+        }
+        const stripeState = resolveStripeVerificationState(config, stripeKey, stripeWh, egress);
+        const isLegacyUnwiredSeed =
+          !egress.wired &&
+          config.stripeApiVerifiedFingerprint === null &&
+          config.stripeSelfTestedFingerprint === null &&
+          !diagState.stripeEverApiVerified &&
+          !diagState.stripeEverSelfTested;
+        if (!isLegacyUnwiredSeed && (!stripeState.apiVerified || !stripeState.selfTestVerified)) {
+          throw new DomainError(
+            "UNAVAILABLE",
+            "PROVIDER_VERIFICATION_STALE",
+            "Stripe credentials or outbound allowlist changed after verification and must be re-verified.",
+          );
+        }
+        credentials = { mode: config.mode, secretKey: stripeKey };
+      } else {
+        try {
+          const loaded = await loadProviderCredentials(activeProvider, config);
+          credentials = loaded.credentials;
+        } catch (credErr) {
+          if (credErr instanceof DomainError && credErr.reasonCode === "PAYMENT_PROVIDER_NOT_CONFIGURED") {
+            throw new DomainError(
+              "UNAVAILABLE",
+              "PROVIDER_NOT_CONFIGURED",
+              "Square credentials or location ID are not configured.",
+            );
+          }
+          throw credErr;
+        }
+      }
+
       const createdSession = await adapter.createCheckout({
         attemptPublicId: preAttempt.attemptPublicId,
         invoicePublicId: invoice.invoicePublicId,
@@ -1651,13 +1961,39 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       };
     } catch (err) {
       const failedAt = deps.clock.now();
-      const reasonCode = err instanceof DomainError ? err.reasonCode : "PROVIDER_CREATE_ERROR";
+      const reasonCode = (err instanceof DomainError ? err.reasonCode : "PROVIDER_CREATE_ERROR").slice(0, 64);
+      const errCode = err instanceof DomainError ? err.code : "UNAVAILABLE";
+      const detailsRec =
+        err instanceof DomainError && err.details && typeof err.details === "object"
+          ? (err.details as Record<string, unknown>)
+          : null;
+      const upstreamStatus =
+        typeof detailsRec?.upstreamStatus === "number" &&
+        Number.isInteger(detailsRec.upstreamStatus) &&
+        detailsRec.upstreamStatus >= 100 &&
+        detailsRec.upstreamStatus <= 599
+          ? detailsRec.upstreamStatus
+          : null;
+      const stripeErrorType = sanitizeStripeDiagnosticToken(detailsRec?.stripeErrorType);
+      const stripeErrorCode = sanitizeStripeDiagnosticToken(detailsRec?.stripeErrorCode);
+      const stripeErrorParam = sanitizeStripeDiagnosticToken(detailsRec?.stripeErrorParam, {
+        allowBrackets: true,
+      });
+      const failureClass = classifyCheckoutFailureReason(reasonCode, "failed") ?? "provider_response";
+      const alertDesc = describeCheckoutFailureForAdmin({
+        provider: activeProvider,
+        mode: config.mode,
+        reasonCode,
+        upstreamStatus,
+        stripeErrorCode,
+      });
+
       await deps.db.transaction(async (tx) => {
         await tx
           .update(paymentAttempts)
           .set({
             status: "failed",
-            failureReasonCode: reasonCode.slice(0, 64),
+            failureReasonCode: reasonCode,
             version: 2,
             updatedAt: failedAt,
           })
@@ -1685,15 +2021,87 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
               invoice_public_id: invoice.invoicePublicId,
               provider: activeProvider,
               environment: config.mode,
-              reason_code: reasonCode.slice(0, 64),
+              reason_code: reasonCode,
+              failure_class: failureClass,
               payment_state: "failed",
+              ...(upstreamStatus !== null ? { upstream_http_status: upstreamStatus } : {}),
+              ...(stripeErrorType ? { stripe_error_type: stripeErrorType } : {}),
+              ...(stripeErrorCode ? { stripe_error_code: stripeErrorCode } : {}),
+              ...(stripeErrorParam ? { stripe_error_param: stripeErrorParam } : {}),
             },
           },
           tx,
         );
+
+        await updateDiagnosticsBestEffort(
+          (prev) => ({
+            ...prev,
+            lastCheckoutFailure: {
+              occurredAt: failedAt.toISOString(),
+              provider: activeProvider,
+              mode: config.mode,
+              reasonCode,
+              failureClass,
+              upstreamStatus,
+              stripeErrorType,
+              stripeErrorCode,
+              stripeErrorParam,
+              attemptPublicId: preAttempt.attemptPublicId,
+              invoicePublicId: invoice.invoicePublicId,
+              orderPublicId: invoice.orderPublicId,
+            },
+          }),
+          tx,
+        );
+
+        await emitPaymentOpsAlert(
+          {
+            dedupKey: `checkout_start_failed:${activeProvider}:${config.mode}:${reasonCode}`,
+            severity: alertDesc.severity,
+            code: `CHECKOUT_${reasonCode}`.slice(0, 64),
+            title: alertDesc.title,
+            text: `${alertDesc.explanation} Next step: ${alertDesc.nextStep}`,
+            orderPublicId: invoice.orderPublicId,
+          },
+          tx,
+        );
       });
-      throw err;
+
+      const onlineReadyNow = await isProviderCredentialsReady(config);
+      throw new DomainError(
+        errCode,
+        reasonCode,
+        customerMessageForCheckoutFailure(failureClass),
+        {
+          ...(upstreamStatus !== null ? { upstreamStatus } : {}),
+          attemptPublicId: preAttempt.attemptPublicId,
+          invoicePublicId: invoice.invoicePublicId,
+          failureClass,
+          onlinePaymentAvailable: onlineReadyNow,
+        },
+      );
     }
+  }
+
+  async function startInvoiceCheckout(
+    invoicePublicId: string,
+    returnPaths?: CheckoutReturnPaths,
+    opts?: StartCheckoutOptions,
+  ): Promise<Exclude<StartCheckoutResult, { mode: "invoice" }>> {
+    const res = await startCheckout(invoicePublicId, returnPaths, opts);
+    if (res.mode === "invoice") {
+      throw new DomainError(
+        "UNAVAILABLE",
+        "ONLINE_PAYMENT_DISABLED",
+        "Online card payment is not currently enabled. Follow the payment instructions on your invoice.",
+        {
+          invoicePublicId: res.invoicePublicId,
+          failureClass: "configuration" satisfies CheckoutFailureClass,
+          onlinePaymentAvailable: false,
+        },
+      );
+    }
+    return res;
   }
 
   async function getCheckoutStatus(
@@ -1763,7 +2171,86 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       attemptRow = latest ?? null;
     }
 
+    const now = deps.clock.now();
     const onlineReady = await isProviderCredentialsReady(config);
+
+    let orderCancelled = false;
+    let orderLocked = false;
+    const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+    if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
+      try {
+        const orderRef = await ordersSvc.getOrderRefById(invoice.orderId);
+        if (orderRef) {
+          orderCancelled = /cancel/.test(orderRef.statusKey);
+          if (ordersSvc.workflows && typeof ordersSvc.workflows.byVersionId === "function") {
+            const bound = await ordersSvc.workflows.byVersionId(
+              deps.db as unknown as Tx,
+              orderRef.workflowVersionId,
+            );
+            const state = bound.definition.states.find((s) => s.key === orderRef.statusKey);
+            orderCancelled = Boolean(state && state.kind === "terminal" && /cancel/.test(state.key));
+          }
+          orderLocked =
+            orderRef.lockState === "legal_hold" || orderRef.lockState === "imported_read_only";
+        }
+      } catch {
+        // Non-fatal read-only order hint; startCheckout enforces authoritative row locks.
+      }
+    }
+
+    let onlinePaymentUnavailableReason: OnlinePaymentUnavailableReason | null = null;
+    if (
+      invoice.origin !== "portal" ||
+      invoice.voidedAt !== null ||
+      invoice.status !== "issued" ||
+      invoice.issuedAt === null ||
+      invoice.balanceDueMinor <= 0
+    ) {
+      onlinePaymentUnavailableReason = "invoice_not_payable";
+    } else if (orderCancelled) {
+      onlinePaymentUnavailableReason = "order_cancelled";
+    } else if (orderLocked) {
+      onlinePaymentUnavailableReason = "order_locked";
+    } else if (config.provider === "none") {
+      onlinePaymentUnavailableReason = "provider_off";
+    } else if (!onlineReady) {
+      onlinePaymentUnavailableReason = "provider_not_ready";
+    } else if (invoice.currency.toUpperCase() !== config.currency.toUpperCase()) {
+      onlinePaymentUnavailableReason = "currency_mismatch";
+    } else {
+      const smallTotals = await loadSmallTotals();
+      const minimumMinor = resolveProviderMinimumMinor(config.provider, invoice.currency, smallTotals);
+      if (
+        invoice.balanceDueMinor > 0 &&
+        invoice.balanceDueMinor < minimumMinor &&
+        smallTotals.belowProviderMinimum === "block"
+      ) {
+        onlinePaymentUnavailableReason = "below_minimum";
+      }
+    }
+
+    const onlinePaymentAvailable = onlinePaymentUnavailableReason === null;
+
+    const attemptExpiredByClock = Boolean(
+      attemptRow &&
+        (attemptRow.status === "created" || attemptRow.status === "redirected") &&
+        attemptRow.expiresAt !== null &&
+        attemptRow.expiresAt.getTime() <= now.getTime(),
+    );
+    const attemptInFlight = Boolean(
+      attemptRow &&
+        (attemptRow.status === "created" || attemptRow.status === "redirected") &&
+        !attemptExpiredByClock,
+    );
+    const lastAttemptFailureClass: CheckoutFailureClass | null = !attemptRow
+      ? null
+      : attemptRow.status === "paid"
+        ? null
+        : attemptRow.status === "created" || attemptRow.status === "redirected"
+          ? attemptExpiredByClock
+            ? "expired"
+            : null
+          : classifyCheckoutFailureReason(attemptRow.failureReasonCode, attemptRow.status);
 
     return {
       invoicePublicId: invoice.invoicePublicId,
@@ -1776,6 +2263,10 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       currency: invoice.currency,
       providerConfigured: onlineReady ? config.provider : "none",
       environment: config.mode,
+      onlinePaymentAvailable,
+      onlinePaymentUnavailableReason,
+      attemptInFlight,
+      lastAttemptFailureClass,
       attempt: attemptRow
         ? {
             attemptPublicId: attemptRow.publicId,
@@ -3550,10 +4041,11 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
   /* ------------------------------------------------------------- admin console */
 
   async function buildAdminSettingsView(tx?: Tx): Promise<PaymentsAdminSettingsView> {
-    const [config, smallTotals, receipts] = await Promise.all([
+    const [config, smallTotals, receipts, diagnostics] = await Promise.all([
       loadConfig(tx),
       loadSmallTotals(tx),
       loadReceiptsSetting(tx),
+      loadDiagnostics(tx),
     ]);
     const [stripeKey, stripeWh, stripeWhSecSet, squareTokenSet, squareSigSet] = await Promise.all([
       readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx),
@@ -3570,8 +4062,26 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
     const egress = await checkEgressPresets(config.mode);
     const stripeState = resolveStripeVerificationState(config, stripeKey, stripeWh, egress);
+    const gate = computeStripeGateSummary({
+      config,
+      stripeKeySet,
+      stripeWhSet,
+      stripeState,
+      diagnostics,
+    });
 
-    const stripeReady = stripeState.ready;
+    const probe = diagnostics.lastStripeCheckoutProbe;
+    const probeMatchesCurrent = Boolean(
+      probe &&
+        stripeState.expectedApiFp &&
+        probe.apiFingerprint === stripeState.expectedApiFp &&
+        probe.mode === config.mode,
+    );
+    const currentProbe = probeMatchesCurrent ? probe : null;
+    const checkoutSessionProbeFailed = Boolean(currentProbe && !currentProbe.ok);
+    const checkoutSessionVerified = Boolean(currentProbe && currentProbe.ok);
+
+    const stripeReady = stripeState.ready && !checkoutSessionProbeFailed;
     const onlineEnabled =
       config.provider === "stripe"
         ? stripeReady
@@ -3606,6 +4116,20 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     const stripeReturnPattern = new URL("/api/payments/return/stripe/<attemptId>", deps.config.canonicalOrigin).href;
     const squareReturnPattern = new URL("/api/payments/return/square/<attemptId>", deps.config.canonicalOrigin).href;
 
+    const effectiveMissingGates: StripeMissingGateKey[] = checkoutSessionProbeFailed
+      ? [...gate.missingGates, "checkout_session_failed"]
+      : config.provider !== "stripe" && !checkoutSessionVerified
+        ? [...gate.missingGates, "checkout_session_not_verified"]
+        : gate.missingGates;
+    const effectiveHeadline =
+      config.provider === "stripe" && checkoutSessionProbeFailed
+        ? `Online card checkout: NOT ACTIVE (Checkout session verification failed)`
+        : gate.statusHeadline;
+    const effectiveCustomerSummary =
+      config.provider === "stripe" && checkoutSessionProbeFailed
+        ? "Stripe Checkout session creation failed during verification. Customers cannot complete online card payment until the staged key or Stripe Checkout domain configuration is fixed."
+        : gate.customerExperienceSummary;
+
     return {
       provider: config.provider,
       mode: config.mode,
@@ -3617,6 +4141,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       stripe: {
         secretKeyConfigured: stripeKeySet,
         secretKeyLast4: stripeKeySet ? config.stripeSecretKeyLast4 : null,
+        secretKeyModeMatches: stripeState.secretKeyModeMatches,
         webhookSecretConfigured: stripeWhSet,
         webhookSecretLast4: stripeWhSet ? config.stripeWebhookSecretLast4 : null,
         webhookSecretSecondaryConfigured: stripeWhSecSet,
@@ -3624,12 +4149,24 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         lastApiVerifiedAt: stripeState.effectiveLastApiVerifiedAt,
         lastSelfTestAt: stripeState.effectiveLastSelfTestAt,
         lastSelfTestWebhookAt: stripeState.effectiveLastSelfTestAt,
+        apiVerified: stripeState.apiVerified,
+        selfTestVerified: stripeState.selfTestVerified,
+        checkoutSessionVerified,
+        lastCheckoutSessionVerifiedAt:
+          checkoutSessionVerified && currentProbe ? currentProbe.checkedAt : null,
         lastVerifiedWebhookAt: latestStripeWebhook ? latestStripeWebhook.receivedAt.toISOString() : null,
         lastVerifiedWebhookEventType: latestStripeWebhook?.eventType ?? null,
         lastVerifiedWebhookStatus: latestStripeWebhook?.status ?? null,
         inboundCountryAllowlistExempt: true,
         requiredEvents: STRIPE_REQUIRED_WEBHOOK_EVENTS,
         ready: stripeReady,
+        statusHeadline: effectiveHeadline,
+        customerExperienceSummary: effectiveCustomerSummary,
+        reverificationNeeded: gate.reverificationNeeded,
+        reverificationReasons: gate.reverificationReasons,
+        missingGates: effectiveMissingGates,
+        lastCheckoutFailure: diagnostics.lastCheckoutFailure,
+        lastCheckoutProbe: currentProbe,
         webhookUrl: stripeWebhookUrl,
         returnUrlPattern: stripeReturnPattern,
         egressHost: "api.stripe.com",
@@ -3645,6 +4182,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         returnUrlPattern: squareReturnPattern,
         egressHost: squareHost,
         egressAllowlisted: egress.squareAllowlisted,
+      },
+      diagnostics: {
+        lastCheckoutFailure: diagnostics.lastCheckoutFailure,
       },
       smallTotals,
       defaultProviderMinimumsMinor: DEFAULT_PROVIDER_MINIMUMS_MINOR,
@@ -3671,6 +4211,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     await runComplianceTx(deps, principal, { type: "payments_settings" }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "payments.manage");
       const prev = await loadConfig(tx);
+      const diagnostics = await loadDiagnostics(tx);
 
       const modeChanged = prev.mode !== input.mode;
       const nextConfig: PaymentsConfigValue = {
@@ -3703,13 +4244,8 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         operation: "rotated" | "cleared";
       }> = [];
 
-      function parseCredential(schema: { safeParse: (v: unknown) => { success: true; data: string } | { success: false } }, raw: string, label: string): string {
-        const res = schema.safeParse(raw);
-        if (!res.success) {
-          throw validation("INVALID_CREDENTIAL_FORMAT", `${label} is not in the expected format.`);
-        }
-        return res.data;
-      }
+      const hasNonBlankInput = (raw: string | undefined): raw is string =>
+        raw !== undefined && raw.trim() !== "";
 
       if (input.clearStripeSecretKey) {
         await deps.settings.setSecret(PAYMENTS_STRIPE_SECRET_KEY.key, null, tx);
@@ -3717,17 +4253,16 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         nextConfig.stripeLastApiVerifiedAt = null;
         nextConfig.stripeApiVerifiedFingerprint = null;
         rotatedSecrets.push({ provider: "stripe", slot: "api_key", operation: "cleared" });
-      } else if (input.stripeSecretKey !== undefined && input.stripeSecretKey.trim() !== "") {
-        const parsed = parseCredential(PAYMENTS_STRIPE_SECRET_KEY.schema, input.stripeSecretKey.trim(), "Stripe secret key");
-        const expectedPrefix = nextConfig.mode === "live" ? /^(?:sk|rk)_live_/u : /^(?:sk|rk)_test_/u;
-        if (!expectedPrefix.test(parsed)) {
-          throw validation(
-            "STRIPE_KEY_MODE_MISMATCH",
-            `Stripe secret key must match ${nextConfig.mode} mode.`,
-          );
+      } else if (hasNonBlankInput(input.stripeSecretKey)) {
+        const check = validateStripeSecretKeyInput(input.stripeSecretKey, nextConfig.mode);
+        if (!check.ok) {
+          throw new DomainError("VALIDATION", check.reasonCode, check.safeMessage, {
+            field: check.field,
+            reason: check.reason,
+          });
         }
-        await deps.settings.setSecret(PAYMENTS_STRIPE_SECRET_KEY.key, parsed, tx);
-        nextConfig.stripeSecretKeyLast4 = maskLast4(parsed);
+        await deps.settings.setSecret(PAYMENTS_STRIPE_SECRET_KEY.key, check.normalized, tx);
+        nextConfig.stripeSecretKeyLast4 = maskLast4(check.normalized);
         nextConfig.stripeLastApiVerifiedAt = null;
         nextConfig.stripeApiVerifiedFingerprint = null;
         rotatedSecrets.push({ provider: "stripe", slot: "api_key", operation: "rotated" });
@@ -3739,10 +4274,19 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         nextConfig.stripeLastSelfTestAt = null;
         nextConfig.stripeSelfTestedFingerprint = null;
         rotatedSecrets.push({ provider: "stripe", slot: "webhook_primary", operation: "cleared" });
-      } else if (input.stripeWebhookSecret !== undefined && input.stripeWebhookSecret.trim() !== "") {
-        const parsed = parseCredential(PAYMENTS_STRIPE_WEBHOOK_SECRET.schema, input.stripeWebhookSecret.trim(), "Stripe webhook signing secret");
-        await deps.settings.setSecret(PAYMENTS_STRIPE_WEBHOOK_SECRET.key, parsed, tx);
-        nextConfig.stripeWebhookSecretLast4 = maskLast4(parsed);
+      } else if (hasNonBlankInput(input.stripeWebhookSecret)) {
+        const check = validateStripeWebhookSecretInput(
+          input.stripeWebhookSecret,
+          "stripeWebhookSecret",
+        );
+        if (!check.ok) {
+          throw new DomainError("VALIDATION", check.reasonCode, check.safeMessage, {
+            field: check.field,
+            reason: check.reason,
+          });
+        }
+        await deps.settings.setSecret(PAYMENTS_STRIPE_WEBHOOK_SECRET.key, check.normalized, tx);
+        nextConfig.stripeWebhookSecretLast4 = maskLast4(check.normalized);
         nextConfig.stripeLastSelfTestAt = null;
         nextConfig.stripeSelfTestedFingerprint = null;
         rotatedSecrets.push({ provider: "stripe", slot: "webhook_primary", operation: "rotated" });
@@ -3752,17 +4296,23 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         await deps.settings.setSecret(PAYMENTS_STRIPE_WEBHOOK_SECRET_SECONDARY.key, null, tx);
         nextConfig.stripeWebhookSecretSecondaryLast4 = null;
         rotatedSecrets.push({ provider: "stripe", slot: "webhook_secondary", operation: "cleared" });
-      } else if (
-        input.stripeWebhookSecretSecondary !== undefined &&
-        input.stripeWebhookSecretSecondary.trim() !== ""
-      ) {
-        const parsed = parseCredential(
-          PAYMENTS_STRIPE_WEBHOOK_SECRET_SECONDARY.schema,
-          input.stripeWebhookSecretSecondary.trim(),
-          "Stripe secondary webhook signing secret",
+      } else if (hasNonBlankInput(input.stripeWebhookSecretSecondary)) {
+        const check = validateStripeWebhookSecretInput(
+          input.stripeWebhookSecretSecondary,
+          "stripeWebhookSecretSecondary",
         );
-        await deps.settings.setSecret(PAYMENTS_STRIPE_WEBHOOK_SECRET_SECONDARY.key, parsed, tx);
-        nextConfig.stripeWebhookSecretSecondaryLast4 = maskLast4(parsed);
+        if (!check.ok) {
+          throw new DomainError("VALIDATION", check.reasonCode, check.safeMessage, {
+            field: check.field,
+            reason: check.reason,
+          });
+        }
+        await deps.settings.setSecret(
+          PAYMENTS_STRIPE_WEBHOOK_SECRET_SECONDARY.key,
+          check.normalized,
+          tx,
+        );
+        nextConfig.stripeWebhookSecretSecondaryLast4 = maskLast4(check.normalized);
         rotatedSecrets.push({ provider: "stripe", slot: "webhook_secondary", operation: "rotated" });
       }
 
@@ -3770,10 +4320,16 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         await deps.settings.setSecret(PAYMENTS_SQUARE_ACCESS_TOKEN.key, null, tx);
         nextConfig.squareAccessTokenLast4 = null;
         rotatedSecrets.push({ provider: "square", slot: "access_token", operation: "cleared" });
-      } else if (input.squareAccessToken !== undefined && input.squareAccessToken.trim() !== "") {
-        const parsed = parseCredential(PAYMENTS_SQUARE_ACCESS_TOKEN.schema, input.squareAccessToken.trim(), "Square access token");
-        await deps.settings.setSecret(PAYMENTS_SQUARE_ACCESS_TOKEN.key, parsed, tx);
-        nextConfig.squareAccessTokenLast4 = maskLast4(parsed);
+      } else if (hasNonBlankInput(input.squareAccessToken)) {
+        const check = validateSquareSecretInput(input.squareAccessToken, "squareAccessToken");
+        if (!check.ok) {
+          throw new DomainError("VALIDATION", check.reasonCode, check.safeMessage, {
+            field: check.field,
+            reason: check.reason,
+          });
+        }
+        await deps.settings.setSecret(PAYMENTS_SQUARE_ACCESS_TOKEN.key, check.normalized, tx);
+        nextConfig.squareAccessTokenLast4 = maskLast4(check.normalized);
         rotatedSecrets.push({ provider: "square", slot: "access_token", operation: "rotated" });
       }
 
@@ -3781,17 +4337,23 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         await deps.settings.setSecret(PAYMENTS_SQUARE_WEBHOOK_SIGNATURE_KEY.key, null, tx);
         nextConfig.squareWebhookSignatureKeyLast4 = null;
         rotatedSecrets.push({ provider: "square", slot: "webhook_signature_key", operation: "cleared" });
-      } else if (
-        input.squareWebhookSignatureKey !== undefined &&
-        input.squareWebhookSignatureKey.trim() !== ""
-      ) {
-        const parsed = parseCredential(
-          PAYMENTS_SQUARE_WEBHOOK_SIGNATURE_KEY.schema,
-          input.squareWebhookSignatureKey.trim(),
-          "Square webhook signature key",
+      } else if (hasNonBlankInput(input.squareWebhookSignatureKey)) {
+        const check = validateSquareSecretInput(
+          input.squareWebhookSignatureKey,
+          "squareWebhookSignatureKey",
         );
-        await deps.settings.setSecret(PAYMENTS_SQUARE_WEBHOOK_SIGNATURE_KEY.key, parsed, tx);
-        nextConfig.squareWebhookSignatureKeyLast4 = maskLast4(parsed);
+        if (!check.ok) {
+          throw new DomainError("VALIDATION", check.reasonCode, check.safeMessage, {
+            field: check.field,
+            reason: check.reason,
+          });
+        }
+        await deps.settings.setSecret(
+          PAYMENTS_SQUARE_WEBHOOK_SIGNATURE_KEY.key,
+          check.normalized,
+          tx,
+        );
+        nextConfig.squareWebhookSignatureKeyLast4 = maskLast4(check.normalized);
         rotatedSecrets.push({ provider: "square", slot: "webhook_signature_key", operation: "rotated" });
       }
 
@@ -3803,11 +4365,19 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       if (nextConfig.provider === "stripe") {
         if (
           requiresFreshPairStrict &&
-          (!input.stripeSecretKey?.trim() || !input.stripeWebhookSecret?.trim())
+          (!normalizeCredentialInput(input.stripeSecretKey ?? "") ||
+            !normalizeCredentialInput(input.stripeWebhookSecret ?? ""))
         ) {
-          throw validation(
+          const missingField: CredentialFieldKey = !normalizeCredentialInput(
+            input.stripeSecretKey ?? "",
+          )
+            ? "stripeSecretKey"
+            : "stripeWebhookSecret";
+          throw new DomainError(
+            "VALIDATION",
             "FRESH_CREDENTIALS_REQUIRED",
-            "Enter both a fresh Stripe secret key and webhook signing secret when switching provider or environment.",
+            "Enter both a fresh Stripe API secret key and primary Stripe webhook signing secret when switching provider or environment.",
+            { field: missingField, reason: "fresh_pair_required" },
           );
         }
         const [stripeKey, stripeWh] = await Promise.all([
@@ -3815,22 +4385,35 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx),
         ]);
         if (!stripeKey || !stripeWh) {
+          const missingField: CredentialFieldKey = !stripeKey
+            ? "stripeSecretKey"
+            : "stripeWebhookSecret";
           if (prev.provider !== "stripe") {
-            throw validation(
+            throw new DomainError(
+              "VALIDATION",
               "FRESH_CREDENTIALS_REQUIRED",
-              "Configure both the Stripe secret key and webhook signing secret before enabling Stripe.",
+              "Configure both the Stripe API secret key and primary Stripe webhook signing secret before enabling Stripe.",
+              { field: missingField, reason: "required" },
             );
           }
-          throw validation(
+          throw new DomainError(
+            "VALIDATION",
             "STRIPE_CREDENTIALS_REQUIRED",
-            "Configure both the Stripe secret key and webhook signing secret before enabling Stripe.",
+            "Configure both the Stripe API secret key and primary Stripe webhook signing secret before enabling Stripe.",
+            { field: missingField, reason: "required" },
           );
         }
         const expectedPrefix = nextConfig.mode === "live" ? /^(?:sk|rk)_live_/u : /^(?:sk|rk)_test_/u;
         if (!expectedPrefix.test(stripeKey)) {
-          throw validation(
+          throw new DomainError(
+            "VALIDATION",
             "STRIPE_KEY_MODE_MISMATCH",
-            `Stripe secret key must match ${nextConfig.mode} mode.`,
+            `Stripe API secret key must match ${nextConfig.mode} mode.`,
+            {
+              field: "stripeSecretKey",
+              reason:
+                nextConfig.mode === "live" ? "wrong_mode_test_in_live" : "wrong_mode_live_in_test",
+            },
           );
         }
         if (egress.wired && !egress.stripeAllowlisted) {
@@ -3839,40 +4422,89 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             "Enable the Stripe outbound HTTPS allowlist preset (api.stripe.com:443) before activating Stripe Checkout.",
           );
         }
-        const expectedApiFp = computeStripeApiFingerprint(
-          nextConfig.mode,
-          stripeKey,
-          egress.stripeEgressStamp,
+
+        const isActivatingStripe = prev.provider !== "stripe" || prev.mode !== nextConfig.mode;
+        const rotatedStripePrimarySecret = rotatedSecrets.some(
+          (s) =>
+            s.provider === "stripe" &&
+            s.operation === "rotated" &&
+            (s.slot === "api_key" || s.slot === "webhook_primary"),
         );
-        if (
-          !nextConfig.stripeLastApiVerifiedAt ||
-          nextConfig.stripeApiVerifiedFingerprint !== expectedApiFp
-        ) {
-          throw validation(
-            "STRIPE_API_NOT_VERIFIED",
-            "Verify outbound Stripe API connectivity for the current staged secret key, mode, and outbound allowlist before activating Stripe Checkout.",
+
+        // In-place secret rotation on an already-activated same-mode Stripe setup saves the new secret
+        // and pauses online card checkout (`onlineEnabled = false`) until re-verification completes.
+        // Initial activation or switching modes/providers strictly requires completed verification first.
+        if (isActivatingStripe || !rotatedStripePrimarySecret) {
+          const expectedApiFp = computeStripeApiFingerprint(
+            nextConfig.mode,
+            stripeKey,
+            egress.stripeEgressStamp,
           );
-        }
-        const expectedWhFp = computeStripeSelfTestFingerprint(nextConfig.mode, stripeWh);
-        if (
-          !nextConfig.stripeLastSelfTestAt ||
-          nextConfig.stripeSelfTestedFingerprint !== expectedWhFp
-        ) {
-          throw validation(
-            "STRIPE_WEBHOOK_NOT_VERIFIED",
-            "Run a passing signed webhook self-test for the current staged signing secret and mode before activating Stripe Checkout.",
+          if (
+            !nextConfig.stripeLastApiVerifiedAt ||
+            nextConfig.stripeApiVerifiedFingerprint !== expectedApiFp
+          ) {
+            throw validation(
+              "STRIPE_API_NOT_VERIFIED",
+              "Verify outbound Stripe API connectivity for the current staged secret key, mode, and outbound allowlist before activating Stripe Checkout.",
+            );
+          }
+          const probe = diagnostics.lastStripeCheckoutProbe;
+          const probeMatchesExpected = Boolean(
+            probe &&
+              probe.apiFingerprint === expectedApiFp &&
+              probe.mode === nextConfig.mode,
           );
+          if (isActivatingStripe) {
+            if (!probeMatchesExpected) {
+              throw validation(
+                "STRIPE_CHECKOUT_SESSION_NOT_VERIFIED",
+                'Run "Verify Checkout session creation" for the current staged Stripe API key and mode before activating Stripe Checkout.',
+              );
+            }
+            if (!probe!.ok) {
+              throw validation(
+                "STRIPE_CHECKOUT_SESSION_NOT_VERIFIED",
+                probe!.message ||
+                  'Stripe Checkout session verification failed for the current staged key. Resolve the error and re-run "Verify Checkout session creation" before activating.',
+              );
+            }
+          } else if (probeMatchesExpected && !probe!.ok) {
+            throw validation(
+              "STRIPE_CHECKOUT_SESSION_NOT_VERIFIED",
+              probe!.message ||
+                'Stripe Checkout session verification failed for the current staged key. Resolve the error and re-run "Verify Checkout session creation".',
+            );
+          }
+          const expectedWhFp = computeStripeSelfTestFingerprint(nextConfig.mode, stripeWh);
+          if (
+            !nextConfig.stripeLastSelfTestAt ||
+            nextConfig.stripeSelfTestedFingerprint !== expectedWhFp
+          ) {
+            throw validation(
+              "STRIPE_WEBHOOK_NOT_VERIFIED",
+              "Run a passing signed webhook self-test for the current staged signing secret and mode before activating Stripe Checkout.",
+            );
+          }
         }
       } else if (nextConfig.provider === "square") {
         const requiresSquareFresh =
           prev.provider !== nextConfig.provider || prev.mode !== nextConfig.mode;
         if (
           requiresSquareFresh &&
-          (!input.squareAccessToken?.trim() || !input.squareWebhookSignatureKey?.trim())
+          (!normalizeCredentialInput(input.squareAccessToken ?? "") ||
+            !normalizeCredentialInput(input.squareWebhookSignatureKey ?? ""))
         ) {
-          throw validation(
+          const missingField: CredentialFieldKey = !normalizeCredentialInput(
+            input.squareAccessToken ?? "",
+          )
+            ? "squareAccessToken"
+            : "squareWebhookSignatureKey";
+          throw new DomainError(
+            "VALIDATION",
             "FRESH_CREDENTIALS_REQUIRED",
             "Enter both a fresh Square access token and webhook signature key when switching provider or environment.",
+            { field: missingField, reason: "fresh_pair_required" },
           );
         }
         const [sqToken, sqSig] = await Promise.all([
@@ -3888,6 +4520,18 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       }
 
       await writeSetting(deps.settings, PAYMENTS_CONFIG_SETTING, nextConfig, tx);
+      if (prev.stripeLastApiVerifiedAt || prev.stripeLastSelfTestAt) {
+        await updateDiagnosticsBestEffort(
+          (prevDiag) => ({
+            ...prevDiag,
+            stripeEverApiVerified:
+              prevDiag.stripeEverApiVerified || Boolean(prev.stripeLastApiVerifiedAt),
+            stripeEverSelfTested:
+              prevDiag.stripeEverSelfTested || Boolean(prev.stripeLastSelfTestAt),
+          }),
+          tx,
+        );
+      }
       if (input.smallTotals !== undefined) {
         const cleanedSmallTotals = parsePaymentsSmallTotals(input.smallTotals);
         await writeSetting(deps.settings, PAYMENTS_SMALL_TOTALS_SETTING, cleanedSmallTotals, tx);
@@ -3947,7 +4591,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     const now = deps.clock.now();
     await pruneExpiredWebhookRejections(now);
 
-    const config = await loadConfig();
+    const [config, diagnostics] = await Promise.all([loadConfig(), loadDiagnostics()]);
     const [stripeKey, stripeWh, stripeWhSecSet, egress] = await Promise.all([
       readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY),
       readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET),
@@ -3959,6 +4603,24 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     const stripeWhSet = Boolean(stripeWh);
     const stripeState = resolveStripeVerificationState(config, stripeKey, stripeWh, egress);
     const secretKeyModeMatches = stripeState.secretKeyModeMatches;
+    const gate = computeStripeGateSummary({
+      config,
+      stripeKeySet,
+      stripeWhSet,
+      stripeState,
+      diagnostics,
+    });
+
+    const probe = diagnostics.lastStripeCheckoutProbe;
+    const currentProbe =
+      probe &&
+      stripeState.expectedApiFp &&
+      probe.apiFingerprint === stripeState.expectedApiFp &&
+      probe.mode === config.mode
+        ? probe
+        : null;
+    const checkoutSessionProbeFailed = Boolean(currentProbe && !currentProbe.ok);
+    const checkoutSessionVerified = Boolean(currentProbe && currentProbe.ok);
 
     const cutoff24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
     const [[lastRealWebhook], [attentionRow], [rejRow]] = await Promise.all([
@@ -3997,7 +4659,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     ]);
 
     const egressReady = stripeState.egressOk;
-    const onlineEnabled = config.provider === "stripe" && stripeState.ready;
+    const onlineEnabled = config.provider === "stripe" && stripeState.ready && !checkoutSessionProbeFailed;
 
     const webhookUrl = new URL("/api/payments/webhooks/stripe", deps.config.canonicalOrigin).href;
 
@@ -4046,6 +4708,18 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           : "Run Test Stripe API to verify egress and key livemode for the current staged key.",
       },
       {
+        key: "checkout_session_verified",
+        label: "Checkout session creation verified",
+        ready: checkoutSessionVerified || (config.provider === "stripe" && !checkoutSessionProbeFailed),
+        detail: checkoutSessionProbeFailed
+          ? currentProbe!.message
+          : checkoutSessionVerified
+            ? `Verified at ${currentProbe!.checkedAt} — probe Checkout Session created and immediately expired at zero cost.`
+            : config.provider === "stripe"
+              ? 'Recommended check (online card checkout remains active): run "Verify Checkout session creation" to confirm Checkout Sessions write permission and redirect domain.'
+              : 'Required before activating Stripe Checkout: run "Verify Checkout session creation" to confirm Checkout Sessions write permission and redirect domain.',
+      },
+      {
         key: "self_test_webhook_verified",
         label: "Signed webhook receiver self-test passed",
         ready: stripeState.selfTestVerified,
@@ -4060,16 +4734,35 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         detail: onlineEnabled
           ? `Online Stripe checkout is active in ${config.mode} mode.`
           : config.provider === "stripe"
-            ? "Stripe is selected, but one or more prerequisites above are incomplete or unverified; checkout remains on invoice fallback until resolved."
+            ? "Stripe is selected, but one or more prerequisites above are incomplete or unverified; card checkout is paused until resolved."
             : "Provider is currently set to off (invoice-only). Activate Stripe when ready.",
       },
     ];
+
+    const effectiveMissingGates: StripeMissingGateKey[] = checkoutSessionProbeFailed
+      ? [...gate.missingGates, "checkout_session_failed"]
+      : config.provider !== "stripe" && !checkoutSessionVerified
+        ? [...gate.missingGates, "checkout_session_not_verified"]
+        : gate.missingGates;
 
     return {
       provider: config.provider,
       mode: config.mode,
       currency: config.currency,
       onlineEnabled,
+      statusHeadline:
+        config.provider === "stripe" && checkoutSessionProbeFailed
+          ? "Online card checkout: NOT ACTIVE (Checkout session verification failed)"
+          : gate.statusHeadline,
+      customerExperienceSummary:
+        config.provider === "stripe" && checkoutSessionProbeFailed
+          ? "Stripe Checkout session creation failed during verification. Customers cannot complete online card payment until resolved."
+          : gate.customerExperienceSummary,
+      reverificationNeeded: gate.reverificationNeeded,
+      reverificationReasons: gate.reverificationReasons,
+      missingGates: effectiveMissingGates,
+      lastCheckoutFailure: diagnostics.lastCheckoutFailure,
+      lastCheckoutProbe: currentProbe,
       webhookUrl,
       requiredWebhookEvents: [...STRIPE_REQUIRED_WEBHOOK_EVENTS],
       egress: {
@@ -4096,6 +4789,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       verification: {
         lastApiVerifiedAt: stripeState.effectiveLastApiVerifiedAt,
         lastSelfTestAt: stripeState.effectiveLastSelfTestAt,
+        checkoutSessionVerified,
+        lastCheckoutSessionVerifiedAt:
+          checkoutSessionVerified && currentProbe ? currentProbe.checkedAt : null,
         lastVerifiedWebhookAt: lastRealWebhook?.receivedAt
           ? lastRealWebhook.receivedAt.toISOString()
           : null,
@@ -4117,16 +4813,23 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         const config = await loadConfig(tx);
         const stripeKey = await readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx);
         if (!stripeKey) {
-          throw validation(
+          throw new DomainError(
+            "VALIDATION",
             "STRIPE_CREDENTIALS_REQUIRED",
-            "Stage a Stripe secret key before testing the Stripe API connection.",
+            "Stage a Stripe API secret key before testing the Stripe API connection.",
+            { field: "stripeSecretKey", reason: "required" },
           );
         }
         const expectedPrefix = config.mode === "live" ? /^(?:sk|rk)_live_/u : /^(?:sk|rk)_test_/u;
         if (!expectedPrefix.test(stripeKey)) {
-          throw validation(
+          throw new DomainError(
+            "VALIDATION",
             "STRIPE_KEY_MODE_MISMATCH",
-            `Stripe secret key must match ${config.mode} mode.`,
+            `Stripe API secret key must match ${config.mode} mode.`,
+            {
+              field: "stripeSecretKey",
+              reason: config.mode === "live" ? "wrong_mode_test_in_live" : "wrong_mode_live_in_test",
+            },
           );
         }
         return { liveActor, config, stripeKey };
@@ -4187,6 +4890,15 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             },
         tx,
       );
+      if (res.ok && verifiedAt) {
+        await updateDiagnosticsBestEffort(
+          (prevDiag) => ({
+            ...prevDiag,
+            stripeEverApiVerified: true,
+          }),
+          tx,
+        );
+      }
     });
 
     await deps.audit.record({
@@ -4223,6 +4935,177 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     };
   }
 
+  async function adminVerifyCheckoutSession(
+    principal: SessionPrincipal,
+  ): Promise<VerifyStripeCheckoutSessionResult> {
+    const stagedCheck = await runComplianceTx(
+      deps,
+      principal,
+      { type: "payments_settings" },
+      async (tx) => {
+        const liveActor = await assertLiveActorInTx(deps, principal, tx, "payments.manage");
+        const config = await loadConfig(tx);
+        const stripeKey = await readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx);
+        if (!stripeKey) {
+          throw new DomainError(
+            "VALIDATION",
+            "STRIPE_CREDENTIALS_REQUIRED",
+            "Stage a Stripe API secret key before verifying Checkout session creation.",
+            { field: "stripeSecretKey", reason: "required" },
+          );
+        }
+        const expectedPrefix = config.mode === "live" ? /^(?:sk|rk)_live_/u : /^(?:sk|rk)_test_/u;
+        if (!expectedPrefix.test(stripeKey)) {
+          throw new DomainError(
+            "VALIDATION",
+            "STRIPE_KEY_MODE_MISMATCH",
+            `Stripe API secret key must match ${config.mode} mode.`,
+            {
+              field: "stripeSecretKey",
+              reason: config.mode === "live" ? "wrong_mode_test_in_live" : "wrong_mode_live_in_test",
+            },
+          );
+        }
+        return { liveActor, config, stripeKey };
+      },
+    );
+
+    if (typeof adapters.stripe.verifyCheckoutSession !== "function") {
+      throw new DomainError(
+        "UNAVAILABLE",
+        "STRIPE_CHECKOUT_VERIFY_UNAVAILABLE",
+        "Stripe Checkout session verification is not supported by the active adapter.",
+      );
+    }
+
+    const now = deps.clock.now();
+    const res = await adapters.stripe.verifyCheckoutSession({
+      credentials: { mode: stagedCheck.config.mode, secretKey: stagedCheck.stripeKey },
+      currency: stagedCheck.config.currency,
+      canonicalOrigin: deps.config.canonicalOrigin,
+      now,
+    });
+
+    const failureReasonCode = res.ok ? null : (res.reasonCode ?? "STRIPE_CHECKOUT_VERIFY_FAILED");
+    const upstreamStatus = res.upstreamStatus ?? null;
+    const stripeErrorType = sanitizeStripeDiagnosticToken(res.stripeErrorType);
+    const stripeErrorCode = sanitizeStripeDiagnosticToken(res.stripeErrorCode);
+    const stripeErrorParam = sanitizeStripeDiagnosticToken(res.stripeErrorParam, {
+      allowBrackets: true,
+    });
+    const verifiedAt = res.ok ? (res.verifiedAt ?? now).toISOString() : null;
+    const checkedAtIso = (res.verifiedAt ?? now).toISOString();
+    const livemode = res.ok ? stagedCheck.config.mode === "live" : null;
+
+    const detail = res.ok
+      ? res.expiredImmediately
+        ? `Created and immediately expired an unpaid Stripe Checkout session on checkout.stripe.com in ${stagedCheck.config.mode} mode (${res.latencyMs}ms). No charge was made.`
+        : `Created an unpaid Stripe Checkout session on checkout.stripe.com in ${stagedCheck.config.mode} mode (${res.latencyMs}ms); immediate expire call did not complete and the session will expire automatically.`
+      : failureReasonCode === "STRIPE_AUTH_INVALID_KEY"
+        ? "Stripe rejected the staged secret key (HTTP 401). Confirm the key in Stripe Dashboard > Developers > API keys."
+        : failureReasonCode === "STRIPE_KEY_MISSING_PERMISSION"
+          ? "Staged restricted key cannot create Checkout Sessions (HTTP 403). Grant Checkout Sessions: Write permission on this restricted key in Stripe."
+          : failureReasonCode === "STRIPE_UNTRUSTED_REDIRECT_URL"
+            ? "Stripe returned a Checkout URL outside checkout.stripe.com (such as a custom Checkout domain). ReadyPackets enforces checkout.stripe.com redirects; disable custom Checkout domains on this Stripe account before activating."
+            : failureReasonCode === "STRIPE_KEY_MODE_MISMATCH" || failureReasonCode === "STRIPE_MODE_MISMATCH"
+              ? `Stripe Checkout session livemode did not match configured ${stagedCheck.config.mode} mode.`
+              : failureReasonCode === "STRIPE_INVALID_REQUEST"
+                ? `Stripe rejected the Checkout session request (HTTP ${upstreamStatus ?? 400}${stripeErrorCode ? `, code: ${stripeErrorCode}` : ""}). Confirm your Stripe account is enabled for ${stagedCheck.config.currency} card payments.`
+                : failureReasonCode && failureReasonCode.startsWith("EGRESS_")
+                  ? `Outbound connection to api.stripe.com was blocked by egress policy (${failureReasonCode}). Enable the Stripe outbound allowlist preset and try again.`
+                  : `Checkout session verification failed (${failureReasonCode}${upstreamStatus ? `, HTTP ${upstreamStatus}` : ""}).`;
+
+    const egress = await checkEgressPresets(stagedCheck.config.mode);
+    const fingerprint = computeStripeApiFingerprint(
+      stagedCheck.config.mode,
+      stagedCheck.stripeKey,
+      egress.stripeEgressStamp,
+    );
+
+    await deps.db.transaction(async (tx) => {
+      const latest = await loadConfig(tx);
+      const currentKey = await readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx);
+      const sameKeyAndMode =
+        latest.mode === stagedCheck.config.mode && currentKey === stagedCheck.stripeKey;
+      if (!sameKeyAndMode) return;
+
+      if (res.ok && verifiedAt) {
+        await writeSetting(
+          deps.settings,
+          PAYMENTS_CONFIG_SETTING,
+          {
+            ...latest,
+            stripeLastApiVerifiedAt: latest.stripeLastApiVerifiedAt ?? verifiedAt,
+            stripeApiVerifiedFingerprint: fingerprint,
+          },
+          tx,
+        );
+      }
+
+      await updateDiagnosticsBestEffort(
+        (prevDiag) => ({
+          ...prevDiag,
+          stripeEverApiVerified: prevDiag.stripeEverApiVerified || Boolean(res.ok && verifiedAt),
+          lastStripeCheckoutProbe: {
+            checkedAt: checkedAtIso,
+            mode: stagedCheck.config.mode,
+            apiFingerprint: fingerprint,
+            ok: res.ok,
+            reasonCode: failureReasonCode ?? "CHECKOUT_SESSION_OK",
+            upstreamStatus,
+            stripeErrorType,
+            stripeErrorCode,
+            message: detail.slice(0, 300),
+          },
+        }),
+        tx,
+      );
+    });
+
+    await deps.audit.record({
+      category: "integration",
+      eventName: "payments.checkout_session.verified",
+      action: "verify",
+      outcome: res.ok ? "completed" : "failed",
+      ...(res.ok
+        ? {}
+        : {
+            severity: "WARN" as const,
+            reasonCode: failureReasonCode ?? "STRIPE_CHECKOUT_VERIFY_FAILED",
+          }),
+      actor: { userId: stagedCheck.liveActor.userId, role: stagedCheck.liveActor.role },
+      resource: { type: "payments_settings" },
+      attributes: {
+        provider: "stripe",
+        mode: stagedCheck.config.mode,
+        currency: stagedCheck.config.currency,
+        expired_immediately: res.expiredImmediately,
+        ...(upstreamStatus !== null ? { upstream_http_status: upstreamStatus } : {}),
+        ...(stripeErrorType ? { stripe_error_type: stripeErrorType } : {}),
+        ...(stripeErrorCode ? { stripe_error_code: stripeErrorCode } : {}),
+        ...(stripeErrorParam ? { stripe_error_param: stripeErrorParam } : {}),
+        ...(failureReasonCode ? { failure_reason_code: failureReasonCode } : {}),
+      },
+    });
+
+    return {
+      ok: res.ok,
+      provider: "stripe",
+      mode: stagedCheck.config.mode,
+      livemode,
+      sessionId: res.sessionId,
+      expiredImmediately: res.expiredImmediately,
+      verifiedAt,
+      failureReasonCode,
+      upstreamStatus,
+      stripeErrorType,
+      stripeErrorCode,
+      stripeErrorParam,
+      detail,
+      message: detail,
+    };
+  }
+
   async function adminSendSelfTestWebhook(
     principal: SessionPrincipal,
   ): Promise<SendStripeSelfTestWebhookResult> {
@@ -4235,9 +5118,11 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         const config = await loadConfig(tx);
         const stripeWh = await readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx);
         if (!stripeWh) {
-          throw validation(
+          throw new DomainError(
+            "VALIDATION",
             "STRIPE_CREDENTIALS_REQUIRED",
             "Stage the primary Stripe webhook signing secret before running a self-test webhook.",
+            { field: "stripeWebhookSecret", reason: "required" },
           );
         }
         return { liveActor, config, stripeWh };
@@ -4286,6 +5171,15 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             },
         tx,
       );
+      if (ok && verifiedAt) {
+        await updateDiagnosticsBestEffort(
+          (prevDiag) => ({
+            ...prevDiag,
+            stripeEverSelfTested: true,
+          }),
+          tx,
+        );
+      }
     });
 
     await deps.audit.record({
@@ -5933,6 +6827,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     getPublicCheckoutConfig,
     evaluateCheckoutAmount,
     startCheckout,
+    startInvoiceCheckout,
     getCheckoutStatus,
     cancelAttemptIfUnpaid,
     handleSignedWebhook,
@@ -5950,6 +6845,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       updateSettings: adminUpdateSettings,
       readiness: adminReadiness,
       testConnection: adminTestConnection,
+      verifyCheckoutSession: adminVerifyCheckoutSession,
       sendSelfTestWebhook: adminSendSelfTestWebhook,
       listWebhookRejections: adminListWebhookRejections,
       listAttempts: adminListAttempts,

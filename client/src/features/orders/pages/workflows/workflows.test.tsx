@@ -225,6 +225,94 @@ describe("workflows page", () => {
   });
 });
 
+describe("workflows page — default workflow (07.2)", () => {
+  const RUSH = "01JTESTWF0000000000000000B";
+  const RUSH_VERSION = "01JTESTWFV000000000000000B";
+  const rushRow = { ...workflowRow, publicId: RUSH, workflowKey: "rush", name: "Rush", isDefault: false, versionNumber: 3, currentVersionPublicId: RUSH_VERSION };
+  const unpublished = { ...workflowRow, publicId: "01JTESTWF0000000000000000C", workflowKey: "later", name: "Later", isDefault: false, versionNumber: 0, currentVersionPublicId: null, definition: null };
+  const cardOf = (name: string) => screen.getByRole("heading", { name, hidden: true }).closest("article")!;
+
+  it("summarises the default, offers Set as default only on other published workflows, and explains drafts", async () => {
+    handlers.set("orders.admin.workflows.list", () => [workflowRow, rushRow, unpublished]);
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    const { container } = renderUi(<AdminWorkflowsPage />, { path: "/admin/workflows" });
+    expect(await screen.findByText("Default workflow for new orders:")).toBeInTheDocument();
+    expect(screen.getByText("Standard (version 1)")).toBeInTheDocument();
+    expect(within(cardOf("Standard")).getByText("Default")).toBeInTheDocument();
+    expect(within(cardOf("Standard")).queryByRole("button", { name: /^Set as default/ })).not.toBeInTheDocument();
+    expect(within(cardOf("Standard")).getByText("New orders use this workflow (version 1).")).toBeInTheDocument();
+    expect(within(cardOf("Rush")).getByRole("button", { name: "Set as default: Rush" })).toBeInTheDocument();
+    expect(within(cardOf("Later")).queryByRole("button", { name: /^Set as default/ })).not.toBeInTheDocument();
+    expect(within(cardOf("Later")).getByText("Publish a version before this workflow can be the default.")).toBeInTheDocument();
+    expect(screen.getByText(/A draft must be published before it can be the default workflow\./)).toBeInTheDocument();
+    expect(screen.getAllByText(/Publish a draft before making it the default\./).length).toBeGreaterThan(0);
+    await expectNoAxeViolations(container);
+  });
+
+  it("the dialog states the effect; Cancel changes nothing and returns focus to the button", async () => {
+    handlers.set("orders.admin.workflows.list", () => [workflowRow, rushRow]);
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    const user = userEvent.setup();
+    renderUi(<AdminWorkflowsPage />, { path: "/admin/workflows" });
+    const button = await screen.findByRole("button", { name: "Set as default: Rush" });
+    await user.click(button);
+    const dialog = await screen.findByRole("dialog", { name: "Make “Rush” the default workflow?" });
+    expect(dialog).toHaveTextContent("Orders created after this use “Rush”, version 3 (its latest published version).");
+    expect(dialog).toHaveTextContent("orders customers place, cart checkout, orders staff create for a customer, and orders created through the API");
+    expect(dialog).toHaveTextContent("Existing orders keep the workflow version they started with.");
+    expect(dialog).toHaveTextContent("Workflows are not chosen per product or package");
+    expect(dialog).toHaveTextContent("Current default: Standard (version 1).");
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
+    await expectNoAxeViolations(document.body);
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(calls.some((c) => c.path === "orders.admin.workflows.setDefault")).toBe(false);
+    await waitFor(() => expect(button).toHaveFocus());
+  });
+
+  it("confirming switches the default: success toast, the badge moves, focus lands on the summary", async () => {
+    let defaultId = WF;
+    handlers.set("orders.admin.workflows.list", () => [
+      { ...workflowRow, isDefault: defaultId === WF },
+      { ...rushRow, isDefault: defaultId === RUSH },
+    ]);
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    handlers.set("orders.admin.workflows.setDefault", (input) => {
+      defaultId = (input as { workflowId: string }).workflowId;
+      return { workflowPublicId: RUSH, name: "Rush", versionNumber: 3, changed: true, previousWorkflowPublicId: WF };
+    });
+    const user = userEvent.setup();
+    renderUi(<AdminWorkflowsPage />, { path: "/admin/workflows" });
+    await user.click(await screen.findByRole("button", { name: "Set as default: Rush" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "Set as default" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(calls.find((c) => c.path === "orders.admin.workflows.setDefault")?.input).toEqual({ workflowId: RUSH });
+    expect(await screen.findByText("Rush is now the default workflow")).toBeInTheDocument();
+    expect(screen.getByText("Rush (version 3)")).toBeInTheDocument();
+    expect(within(cardOf("Rush")).getByText("Default")).toBeInTheDocument();
+    expect(within(cardOf("Standard")).queryByText("Default")).not.toBeInTheDocument();
+    expect(within(cardOf("Standard")).getByRole("button", { name: "Set as default: Standard" })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("Default workflow for new orders:").closest("p")).toHaveFocus());
+  });
+
+  it("a refusal is shown in the dialog, which stays open", async () => {
+    handlers.set("orders.admin.workflows.list", () => [workflowRow, rushRow]);
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    handlers.set("orders.admin.workflows.setDefault", () => {
+      throw Object.assign(new Error("refused"), { data: { safe: { domainCode: "VALIDATION", reasonCode: "WORKFLOW_NOT_PUBLISHED", safeMessage: "This workflow has no published version yet. Publish it first, then make it the default.", requestId: "r1" } } });
+    });
+    const user = userEvent.setup();
+    renderUi(<AdminWorkflowsPage />, { path: "/admin/workflows" });
+    await user.click(await screen.findByRole("button", { name: "Set as default: Rush" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "Set as default" }));
+    expect(await within(dialog).findByText(/Publish it first, then make it the default\./)).toBeInTheDocument();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(within(cardOf("Standard")).getByText("Default")).toBeInTheDocument();
+  });
+});
+
 describe("designer phases-first", () => {
   it("opens every draft on the Phases tab, first in the tab order", async () => {
     handlers.set("orders.admin.workflows.drafts.get", () => draftView([transition], []));
@@ -602,7 +690,26 @@ describe("workflow designer — review summary", () => {
     expect(summary).toHaveTextContent("before submitting from “Submitted”; type their full name; asked again for a new policy version");
     expect(summary).toHaveTextContent("Orders/{order_ref}; 1 upload slot uses its own folder");
     expect(summary).toHaveTextContent("Example: Orders/RP-2026-000123");
+    // 07.2: where the default lives (a new version of an existing workflow).
+    expect(screen.getByText(/A draft must be published before it can be the default\./)).toHaveTextContent("You can change the default workflow any time with “Set as default” on the Workflows list.");
+    expect(screen.getByRole("checkbox", { name: /Use for new orders \(default workflow\)/ })).toBeInTheDocument();
     await expectNoAxeViolations(container);
+  });
+
+  it("07.2: a draft for a NEW workflow keeps the make-default checkbox and says it can be chosen now or later", async () => {
+    handlers.set("orders.admin.workflows.drafts.get", () => ({ ...draftView([transition], []), workflowPublicId: null, workflowKey: "rush", name: "Rush", source: "blank" }));
+    handlers.set("orders.admin.workflows.drafts.save", () => ({ rowVersion: 2, issues: [], publishable: true }));
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    const user = userEvent.setup();
+    designer();
+    await user.click(await screen.findByRole("tab", { name: "Statuses wizard" }));
+    await screen.findByRole("heading", { level: 2, name: "Statuses" });
+    for (const next of ["Transitions", "Who may move", "Notices and notes", "Status requirements", "Review and publish"]) {
+      await user.click(screen.getByRole("button", { name: "Save and continue" }));
+      expect(await screen.findByRole("heading", { level: 2, name: next })).toBeInTheDocument();
+    }
+    expect(screen.getByRole("checkbox", { name: /Use for new orders \(default workflow\)/ })).toBeInTheDocument();
+    expect(screen.getByText(/Tick the box above to make this new workflow the default when you publish it, or publish now and choose it later\./)).toHaveTextContent("“Set as default” on the Workflows list");
   });
 });
 

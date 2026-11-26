@@ -251,6 +251,32 @@ function createProtocolFakeStripe(opts: { nowSec: () => number }) {
         };
       }
 
+      // POST /v1/checkout/sessions/:id/expire (verifyCheckoutSession probe cleanup)
+      if (
+        method === "POST" &&
+        parsed.pathname.startsWith("/v1/checkout/sessions/") &&
+        parsed.pathname.endsWith("/expire")
+      ) {
+        const sessionId = decodeURIComponent(
+          parsed.pathname.slice("/v1/checkout/sessions/".length, -"/expire".length),
+        );
+        const session = sessions.get(sessionId);
+        if (!session) {
+          return {
+            status: 404,
+            headers: { "content-type": "application/json" },
+            body: Buffer.from(JSON.stringify({ error: { code: "resource_missing" } }), "utf8"),
+          };
+        }
+        const expired: FakeStripeSession = { ...session, status: "expired" };
+        sessions.set(sessionId, expired);
+        return {
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from(JSON.stringify(expired), "utf8"),
+        };
+      }
+
       // GET /v1/checkout/sessions/:id?expand[]=payment_intent.latest_charge
       if (method === "GET" && parsed.pathname.startsWith("/v1/checkout/sessions/")) {
         const sessionId = decodeURIComponent(parsed.pathname.slice("/v1/checkout/sessions/".length));
@@ -587,6 +613,10 @@ describe("Increment 07 — Stripe completion (D9), receipt PDF sync port (D12), 
     expect(okConn.ok).toBe(true);
     expect(okConn.verifiedAt).not.toBeNull();
 
+    const probeCheck = await paymentsMod.admin.verifyCheckoutSession(admin.principal);
+    expect(probeCheck.ok).toBe(true);
+    expect(probeCheck.expiredImmediately).toBe(true);
+
     const selfTest = await paymentsMod.admin.sendSelfTestWebhook(admin.principal);
     expect(selfTest.ok).toBe(true);
     expect(selfTest.httpStatus).toBe(200);
@@ -634,9 +664,12 @@ describe("Increment 07 — Stripe completion (D9), receipt PDF sync port (D12), 
     expect(submitted.provider).toBe("stripe");
     expect(submitted.redirectUrl).toMatch(/^https:\/\/checkout\.stripe\.com\/c\/pay\/cs_test_inc07_/u);
 
-    // Verify POST /v1/checkout/sessions was called with an Idempotency-Key
+    // Verify POST /v1/checkout/sessions was called with an Idempotency-Key for cart checkout
     const postSessionReq = fakeStripe.requests.find(
-      (r) => r.method === "POST" && r.path === "/v1/checkout/sessions",
+      (r) =>
+        r.method === "POST" &&
+        r.path === "/v1/checkout/sessions" &&
+        !r.idempotencyKey?.startsWith("rp-probe-"),
     );
     expect(postSessionReq).toBeDefined();
     expect(postSessionReq?.idempotencyKey).toMatch(/^rp-checkout:/u);
@@ -791,6 +824,7 @@ describe("Increment 07 — Stripe completion (D9), receipt PDF sync port (D12), 
       stripeWebhookSecret: stripeWh,
     });
     expect((await paymentsMod.admin.testConnection(admin.principal)).ok).toBe(true);
+    expect((await paymentsMod.admin.verifyCheckoutSession(admin.principal)).ok).toBe(true);
     expect((await paymentsMod.admin.sendSelfTestWebhook(admin.principal)).ok).toBe(true);
     await paymentsMod.admin.updateSettings(admin.principal, {
       provider: "stripe",
@@ -1026,6 +1060,7 @@ describe("Increment 07 — Stripe completion (D9), receipt PDF sync port (D12), 
       stripeWebhookSecret: stripeWh,
     });
     expect((await paymentsMod.admin.testConnection(admin.principal)).ok).toBe(true);
+    expect((await paymentsMod.admin.verifyCheckoutSession(admin.principal)).ok).toBe(true);
     expect((await paymentsMod.admin.sendSelfTestWebhook(admin.principal)).ok).toBe(true);
     await paymentsMod.admin.updateSettings(admin.principal, {
       provider: "stripe",
@@ -1214,6 +1249,7 @@ describe("Increment 07 — Stripe completion (D9), receipt PDF sync port (D12), 
       stripeWebhookSecretSecondary: secondaryWh,
     });
     expect((await paymentsMod.admin.testConnection(admin.principal)).ok).toBe(true);
+    expect((await paymentsMod.admin.verifyCheckoutSession(admin.principal)).ok).toBe(true);
     expect((await paymentsMod.admin.sendSelfTestWebhook(admin.principal)).ok).toBe(true);
     const savedWithSecondary = await paymentsMod.admin.updateSettings(admin.principal, {
       provider: "stripe",
@@ -1521,8 +1557,9 @@ describe("Increment 07 — Stripe completion (D9), receipt PDF sync port (D12), 
       reasonCode: "STRIPE_API_NOT_VERIFIED",
     });
 
-    // Re-verify API -> activate succeeds -> switching back to Pay by invoice ("none") works cleanly.
+    // Re-verify API + Checkout session probe -> activate succeeds -> switching back to Pay by invoice ("none") works cleanly.
     expect((await paymentsMod.admin.testConnection(admin.principal)).ok).toBe(true);
+    expect((await paymentsMod.admin.verifyCheckoutSession(admin.principal)).ok).toBe(true);
     const activated = await paymentsMod.admin.updateSettings(admin.principal, {
       provider: "stripe",
       mode: "test",
@@ -1531,7 +1568,7 @@ describe("Increment 07 — Stripe completion (D9), receipt PDF sync port (D12), 
     expect(activated.provider).toBe("stripe");
     expect(activated.onlineEnabled).toBe(true);
 
-    // Rotating the staged secret key invalidates lastApiVerifiedAt immediately even while provider is stripe.
+    // Rotating the staged secret key invalidates lastApiVerifiedAt + probe immediately.
     const rotated = await paymentsMod.admin.updateSettings(admin.principal, {
       provider: "none",
       mode: "test",
@@ -1541,6 +1578,17 @@ describe("Increment 07 — Stripe completion (D9), receipt PDF sync port (D12), 
     expect(rotated.provider).toBe("none");
     expect(rotated.stripe.lastApiVerifiedAt).toBeNull();
     expect((await paymentsMod.admin.testConnection(admin.principal)).ok).toBe(true);
+    await expect(
+      paymentsMod.admin.updateSettings(admin.principal, {
+        provider: "stripe",
+        mode: "test",
+        currency: "USD",
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      reasonCode: "STRIPE_CHECKOUT_SESSION_NOT_VERIFIED",
+    });
+    expect((await paymentsMod.admin.verifyCheckoutSession(admin.principal)).ok).toBe(true);
     await paymentsMod.admin.updateSettings(admin.principal, {
       provider: "stripe",
       mode: "test",
