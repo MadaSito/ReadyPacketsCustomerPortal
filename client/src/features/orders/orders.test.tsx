@@ -567,6 +567,8 @@ describe("order detail host", () => {
     handlers.set("orders.get", () => detail);
     const { container } = renderDetail(`/orders/${ORDER_ID}`);
     expect(await screen.findByRole("heading", { level: 1, name: "Synthetic project" })).toBeInTheDocument();
+    // Increment 08: customers land on the wizard; the former tabs sit behind "Order details".
+    await userEvent.setup().click(screen.getByRole("button", { name: "Order details" }));
     const tabs = screen.getByRole("tablist", { name: "Order sections" });
     expect(within(tabs).getAllByRole("tab").map((t) => t.textContent)).toEqual(["Overview", "Files", "Notes", "Sharing"]);
     expect(screen.getAllByText("Synthetic item").length).toBeGreaterThan(0);
@@ -887,6 +889,7 @@ describe("increment 02 display", () => {
       </Route>,
       { path: `/orders/${ORDER_ID}` },
     );
+    await user.click(await screen.findByRole("button", { name: "Order details" }));
     expect((await screen.findAllByText("Premium")).length).toBeGreaterThan(0);
     expect(screen.getAllByText("1 - 2 synthetic days").length).toBeGreaterThan(0);
     expect(screen.getAllByText(/Synthetic outcome/).length).toBeGreaterThan(0);
