@@ -97,13 +97,13 @@ Run these 15 checks, marking the results in the main worksheet below. For Stripe
 
 | ID | Priority | Where and what to do | Expected | Result / evidence / tester |
 | --- | --- | --- | --- | --- |
-| ADD-01 | Blocker | Open the first `Ice Queen` order → **Add packets to this project**. | `/orders/new?addTo=…` shows the fixed project name. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ADD-01 | Blocker | `/orders` → open the first `Ice Queen` order → **Add packets to this project**. | `/orders/new?addTo=…` opens **Add packets to Ice Queen**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | ADD-02 | Blocker | In that picker try choosing a different tier of packet 1. | **Already in this project**; packet 1 cannot be selected. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| ADD-03 | Important | Select packets 2 and 4; go from `/cart` to `/cart/checkout`. | Summary identifies `Ice Queen` and the root reference. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ADD-03 | Important | Select packets 2 and 4; go from `/cart` to `/cart/checkout`. | **Adding to project Ice Queen** followed by the root reference in parentheses. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | ADD-04 | Blocker | Finish the addition; open it from `/orders`. | A distinct reference shares the root stem and uses the next unused suffix. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | ADD-05 | Blocker | Compare the root and addition invoice links. | The addition has its own invoice. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | ADD-06 | Blocker | In customer B’s session, open customer A’s synthetic add-on URL. | No project details exposed and no addition can be placed. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
-| ADD-07 | Important | `/admin/orders` → open the synthetic root → open its related addition. | Console link opens the correct related order. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| ADD-07 | Important | `/admin/orders` → open the root → **Orders in this project** → click the addition reference. | The addition opens, not the root. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Billing
 
@@ -372,5 +372,4 @@ In Stripe, open **each** configured endpoint and compare its subscribed events w
 ### TODO for release lead: confirm final Increment 08 labels
 
 - **D1/D4:** Confirm registration billing disclosure and checkout radio and checkbox copy (BIL-01–02, BIL-05–07).
-- **D3:** Confirm final checkout project-target text and console related-orders heading (ADD-03, ADD-07).
 - **D5:** Confirm admin repair placement and the new paid banner, receipt and wizard actions (PAY-09, PAY-11–12, PAY-15, PAY-29, PAY-31–32).
