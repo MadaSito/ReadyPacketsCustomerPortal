@@ -14,6 +14,7 @@ import { Link, useLocation } from "wouter";
 import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
 import { Badge, Button, Callout, Card, ConfirmDialog, DataTable, DateTime, Dialog, EmptyState, ErrorState, Field, Input, PageHeader, RadioGroup, Select, Skeleton, StepUpCancelledError, useStepUp, useToast } from "@/ui";
 import { OrderStatusBadge } from "../shared";
+import { PublishDraftRowAction } from "./workflows/PublishDraftDialog";
 import { keyFromLabel, type DraftListRow, type WorkflowListRow } from "./workflows/model";
 import { useWorkflowTransfer } from "./workflows/useWorkflowTransfer";
 
@@ -282,6 +283,9 @@ export default function AdminWorkflowsPage() {
           ]}
           rowActions={(draft) => (
             <div className="flex flex-wrap gap-2 md:justify-end">
+              <PublishDraftRowAction
+                draft={{ publicId: draft.publicId, name: draft.name, rowVersion: draft.rowVersion, errorCount: draft.errorCount, newWorkflow: draft.workflowPublicId === null }}
+              />
               {draft.workflowPublicId === null ? transfer.exportAction(draft.workflowKey, draft.name) : null}
               <Button size="sm" variant="ghost" aria-label={`Discard draft ${draft.name}`} onClick={() => setDiscarding(draft)}>
                 Discard
