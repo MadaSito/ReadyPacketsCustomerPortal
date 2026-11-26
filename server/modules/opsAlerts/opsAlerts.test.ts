@@ -8,6 +8,7 @@ import { orders } from "../orders/schema.js";
 import { ATTENTION_ALERTS_ENABLED } from "./attention.js";
 import { createOpsAlertsModule, type OpsAlertsModule } from "./index.js";
 import { operationalAlerts } from "./schema.js";
+import { stripeWebhookDeliveryMissingAlert } from "./stripeWebhook.js";
 
 let database: TestDb;
 let harness: TestHarness;
@@ -33,6 +34,21 @@ beforeEach(async () => {
 });
 
 describe("operations alert persistence", () => {
+  it("deduplicates missing Stripe webhook warnings by environment, not by payment", async () => {
+    const test = stripeWebhookDeliveryMissingAlert("test");
+    const [first, second] = await Promise.all([service.emit(test), service.emit(test)]);
+    expect(second.publicId).toBe(first.publicId);
+    const live = await service.emit(stripeWebhookDeliveryMissingAlert("live"));
+    expect(live.publicId).not.toBe(first.publicId);
+    expect(await service.summary()).toMatchObject({ warning: 2 });
+    const alerts = await service.list({ source: "payment" });
+    expect(alerts.items.map(({ title, code, orderPublicId }) => ({ title, code, orderPublicId }))).toEqual(
+      Array.from({ length: 2 }, () => ({
+        title: "Stripe is not delivering webhooks to this server", code: "STRIPE_WEBHOOK_DELIVERY_MISSING", orderPublicId: null,
+      })),
+    );
+  });
+
   it("registers the daily attention queue and leaves it off on older configuration", async () => {
     expect(await service.reminderConfig()).toEqual({ enabled: false, hours: 48 });
     const schedule = harness.jobs.schedules.find(({ type }) => type === "ops.alerts.attention_check")!;

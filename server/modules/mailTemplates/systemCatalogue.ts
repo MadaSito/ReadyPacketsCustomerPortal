@@ -26,13 +26,14 @@ interface CatalogueSeed {
 }
 
 const DEFAULT_VAR_LABELS: Readonly<Record<string, { label: string; sample: string }>> = {
-  name: { label: "Recipient display name", sample: "Alex Rivera" },
-  recipient_name: { label: "Recipient display name", sample: "Alex Rivera" },
+  name: { label: "Recipient name", sample: "Zeus" },
+  recipient_name: { label: "Recipient greeting name", sample: "Zeus" },
   link: { label: "Action or portal URL", sample: "https://portal.readypackets.example/orders/01J9EXAMPLE00000000000000" },
   signInLink: { label: "Sign-in URL", sample: "https://portal.readypackets.example/sign-in" },
   resetLink: { label: "Password reset URL", sample: "https://portal.readypackets.example/forgot-password" },
-  reference: { label: "Order reference", sample: "RP-2026-0142" },
-  orderReference: { label: "Order reference", sample: "RP-2026-0142" },
+  reference: { label: "Order reference", sample: "RP-A1B2-ZEUGRE-ICEQUE-001" },
+  orderReference: { label: "Order reference", sample: "RP-A1B2-ZEUGRE-ICEQUE-001" },
+  order_reference: { label: "Order reference", sample: "RP-A1B2-ZEUGRE-ICEQUE-001" },
   projectName: { label: "Project", sample: "Acme Formation Packet" },
   statusLabel: { label: "Order status", sample: "In review" },
   questionnaireTitle: { label: "Questionnaire title", sample: "Entity Onboarding Questionnaire" },
@@ -44,6 +45,12 @@ const DEFAULT_VAR_LABELS: Readonly<Record<string, { label: string; sample: strin
   windowLabel: { label: "Maintenance window", sample: "Sunday 02:00–03:00 UTC" },
   summary: { label: "Maintenance summary", sample: "Scheduled database and security maintenance" },
 };
+
+/** Refresh shipped previews without changing published template contracts or custom samples. */
+export function systemOrderReferenceSamples(vars: MailTemplateVariableSpec[]): MailTemplateVariableSpec[] {
+  return vars.map((spec) => spec.name === "reference" || spec.name === "orderReference" || spec.name === "order_reference"
+    ? { ...spec, sampleValue: DEFAULT_VAR_LABELS[spec.name]!.sample } : spec);
+}
 
 const KNOWN_SYSTEM_SEEDS: Readonly<Record<string, CatalogueSeed>> = {
   payment_receipt: {

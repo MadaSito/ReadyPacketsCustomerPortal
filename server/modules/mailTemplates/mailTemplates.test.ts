@@ -1,3 +1,4 @@
+import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
@@ -102,6 +103,15 @@ beforeEach(async () => {
 });
 
 describe("mailTemplates module (Package D)", () => {
+  it("uses the new synthetic order reference in system samples", async () => {
+    const template = await mod.get(adminPrincipal, { templateKey: "orders.status_changed" });
+    const expected = expect.objectContaining({ name: "reference", sampleValue: "RP-A1B2-ZEUGRE-ICEQUE-001" });
+    expect(template.declaredVars).toContainEqual(expected);
+    await tdb.db.update(mailTemplates).set({
+      declaredVarsJson: template.declaredVars.map((spec) => spec.name === "reference" ? { ...spec, sampleValue: "RP-2026-000100" } : spec),
+    }).where(eq(mailTemplates.templateKey, template.templateKey));
+    expect((await mod.get(adminPrincipal, { templateKey: template.templateKey })).declaredVars).toContainEqual(expected);
+  });
   it("limits phase actions to the approved contracts and compatible published custom mail", async () => {
     async function create(templateKey: string, name: string, variable: string, sensitive = false) {
       return mod.createCustom(adminPrincipal, {
