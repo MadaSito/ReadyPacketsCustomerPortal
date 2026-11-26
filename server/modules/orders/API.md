@@ -537,7 +537,7 @@ See [D4 phase work API](./questions/API.md) for the `orders.questions` and `orde
 | Surface | Change |
 | --- | --- |
 | `orders.create`, `admin.createForCustomer` | optional `addToOrderPublicId` (any order in the group; resolved to the root). Errors: `CONFLICT:ADD_ON_TARGET_UNAVAILABLE` (not found, other owner, cancelled root, other currency), `CONFLICT:PACKET_ALREADY_IN_PROJECT` (a packet number already in a non-cancelled group order). |
-| `orders.addOnTarget({ orderId })` | customer + `orders.create`: `{ rootPublicId, rootReference, projectName, currency, packetNumbers, available, reason }`. |
+| `orders.addOnTarget({ orderId })` | customer + `orders.create`: `{ rootPublicId, rootReference, projectName, currency, packetNumbers } \| null` (null when the order is missing, belongs to someone else or the root is cancelled; staff get null). |
 | `orders.get` | adds `group: { rootPublicId, orders: [{ publicId, reference, createdAt, statusLabel, packetNumbers, current }] }` (owner, staff and admin see the whole group; grantees see only the current order), `canAddPackets`, and `transitions[].kind: "forward" \| "cancel"`. |
 | `orders.list`, admin list | items add `group: { rootPublicId, rootReference } \| null`. |
 | Ports (`OrdersModule`) | `addOnTargetInTx(tx, ownerUserId, publicId)`, `lockAddOnRootInTx(tx, ownerUserId, publicId) → { rootPublicId } \| null` (cart checkout locks the root before its actor check). `createOrderFromCheckoutInTx` accepts `addToOrderPublicId`. |
