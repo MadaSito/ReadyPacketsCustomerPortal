@@ -234,7 +234,11 @@ export interface CartBillingProfileRecord {
 }
 
 export interface CartBillingProfilePort {
-  getForUserInTx(tx: DbOrTx, userId: number): Promise<CartBillingProfileRecord | null>;
+  getForUserInTx(
+    tx: DbOrTx,
+    userId: number,
+    options?: { forUpdate?: boolean },
+  ): Promise<CartBillingProfileRecord | null>;
   saveForUserInTx(
     tx: Tx,
     userId: number,

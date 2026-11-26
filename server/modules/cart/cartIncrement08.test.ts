@@ -37,6 +37,7 @@ import {
 import type { CartCheckoutAmountEvaluation, CartPaymentsPort } from "./ports.js";
 import * as cartTables from "./schema.js";
 import { CART_FEATURE_FLAG, CART_UPSELL_FEATURE_FLAG } from "./settings.js";
+import { checkoutInputSchema } from "./types.js";
 
 const testSchema = {
   users,
@@ -133,6 +134,7 @@ let ordersMod: OrdersModule;
 let billingProfileMod: BillingProfileModule;
 let cartMod: CartModule;
 let callTrace: string[];
+let afterLockAddOnRootHook: (() => Promise<void>) | null = null;
 let admin: TestUser;
 let zeus: TestUser;
 let otherBuyer: TestUser;
@@ -151,7 +153,15 @@ beforeAll(async () => {
     ...rawOrdersMod,
     async lockAddOnRootInTx(tx, ownerUserId, orderPublicId) {
       callTrace.push("orders.lockAddOnRootInTx");
-      return origLockAddOnRoot(tx, ownerUserId, orderPublicId);
+      const res = await origLockAddOnRoot(tx, ownerUserId, orderPublicId);
+      // Ensure `tx`'s InnoDB REPEATABLE READ consistent snapshot is open before `users` FOR UPDATE:
+      await tx.select({ id: users.id }).from(users).where(eq(users.id, ownerUserId)).limit(1);
+      if (afterLockAddOnRootHook) {
+        const hook = afterLockAddOnRootHook;
+        afterLockAddOnRootHook = null;
+        await hook();
+      }
+      return res;
     },
   };
 
@@ -305,6 +315,99 @@ describe("Increment 08 — D4 shared billing schema re-export", () => {
 });
 
 describe("Increment 08 — D4 saved billing profile vs custom billing at checkout", () => {
+  it("enforces mandatory CAS generation tokens on billingSource='saved' and saveAsBillingProfile=true while keeping plain custom checkout unchanged", () => {
+    const base = {
+      cartPublicId: ulid(),
+      expectedVersion: 1,
+      policyAcceptances: [],
+      idempotencyKey: "idem-schema-cas-check",
+    };
+
+    // Legacy plain custom checkout (no billingSource / saveAsBillingProfile=false) requires no CAS tokens.
+    expect(
+      checkoutInputSchema.safeParse({
+        ...base,
+        billing: ZEUS_SAVED_BILLING,
+      }).success,
+    ).toBe(true);
+    expect(
+      checkoutInputSchema.safeParse({
+        ...base,
+        billingSource: "custom",
+        billing: ZEUS_SAVED_BILLING,
+        saveAsBillingProfile: false,
+      }).success,
+    ).toBe(true);
+
+    // `billingSource: "saved"` requires BOTH `savedBillingVersion >= 1` AND `savedBillingPublicId`.
+    expect(
+      checkoutInputSchema.safeParse({
+        ...base,
+        billingSource: "saved",
+      }).success,
+    ).toBe(false);
+    expect(
+      checkoutInputSchema.safeParse({
+        ...base,
+        billingSource: "saved",
+        savedBillingVersion: 1,
+      }).success,
+    ).toBe(false);
+    expect(
+      checkoutInputSchema.safeParse({
+        ...base,
+        billingSource: "saved",
+        savedBillingPublicId: ulid(),
+      }).success,
+    ).toBe(false);
+    expect(
+      checkoutInputSchema.safeParse({
+        ...base,
+        billingSource: "saved",
+        savedBillingPublicId: ulid(),
+        savedBillingVersion: 1,
+      }).success,
+    ).toBe(true);
+
+    // `saveAsBillingProfile: true` requires either `savedBillingVersion: 0` (sentinel) or `version >= 1` + `publicId`.
+    expect(
+      checkoutInputSchema.safeParse({
+        ...base,
+        billingSource: "custom",
+        billing: ZEUS_SAVED_BILLING,
+        saveAsBillingProfile: true,
+      }).success,
+    ).toBe(false);
+    expect(
+      checkoutInputSchema.safeParse({
+        ...base,
+        billingSource: "custom",
+        billing: ZEUS_SAVED_BILLING,
+        saveAsBillingProfile: true,
+        savedBillingVersion: 0,
+      }).success,
+    ).toBe(true);
+    expect(
+      checkoutInputSchema.safeParse({
+        ...base,
+        billingSource: "custom",
+        billing: ZEUS_SAVED_BILLING,
+        saveAsBillingProfile: true,
+        savedBillingVersion: 2,
+      }).success,
+    ).toBe(false);
+    expect(
+      checkoutInputSchema.safeParse({
+        ...base,
+        billingSource: "custom",
+        billing: ZEUS_SAVED_BILLING,
+        saveAsBillingProfile: true,
+        savedBillingPublicId: ulid(),
+        savedBillingVersion: 2,
+      }).success,
+    ).toBe(true);
+  });
+
   it("rejects billingSource='saved' with SAVED_BILLING_NOT_FOUND when customer has no saved profile", async () => {
     const afterAdd = await cartMod.addItems(zeus.principal, {
       items: [{ productPublicId: packet1ProductId, quantity: 1 }],
@@ -316,6 +419,8 @@ describe("Increment 08 — D4 saved billing profile vs custom billing at checkou
         cartPublicId: afterAdd.cartPublicId!,
         expectedVersion: afterAdd.version,
         billingSource: "saved",
+        savedBillingPublicId: ulid(),
+        savedBillingVersion: 1,
         policyAcceptances: [],
         idempotencyKey: `idem-nosaved-${ulid()}`,
       }),
@@ -339,6 +444,7 @@ describe("Increment 08 — D4 saved billing profile vs custom billing at checkou
       billingSource: "custom",
       billing: ZEUS_SAVED_BILLING,
       saveAsBillingProfile: true,
+      savedBillingVersion: 0,
       policyAcceptances: [],
       idempotencyKey: `idem-save-profile-${ulid()}`,
     });
@@ -350,7 +456,7 @@ describe("Increment 08 — D4 saved billing profile vs custom billing at checkou
     expect(savedAfterFirst?.details.company).toBe("Ice Queen Studio");
     expect(savedAfterFirst?.details.country).toBe("US");
 
-    // Second checkout uses `billingSource: "saved"` without sending `billing` (and ignores any stale client fields).
+    // Second checkout uses `billingSource: "saved"` with generation tuple without sending `billing`.
     const secondCart = await cartMod.addItems(zeus.principal, {
       items: [{ productPublicId: packet2ProductId, quantity: 1 }],
       projectName: "Glacier Ridge",
@@ -360,6 +466,8 @@ describe("Increment 08 — D4 saved billing profile vs custom billing at checkou
       expectedVersion: secondCart.version,
       projectName: "Glacier Ridge",
       billingSource: "saved",
+      savedBillingPublicId: savedAfterFirst!.publicId,
+      savedBillingVersion: savedAfterFirst!.version,
       policyAcceptances: [],
       idempotencyKey: `idem-use-saved-${ulid()}`,
     });
@@ -450,6 +558,7 @@ describe("Increment 08 — D3 add-to-existing-order cart & checkout flow", () =>
   let iceQueenRootOrderPublicId: string;
 
   it("sets addToOrderPublicId, excludes owned packets from upsells, rejects duplicate/foreign targets, and locks root order before actorCheck at checkout", async () => {
+    const savedProfile = (await billingProfileMod.get(zeus.principal))!;
     // Create a clean root order on "Ice Queen" with Packet 1.
     const rootCart = await cartMod.addItems(zeus.principal, {
       items: [{ productPublicId: packet1ProductId, quantity: 1 }],
@@ -461,6 +570,8 @@ describe("Increment 08 — D3 add-to-existing-order cart & checkout flow", () =>
       expectedVersion: rootCart.version,
       projectName: "Ice Queen",
       billingSource: "saved",
+      savedBillingPublicId: savedProfile.publicId,
+      savedBillingVersion: savedProfile.version,
       policyAcceptances: [],
       idempotencyKey: `idem-root-iq-${ulid()}`,
     });
@@ -512,12 +623,46 @@ describe("Increment 08 — D3 add-to-existing-order cart & checkout flow", () =>
       reasonCode: "PACKET_ALREADY_IN_PROJECT",
     } satisfies Partial<DomainError>);
 
+    // Forced InnoDB REPEATABLE READ overlap around `users` lock:
+    // After D3 `lockAddOnRootInTx` opens `tx`'s RR consistent snapshot at `savedProfile.version` (before `users FOR UPDATE`),
+    // a concurrent `billingProfile.save` commits `version + 1` right before `cart.checkout` acquires `users FOR UPDATE`.
+    // `getForUserInTx(..., { forUpdate: true })` performs a current locking read and catches `SAVED_BILLING_CHANGED`.
+    afterLockAddOnRootHook = async () => {
+      await billingProfileMod.save(zeus.principal, {
+        details: {
+          ...ZEUS_SAVED_BILLING,
+          addressLine1: "401 Glacier Way",
+        },
+        expectedPublicId: savedProfile.publicId,
+        expectedVersion: savedProfile.version,
+      });
+    };
+    await expect(
+      cartMod.checkout(zeus.principal, {
+        cartPublicId: addOnCart.cartPublicId!,
+        expectedVersion: addOnCart.version,
+        billingSource: "saved",
+        savedBillingPublicId: savedProfile.publicId,
+        savedBillingVersion: savedProfile.version,
+        policyAcceptances: [],
+        idempotencyKey: `idem-rr-overlap-${ulid()}`,
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      reasonCode: "SAVED_BILLING_CHANGED",
+    } satisfies Partial<DomainError>);
+
+    const refreshedProfile = (await billingProfileMod.get(zeus.principal))!;
+    expect(refreshedProfile.version).toBe(savedProfile.version + 1);
+
     // Checkout locks group root (`orders.lockAddOnRootInTx`) BEFORE `identity.assertActiveActor` and links child order!
     callTrace.length = 0;
     const childCheckout = await cartMod.checkout(zeus.principal, {
       cartPublicId: addOnCart.cartPublicId!,
       expectedVersion: addOnCart.version,
       billingSource: "saved",
+      savedBillingPublicId: refreshedProfile.publicId,
+      savedBillingVersion: refreshedProfile.version,
       policyAcceptances: [],
       idempotencyKey: `idem-child-iq-${ulid()}`,
     });
@@ -542,6 +687,7 @@ describe("Increment 08 — D3 add-to-existing-order cart & checkout flow", () =>
   });
 
   it("flags existing conflicting items when setTarget attaches an open cart, blocks checkout until resolved, and clears target cleanly", async () => {
+    const savedProfile = (await billingProfileMod.get(zeus.principal))!;
     // Zeus adds Packet 1 to a standalone open cart first, then points the cart at "Ice Queen" via `setTarget`.
     await cartMod.addItems(zeus.principal, {
       items: [{ productPublicId: packet1ProductId, quantity: 1 }],
@@ -561,6 +707,8 @@ describe("Increment 08 — D3 add-to-existing-order cart & checkout flow", () =>
         cartPublicId: retargeted.cartPublicId!,
         expectedVersion: retargeted.version,
         billingSource: "saved",
+        savedBillingPublicId: savedProfile.publicId,
+        savedBillingVersion: savedProfile.version,
         policyAcceptances: [],
         idempotencyKey: `idem-conflict-iq-${ulid()}`,
       }),
@@ -582,6 +730,8 @@ describe("Increment 08 — D3 add-to-existing-order cart & checkout flow", () =>
       expectedVersion: cleared.version,
       projectName: "Fresh Standalone Project",
       billingSource: "saved",
+      savedBillingPublicId: savedProfile.publicId,
+      savedBillingVersion: savedProfile.version,
       policyAcceptances: [],
       idempotencyKey: `idem-fresh-standalone-${ulid()}`,
     });

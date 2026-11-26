@@ -278,11 +278,28 @@ export const checkoutInputSchema = z
         message: "Provide billing information or select your saved billing information.",
       });
     }
-    if (effectiveSource === "saved" && val.savedBillingVersion === 0) {
+    if (effectiveSource === "saved") {
+      if (val.savedBillingVersion === undefined || val.savedBillingVersion < 1) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["savedBillingVersion"],
+          message: "savedBillingVersion must be at least 1 when billingSource is saved.",
+        });
+      }
+      if (!val.savedBillingPublicId) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["savedBillingPublicId"],
+          message: "savedBillingPublicId is required when billingSource is saved.",
+        });
+      }
+      return;
+    }
+    if (val.saveAsBillingProfile && val.savedBillingVersion === undefined) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["savedBillingVersion"],
-        message: "savedBillingVersion must be at least 1 when billingSource is saved.",
+        message: "savedBillingVersion is required when saveAsBillingProfile is true.",
       });
     }
     if (val.savedBillingVersion !== undefined && val.savedBillingVersion >= 1 && !val.savedBillingPublicId) {

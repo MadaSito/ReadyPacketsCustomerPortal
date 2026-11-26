@@ -1145,3 +1145,52 @@ it("Increment 08 D3 + D4 + D6: supports saved vs custom billing choice, save-as-
   paidReturn.unmount();
 }, 15_000);
 
+it("WCAG 2.2 AA 2.4.3: preserves keyboard focus to Continue to your order when manual Check payment status or error retry settles, without stealing focus during polling", async () => {
+  const user = userEvent.setup();
+  const settledPaid = {
+    ...pending,
+    confirmationState: "paid" as const,
+    attemptStatus: "paid" as const,
+    invoiceStatus: "paid" as const,
+    balanceDueMinor: 0,
+    attemptInFlight: false,
+    canRestoreToCart: false,
+  };
+
+  // 1. Keyboard user activates `Check payment status` -> button unmounts on `paid` -> focus lands on `Continue to your order`
+  mocks.status.mockResolvedValueOnce(pending).mockResolvedValueOnce(settledPaid);
+  const manualView = returned(`?cart=${cartId}`);
+  const checkBtn = await screen.findByRole("button", { name: "Check payment status" });
+  checkBtn.focus();
+  expect(document.activeElement).toBe(checkBtn);
+  await user.keyboard("{Enter}");
+
+  const continueLinkAfterManual = await screen.findByRole("link", { name: "Continue to your order" });
+  await waitFor(() => expect(document.activeElement).toBe(continueLinkAfterManual));
+  manualView.unmount();
+
+  // 2. First-error retry (`Try again`) settles to `paid` -> focus lands on `Continue to your order`
+  mocks.status.mockRejectedValueOnce(new Error("Temporary network timeout.")).mockResolvedValueOnce(settledPaid);
+  const errorRetryView = returned(`?cart=${cartId}`);
+  const retryBtn = await screen.findByRole("button", { name: /try again/i });
+  retryBtn.focus();
+  await user.keyboard("{Enter}");
+
+  const continueLinkAfterRetry = await screen.findByRole("link", { name: "Continue to your order" });
+  await waitFor(() => expect(document.activeElement).toBe(continueLinkAfterRetry));
+  errorRetryView.unmount();
+
+  // 3. Background polling transition does NOT steal focus from another focused element
+  mocks.status.mockResolvedValueOnce(pending).mockResolvedValueOnce(settledPaid);
+  const pollView = returned(`?cart=${cartId}`);
+  await screen.findByRole("button", { name: "Check payment status" });
+  const invoiceLink = screen.getByRole("link", { name: "View invoice" });
+  invoiceLink.focus();
+  expect(document.activeElement).toBe(invoiceLink);
+
+  // Wait for automatic 2.5s poll to settle to `paid`
+  await screen.findByRole("link", { name: "Continue to your order" }, { timeout: 4500 });
+  expect(document.activeElement).toBe(invoiceLink);
+  pollView.unmount();
+}, 15_000);
+

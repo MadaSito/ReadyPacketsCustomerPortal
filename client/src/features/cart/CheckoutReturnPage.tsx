@@ -1,7 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { inferRouterOutputs } from "@trpc/server";
 import type { AppRouter } from "@server/trpc/root";
-import { useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { Link, useSearch } from "wouter";
 import { StaffOrderHandoff } from "@/app/portal";
 import { InvoiceOnlinePayAction } from "@/features/compliance/customer/InvoicePages";
@@ -74,11 +74,13 @@ function CheckoutResult({
   data,
   cancelRoute,
   onChanged,
+  primaryActionRef,
   actions,
 }: {
   data: CheckoutStatus;
   cancelRoute: boolean;
   onChanged: () => void;
+  primaryActionRef?: RefObject<HTMLAnchorElement | null>;
   actions?: ReactNode;
 }) {
   const [payError, setPayError] = useState<string | null>(null);
@@ -142,7 +144,7 @@ function CheckoutResult({
           ) : awaitingUnpaid && !data.onlinePaymentAvailable ? (
             <>
               <Button asChild variant="primary">
-                <Link href={`/invoices/${encodeURIComponent(data.invoicePublicId)}`}>View invoice</Link>
+                <Link ref={primaryActionRef} href={`/invoices/${encodeURIComponent(data.invoicePublicId)}`}>View invoice</Link>
               </Button>
               <Button asChild variant="secondary">
                 <Link href={`/orders/${encodeURIComponent(data.orderPublicId)}`}>View order</Link>
@@ -154,7 +156,7 @@ function CheckoutResult({
           ) : data.confirmationState === "paid" || data.confirmationState === "no_payment_due" ? (
             <>
               <Button asChild variant="primary">
-                <Link href={`/orders/${encodeURIComponent(data.orderPublicId)}`}>Continue to your order</Link>
+                <Link ref={primaryActionRef} href={`/orders/${encodeURIComponent(data.orderPublicId)}`}>Continue to your order</Link>
               </Button>
               <Button asChild variant="secondary">
                 <Link href={`/invoices/${encodeURIComponent(data.invoicePublicId)}`}>View invoice</Link>
@@ -163,7 +165,7 @@ function CheckoutResult({
           ) : (
             <>
               <Button asChild variant="secondary">
-                <Link href={`/orders/${encodeURIComponent(data.orderPublicId)}`}>View order</Link>
+                <Link ref={primaryActionRef} href={`/orders/${encodeURIComponent(data.orderPublicId)}`}>View order</Link>
               </Button>
               <Button asChild variant="secondary">
                 <Link href={`/invoices/${encodeURIComponent(data.invoicePublicId)}`}>View invoice</Link>
@@ -184,6 +186,10 @@ function CheckoutStatusLoader({ target, cancelRoute, renderActions }: {
 }) {
   const trpc = useTRPC();
   const queryClient = useQueryClient();
+  const manualCheckPendingRef = useRef(false);
+  const errorRetryPendingRef = useRef(false);
+  const primaryActionRef = useRef<HTMLAnchorElement | null>(null);
+  const manualCheckButtonRef = useRef<HTMLButtonElement | null>(null);
   const options = trpc.cart.checkoutStatus.queryOptions(target, {
     refetchOnMount: "always",
     refetchIntervalInBackground: false,
@@ -193,11 +199,42 @@ function CheckoutStatusLoader({ target, cancelRoute, renderActions }: {
   const status = useQuery(options);
   const reload = () => { void status.refetch(); };
   const data = status.data;
+  const showManualCheckButton = Boolean(
+    data && (data.confirmationState === "pending_confirmation" || data.attemptInFlight),
+  );
+
+  // WCAG 2.2 AA 2.4.3: only when the user explicitly activated `Check payment status` or `ErrorState` retry and
+  // that control unmounted on transition, hand focus to the persistent actionable element (never during polling).
+  useEffect(() => {
+    if (status.isFetching || !manualCheckPendingRef.current) return;
+    const fromErrorRetry = errorRetryPendingRef.current;
+    manualCheckPendingRef.current = false;
+    errorRetryPendingRef.current = false;
+    if (!data) return;
+    if (!showManualCheckButton) {
+      primaryActionRef.current?.focus();
+    } else if (fromErrorRetry) {
+      manualCheckButtonRef.current?.focus();
+    }
+  }, [data, showManualCheckButton, status.isFetching]);
+
   if (status.isPending) return <div role="status" aria-label="Checking checkout status"><Skeleton lines={5} /></div>;
-  if (status.isError || !data) return <ErrorState title="Checkout status could not be confirmed" error={status.error} onRetry={reload} />;
+  if (status.isError || !data) {
+    return (
+      <ErrorState
+        title="Checkout status could not be confirmed"
+        error={status.error}
+        onRetry={() => {
+          manualCheckPendingRef.current = true;
+          errorRetryPendingRef.current = true;
+          reload();
+        }}
+      />
+    );
+  }
   const checks = queryClient.getQueryState(options.queryKey)?.dataUpdateCount ?? 0;
   const pollingFinished = !cancelRoute && data.confirmationState === "pending_confirmation" && checks >= maxStatusChecks;
-  return <CheckoutResult data={data} cancelRoute={cancelRoute} onChanged={reload} actions={<div className="grid gap-4">
+  return <CheckoutResult data={data} cancelRoute={cancelRoute} onChanged={reload} primaryActionRef={primaryActionRef} actions={<div className="grid gap-4">
     {renderActions?.(data, target, reload)}
     {pollingFinished ? <p role="status" className="text-sm text-muted">Automatic checks ended. You can check the payment status again at any time.</p> : null}
     {!cancelRoute &&
@@ -208,8 +245,18 @@ function CheckoutStatusLoader({ target, cancelRoute, renderActions }: {
       (data.canRestoreToCart || data.alreadyRestored) ? <div><Button asChild variant="secondary">
         <Link href={`/checkout/cancel?cart=${encodeURIComponent(data.cartPublicId)}`}>Review cart recovery</Link>
       </Button></div> : null}
-    {data.confirmationState === "pending_confirmation" || data.attemptInFlight ? <div>
-      <Button variant="secondary" onClick={reload} disabled={status.isFetching}>Check payment status</Button>
+    {showManualCheckButton ? <div>
+      <Button
+        ref={manualCheckButtonRef}
+        variant="secondary"
+        loading={status.isFetching}
+        onClick={() => {
+          manualCheckPendingRef.current = true;
+          reload();
+        }}
+      >
+        Check payment status
+      </Button>
     </div> : null}
   </div>} />;
 }

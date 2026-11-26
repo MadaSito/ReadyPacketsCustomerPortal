@@ -1,4 +1,4 @@
-# Cart & Checkout Module API (Increments 04–07 — Package L, Package B, Package D & Package C)
+# Cart & Checkout Module API (Increments 04–08)
 
 Owner: `recovery_ops_engineer` (`server/modules/cart/**`, `client/src/features/cart/**`).
 Import types from `server/modules/cart/index.ts`; reach the runtime instance at call time via `deps.services.cart`.
@@ -22,6 +22,14 @@ Import types from `server/modules/cart/index.ts`; reach the runtime instance at 
 - **Transactional invoice payment hook (Increment 07 Decision D9):**
   - `CartService.onInvoicePaidInTx({ invoiceId, tx })` is invoked by `compliance` inside the same database transaction where an invoice transitions to `paid`. It locks any matching `carts` row (`checkout_invoice_id = invoiceId`, `FOR UPDATE`), transitions `awaiting_payment -> checked_out` (`open_customer_key = null`, `version + 1`), records `cart.checkout_completed` (`category: "business"`, `actor: { role: "system" }`), and returns `{ transitioned: boolean; cartPublicId: string | null }` idempotently.
   - Phase 2 of `cart.checkout` guards against fast payment webhooks (`locked.status === "checked_out"` is never downgraded back to `awaiting_payment`), and `cart.restoreCheckout` rejects restoring any cart whose `status === "checked_out"` with `CONFLICT:CHECKOUT_ALREADY_PAID`.
+- **Add packets to an existing project (Increment 08 Decision D3):**
+  - Open carts carry optional `carts.add_to_order_public_id` (updated via `cart.addItems(..., { addToOrderPublicId })` or `cart.setTarget({ addToOrderPublicId, expectedVersion? })`). Foreign/missing orders return indistinguishable `NOT_FOUND:ORDER_NOT_FOUND` and record `authz.cart.denied` (`ADD_ON_TARGET_NOT_AUTHORIZED`).
+  - `cart.get` resolves the target project via `orders.addOnTargetInTx`, hides packets already in the target project from upsells, flags conflicting items (`alreadyInTargetProject`), and blocks checkout (`CONFLICT:PACKET_ALREADY_IN_PROJECT`) until conflicts are removed or the target is cleared.
+  - Inside `cart.checkout`, `orders.lockAddOnRootInTx` locks the target root order `FOR UPDATE` before `users` / `user_sessions` / `carts` (`orders -> users -> customer_billing_profiles -> carts -> cart_items`).
+- **Saved billing profile vs one-off billing at checkout (Increment 08 Decision D4):**
+  - `server/modules/cart/types.ts` re-exports `shared/billingDetails.ts` directly.
+  - `cart.checkout` enforces mandatory CAS generation tokens on the new D4 modes while keeping plain one-off custom checkouts (`billingSource: "custom"`, `saveAsBillingProfile: false`) backwards-compatible: `billingSource: "saved"` requires `savedBillingPublicId` + `savedBillingVersion >= 1`; `saveAsBillingProfile: true` requires `savedBillingVersion: 0` (when no profile existed) or `savedBillingPublicId` + `savedBillingVersion >= 1`.
+  - Under the transaction's existing `users FOR UPDATE` lock, `cart.checkout` calls `billingProfile.getForUserInTx(tx, principal.userId, { forUpdate: true })` (current locking read so InnoDB `REPEATABLE READ` never reads a stale pre-lock snapshot) and rejects drift with `CONFLICT:SAVED_BILLING_CHANGED` (`CONFLICT:SAVED_BILLING_NOT_FOUND` when cleared).
 
 ---
 
@@ -37,6 +45,7 @@ Import types from `server/modules/cart/index.ts`; reach the runtime instance at 
 | `cart.updateItem` | mutation | `{ itemPublicId, expectedVersion, productPublicId?, quantity? }` | Updates packet tier or add-on quantity with CAS -> `CartView` |
 | `cart.removeItem` | mutation | `{ itemPublicId, expectedVersion }` | Removes item with CAS -> `CartView` |
 | `cart.clear` | mutation | `{ expectedVersion }` | Empties open cart items with CAS -> `CartView` |
+| `cart.setTarget` | mutation | `{ addToOrderPublicId: string \| null, expectedVersion? }` | Attaches open cart to an existing project (`addToOrderPublicId`) or clears target (`null`) with optional CAS -> `CartView` |
 | `cart.saveDraftDetails` | mutation | `{ expectedVersion, projectName, note?, billing? }` | Encrypts note & billing details (`AES-256-GCM`) -> `CartView` |
 | `cart.applyCode` | mutation | `{ code (1..64), idempotencyKey (8..128) }` | Validates & applies discount code via `promotions.preview` (`recordAttempt: true`), stores encrypted `promo_code_enc` -> `CartView` |
 | `cart.removeCode` | mutation | `{ expectedVersion? }?` | Clears applied discount code from caller's open cart -> `CartView` |

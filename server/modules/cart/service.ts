@@ -1948,11 +1948,23 @@ export function createCartService(deps: ModuleDeps): CartModule {
                   effectiveProjectName = rawProjectName;
                 }
 
-                // Resolve D4 billing details (`saved` profile vs `custom` details) and generation tokens.
+                // Resolve D4 billing details (`saved` profile vs `custom` details) and generation tokens
+                // using a locking current read (`{ forUpdate: true }`) under `users` FOR UPDATE so InnoDB
+                // REPEATABLE READ never reads a stale pre-lock `customer_billing_profiles` snapshot.
                 let resolvedBilling: BillingDetails;
                 if (effectiveBillingSource === "saved") {
+                  if (
+                    !input.savedBillingPublicId ||
+                    input.savedBillingVersion === undefined ||
+                    input.savedBillingVersion < 1
+                  ) {
+                    throw validation(
+                      "SAVED_BILLING_TOKEN_REQUIRED",
+                      "Review your saved billing information and confirm again.",
+                    );
+                  }
                   const savedProfile = billingProfileSvc
-                    ? await billingProfileSvc.getForUserInTx(tx, principal.userId)
+                    ? await billingProfileSvc.getForUserInTx(tx, principal.userId, { forUpdate: true })
                     : null;
                   if (!savedProfile) {
                     throw conflict(
@@ -1961,11 +1973,8 @@ export function createCartService(deps: ModuleDeps): CartModule {
                     );
                   }
                   if (
-                    (input.savedBillingPublicId !== undefined &&
-                      input.savedBillingPublicId !== null &&
-                      savedProfile.publicId !== undefined &&
-                      savedProfile.publicId !== input.savedBillingPublicId) ||
-                    (input.savedBillingVersion !== undefined && savedProfile.version !== input.savedBillingVersion)
+                    savedProfile.publicId !== input.savedBillingPublicId ||
+                    savedProfile.version !== input.savedBillingVersion
                   ) {
                     throw conflict(
                       "SAVED_BILLING_CHANGED",
@@ -1977,12 +1986,22 @@ export function createCartService(deps: ModuleDeps): CartModule {
                   if (!input.billing) {
                     throw validation("BILLING_REQUIRED", "Enter your billing details to continue.");
                   }
-                  if (
-                    willSaveBillingProfile &&
-                    billingProfileSvc &&
-                    (input.savedBillingVersion !== undefined || input.savedBillingPublicId !== undefined)
-                  ) {
-                    const currentProfile = await billingProfileSvc.getForUserInTx(tx, principal.userId);
+                  if (willSaveBillingProfile) {
+                    if (
+                      input.savedBillingVersion === undefined ||
+                      input.savedBillingVersion < 0 ||
+                      (input.savedBillingVersion >= 1 && !input.savedBillingPublicId)
+                    ) {
+                      throw validation(
+                        "SAVED_BILLING_TOKEN_REQUIRED",
+                        "Review your billing choice and confirm again.",
+                      );
+                    }
+                  }
+                  if (willSaveBillingProfile && billingProfileSvc) {
+                    const currentProfile = await billingProfileSvc.getForUserInTx(tx, principal.userId, {
+                      forUpdate: true,
+                    });
                     const expectedAbsent =
                       input.savedBillingVersion === 0 || input.savedBillingPublicId === null;
                     if (expectedAbsent) {
@@ -1994,12 +2013,8 @@ export function createCartService(deps: ModuleDeps): CartModule {
                       }
                     } else if (
                       !currentProfile ||
-                      (input.savedBillingVersion !== undefined &&
-                        currentProfile.version !== input.savedBillingVersion) ||
-                      (input.savedBillingPublicId !== undefined &&
-                        input.savedBillingPublicId !== null &&
-                        currentProfile.publicId !== undefined &&
-                        currentProfile.publicId !== input.savedBillingPublicId)
+                      currentProfile.version !== input.savedBillingVersion ||
+                      currentProfile.publicId !== input.savedBillingPublicId
                     ) {
                       throw conflict(
                         "SAVED_BILLING_CHANGED",
