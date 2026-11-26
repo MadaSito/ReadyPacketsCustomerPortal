@@ -3,7 +3,7 @@
  * Owner: compliance_engineer.
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Link } from "wouter";
 import type {
   BillingProfileView,
@@ -79,9 +79,23 @@ export default function BillingInformationPage() {
   const [confirmClearOpen, setConfirmClearOpen] = useState(false);
 
   const errorBannerRef = useRef<HTMLDivElement | null>(null);
+  const emptySummaryHeadingRef = useRef<HTMLSpanElement | null>(null);
+  const pendingClearFocusRef = useRef(false);
 
   const savedProfile = profileQuery.data ?? null;
   const draft: BillingDetails = editedDraft ?? savedProfile?.details ?? EMPTY_BILLING_DETAILS;
+
+  useEffect(() => {
+    if (pendingClearFocusRef.current && !confirmClearOpen && !savedProfile) {
+      pendingClearFocusRef.current = false;
+      emptySummaryHeadingRef.current?.focus();
+      setTimeout(() => {
+        if (document.activeElement === null || document.activeElement === document.body) {
+          emptySummaryHeadingRef.current?.focus();
+        }
+      }, 0);
+    }
+  }, [confirmClearOpen, savedProfile]);
 
   const header = (
     <PageHeader
@@ -207,6 +221,7 @@ export default function BillingInformationPage() {
         expectedVersion: savedProfile.version,
         expectedPublicId: savedProfile.publicId,
       });
+      pendingClearFocusRef.current = true;
       setConfirmClearOpen(false);
       queryClient.setQueryData(api.get.queryKey(), null);
       setEditedDraft(null);
@@ -235,7 +250,20 @@ export default function BillingInformationPage() {
       {header}
 
       <Card
-        title={savedProfile ? "Saved billing summary" : "No saved billing information"}
+        title={
+          savedProfile ? (
+            "Saved billing summary"
+          ) : (
+            <span
+              ref={emptySummaryHeadingRef}
+              tabIndex={-1}
+              data-testid="billing-profile-empty-heading"
+              className="rounded outline-none focus-visible:ring-2 focus-visible:ring-action"
+            >
+              No saved billing information
+            </span>
+          )
+        }
         description="Updating or clearing these details applies to future checkouts only and never modifies issued invoices or payment receipts."
       >
         {savedProfile ? (

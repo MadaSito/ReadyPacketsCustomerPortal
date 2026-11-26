@@ -1,7 +1,7 @@
 /** Console invoice detail (/admin/invoices/:invoiceId): lines, balance, issue, manual payment, refund, void, PDF. Owner: orders_engineer (compliance admin UI). */
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Download } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "wouter";
 import { AdminCheckStripePaymentButton } from "@/features/payments/AdminCheckStripePaymentButton";
 import { useSession } from "@/lib/session";
@@ -28,7 +28,24 @@ export default function InvoiceDetailPage() {
   const detail = useQuery(trpc.compliance.invoices.get.queryOptions({ invoicePublicId: invoiceId }, { enabled: valid }));
   const [action, setAction] = useState<Action>(null);
   const [downloading, setDownloading] = useState(false);
+  const headerActionsRef = useRef<HTMLDivElement | null>(null);
+  const pendingStripeFocusRef = useRef(false);
   const inv = detail.data;
+  const canCheckStripeNow = Boolean(inv && inv.canRecordPayment && inv.status === "issued" && inv.balanceDueMinor > 0);
+  const restoreHeaderFocusIfLost = () => {
+    headerActionsRef.current?.focus();
+    setTimeout(() => {
+      if (document.activeElement === null || document.activeElement === document.body) {
+        headerActionsRef.current?.focus();
+      }
+    }, 0);
+  };
+  useEffect(() => {
+    if (pendingStripeFocusRef.current && inv && !canCheckStripeNow) {
+      pendingStripeFocusRef.current = false;
+      restoreHeaderFocusIfLost();
+    }
+  }, [canCheckStripeNow, inv]);
   const canRefundManual = Boolean(inv?.canManage && session.view.status === "full" && session.view.role === "admin");
   const title = inv ? (inv.invoiceNumber ? `Invoice ${inv.invoiceNumber}` : "Draft invoice") : "Invoice";
   const download = async () => {
@@ -56,7 +73,13 @@ export default function InvoiceDetailPage() {
       meta={inv ? <InvoiceStatusBadge status={inv.status} /> : undefined}
       actions={
         inv ? (
-          <>
+          <div
+            ref={headerActionsRef}
+            tabIndex={-1}
+            role="group"
+            aria-label="Invoice actions"
+            className="flex max-w-full flex-wrap items-center gap-2 rounded-[var(--radius-control)] outline-none focus-visible:ring-2 focus-visible:ring-action"
+          >
             <Button variant="secondary" leadingIcon={<Download aria-hidden />} loading={downloading} onClick={() => void download()}>
               Download PDF
             </Button>
@@ -68,13 +91,23 @@ export default function InvoiceDetailPage() {
                 <Button onClick={() => setAction({ kind: "issue" })}>Issue invoice</Button>
               </>
             ) : null}
-            {inv.canRecordPayment && inv.status === "issued" && inv.balanceDueMinor > 0 ? (
+            {canCheckStripeNow ? (
               <AdminCheckStripePaymentButton
                 invoicePublicId={inv.invoicePublicId}
                 invoiceStatus={inv.status}
                 origin={inv.origin}
                 onUpdated={() => {
-                  void detail.refetch();
+                  pendingStripeFocusRef.current = true;
+                  void detail.refetch().then((res) => {
+                    const next = res.data;
+                    const stillEligible = Boolean(
+                      next && next.canRecordPayment && next.status === "issued" && next.balanceDueMinor > 0,
+                    );
+                    pendingStripeFocusRef.current = false;
+                    if (!stillEligible) {
+                      restoreHeaderFocusIfLost();
+                    }
+                  });
                 }}
               />
             ) : null}
@@ -84,7 +117,7 @@ export default function InvoiceDetailPage() {
                 Void
               </Button>
             ) : null}
-          </>
+          </div>
         ) : undefined
       }
     />

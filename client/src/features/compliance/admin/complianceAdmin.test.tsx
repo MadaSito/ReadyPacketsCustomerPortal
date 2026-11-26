@@ -963,5 +963,10 @@ describe("invoices", () => {
     await waitFor(() =>
       expect(screen.queryByRole("button", { name: "Check with Stripe now" })).not.toBeInTheDocument(),
     );
+    // WCAG 2.4.3: opener ("Check with Stripe now") unmounted on paid refetch; focus moves to the stable Invoice actions group.
+    await waitFor(() =>
+      expect(screen.getByRole("group", { name: "Invoice actions" })).toHaveFocus(),
+    );
+    await expectNoAxeViolations(view.container);
   });
 });

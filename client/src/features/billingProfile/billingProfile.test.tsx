@@ -244,6 +244,10 @@ describe("BillingInformationPage (/account/billing)", () => {
     );
     expect(await screen.findByTestId("billing-profile-empty")).toBeInTheDocument();
     expect(page).toHaveAttribute("data-profile-state", "empty");
+    // WCAG 2.4.3: opener ("Clear billing information") unmounted on transition to empty state; focus moves to the empty summary heading.
+    await waitFor(() =>
+      expect(screen.getByTestId("billing-profile-empty-heading")).toHaveFocus(),
+    );
     await expectNoAxeViolations();
   });
 
