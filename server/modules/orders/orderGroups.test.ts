@@ -8,7 +8,8 @@
  * All data SYNTHETIC (Zeus Greene, RPCUS-A1B2CJJG5, project "Ice Queen").
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
+import { users } from "../identity/schema.js";
 import { DomainError } from "../../core/errors.js";
 import type { DbOrTx } from "../../core/types.js";
 import type { Services } from "../../container.js";
@@ -196,5 +197,105 @@ describe("D3 add-on orders", () => {
     await expectError(create(zeus, [packet[2]!.a], { addToOrderPublicId: lone.publicId }), "CONFLICT:ADD_ON_TARGET_UNAVAILABLE");
     expect((await mod.orders.get(zeus.principal, lone.publicId)).canAddPackets).toBe(false);
     expect(await mod.orders.addOnTarget(zeus.principal, { orderId: lone.publicId })).toBeNull();
+  });
+});
+
+describe("D3 add-on lock scope and order (http_security findings)", () => {
+  /** Opens a transaction on another connection that runs `body` and then holds its locks until `release()`. */
+  function holdLocks(body: (tx: Parameters<Parameters<TestDb["db"]["transaction"]>[0]>[0]) => Promise<void>) {
+    let release!: () => void;
+    let ready!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    const locked = new Promise<void>((r) => (ready = r));
+    const done = t.db.transaction(async (tx) => {
+      await body(tx);
+      ready();
+      await released;
+    });
+    return { locked, release, done };
+  }
+  const within = <T,>(promise: Promise<T>, ms: number) =>
+    Promise.race([promise, new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`still blocked after ${ms} ms`)), ms))]);
+
+  it("a foreign order id answers ORDER_NOT_FOUND without waiting on (or taking) the foreign root's lock", async () => {
+    const root = await create(zeus, [packet[1]!.a], { projectName: "Foreign Lock" });
+    const holder = holdLocks(async (tx) => {
+      await tx.select({ id: orders.id }).from(orders).where(eq(orders.publicId, root.publicId)).for("update");
+    });
+    await holder.locked;
+    try {
+      await expectError(within(create(other, [packet[2]!.a], { addToOrderPublicId: root.publicId }), 5_000), "NOT_FOUND:ORDER_NOT_FOUND");
+    } finally {
+      holder.release();
+      await holder.done;
+    }
+  });
+
+  it("a child reassigned away can no longer select the project, for the old or the new owner", async () => {
+    const root = await create(zeus, [packet[1]!.a], { projectName: "Moved Child" });
+    const child = await create(zeus, [packet[2]!.a], { addToOrderPublicId: root.publicId });
+    await t.db.update(orders).set({ ownerUserId: other.id }).where(eq(orders.publicId, child.publicId));
+    await expectError(create(zeus, [packet[3]!.a], { addToOrderPublicId: child.publicId }), "NOT_FOUND:ORDER_NOT_FOUND");
+    await expectError(create(other, [packet[3]!.a], { addToOrderPublicId: child.publicId }), "NOT_FOUND:ORDER_NOT_FOUND");
+    expect(await mod.orders.addOnTarget(zeus.principal, { orderId: child.publicId })).toBeNull();
+  });
+
+  it("takes every order-row lock before the actor's users row (a held member lock blocks the add-on before it locks the user)", async () => {
+    const root = await create(zeus, [packet[1]!.a], { projectName: "Lock Order" });
+    const child = await create(zeus, [packet[2]!.a], { addToOrderPublicId: root.publicId });
+    const holder = holdLocks(async (tx) => {
+      await tx.select({ id: orders.id }).from(orders).where(eq(orders.publicId, child.publicId)).for("update");
+    });
+    await holder.locked;
+    const pending = create(zeus, [packet[3]!.a], { addToOrderPublicId: root.publicId });
+    const settled = pending.then(() => "ok", (error: unknown) => code(error));
+    try {
+      await new Promise((r) => setTimeout(r, 300));
+      // The add-on now waits on the child; it must not hold Zeus's users row yet (an existing-order write would lock the
+      // child first and then that users row — the inverted order would deadlock).
+      const probe = await within(
+        t.db.transaction(async (tx) => {
+          await tx.execute(sql`SET SESSION innodb_lock_wait_timeout = 3`);
+          const rows = await tx.select({ id: users.id }).from(users).where(eq(users.id, zeus.id)).for("update");
+          await tx.execute(sql`SET SESSION innodb_lock_wait_timeout = 50`);
+          return rows.length;
+        }),
+        5_000,
+      );
+      expect(probe).toBe(1);
+    } finally {
+      holder.release();
+      await holder.done;
+    }
+    expect(await settled).toBe("ok");
+  });
+
+  it("two simultaneous submits of the same addition (same idempotency key) resolve to one order", async () => {
+    const root = await create(zeus, [packet[1]!.a], { projectName: "Same Key" });
+    const input = { projectName: "Same Key", items: [{ productPublicId: packet[2]!.a, quantity: 1 }], idempotencyKey: idemKey(), addToOrderPublicId: root.publicId };
+    const [a, b] = await Promise.all([mod.orders.create(zeus.principal, input), mod.orders.create(zeus.principal, input)]);
+    expect(a.publicId).toBe(b.publicId);
+    expect([a.created, b.created].sort()).toEqual([false, true]);
+    expect((await mod.orders.get(zeus.principal, root.publicId)).group.orders).toHaveLength(2);
+  });
+
+  it("staff add through the console hand-off (orders.manage) for the root's owner; the audit names the root", async () => {
+    const root = await create(zeus, [packet[1]!.a], { projectName: "Console Add" });
+    const addition = await mod.orders.create(staff.principal, {
+      projectName: "ignored",
+      items: [{ productPublicId: packet[2]!.a, quantity: 1 }],
+      idempotencyKey: idemKey(),
+      onBehalfOfCustomerPublicId: zeus.publicId,
+      addToOrderPublicId: root.publicId,
+    });
+    expect(addition.reference).toBe("RP-JJG5-ZEUGRE-CONSOL-002");
+    const event = h.audit.named("order.created").find((e) => e.resource?.publicId === addition.publicId);
+    expect(event?.attributes).toMatchObject({ group_root_public_id: root.publicId, on_behalf: true });
+    expect(event?.actor).toMatchObject({ userId: staff.id });
+    // Without the hand-off, staff cannot add to a customer's project (the root is not theirs).
+    await expectError(
+      mod.orders.create(staff.principal, { projectName: "x", items: [{ productPublicId: packet[3]!.a, quantity: 1 }], idempotencyKey: idemKey(), addToOrderPublicId: root.publicId }),
+      "NOT_FOUND:ORDER_NOT_FOUND",
+    );
   });
 });

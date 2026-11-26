@@ -642,18 +642,37 @@ export function createOrderService(deps: OrderServiceDeps) {
         // C1: with a code, the promotions attempt guard wraps the whole tx (refusals are recorded after rollback).
         return await withPromoAttemptGuard(deps.services, input.promoCode, principal.userId, () =>
           deps.db.transaction(async (tx) => {
-            // Increment 08 (D3): an addition locks the group root FIRST — the same order as every existing-order write
-            // (order row → actor users row, actor.ts) — so an add-on and a concurrent root mutation cannot deadlock.
-            // Lock only; ownership and eligibility are decided after the actor check, inside createInTx.
-            if (input.addToOrderPublicId) await prelockGroupRoot(tx, input.addToOrderPublicId);
-            // Otherwise no existing order row is locked here, so the actor check is the first statement.
+            // Increment 08 (D3): an addition takes ALL its order-row locks first (root FOR UPDATE, members and their
+            // line items FOR SHARE), scoped to the owner, before any users row — the same order as every existing-order
+            // write (order rows → users rows ascending → session, actor.ts). Foreign ids take no lock. Ownership,
+            // cancellation, currency and packets are decided under these locks by assertAddOnAllowed in createInTx.
+            if (input.addToOrderPublicId) {
+              await prelockGroupRoot(tx, input.addToOrderPublicId, ownerUserId);
+              // Same-key replay under the root fence: a simultaneous submit of the same addition waited on the root
+              // and must resolve to the first order (current read), not fail PACKET_ALREADY_IN_PROJECT on its packets.
+              const [replay] = await tx
+                .select({ publicId: orders.publicId, reference: orders.reference })
+                .from(orders)
+                .where(and(eq(orders.ownerUserId, ownerUserId), eq(orders.createKey, input.idempotencyKey)))
+                .for("share")
+                .limit(1);
+              if (replay) return { ...replay, created: false as const };
+            }
+            if (input.onBehalfOfCustomerPublicId) {
+              // Users rows in ascending id (actor and target customer, as in reassign), so the target customer is
+              // re-validated from a CURRENT locked read, not from the transaction's snapshot.
+              const identity = identityPort(deps.services);
+              let target: Awaited<ReturnType<typeof identity.getUser>> = null;
+              for (const userId of [...new Set([principal.userId, ownerUserId])].sort((x, y) => x - y)) {
+                const locked = await identity.getUser(userId, { tx, forUpdate: true });
+                if (userId === ownerUserId) target = locked;
+              }
+              if (!target || target.publicId !== input.onBehalfOfCustomerPublicId || target.role !== "customer" || target.status !== "active")
+                throw validation("CUSTOMER_NOT_ELIGIBLE", "Choose an active customer account.");
+            }
+            // Without an addition or a target customer no existing row is locked yet, so the actor check comes first.
             const actor = await assertActorCurrent(principal, tx, "orders.create");
             if (input.onBehalfOfCustomerPublicId && !roleHasCapability(actor.role, "orders.manage")) throw forbidden("ACTOR_NOT_AUTHORIZED");
-            if (input.onBehalfOfCustomerPublicId) {
-              // Re-validate the target customer inside the transaction (the pre-check above ran outside it).
-              const owner = await ownerUser(input.onBehalfOfCustomerPublicId, tx);
-              if (!owner || owner.id !== ownerUserId) throw validation("CUSTOMER_NOT_ELIGIBLE", "Choose an active customer account.");
-            }
             // D14: a customer placing an order accepts the order agreement first (staff creating for a customer are
             // not gated; that customer is checked when they work on the order).
             await deps.gates.assertCustomerMayPlaceOrder({ tx, actor: principal });
@@ -689,11 +708,14 @@ export function createOrderService(deps: OrderServiceDeps) {
       await assertActorCurrent(principal, tx, "orders.create");
       await compliancePort(deps.services)?.assertRequiredPoliciesAccepted(principal.userId, { audience: "customer", tx });
       await deps.gates.assertCustomerMayPlaceOrder({ tx, actor: principal });
-      const [existing] = await tx
+      const existingQuery = tx
         .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, currency: orders.currency, subtotalMinor: orders.subtotalMinor, discountMinor: orders.discountMinor, discountLabel: orders.discountLabel, promoDiscountMinor: orders.promoDiscountMinor, promoLabel: orders.promoLabel, totalMinor: orders.totalMinor })
         .from(orders)
         .where(and(eq(orders.ownerUserId, principal.userId), eq(orders.createKey, input.idempotencyKey)))
         .limit(1);
+      // Increment 08 (D3): an addition's replay is a CURRENT read (the caller already holds the root lock), so a
+      // same-key checkout that waited on the root sees the first order instead of failing on its packets.
+      const [existing] = input.addToOrderPublicId ? await existingQuery.for("share") : await existingQuery;
       const afterCommit = async () => undefined;
       if (existing) {
         const lines = await tx.select().from(orderLineItems).where(eq(orderLineItems.orderId, existing.id)).orderBy(asc(orderLineItems.sortOrder));

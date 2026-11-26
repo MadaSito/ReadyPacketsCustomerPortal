@@ -7,7 +7,7 @@
  * additions to one project serialise and cannot both buy the same packet. Under that fence, members and their line
  * items are read with LOCKING reads (`FOR SHARE`), which see the latest committed rows rather than the transaction's
  * repeatable-read snapshot (that snapshot may predate a concurrent addition that committed while we waited).
- * Lock order: root order row → member order rows → member line items.
+ * Lock order: root order row → member order rows → member line items, all before any users row (see lockGroupRoot).
  */
 import { and, asc, eq, inArray, or } from "drizzle-orm";
 import { conflict } from "../../core/errors.js";
@@ -36,32 +36,49 @@ async function isCancelled(tx: DbOrTx, workflows: GroupWorkflows, row: { workflo
 }
 
 /**
- * Lock-order helper: locks the group root of `orderPublicId` (if any) BEFORE the caller's actor check, matching the
- * order → actor lock order used by every existing-order write. Decides nothing; group membership is immutable, so the
- * plain member read is safe.
- */
-export async function prelockGroupRoot(tx: Tx, orderPublicId: string): Promise<void> {
-  const [member] = await tx.select({ id: orders.id, groupRootOrderId: orders.groupRootOrderId }).from(orders).where(eq(orders.publicId, orderPublicId)).limit(1);
-  if (!member) return;
-  await tx.select({ id: orders.id }).from(orders).where(eq(orders.id, member.groupRootOrderId ?? member.id)).for("update").limit(1);
-}
-
-/**
- * Resolves any group member's public id to its root and locks the root row. Returns null when the order does not
- * exist or the root is not owned by `ownerUserId` (callers answer ORDER_NOT_FOUND, so foreign roots stay hidden).
+ * Locks the project of `orderPublicId` for an addition by `ownerUserId` and returns the root, or null when the
+ * addressed order or its root is missing or not this owner's (callers answer ORDER_NOT_FOUND).
+ *
+ * Lock order — every ORDER-row lock is taken here, BEFORE any users-row lock (the actor check), matching existing
+ * order mutations (order row → users rows, actor.ts): root FOR UPDATE → addressed member FOR SHARE → all members FOR
+ * SHARE → their line items FOR SHARE. Call it first in the transaction; calling it again later is a no-op for locks.
+ *
+ * Foreign ids never take a lock: a plain read with the owner in the WHERE clause gates first (InnoDB would keep a
+ * lock on a scanned non-matching row under repeatable read). Ownership is then DECIDED only from locking (current)
+ * reads under the root fence: the root again with the owner predicate, and the addressed member re-read FOR SHARE so
+ * a child reassigned while we waited can no longer select the project.
  */
 export async function lockGroupRoot(tx: Tx, orderPublicId: string, ownerUserId: number): Promise<GroupRootRow | null> {
-  const [member] = await tx
-    .select({ id: orders.id, groupRootOrderId: orders.groupRootOrderId, ownerUserId: orders.ownerUserId })
+  const [seen] = await tx
+    .select({ id: orders.id, groupRootOrderId: orders.groupRootOrderId })
     .from(orders)
-    .where(eq(orders.publicId, orderPublicId))
+    .where(and(eq(orders.publicId, orderPublicId), eq(orders.ownerUserId, ownerUserId)))
     .limit(1);
-  // The addressed member must be the caller's too (a reassigned/foreign addition is never a project selector).
-  if (!member || member.ownerUserId !== ownerUserId) return null;
-  const rootId = member.groupRootOrderId ?? member.id;
-  const [root] = await tx.select().from(orders).where(eq(orders.id, rootId)).for("update").limit(1);
-  if (!root || root.ownerUserId !== ownerUserId) return null;
+  if (!seen) return null;
+  const rootId = seen.groupRootOrderId ?? seen.id;
+  if (rootId !== seen.id) {
+    const [seenRoot] = await tx.select({ id: orders.id }).from(orders).where(and(eq(orders.id, rootId), eq(orders.ownerUserId, ownerUserId))).limit(1);
+    if (!seenRoot) return null;
+  }
+  const [root] = await tx.select().from(orders).where(and(eq(orders.id, rootId), eq(orders.ownerUserId, ownerUserId))).for("update").limit(1);
+  if (!root || root.groupRootOrderId !== null) return null;
+  if (seen.id !== rootId) {
+    const [member] = await tx
+      .select({ ownerUserId: orders.ownerUserId, groupRootOrderId: orders.groupRootOrderId })
+      .from(orders)
+      .where(eq(orders.id, seen.id))
+      .for("share")
+      .limit(1);
+    if (!member || member.ownerUserId !== ownerUserId || member.groupRootOrderId !== rootId) return null;
+  }
+  const members = await groupMembers(tx, root, { locking: true });
+  await packetNumbersByOrder(tx, members.map((m) => m.id), { locking: true });
   return root;
+}
+
+/** Lock-order alias used before the actor check (decides nothing; the caller re-checks through assertAddOnAllowed). */
+export async function prelockGroupRoot(tx: Tx, orderPublicId: string, ownerUserId: number): Promise<void> {
+  await lockGroupRoot(tx, orderPublicId, ownerUserId);
 }
 
 /** Upper bound of a group; the write path fails closed above it instead of checking a truncated list. */

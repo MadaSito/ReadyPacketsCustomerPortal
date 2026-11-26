@@ -89,6 +89,10 @@ export async function noteStemReferenceUsed(tx: Tx, reference: string): Promise<
   if (!stem) return;
   const used = Number(reference.slice(stem.length + 1));
   if (!Number.isSafeInteger(used) || used < 1 || used > 4_000_000_000) return;
+  // Never advance past the last number that still fits the 32-character column: a maximal imported suffix (for
+  // example a six-letter prefix and 999999) would otherwise leave the stem with no next value. Below the bound the
+  // generator still skips every reserved value, so not bumping is always safe.
+  if (stem.length + 1 + String(used + 1).length > 32) return;
   await tx
     .insert(orderReferenceCounters)
     .values({ scope: stem, nextValue: used })
