@@ -454,7 +454,7 @@ describe("navigation and new-order cart handoff", () => {
     await user.click(screen.getByRole("button", { name: "Continue" }));
     await user.click(await screen.findByRole("button", { name: "Add to cart" }));
     await waitFor(() => expect(location.history?.at(-1)).toBe("/cart"));
-    expect(calls.find((c) => c.path === "cart.addItems")?.input).toEqual({ items: [{ productPublicId: "01JTESTPROD000000000000A1", quantity: 1 }], projectName: "Synthetic cart project" });
+    expect(calls.find((c) => c.path === "cart.addItems")?.input).toEqual({ items: [{ productPublicId: "01JTESTPROD000000000000A1", quantity: 1 }], projectName: "Synthetic cart project", addToOrderPublicId: null });
     expect(calls.some((c) => c.path === "orders.create")).toBe(false);
   });
 });

@@ -2,11 +2,13 @@
  * Customer order wizard (/orders/new): choose items → details → review. Owner: orders_engineer.
  * Packet catalogs (increment 02) use the packet picker from ./customer/packets; any other groups keep the
  * quantity list. Every amount shown comes from the server quote (`orders.quote`); the client never prices.
+ * Increment 08 (D3): `/orders/new?addTo=<orderPublicId>` adds packets to that order's project. The project name is
+ * fixed, packets already in the project can't be chosen, and the server re-checks everything at create/checkout.
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { PackageOpen } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
-import { Link, useLocation } from "wouter";
+import { Link, useLocation, useSearch } from "wouter";
 import { AgreementDialog, parseAgreementRequiredDetails, type AgreementRequiredDetails } from "@/lib/agreementGate";
 import { useFeatureEnabled } from "@/lib/features";
 import { errorMessage, safeError, useTRPC, useTRPCClient } from "@/lib/trpc";
@@ -34,7 +36,17 @@ const REASON_MESSAGES: Record<string, string> = {
   PACKET_QUANTITY_ONE: "Each packet can be ordered once.",
   MIXED_CURRENCY: "Items priced in different currencies must be ordered separately.",
   PROMO_NOT_APPLICABLE: "This code cannot be applied. Remove the discount code or try another one.",
+  PACKET_ALREADY_IN_PROJECT: "A packet you chose is already in this project. Remove it and try again.",
+  ADD_ON_TARGET_UNAVAILABLE: "Packets can no longer be added to this project.",
 };
+
+const PUBLIC_ID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+
+/** Increment 08 (D3): the `addTo` order public id from the query string (anything malformed is ignored). */
+export function readAddTo(search: string): string | null {
+  const value = new URLSearchParams(search).get("addTo");
+  return value && PUBLIC_ID.test(value) ? value : null;
+}
 
 const STEPS = ["Choose items", "Details", "Review"] as const;
 const MAX_QUANTITY = 1000;
@@ -47,10 +59,56 @@ const MAX_QUANTITY = 1000;
 export default function NewOrderPage() {
   const staffViewer = useIsStaffViewer();
   if (staffViewer) return <StaffOrderHandoff />;
-  return <CustomerNewOrderWizard />;
+  return <CustomerNewOrderEntry />;
 }
 
-function CustomerNewOrderWizard() {
+type AddOnTarget = { rootPublicId: string; rootReference: string; projectName: string; currency: string; packetNumbers: number[] };
+
+function CustomerNewOrderEntry() {
+  const addTo = readAddTo(useSearch());
+  if (!addTo) return <CustomerNewOrderWizard target={null} />;
+  return <AddOnEntry addTo={addTo} />;
+}
+
+function AddOnEntry({ addTo }: { addTo: string }) {
+  const trpc = useTRPC();
+  const target = useQuery(trpc.orders.addOnTarget.queryOptions({ orderId: addTo }));
+  const header = (
+    <PageHeader breadcrumbs={<Breadcrumbs items={[{ label: "Orders", href: "/orders" }, { label: "Add packets" }]} />} title="Add packets to this project" />
+  );
+  if (target.isPending)
+    return (
+      <>
+        {header}
+        <Skeleton lines={5} />
+      </>
+    );
+  if (target.error)
+    return (
+      <>
+        {header}
+        <ErrorState error={target.error} onRetry={() => void target.refetch()} />
+      </>
+    );
+  if (!target.data)
+    return (
+      <>
+        {header}
+        <Callout tone="warning" title="Packets can't be added to this project">
+          <p>
+            This project is not available for additions, for example because the order was cancelled.{" "}
+            <Link href="/orders/new" className="font-medium text-action underline underline-offset-2">
+              Start a new order
+            </Link>{" "}
+            instead.
+          </p>
+        </Callout>
+      </>
+    );
+  return <CustomerNewOrderWizard target={target.data} />;
+}
+
+function CustomerNewOrderWizard({ target }: { target: AddOnTarget | null }) {
   const trpc = useTRPC();
   const trpcClient = useTRPCClient();
   const wizardFormId = useId();
@@ -105,7 +163,14 @@ function CustomerNewOrderWizard() {
   const chosenList = listProducts
     .map((product) => ({ product, quantity: Number(quantities[product.publicId] ?? "0") }))
     .filter((line) => Number.isInteger(line.quantity) && line.quantity > 0 && line.quantity <= MAX_QUANTITY);
-  const packetLines = packetCatalog ? packetItems(selection, groups) : [];
+  // Increment 08 (D3): packets already in the project are never sent, even if a stale selection still holds them.
+  const owned = useMemo(() => new Set(target?.packetNumbers ?? []), [target]);
+  const effectiveSelection = useMemo<Record<number, string | null>>(
+    () => (owned.size === 0 ? selection : Object.fromEntries(Object.entries(selection).filter(([packet]) => !owned.has(Number(packet))))),
+    [owned, selection],
+  );
+  const packetLines = packetCatalog ? packetItems(effectiveSelection, groups) : [];
+  const fixedProjectName = target?.projectName ?? null;
   const items = [...packetLines, ...chosenList.map((line) => ({ productPublicId: line.product.publicId, quantity: line.quantity }))];
   const chosen = items.flatMap((item) => {
     const product = products.find((candidate) => candidate.publicId === item.productPublicId);
@@ -191,7 +256,15 @@ function CustomerNewOrderWizard() {
   const quoteReason = quote.error ? safeError(quote.error)?.reasonCode : undefined;
   const quoteProblem = quote.error ? (quoteReason && REASON_MESSAGES[quoteReason]) || "The total could not be calculated. Please try again." : null;
 
-  const header = (
+  const header = target ? (
+    <PageHeader
+      breadcrumbs={
+        <Breadcrumbs items={[{ label: "Orders", href: "/orders" }, { label: target.rootReference, href: `/orders/${target.rootPublicId}` }, { label: "Add packets" }]} />
+      }
+      title={`Add packets to ${target.projectName}`}
+      description={`Adding to project ${target.projectName} (${target.rootReference}). The new packets become a separate order in the same project.`}
+    />
+  ) : (
     <PageHeader
       breadcrumbs={<Breadcrumbs items={[{ label: "Orders", href: "/orders" }, { label: "New order" }]} />}
       title="New order"
@@ -243,7 +316,7 @@ function CustomerNewOrderWizard() {
       if (chosen.length === 0) return setError(packetCatalog ? "Choose at least one packet or item to continue." : "Choose at least one item to continue.");
       if (mixedCurrency) return setError("Items priced in different currencies must be ordered separately.");
     }
-    if (step === 1) {
+    if (step === 1 && fixedProjectName === null) {
       if (projectName.trim().length === 0) {
         setNameError("Enter a project name.");
         return setError("Please fix the highlighted field.");
@@ -258,14 +331,21 @@ function CustomerNewOrderWizard() {
     setPolicyBlocked(false);
     try {
       if (cartEnabled) {
-        await addToCart.mutateAsync({ items, projectName: projectName.trim(), note: note.trim() ? note.trim() : undefined });
+        await addToCart.mutateAsync({
+          items,
+          projectName: fixedProjectName ?? projectName.trim(),
+          note: note.trim() ? note.trim() : undefined,
+          // A standalone order clears any earlier add-on target on the open cart instead of inheriting it.
+          addToOrderPublicId: target ? target.rootPublicId : null,
+        });
         await queryClient.invalidateQueries({ queryKey: trpc.cart.pathKey() });
         toast.show({ tone: "success", title: "Added to your cart", description: "Review and check out when you are ready." });
         navigate("/cart");
         return;
       }
       const result = await create.mutateAsync({
-        projectName: projectName.trim(),
+        projectName: fixedProjectName ?? projectName.trim(),
+        ...(target ? { addToOrderPublicId: target.rootPublicId } : {}),
         items,
         note: note.trim() ? note.trim() : undefined,
         idempotencyKey,
@@ -350,8 +430,8 @@ function CustomerNewOrderWizard() {
           <div className="flex flex-col gap-4">
             {packetCatalog ? (
               <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
-                <PacketPicker groups={groups} selection={selection} onChange={setSelection} headingLevel={3} />
-                <PacketSummary groups={groups} selection={selection} quote={quote.quote} pending={quote.pending} error={quote.error} headingLevel={3} />
+                <PacketPicker groups={groups} selection={effectiveSelection} onChange={setSelection} headingLevel={3} alreadyInProject={target?.packetNumbers} />
+                <PacketSummary groups={groups} selection={effectiveSelection} quote={quote.quote} pending={quote.pending} error={quote.error} headingLevel={3} />
               </div>
             ) : null}
             {listGroups.map((group) => (
@@ -412,9 +492,15 @@ function CustomerNewOrderWizard() {
         ) : null}
         {step === 1 ? (
           <div className="flex flex-col gap-4">
-            <Field label="Project name" hint="A short name you will recognise later." required error={nameError}>
-              <Input value={projectName} onChange={(event) => setProjectName(event.target.value)} maxLength={160} autoComplete="off" />
-            </Field>
+            {fixedProjectName !== null ? (
+              <Field label="Project name" hint="Additions keep the project's name.">
+                <Input value={fixedProjectName} readOnly />
+              </Field>
+            ) : (
+              <Field label="Project name" hint="A short name you will recognise later." required error={nameError}>
+                <Input value={projectName} onChange={(event) => setProjectName(event.target.value)} maxLength={160} autoComplete="off" />
+              </Field>
+            )}
             <Field label="Note for ReadyPackets" hint="Optional. Anything we should know before we start.">
               <Textarea value={note} onChange={(event) => setNote(event.target.value)} maxLength={5000} rows={5} />
             </Field>
@@ -424,7 +510,9 @@ function CustomerNewOrderWizard() {
           <Card title="Summary" headingLevel={3}>
             <KeyValueList
               items={[
-                { label: "Project", value: <span className="break-words">{projectName.trim()}</span>, wide: true },
+                target
+                  ? { label: "Project", value: <span className="break-words">Adding to project {target.projectName} ({target.rootReference})</span>, wide: true }
+                  : { label: "Project", value: <span className="break-words">{projectName.trim()}</span>, wide: true },
                 ...chosen.map((line) => ({
                   label: line.product.name,
                   value: (
