@@ -28,6 +28,17 @@
       "minLength": 1,
       "maxLength": 64
     },
+    "groupRootOrderPublicId": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "projectName": {
       "anyOf": [
         {
