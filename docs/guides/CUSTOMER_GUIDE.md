@@ -24,6 +24,7 @@ Anything that exists on the server but has no screen yet is marked **Not availab
 - [Messages, support, policies and invoices](#messages-support-policies-and-invoices)
 - [Notifications and search](#notifications-and-search)
 - [Install the portal as an app](#install-the-portal-as-an-app)
+- [What's new (increment 08)](#whats-new-increment-08)
 - [Privacy and analytics](#privacy-and-analytics)
 
 ## Create your account
@@ -235,6 +236,15 @@ or files offline.
 - The portal never reloads by itself.
 
 These flows have not yet been checked in real browsers or on physical devices.
+
+## What's new (increment 08)
+
+- **Your name.** Your profile has **First name**, **Last name** and **Preferred name (optional)**, each up to 50 characters. We greet you by your preferred name, or your first name if you have not set one. Invoices keep your full name.
+- **Order wizard.** Opening an order shows the current phase step by step, for example "Step 2 of 4: Questions". Use **Back** and **Next**; if **Next** is unavailable, the reason is shown next to it. **Submit** asks you to confirm. Everything else about the order is under **Order details**.
+- **Adding packets to a project.** On your order, choose **Add packets to this project**. The packets you add become a new order in the same project, with their own invoice and payment. Packets the project already has are marked "Already in this project". A project with more than one order lists them all under **Orders in this project**.
+- **Saved billing information.** Save your billing contact and address under **Account → Billing information**, or when you register. At checkout, choose **Use my saved billing information** or **Enter different billing information**, and tick **Save as my billing information** to keep the new details. **Clear billing information** removes them. Invoices that were already issued never change.
+- **After paying.** The return page checks your payment with Stripe and shows "Payment received" with **Continue to your order**. If the payment is still processing, use **Check payment status**. Do not pay again.
+- **Choosing a tier** shows that tier's outcome and deliverables.
 
 ## Privacy and analytics
 

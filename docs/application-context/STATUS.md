@@ -384,19 +384,19 @@ Details are in `docs/session-logs/2026-11-22-session-03.md`.
 
 ## Increment 08 (in progress)
 
-<!-- DRAFT by platform_engineer. Rows move to "Implemented" only after the owner's commit and /root's verification. -->
+<!-- Rows move to "Implemented" only after /root's verification. -->
 
 Owner's prompt 34 of 2026-11-26 ([session log](../session-logs/2026-11-26-session-02.md), [contract](../engineering/INCREMENT_08_CONTRACT.md)). Migration `0008_increment_08`, additive only.
 
 | Decision | What | Owner | State |
 | --- | --- | --- | --- |
-| D1 | First, last and preferred name | identity_engineer | in progress |
-| D2 | Order numbers `RP-<C4>-<F3><L3>-<P6>-<NNN>` | orders_engineer | in progress |
-| D3 | Add packets to an earlier order (order group) | orders_engineer, recovery_ops_engineer | in progress |
-| D4 | Saved billing profile; choice at checkout | compliance_engineer, recovery_ops_engineer, identity_engineer | in progress |
-| D5 | Payment booked by webhook or provider lookup; missing-webhook alert | integrations_engineer | in progress |
-| D6 | Customer order wizard | audit_engineer | in progress |
-| D7 | Workflow **Publish** button; tier expansion | ui_foundation_engineer | in progress |
+| D1 | First, last and preferred name | identity_engineer | committed (8d73893, a6cc951, 1f96d68); awaiting lead verification |
+| D2 | Order numbers `RP-<C4>-<F3><L3>-<P6>-<NNN>` | orders_engineer | committed (acdd2ac); awaiting lead verification |
+| D3 | Add packets to an earlier order (order group) | orders_engineer, recovery_ops_engineer | committed (acdd2ac, 35df3ed, 88a3e90, b332d1b, 331a3e4, 3f8bcf3); awaiting lead verification |
+| D4 | Saved billing profile; choice at checkout | compliance_engineer, recovery_ops_engineer, identity_engineer | committed (faab6fe, dfcc89a, 8d73893, 35df3ed, 331a3e4); awaiting lead verification |
+| D5 | Payment booked by webhook or provider lookup; missing-webhook alert | integrations_engineer | committed (4331010, b4962ee, 07883a2, 62e0ddc, 4c5a1a3); awaiting lead verification |
+| D6 | Customer order wizard | audit_engineer | committed (f12afdc, a2450b9, 4d0914f); awaiting lead verification |
+| D7 | Workflow **Publish** button; tier expansion | ui_foundation_engineer | committed (09654b4, b332d1b); awaiting lead verification |
 | D8 | Go-live checklist; documents | assurance_engineer, platform_engineer | in progress |
 
 ### Verification for increment 08
@@ -766,6 +766,7 @@ Defects found in lead QA and fixed before merge:
 ## Outstanding and known limits
 
 - **Increment 08 known gaps:**
+  - Low severity, existed before increment 08, no code change: account names may contain zero-width joiners (ZWJ/ZWNJ), but the typed-signature validator rejects these format characters. Exact-name matching may also not accept a version without them.
   - ReadyPackets has no self-service account data export or account erasure yet; an administrator handles privacy requests, and a customer can clear their own saved billing information under Account settings → Billing information.
 - Increment 07 decisions the owner should confirm (ADRs 0055–0062):
   - the progress formula: weighted, capped at 99 until a `done` status, and the higher of derived and explicit;
