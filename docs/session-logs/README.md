@@ -13,3 +13,4 @@ values redacted. Newest last.
 | 2026-11-23 | [2026-11-23-session-01.md](2026-11-23-session-01.md) | Increment 06: recording, phase tasks, reports, sign-in bans, policies and MNDA, receipts, PWA |
 | 2026-11-24 | [2026-11-24-session-01.md](2026-11-24-session-01.md) | Increment 07: phases-first workflow, statuses, progress, phase actions, alerts, Stripe completion, SAML, Microsoft 365 sync |
 | 2026-11-25 | [2026-11-25-session-01.md](2026-11-25-session-01.md) | Upgrade command; increment 07.1: staff ordering handoff, visible portal switch, discount code hints, responsive and accessibility sweep |
+| 2026-11-26 | [2026-11-26-session-01.md](2026-11-26-session-01.md) | Increment 07.2: update prompt, Stripe checkout diagnostics, branded invoices and receipts, signing secret validation, default workflow |

@@ -1,6 +1,6 @@
 # ReadyPackets Portal — Status
 
-Last updated: 2026-11-25 (increment 07 merged to `main` as `c337492` through PR #16; fix pack 07.1 merged to `main` as `547a31d` through PR #19). Keep this file current; it is the honest state of the build,
+Last updated: 2026-11-25 (increment 07 merged to `main` as `c337492` through PR #16; fix pack 07.1 merged to `main` as `547a31d` through PR #19; fix pack 07.2 on `fix/increment-07-2`, PR and merge commit filled at merge). Keep this file current; it is the honest state of the build,
 not a certification. "Verified" below means the integrator ran the check and saw the result. Anything not
 listed under "Verified" has not been proven and must not be described as working in production.
 
@@ -81,6 +81,7 @@ listed under "Verified" has not been proven and must not be described as working
 | SAML with Entra ID (increment 07) | SP-initiated SAML 2.0 with a hardened wrapper, pinned certificates, MFA modes `claim` / `entra` / `portal`, allowed roles, daily metadata check (off until configured); ADR 0062 | `server/modules/identity/sso`, `client/src/features/identity/sso` |
 | Migration (increment 07) | `migrations/0007_increment_07.sql`, additive: 16 tables, 40 columns on 11 tables, one widened enum, 96 statements, no `DROP` | `migrations/` |
 | Staff ordering handoff and portal switch (increment 07.1) | staff and administrators get a handoff panel on `/orders/new`, `/cart`, `/cart/checkout`, `/checkout/return` and `/checkout/cancel` with **New order for a customer** → `/admin/orders?new=1`; visible **Customer portal** / **Admin portal** / **Staff portal** switch; staff landing on `/admin` with a per-tab choice; discount code hints | `client/src/app/portal.tsx`, `client/src/lib/portal.ts`, `client/src/features/{cart,orders}` |
+| Increment 07.2 fix pack | Stripe checkout failure diagnostics, **Verify Checkout session creation**, ACTIVE / NOT ACTIVE banner, **Pay now** recovery; signing secret normalisation and per-field errors; branded invoice / receipt / refund note PDFs with Order and Project; **Set as default** workflow; clearer update prompt. No migration | `server/modules/{payments,cart,compliance,orders,jobs}`, `client/src/features/{payments,cart,compliance,orders}`, `client/src/app/PwaUpdatePrompt.tsx` |
 | Documentation | 62 ADRs, threat model, security reviews, guides for customers / staff / admins, runbooks, requirements register | `docs/` |
 
 ## Verified in session 01 (integrator's own runs)
@@ -380,6 +381,46 @@ Details are in `docs/session-logs/2026-11-22-session-03.md`.
   `bundle_scope_manifest` as a JSON string); a second "Start Phase I" was refused; Phase II was offered and
   not started; the pipeline switch was turned off afterwards. webhook.site is a request inspector, so this
   proves delivery and format, not the production receiver.
+
+## Verification for increment 07.2
+
+Fix pack for the owner's prompt 30 of 2026-11-26 ([session log](../session-logs/2026-11-26-session-01.md)). Code commits: `1be1cc2`, `4fb93be`, `8a9901b`, `fdd5583`, `c082b4e`, `8d20507`, `53786b0`. Nothing under `migrations/` changed (checked with `git diff main..HEAD --stat -- migrations`), and the upgrade commands are unchanged.
+
+### What changed
+
+| Owner point | Change | Where |
+| --- | --- | --- |
+| 1. Update message | Explains that the server was updated and this tab runs the previous version. **Later** re-shows it on the next in-app navigation, and it never reloads by itself | `client/src/app/PwaUpdatePrompt.tsx` |
+| 2. No redirect to Stripe | Typed `payment_unavailable` after the order commits; the browser allowlist matches the server's; the return and cancel pages tell awaiting payment from pending confirmation, with **Pay now**; classified session failures, `payments.attempt.failed`, the alert "Customers cannot reach Stripe Checkout", the ACTIVE / NOT ACTIVE banner, **Last checkout-session failure**, and **Verify Checkout session creation** | `server/modules/{cart,payments}`, `/admin/payments/setup` |
+| 3. Branding, order and project | Branded PDFs with an Order + Project block; pages, lists and e-mails; WinAnsi fix; invoices drawn on demand; stored receipts keep their bytes | `server/modules/compliance`, `/admin/invoices` → **Company profile**, `/admin/payments` → **Receipt footer note** |
+| 4. Signing secret format | Paste normalisation, per-field shape errors, show/hide, no autofill, hints; Primary and Secondary explained | `client/src/features/payments`, `server/modules/payments/settings.ts` |
+| 5. Default workflow | **Set as default** with step-up and the audit event `workflow.default.changed`; existing orders keep their version | `/admin/workflows`, `orders.admin.workflows.setDefault` |
+
+### Root cause of point 2
+
+**Not confirmed.** There was no access to the owner's server logs, and a real Stripe account cannot be tested here. On the owner's server, the banner and **Last checkout-session failure** on `/admin/payments/setup` should now name the cause.
+
+### Verified by the lead
+
+Verified by lead on a running build: <TO FILL BY LEAD>
+
+### Peer-reported (automated tests, not driven by the lead in a browser)
+
+<TO FILL BY LEAD: peer-reported test counts, labelled as peer-reported>
+
+### Gates
+
+<TO FILL BY LEAD>
+
+### Not verifiable here
+
+- A real Stripe account, in test or live mode, including a real webhook delivery and a real Checkout redirect.
+- Real mail delivery of the branded e-mails.
+- Physical phones and tablets.
+- Screen readers.
+- PDF/UA: it is not claimed (see [CHANGELOG](../../CHANGELOG.md)).
+
+The interfaces are designed and tested against WCAG 2.2 AA.
 
 ## Verification for increment 07.1
 

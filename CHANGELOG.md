@@ -5,7 +5,70 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See `docs/engineering/SDLC.md` for the release
 procedure.
 
-## Increment 07.1 (fixes after increment 07)
+## Increment 07.2 (fixes after increment 07.1)
+
+Requested by the owner on 2026-11-26 (prompt 30). See the [session log](docs/session-logs/2026-11-26-session-01.md).
+- **No database migration.** New values use existing settings and columns.
+- **Upgrade commands** are unchanged.
+- **PR and merge commit:** (filled at merge).
+
+### Fixed
+
+- **Customers placed an order but were not sent to Stripe** (`c082b4e`, `53786b0`). The cause on the owner's server is **not confirmed**: we had no access to its logs, and a real Stripe account is not testable here. Every such failure is now explicit, recorded and recoverable.
+  - **Checkout result.** After the order and invoice commit, checkout returns a typed `payment_unavailable` result instead of falling through silently. The customer sees "Your order … is placed, but we could not open the secure payment page", with the order, the invoice and **Pay now**.
+  - **Redirect allowlist.** The browser's allowlist now matches the server's (`https://checkout.stripe.com` only).
+  - **Return and cancel pages.** `/checkout/return` and `/checkout/cancel` tell "awaiting payment" apart from "pending confirmation", and offer **Pay now** when online payment is available.
+  - **Diagnosis.**
+    - Every Checkout Session failure gets a specific reason code.
+    - The audit events `payments.attempt.failed` (sanitised upstream status and code) and `cart.checkout_payment_start_failed` are written.
+    - The operational alert "Customers cannot reach Stripe Checkout" is raised.
+    - **Last checkout-session failure** is shown on `/admin/payments/setup`.
+- **"Signing secret is not in the correct format"** (`53786b0`). The likely cause, inferred from the owner's screenshot and not confirmed, is a longer value without the `whsec_` prefix in **Primary**, while the 38-character `whsec_` secret was in **Secondary**.
+  - **Normalised pastes.** Surrounding quotes and backticks, non-breaking spaces, zero-width characters and wrapped line breaks are removed.
+  - **Per-field errors.** Each field gets its own error, which never echoes the value. It recognises publishable keys, API keys in the wrong field, endpoint IDs (`we_…`), masked values, and values too short or too long.
+  - **Field controls.** Each field has a Show/Hide control, settings that stop browsers and password managers from filling it, and hints that say where to copy each value in Stripe.
+  - **Primary and Secondary** are explained.
+- **Characters in PDFs** (`8d20507`). Full WinAnsi characters such as `·`, `•`, `–`, `—`, curly quotes, `€`, `™` and accented letters now print correctly. Other characters are replaced with readable equivalents, never "?".
+
+### Added
+
+- **Verify Checkout session creation** on `/admin/payments/setup` (`payments.admin.verifyCheckoutSession`, step-up, audited `payments.setup.checkout_probe`) (`53786b0`).
+  - It creates an unpaid probe session and expires it at once, at no cost.
+  - It catches restricted keys without Checkout Sessions Write (`STRIPE_KEY_MISSING_PERMISSION`) and custom Checkout domains (`STRIPE_UNTRUSTED_REDIRECT_URL`).
+  - If it failed for the current key, activation is refused with `STRIPE_CHECKOUT_SESSION_NOT_VERIFIED`.
+- **Status banner** on `/admin/payments/setup` (`53786b0`): **Online card checkout: ACTIVE** or **NOT ACTIVE**, what customers experience right now, and the missing gates.
+- **Branded invoice, payment receipt and refund note PDFs** (`8d20507`):
+  - mark, wordmark, tagline and legal name;
+  - brand colours with dark text on light fills;
+  - a footer with page numbers, in Letter and A4;
+  - an **Order** and **Project** block near the top of page 1.
+- **Order and project everywhere** (`8d20507`, `8a9901b`, `fdd5583`):
+  - an "Order & project" card on the customer and console invoice and receipt pages, with Order and Project in the lists;
+  - Order and Project in the invoice issued, invoice paid and payment receipt e-mails, including under published template overrides.
+- **Set as default** on `/admin/workflows` (`orders.admin.workflows.setDefault`) (`4fb93be`).
+  - Administrators with `workflows.manage` can set the default, with fresh step-up.
+  - It is audited as `workflow.default.changed`.
+  - New orders on every create path use the new default's latest published version. Existing orders keep their version.
+
+### Changed
+
+- **Update prompt** (`1be1cc2`). The prompt now reads "ReadyPackets was updated on the server" and explains that this tab still runs the previous version.
+  - **Later** hides it only until the next in-app navigation.
+  - It never reloads by itself.
+  - Below medium width it sits above the phone tab bar, with 44 px buttons.
+- **Default issuer details.** The legal name now defaults to "Ready Packets Consulting LLC", and the logo to the ReadyPackets header mark.
+  - Invoices that carry the old default "ReadyPackets" show the new name. A name an administrator set is kept.
+  - Invoices are drawn on demand, so existing invoices pick up the branding.
+  - Stored receipt and refund note PDFs are never rewritten, because of their integrity hash. Their pages and resent e-mails still show the order and project.
+- **Restricted-key permissions** are documented: Checkout Sessions Write, Payment Intents Read, and Charges Read (Write for refunds).
+- **Rotating secrets.** Rotating the key or the Primary signing secret, or changing the mode or the egress preset, pauses online checkout until the matching check is run again.
+
+### Accessibility
+
+- **PDFs.** The PDFs set the document language and title. They mark the content as tagged, give the logo alternative text, and keep the text selectable. **PDF/UA is not claimed**: the standard Helvetica font is not embedded with a Unicode map, and there are no full table structure tags.
+- **Screens.** The changed screens are designed and tested against WCAG 2.2 AA.
+- **Not done.** No screen-reader pass and no physical-device pass were done.
+
 
 Requested by the owner on 2026-11-25 (prompts 28 and 29). PR #19. Mostly client-side: the one server change is the single-page app fallback for dotted mail template keys. There is no server permission, schema or migration change, and the upgrade commands are unchanged. See the [session log](docs/session-logs/2026-11-25-session-01.md).
 

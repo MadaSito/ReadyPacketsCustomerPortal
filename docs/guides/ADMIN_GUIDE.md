@@ -53,6 +53,13 @@ TLS, upgrades, and go-live checks are in the [deployment profiles](../../deploy/
   - [Turning on discount codes](#turning-on-discount-codes)
   - [Troubleshooting: "You do not have permission to perform this action"](#troubleshooting-you-do-not-have-permission-to-perform-this-action)
   - [Troubleshooting: a mail template editor link returns 404](#troubleshooting-a-mail-template-editor-link-returns-404)
+- [Increment 07.2: payments, branding and the default workflow](#increment-072-payments-branding-and-the-default-workflow)
+  - [Getting card checkout active](#getting-card-checkout-active-increment-072)
+  - [Stripe secret fields: Primary and Secondary](#stripe-secret-fields-primary-and-secondary)
+  - [Troubleshooting: customers are not sent to Stripe](#troubleshooting-customers-are-not-sent-to-stripe)
+  - [Company branding on invoices and receipts](#company-branding-on-invoices-and-receipts)
+  - [Setting the default workflow](#setting-the-default-workflow)
+  - [The "ReadyPackets was updated on the server" prompt](#the-readypackets-was-updated-on-the-server-prompt)
 - [Customer tasks and the order agreement](./WORKFLOW_CUSTOMER_TASKS.md)
 
 ## Increment 04 operating guides
@@ -426,11 +433,13 @@ Use **Stripe setup** (`/admin/payments/setup`), described in [Hosted online paym
 - **Activation requirements.** All of these must be met for the current staged key and mode:
   - the Stripe egress preset is switched on;
   - **Test Stripe API** succeeded;
-  - **Send self-test webhook** succeeded.
+  - **Send self-test webhook** succeeded;
+  - from 07.2, the last **Verify Checkout session creation** probe for the current key has not failed.
 - **Activating.** You then confirm in a dialog. Live mode also needs the typed words `ACTIVATE LIVE PAYMENTS`.
 - **Events.** Subscribe the nine events listed on the page.
 - **Unmatched payments.** A paid session that carries portal metadata but matches no order raises a warning alert for staff.
 - **Small amounts.** Card payments below Stripe's minimum charge still follow the small-totals setting.
+- **From 07.2.** See [Getting card checkout active](#getting-card-checkout-active-increment-072).
 
 ### SAML single sign-on with Entra ID
 
@@ -582,6 +591,122 @@ On builds before 07.1, reloading or bookmarking a template editor whose key has 
   - the account is not suspended;
   - the feature in use is on at `/admin/settings/features`.
   Then look up the request's correlation ID in the audit centre.
+
+## Increment 07.2: payments, branding and the default workflow
+
+These changes answer the owner's prompt 30 of 2026-11-26 ([session log](../session-logs/2026-11-26-session-01.md)). There is no database migration, and the upgrade commands are unchanged.
+
+### Getting card checkout active (increment 07.2)
+
+Card checkout is active only when the banner at the top of **Stripe setup** (`/admin/payments/setup`) reads **Online card checkout: ACTIVE**. Until then, customers can place orders and get an invoice, but they are not sent to Stripe. The banner says what customers experience right now and which step is missing.
+
+1. **Create the key and endpoint in Stripe.**
+   - **Key:** an API secret key (`sk_…`) or a restricted key (`rk_…`) for the right mode. A restricted key needs at least:
+     - **Checkout Sessions: Write**;
+     - **Payment Intents: Read**;
+     - **Charges: Read** (and **Write** if staff issue refunds from ReadyPackets).
+
+     A Read-only Checkout Sessions permission passes **Test Stripe API**, but customers then cannot be sent to Stripe.
+   - **Endpoint:** register `https://<your host>/api/payments/webhooks/stripe` with the nine events listed on the page.
+   - Publishable keys (`pk_…`) are not used.
+2. **Stage the credentials.** In **Stripe setup** or **Payments → Configuration**, paste the **Stripe API secret key** and the **Primary Stripe webhook signing secret** (`whsec_…`) and save. You can keep Pay by invoice while you do this.
+3. **Allow the outbound connection.** Turn on **Allow api.stripe.com:443** (the `stripe` egress preset).
+4. **Check the connection.** Select **Test Stripe API**.
+5. **Check that sessions can be created.** Select **Verify Checkout session creation**. This creates an unpaid probe session and expires it at once, at no cost. It catches:
+   - a restricted key without Checkout Sessions Write;
+   - a custom Checkout domain, which ReadyPackets refuses because it sends customers only to `https://checkout.stripe.com`.
+6. **Check the signing secret.** Select **Send self-test webhook**. This proves the portal's own signature check with the stored Primary secret. To prove that Stripe has the same endpoint and secret, also use **Send test event** in Stripe Workbench, or make a test payment.
+7. **Activate.** Select **Activate Stripe Checkout** and confirm. In live mode, type `ACTIVATE LIVE PAYMENTS`.
+
+Steps 4–6 ask you to verify it's you again (step-up). Online checkout pauses until you run the matching step again if you:
+- change the key;
+- change the Primary signing secret;
+- change the mode;
+- change the egress preset.
+
+The full reference is [Hosted online payments](../../server/modules/payments/ADMIN_GUIDE.md).
+
+### Stripe secret fields: Primary and Secondary
+
+- **Stripe API secret key.** Paste the `sk_…` or `rk_…` key for the selected mode.
+- **Primary Stripe webhook signing secret.** This is the endpoint's signing secret, `whsec_…`. In Stripe, open the webhook endpoint and select **Reveal** under **Signing secret**. Do not copy the endpoint ID (`we_…`). To replace your saved secret, paste the new one here.
+- **Secondary Stripe webhook signing secret (optional rollover).** Leave it empty in normal setup. Use it only while Stripe signs with both an old and a new secret during a rollover. Then paste the new secret into Primary, run **Send self-test webhook** again, and remove Secondary.
+
+From 07.2, the fields help with pasting:
+- They remove surrounding quotes or backticks, non-breaking spaces, invisible characters and line breaks from a wrapped paste.
+- Each field gets its own error. The error says what the pasted value looks like (a publishable key, an API key in the signing-secret field, an endpoint ID, a masked value, too short or too long) without repeating it.
+- Each field has a **Show** / **Hide** button and is set to stop browsers and password managers from filling it in.
+- The hints say where in Stripe to copy each value.
+- Saved secrets are shown only as their last four characters.
+
+If a secret ever appears in a screenshot, e-mail or ticket, roll it in Stripe and paste the new value into the portal.
+
+### Troubleshooting: customers are not sent to Stripe
+
+1. **Read the banner.** Open **Stripe setup**. If it says **NOT ACTIVE**, finish the missing step it names; see [Getting card checkout active](#getting-card-checkout-active-increment-072).
+2. **Check the last failure.** Look at **Last checkout-session failure** on the same page, and in **Alerts** (`/admin/alerts`) look for "Customers cannot reach Stripe Checkout". The audit centre has `payments.attempt.failed`, with a reason code and Stripe's status, and `cart.checkout_payment_start_failed`. Neither contains keys or Stripe's own wording.
+3. **Fix the cause, then run Verify Checkout session creation again.** Common causes are:
+   - a revoked key;
+   - a restricted key without Checkout Sessions Write;
+   - the egress preset switched off;
+   - a custom Checkout domain.
+
+The customer's order and invoice are kept. The customer sees "Your order … is placed, but we could not open the secure payment page", and can select **Pay now** later, from the return page or the invoice, without placing a second order.
+
+### Company branding on invoices and receipts
+
+- **What the PDFs show.** Invoice, payment receipt and refund note PDFs have:
+  - the ReadyPackets mark, wordmark and tagline;
+  - your legal company name;
+  - brand colours, with dark text on light fills;
+  - a footer with `my.readypackets.com` and "Page X of Y", in Letter and A4.
+- **Order and project.**
+  - Each PDF has an **Order** and **Project** block near the top of page 1.
+  - The invoice and receipt pages for customers and staff show an "Order & project" card, and the lists show both.
+  - The invoice issued, invoice paid and payment receipt e-mails include Order and Project.
+  - Published overrides of those e-mail templates still work, and the order and project are added to them.
+- **Where to change it.**
+  - **Company profile** on **Invoices** (`/admin/invoices`) holds:
+    - **Legal company name**;
+    - **Tax or registration ID**;
+    - **Billing address**;
+    - **Billing contact**;
+    - **PDF header logo** and **Brand logo asset**;
+    - **Offline payment instructions**.
+  - **Receipt footer note** is under **Payments → Configuration** (`/admin/payments`).
+  - Saving asks you to verify it's you again.
+- **Defaults.** The legal name defaults to "Ready Packets Consulting LLC", and the logo to the ReadyPackets header mark.
+  - **Legal name on an upgraded server:** a name you set yourself is kept. Invoices that carry the old default "ReadyPackets" show "Ready Packets Consulting LLC".
+  - **Logo:** the default changed from the 192 px app icon to the header mark, so an upgraded server that never chose a logo shows the header mark.
+- **Existing documents.**
+  - Invoices are drawn when opened, so existing invoices show the new layout and the order's current project name.
+  - Receipt and refund note PDFs are stored with an integrity hash and are never rewritten. A receipt issued before the upgrade keeps its original PDF, but its page and any resent e-mail show the order and project.
+- **Characters.** Characters such as `·`, `•`, `–`, `—`, `€`, `™`, curly quotes and accented letters now print correctly. Other characters are replaced with readable equivalents, not "?".
+- **PDF accessibility.** The PDFs set the document language and title. They mark the content as tagged and give the logo alternative text ("ReadyPackets company logo"), and the text can be selected. They are **not** PDF/UA conformant: the standard Helvetica font is not embedded with a Unicode map, and tables have no full structure tags.
+
+### Setting the default workflow
+
+The top of **Workflows** (`/admin/workflows`) shows **Default workflow for new orders: name (version N)**.
+
+1. Choose **Set as default** on another published workflow.
+2. Confirm. You are asked for your password and authentication code.
+
+- **New orders.** Orders created from then on use that workflow's latest published version. This applies to orders customers place, cart checkout, orders staff create for a customer, and the API. If you publish a newer version later, new orders use it.
+- **Existing orders** keep the version they started with.
+- **Drafts.** A draft cannot be the default until it is published. When publishing a draft you can tick **Use for new orders (default workflow)**.
+- **Audit.** Every change is recorded as `workflow.default.changed`, with the previous and the new default.
+- **Products.** Workflows are not chosen per product or package.
+
+More detail is in [Workflow phases, requirements and console order actions](../../server/modules/orders/ADMIN_GUIDE_WORKFLOW_RULES.md#the-default-workflow-for-new-orders-increment-072).
+
+### The "ReadyPackets was updated on the server" prompt
+
+This prompt appears after you upgrade the server, in browser tabs that still run the previous version of the web app.
+- **Reload** switches to the new version and keeps the session. Unsaved input on that page is lost.
+- **Later** hides it until the next page change, then it is shown again.
+- It never reloads by itself.
+
+Ask users to reload after an upgrade.
 
 ## Storage copy log
 
@@ -782,7 +907,7 @@ All of these are audited. You never see a user's existing password or codes.
 | Outbound SMTP mail | integrations |
 | Microsoft Clarity analytics | integrations |
 | PostHog analytics | integrations |
-| Stripe webhook adapter | integrations (**Disabled in this release**; cannot activate online payment) |
+| Stripe webhook adapter | Stripe setup (`/admin/payments/setup`); available from increment 07, off until activated |
 
 Do not turn on the in-app backup schedule if the host uses the `readypackets-backup.timer` systemd timer. Use only
 one scheduler ([INSTALL.md](../operations/INSTALL.md#backups-and-audit-forwarding)).
@@ -909,9 +1034,9 @@ Until they land:
 - Turn providers on or off on **Features**, and set their values on **Settings** (groups **mail** and **analytics**).
 - SMTP: configure an approved host with authenticated TLS, then confirm delivery to an approved inbox. Never enable
   mail capture in production ([INSTALL.md](../operations/INSTALL.md#install-and-enroll-the-first-administrator)).
-- **Disabled in this release**: Stripe online payments (staff record offline payments), SAML single sign-on (local
-  sign-in with MFA is the only method) and SharePoint storage (local encrypted storage is the file backend). These
-  refuse activation on the server.
+- **Off until configured** (available from increment 07): Stripe online payments (`/admin/payments/setup`), SAML single
+  sign-on (`/admin/sso`) and Microsoft 365 / SharePoint file sync. Until then, staff record offline payments, local
+  sign-in with MFA is the only method, and local encrypted storage is the file backend.
 
 ## Production pipeline (Phase I and Phase II webhooks)
 
@@ -1048,4 +1173,4 @@ The portal is an authenticated application and is intentionally **not indexed**:
 | Backups | Command line and systemd; console pages available for status/metadata |
 | Integrations console (SMTP, analytics, outbound connections) | Available |
 | Messages, support tickets, notifications, global search | Available |
-| Stripe online payments, SAML SSO, SharePoint | Disabled in this release |
+| Stripe online payments, SAML SSO, SharePoint | Available from increment 07, off until configured |
