@@ -120,8 +120,10 @@ across the wire, no secrets or personal data in logs, WCAG 2.2 AA in both themes
 - Checkout: when a profile exists, radio group "Use my saved billing information" (summary shown, default) /
   "Enter different billing information"; with new details a checkbox "Save as my billing information"
   (checked when no profile exists). No profile → today's form plus the checkbox.
-- Export/erasure: the profile is personal data — included in the account data export and removed/anonymised
-  with the account (portable_contract_engineer covers backup/export/import).
+- The profile is personal data. It is covered by portable export/import and backup
+  (portable_contract_engineer). The customer can clear it at any time (`billingProfile.clear`). The portal has
+  no self-service account data export or account erasure feature today (only deactivation); none is added in
+  08 — documented as a known gap, privacy requests are handled by an administrator.
 
 ### D5 Payment confirmation (integrations_engineer)
 
