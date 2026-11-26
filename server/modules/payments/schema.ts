@@ -72,6 +72,9 @@ export const PAYMENT_REFUND_STATUSES = [
 ] as const;
 export type PaymentRefundStatus = (typeof PAYMENT_REFUND_STATUSES)[number];
 
+export const PAYMENT_BOOKING_SOURCES = ["webhook", "provider_lookup"] as const;
+export type PaymentBookingSource = (typeof PAYMENT_BOOKING_SOURCES)[number];
+
 export const paymentAttempts = mysqlTable(
   "payment_attempts",
   {
@@ -103,11 +106,13 @@ export const paymentAttempts = mysqlTable(
     paymentMethodLast4: varchar("payment_method_last4", { length: 4 }),
     /** AES-256-GCM encrypted hosted checkout URL (`payment_attempts.redirect_url:<publicId>`). */
     redirectUrlEnc: text("redirect_url_enc"),
-    /** External event ID of the verified signed webhook that authorized Decision 12 booking. */
+    /** External event ID of the verified signed webhook when Stripe/Square delivered a webhook for this attempt. */
     verifiedWebhookEventId: varchar("verified_webhook_event_id", { length: 128 }),
+    /** Increment 08 D5: authoritative channel that first booked the payment (`webhook` | `provider_lookup`). */
+    bookingSource: mysqlEnum("booking_source", PAYMENT_BOOKING_SOURCES),
     /** Resulting `compliance_invoice_payments.public_id` once booked. */
     compliancePaymentPublicId: char("compliance_payment_public_id", { length: 26 }),
-    /** Non-secret operator note (e.g. `awaiting_webhook` when poll sees paid before signed webhook arrives). */
+    /** Non-secret operator note (e.g. `awaiting_async_settlement` or lookup diagnostic reason). */
     reconciliationNote: varchar("reconciliation_note", { length: 120 }),
     failureReasonCode: varchar("failure_reason_code", { length: 64 }),
     redirectedAt: utcDateTime("redirected_at"),
@@ -115,6 +120,10 @@ export const paymentAttempts = mysqlTable(
     paidAt: utcDateTime("paid_at"),
     cancelledAt: utcDateTime("cancelled_at"),
     lastReconciledAt: utcDateTime("last_reconciled_at"),
+    /** Increment 08 D5: per-attempt customer confirmation lookup cool-down timestamp. */
+    lastCustomerLookupAt: utcDateTime("last_customer_lookup_at"),
+    /** Increment 08 D5: set once a lookup-booked attempt without a verified webhook has raised the missing-webhook ops alert. */
+    missingWebhookAlertedAt: utcDateTime("missing_webhook_alerted_at"),
     version: versionColumn(),
     createdAt: createdAtColumn(),
     updatedAt: updatedAtColumn(),
@@ -131,6 +140,7 @@ export const paymentAttempts = mysqlTable(
     index("pmt_att_cust_idx").on(t.customerUserId, t.id),
     index("pmt_att_st_exp_idx").on(t.status, t.expiresAt),
     index("pmt_att_prov_ord_idx").on(t.provider, t.providerOrderRef),
+    index("pmt_att_bk_wh_idx").on(t.provider, t.environment, t.bookingSource, t.paidAt),
   ],
 );
 
