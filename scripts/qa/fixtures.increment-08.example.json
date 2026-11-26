@@ -1,0 +1,43 @@
+{
+  "sessions": {
+    "customer": "customer.state.json",
+    "admin": "admin.state.json"
+  },
+  "checkoutSandbox": false,
+  "increment08": {
+    "registration-names": {},
+    "registration-billing": {
+      "steps": [{ "role": "button", "name": "Billing information (optional — you can add it later)" }]
+    },
+    "billing-settings-empty": { "storageState": "customer-no-billing.state.json" },
+    "billing-settings-saved": { "storageState": "customer-with-billing.state.json" },
+    "packet-tier-expanded": {
+      "steps": [{ "role": "radio", "name": "Basic", "namePrefix": true, "first": true, "key": "Space" }]
+    },
+    "add-to-order": { "path": "/orders/new?addTo=REPLACE_WITH_SEEDED_ORDER_PUBLIC_ID" },
+    "order-wizard": { "path": "/orders/REPLACE_WITH_WIZARD_ORDER_PUBLIC_ID" },
+    "order-wizard-waiting": { "path": "/orders/REPLACE_WITH_WAITING_ORDER_PUBLIC_ID" },
+    "cart-add-to-order": { "storageState": "customer-with-target-order-cart.state.json" },
+    "checkout-add-to-order": { "storageState": "customer-with-target-order-cart.state.json" },
+    "checkout-saved-billing": { "storageState": "customer-with-billing-and-cart.state.json" },
+    "checkout-different-billing": {
+      "storageState": "customer-with-billing-and-cart.state.json",
+      "steps": [{ "testId": "checkout-billing-choice-custom", "key": "Space" }]
+    },
+    "checkout-no-saved-billing": { "storageState": "customer-no-billing-with-cart.state.json" },
+    "checkout-return-paid": { "path": "/checkout/return?attempt=REPLACE_WITH_PAID_ATTEMPT_PUBLIC_ID" },
+    "checkout-return-pending": { "path": "/checkout/return?attempt=REPLACE_WITH_PENDING_ATTEMPT_PUBLIC_ID" },
+    "checkout-return-unpaid": { "path": "/checkout/return?attempt=REPLACE_WITH_UNPAID_ATTEMPT_PUBLIC_ID" },
+    "checkout-return-invalid": { "path": "/checkout/return?attempt=REPLACE_WITH_A_KNOWN_NONEXISTENT_ATTEMPT_PUBLIC_ID" },
+    "checkout-return-missing-target": { "path": "/checkout/return" },
+    "stripe-webhook-diagnostics": {},
+    "workflows-publish-dialog": {
+      "steps": [{ "testId": "publish-draft-row", "first": true }]
+    },
+    "workflow-draft-publish-dialog": {
+      "path": "/admin/workflows/drafts/REPLACE_WITH_DRAFT_PUBLIC_ID",
+      "steps": [{ "testId": "workflow-publish" }]
+    },
+    "workflow-draft-blocked-publish": { "path": "/admin/workflows/drafts/REPLACE_WITH_INVALID_DRAFT_PUBLIC_ID" }
+  }
+}

@@ -5,6 +5,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { INCREMENT_08, increment08FixtureProblem, increment08States } from "./increment-08.mjs";
 
 const run = promisify(execFile);
 const repo = fileURLToPath(new URL("../../../", import.meta.url));
@@ -99,13 +100,59 @@ export function resolveQaScenarios(inventory, config = {}, directory = process.c
   return { cases, missing, partial: Boolean(filter) };
 }
 
+export function resolveIncrement08Scenarios(inventory, config = {}, directory = process.cwd(), filter = "") {
+  const { increment08: overrides = {}, sessions } = config;
+  const routeMap = new Map(inventory.map((route) => [route.id, route]));
+  for (const key of Object.keys(overrides)) {
+    if (!Object.hasOwn(increment08States, key)) throw new Error("QA Increment 08 fixtures contain an unknown state ID.");
+  }
+  const cases = [];
+  const missing = [];
+  const exactState = Object.hasOwn(increment08States, filter);
+  for (const [key, spec] of Object.entries(increment08States)) {
+    if (exactState ? key !== filter : !key.includes(filter) && !spec.route.includes(filter)) continue;
+    const name = `${spec.route} [${spec.role}; ${key}]`;
+    const route = routeMap.get(spec.route);
+    const fixture = overrides[key] ?? {};
+    const item = { ...fixture, ready: spec.ready ?? fixture.ready, role: spec.role };
+    const path = item.path ?? route?.path;
+    const stop = (reason) => missing.push(`${name}: ${reason}.`);
+    if (!route) {
+      stop("route is not registered in this build");
+      continue;
+    }
+    if (!matchesQaRoute(route.path, path) || path.includes("/:")) {
+      stop("supply a concrete same-origin fixture path");
+      continue;
+    }
+    if (item.redirectsTo !== undefined) {
+      stop("an Increment 08 state must not redirect to another page");
+      continue;
+    }
+    const problem = increment08FixtureProblem(spec, item, path, config.checkoutSandbox);
+    if (problem) {
+      stop(problem);
+      continue;
+    }
+    const result = resolveQaScenarios([route], { sessions, cases: { [route.id]: [item] } }, directory);
+    const matching = result.cases.find((candidate) => candidate.role === spec.role);
+    if (matching) cases.push({ ...matching, name });
+    else stop("supply a disposable QA storage-state file for this role");
+  }
+  if (!cases.length && !missing.length) throw new Error("QA route filter matched no Increment 08 scenarios.");
+  return { cases, missing, partial: true, suite: INCREMENT_08 };
+}
+
 export async function qaRouteScenarios() {
   const fixturePath = process.env.QA_ROUTE_FIXTURES;
   let config;
   if (fixturePath) {
     try { config = JSON.parse(await readFile(fixturePath, "utf8")); } catch { throw new Error("QA_ROUTE_FIXTURES is unreadable or not valid JSON."); }
   }
-  const result = resolveQaScenarios(await qaRouteInventory(), config, fixturePath ? dirname(resolve(fixturePath)) : process.cwd(), process.env.QA_ROUTE_FILTER);
+  const suite = process.env.QA_SUITE;
+  if (suite && suite !== INCREMENT_08) throw new Error("QA_SUITE must be increment-08 or unset.");
+  const resolver = suite === INCREMENT_08 ? resolveIncrement08Scenarios : resolveQaScenarios;
+  const result = resolver(await qaRouteInventory(), config, fixturePath ? dirname(resolve(fixturePath)) : process.cwd(), process.env.QA_ROUTE_FILTER);
   result.cases.sort((a, b) => roleOrder.indexOf(a.role) - roleOrder.indexOf(b.role));
   return result;
 }
@@ -232,7 +279,8 @@ async function openQaRouteOnce(page, baseUrl, scenario, theme, beforeSteps) {
     await beforeSteps?.();
     if (scenario.tab) await page.getByRole("tab", { name: scenario.tab, exact: true }).click({ timeout: 5_000 });
     for (const step of scenario.steps) {
-      let control = step.label ? page.getByLabel(step.label, { exact: step.labelPrefix !== true }) :
+      let control = step.testId ? page.getByTestId(step.testId) :
+        step.label ? page.getByLabel(step.label, { exact: step.labelPrefix !== true }) :
         page.getByRole(step.role, { name: step.name, exact: step.namePrefix !== true });
       if (step.first === true) control = control.first();
       if (typeof step.text === "string") await control.pressSequentially(step.text, { timeout: 5_000 });

@@ -4,10 +4,11 @@ import axe from "axe-core";
 import { createQaPages, launchQaBrowser } from "./lib/browser.mjs";
 import { openQaRoute, qaRouteScenarios, QaRateLimitedError, routeQaContext, withQaRateLimitRetry } from "./lib/routes.mjs";
 import { createQaZoomDriver, setLiteralZoom } from "./lib/zoom.mjs";
+import { INCREMENT_08_WIDTHS } from "./lib/increment-08.mjs";
 
 const tags = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa", "best-practice"];
 // Desktop zoom-equivalent CSS viewports, NOT literal browser zoom. See ACCESSIBILITY.md.
-const sizes = [
+const reflowSizes = [
   { factor: 1, label: "desktop baseline", width: 1280, height: 960 },
   { factor: 2, label: "200% reflow equivalent", width: 640, height: 480 },
   { factor: 4, label: "400% reflow equivalent", width: 320, height: 240 },
@@ -32,9 +33,12 @@ async function scan(page) {
 }
 
 async function main() {
+  const { cases, missing, partial, suite } = await qaRouteScenarios();
   const driver = process.env.QA_LITERAL_ZOOM === "1" ? await createQaZoomDriver() : await launchQaBrowser();
   const { baseUrl } = driver;
   const literalZoom = "openZoomProfile" in driver;
+  const sizes = suite && !literalZoom ? INCREMENT_08_WIDTHS.map((width) =>
+    reflowSizes.find((size) => size.width === width) ?? { width, height: width < 768 ? 800 : 900, label: "responsive viewport" }) : reflowSizes;
   const reuse = !literalZoom && process.env.QA_REUSE_CONTEXT === "1";
   const pages = literalZoom ? null : createQaPages(driver.browser, baseUrl, reuse);
   console.log(`Browser context mode: ${literalZoom ? "fresh native-zoom profile at every width" :
@@ -44,8 +48,7 @@ async function main() {
   let rateLimited = 0;
   let unchecked = 0;
   try {
-    const { cases, missing, partial } = await qaRouteScenarios();
-    if (partial) console.log("Partial run: QA_ROUTE_FILTER was supplied. Not release-wide accessibility evidence.");
+    if (partial) console.log(`Partial run: ${suite ?? "route filter"}. Not release-wide accessibility evidence.`);
     for (const message of missing) console.error(`NOT CHECKED ${message}`);
     const matrix = cases.flatMap((scenario) => ["light", "dark"].flatMap((theme) =>
       sizes.map((size) => ({ scenario, theme, size, retry: false }))));
