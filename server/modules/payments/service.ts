@@ -13,7 +13,7 @@
  *    hardcoded reviewed same-origin paths; browser URL parameters are never trusted as proof of payment.
  */
 import { createHash } from "node:crypto";
-import { and, asc, count, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, or } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
@@ -857,6 +857,38 @@ function toWebhookRejectionSummary(row: PaymentWebhookRejectionRow): PaymentWebh
 }
 
 const WEBHOOK_REJECTION_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+
+function isMysqlDeadlockError(err: unknown): boolean {
+  let cur: unknown = err;
+  for (let depth = 0; depth < 4 && cur && typeof cur === "object"; depth += 1) {
+    const rec = cur as { code?: unknown; errno?: unknown; sqlState?: unknown; cause?: unknown };
+    if (
+      rec.code === "ER_LOCK_DEADLOCK" ||
+      rec.errno === 1213 ||
+      rec.sqlState === "40001"
+    ) {
+      return true;
+    }
+    cur = rec.cause;
+  }
+  return false;
+}
+
+async function runWithMysqlDeadlockRetry<T>(fn: () => Promise<T>, maxAttempts = 4): Promise<T> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt >= maxAttempts || !isMysqlDeadlockError(err)) {
+        throw err;
+      }
+      const backoffMs = 5 * attempt + Math.floor(Math.random() * 10);
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, backoffMs);
+      });
+    }
+  }
+}
 
 function sanitizeOpsAlertCode(raw: string, fallback = "PAYMENT_VERIFICATION_FAILED"): string {
   const upper = raw.trim().toUpperCase().replace(/[^A-Z0-9_]/gu, "_").slice(0, 64);
@@ -3020,6 +3052,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
     await resolvePaymentOpsAlert(`webhook-verify:${locked.publicId}`, tx);
     await resolvePaymentOpsAlert(`verification-mismatch:${locked.publicId}`, tx);
+    if (input.source === "webhook" && locked.provider === "stripe") {
+      await resolvePaymentOpsAlert(stripeWebhookDeliveryMissingAlert(locked.environment).dedupKey, tx);
+    }
 
     await deps.audit.record(
       {
@@ -3170,21 +3205,31 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
       const complianceSvc = requireComplianceService();
 
+      let resolvedId = expectedAttemptId;
+      if (resolvedId === undefined) {
+        const [lookup] = await tx
+          .select({ id: paymentAttempts.id })
+          .from(paymentAttempts)
+          .where(eq(paymentAttempts.publicId, input.attemptPublicId))
+          .limit(1);
+        if (!lookup) {
+          throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+        }
+        resolvedId = lookup.id;
+      }
+
       const [attempt] = await tx
         .select()
         .from(paymentAttempts)
-        .where(
-          expectedAttemptId !== undefined
-            ? and(
-                eq(paymentAttempts.id, expectedAttemptId),
-                eq(paymentAttempts.publicId, input.attemptPublicId),
-              )
-            : eq(paymentAttempts.publicId, input.attemptPublicId),
-        )
+        .where(eq(paymentAttempts.id, resolvedId))
         .for("update")
         .limit(1);
 
-      if (!attempt || attempt.customerUserId !== liveActor.userId) {
+      if (
+        !attempt ||
+        attempt.publicId !== input.attemptPublicId ||
+        attempt.customerUserId !== liveActor.userId
+      ) {
         throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
       }
 
@@ -3306,15 +3351,16 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       });
     }
 
-    return runComplianceTx(
-      deps,
-      principal,
-      { type: "payment_attempt", publicId: staged.attempt.publicId },
-      async (tx) => {
-        const { liveActor, livePrincipal, attempt: locked, invoice } = await loadOwnedCustomerAttemptInTx(
-          tx,
-          staged.attempt.id,
-        );
+    return runWithMysqlDeadlockRetry(() =>
+      runComplianceTx(
+        deps,
+        principal,
+        { type: "payment_attempt", publicId: staged.attempt.publicId },
+        async (tx) => {
+          const { liveActor, livePrincipal, attempt: locked, invoice } = await loadOwnedCustomerAttemptInTx(
+            tx,
+            staged.attempt.id,
+          );
 
         if (
           locked.provider !== "stripe" ||
@@ -3457,6 +3503,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           forceState: "processing",
         });
       },
+    ),
     );
   }
 
@@ -4719,12 +4766,14 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       };
     }
 
-    const bookedResult = await deps.db.transaction((tx) =>
-      finalizeVerifiedPaidAttemptInTx(tx, {
-        attemptId: attempt.id,
-        webhookRowId,
-        fetched,
-      }),
+    const bookedResult = await runWithMysqlDeadlockRetry(() =>
+      deps.db.transaction((tx) =>
+        finalizeVerifiedPaidAttemptInTx(tx, {
+          attemptId: attempt.id,
+          webhookRowId,
+          fetched,
+        }),
+      ),
     );
 
     return {
@@ -4766,17 +4815,17 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
     if (overdue.length === 0) return;
 
-    const byEnv = new Map<PaymentEnvironmentMode, { ids: number[]; oldestPaidAt: Date }>();
+    const byEnv = new Map<PaymentEnvironmentMode, { ids: number[]; newestPaidAt: Date }>();
     for (const row of overdue) {
       if (!row.paidAt) continue;
       const existing = byEnv.get(row.environment);
       if (existing) {
         existing.ids.push(row.id);
-        if (row.paidAt.getTime() < existing.oldestPaidAt.getTime()) {
-          existing.oldestPaidAt = row.paidAt;
+        if (row.paidAt.getTime() > existing.newestPaidAt.getTime()) {
+          existing.newestPaidAt = row.paidAt;
         }
       } else {
-        byEnv.set(row.environment, { ids: [row.id], oldestPaidAt: row.paidAt });
+        byEnv.set(row.environment, { ids: [row.id], newestPaidAt: row.paidAt });
       }
     }
 
@@ -4790,7 +4839,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             eq(paymentWebhookEvents.environment, env),
             ne(paymentWebhookEvents.eventType, "readypackets.self_test"),
             inArray(paymentWebhookEvents.status, ["processed", "awaiting_settlement"]),
-            gte(paymentWebhookEvents.receivedAt, group.oldestPaidAt),
+            gte(paymentWebhookEvents.receivedAt, group.newestPaidAt),
           ),
         )
         .limit(1);
@@ -4933,18 +4982,20 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             .limit(1);
 
           if (pendingWh) {
-            const res = await deps.db.transaction(async (tx) => {
-              if (!(await verifyPostEgressStripeDigestInTx(tx))) {
-                return { booked: false, alreadyPaid: false, drifted: true };
-              }
-              const bookedRes = await bookAuthoritativeAttemptPaymentInTx(tx, {
-                attemptId: attempt.id,
-                source: "webhook",
-                webhookRowId: pendingWh.id,
-                fetched,
-              });
-              return { ...bookedRes, drifted: false };
-            });
+            const res = await runWithMysqlDeadlockRetry(() =>
+              deps.db.transaction(async (tx) => {
+                if (!(await verifyPostEgressStripeDigestInTx(tx))) {
+                  return { booked: false, alreadyPaid: false, drifted: true };
+                }
+                const bookedRes = await bookAuthoritativeAttemptPaymentInTx(tx, {
+                  attemptId: attempt.id,
+                  source: "webhook",
+                  webhookRowId: pendingWh.id,
+                  fetched,
+                });
+                return { ...bookedRes, drifted: false };
+              }),
+            );
             if (res.drifted) {
               stillPending += 1;
             } else if (res.booked) {
@@ -4957,16 +5008,18 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         }
 
         if (attempt.provider === "stripe") {
-          const res = await deps.db.transaction(async (tx) => {
-            if (!(await verifyPostEgressStripeDigestInTx(tx))) {
-              return { booked: false, alreadyPaid: false };
-            }
-            return bookAuthoritativeAttemptPaymentInTx(tx, {
-              attemptId: attempt.id,
-              source: "provider_lookup",
-              fetched,
-            });
-          });
+          const res = await runWithMysqlDeadlockRetry(() =>
+            deps.db.transaction(async (tx) => {
+              if (!(await verifyPostEgressStripeDigestInTx(tx))) {
+                return { booked: false, alreadyPaid: false };
+              }
+              return bookAuthoritativeAttemptPaymentInTx(tx, {
+                attemptId: attempt.id,
+                source: "provider_lookup",
+                fetched,
+              });
+            }),
+          );
           if (res.booked) {
             if (!res.alreadyPaid) booked += 1;
           } else {
@@ -5217,6 +5270,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             isNull(paymentAttempts.verifiedWebhookEventId),
             isNotNull(paymentAttempts.paidAt),
             lte(paymentAttempts.paidAt, graceCutoff),
+            ...(latestStripeWebhook
+              ? [gt(paymentAttempts.paidAt, latestStripeWebhook.receivedAt)]
+              : []),
           ),
         )
         .orderBy(asc(paymentAttempts.paidAt), asc(paymentAttempts.id))
@@ -5246,12 +5302,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       }));
 
     const oldestUnwebhooked = unwebhookedLookupRows[0]?.paidAt ?? null;
-    const hasVerifiedWebhookSinceOldest = Boolean(
-      oldestUnwebhooked &&
-        latestStripeWebhook &&
-        latestStripeWebhook.receivedAt.getTime() >= oldestUnwebhooked.getTime(),
-    );
-    const missingWebhookDetected = Boolean(oldestUnwebhooked && !hasVerifiedWebhookSinceOldest);
+    const missingWebhookDetected = oldestUnwebhooked !== null;
 
     const stripeWebhookUrl = new URL("/api/payments/webhooks/stripe", deps.config.canonicalOrigin).href;
     const squareWebhookUrl = new URL("/api/payments/webhooks/square", deps.config.canonicalOrigin).href;
@@ -6691,11 +6742,12 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       }
     }
 
-    return runComplianceTx(
-      deps,
-      principal,
-      { type: "payment_attempt", publicId: input.attemptPublicId ?? staged.targetInvoicePublicId },
-      async (tx) => {
+    return runWithMysqlDeadlockRetry(() =>
+      runComplianceTx(
+        deps,
+        principal,
+        { type: "payment_attempt", publicId: input.attemptPublicId ?? staged.targetInvoicePublicId },
+        async (tx) => {
         const liveActor = await assertLiveActorInTx(deps, principal, tx, "payments.manage");
         const complianceSvc = requireComplianceService();
         let lastReasonCode = "STILL_UNPAID";
@@ -6813,7 +6865,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         return {
           checkedCount: fetchedEntries.length,
           booked: didBook,
-          alreadyPaid: wasAlreadyPaid || refreshedInvoice.status === "paid",
+          alreadyPaid: !didBook && (wasAlreadyPaid || refreshedInvoice.status === "paid"),
           invoicePublicId: refreshedInvoice.invoicePublicId,
           invoiceStatus: refreshedInvoice.status,
           receiptPublicId: refreshedInvoice.receiptPublicId ?? null,
@@ -6823,6 +6875,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           reasonCode: lastReasonCode,
         };
       },
+    ),
     );
   }
 
