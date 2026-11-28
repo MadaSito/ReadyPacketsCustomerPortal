@@ -11,6 +11,7 @@ import { lastRunText } from "./RetentionPanel";
 import { MoveToTrashDialog } from "./TrashDialogs";
 import TrashCentrePage, { toListInput } from "./TrashCentrePage";
 import { trashFeature } from "./routes";
+import { TrashNavCount } from "./TrashNavCount";
 
 const { handlers, calls } = vi.hoisted(() => ({
   handlers: new Map<string, (input: unknown) => unknown>(),
@@ -123,6 +124,23 @@ describe("trash model", () => {
     const input = toListInput("order", { q: " RP-2026 ", movedFrom: "2026-11-01", movedTo: "", movedBy: "01JADMIN", dueWithin: "7" }, { key: "dueAt", direction: "asc" }, null);
     expect(input).toMatchObject({ kind: "order", q: "RP-2026", movedByPublicId: "01JADMIN", dueWithinDays: 7, sort: "dueAt", dir: "asc", limit: 25 });
     expect(trashFeature.routes[0]).toMatchObject({ path: "/admin/trash", access: "admin", capability: "trash.read" });
+  });
+});
+
+describe("TrashNavCount", () => {
+  it("shows the total and is the nav badge", async () => {
+    renderUi(<TrashNavCount />);
+    expect(await screen.findByText("2")).toHaveTextContent("2 in the trash");
+    expect(trashFeature.nav?.[0]?.badge).toBe(TrashNavCount);
+  });
+
+  it("renders nothing on an error, without retrying", async () => {
+    handlers.set("trash.counts", () => { throw safe("FORBIDDEN", "No access.", "FORBIDDEN"); });
+    renderUi(<TrashNavCount />);
+    await waitFor(() => expect(calls.filter((c) => c.path === "trash.counts")).toHaveLength(1));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByText(/in the trash/)).not.toBeInTheDocument();
+    expect(calls.filter((c) => c.path === "trash.counts")).toHaveLength(1);
   });
 });
 

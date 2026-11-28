@@ -2,10 +2,11 @@
 import { lazy } from "react";
 import { Trash2 } from "lucide-react";
 import type { FeatureRoutes } from "@/lib/routes";
+import { TrashNavCount } from "./TrashNavCount";
 
 const read = { access: "admin", capability: "trash.read" } as const;
 
 export const trashFeature: FeatureRoutes = {
   routes: [{ ...read, path: "/admin/trash", title: "Trash", component: lazy(() => import("./TrashCentrePage")) }],
-  nav: [{ ...read, label: "Trash", href: "/admin/trash", icon: Trash2, area: "console", group: "Operations", order: 59 }],
+  nav: [{ ...read, label: "Trash", href: "/admin/trash", icon: Trash2, area: "console", group: "Operations", order: 59, badge: TrashNavCount }],
 };

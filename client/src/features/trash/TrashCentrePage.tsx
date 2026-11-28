@@ -249,11 +249,3 @@ export default function TrashCentrePage() {
   );
 }
 
-/** Count badge for the admin navigation entry (items in the trash), or nothing while zero or loading. */
-export function TrashNavCount() {
-  const api = useTrashApi();
-  const counts = useQuery({ ...api.counts.queryOptions(), staleTime: 60_000 });
-  const total = counts.data ? counts.data.orders + counts.data.customers : 0;
-  if (!total) return null;
-  return <Badge>{total}<span className="sr-only"> in the trash</span></Badge>;
-}
