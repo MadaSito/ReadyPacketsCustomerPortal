@@ -1007,8 +1007,10 @@ describe("portable classification and backup traversal", () => {
     const now = h.clock.now();
     const admin = fakePrincipal({ role: "admin", stepUpAt: now });
     const sessionCheck = vi.spyOn(h.services.identity.sessions, "assertCurrent");
-    const list = (includeTrashedOrders: boolean) => t.db.transaction((tx) =>
-      files.portableFiles(tx, { principal: admin, limit: 10, includeTrashedOrders }), { accessMode: "read only" });
+    const list = (includeTrashedOrders: boolean) => t.db.transaction(
+      (tx) => files.portableFiles(tx, { principal: admin, limit: 10, includeTrashedOrders }),
+      { isolationLevel: "repeatable read", accessMode: "read only" },
+    );
     try {
       await t.db.update(orders).set({ trashedAt: now, trashBatchId: orderPublicId }).where(eq(orders.id, orderId));
       await expect(list(false)).resolves.toMatchObject({ items: [] });
