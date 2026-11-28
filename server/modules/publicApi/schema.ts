@@ -57,7 +57,11 @@ export const apiKeys = mysqlTable(
     createdAt: createdAtColumn(),
     updatedAt: updatedAtColumn(),
   },
-  (t) => [uniqueIndex("api_keys_prefix_uq").on(t.prefix), index("api_keys_state_idx").on(t.state, t.id)],
+  (t) => [
+    uniqueIndex("api_keys_prefix_uq").on(t.prefix),
+    index("api_keys_state_idx").on(t.state, t.id),
+    index("api_keys_creator_idx").on(t.createdByUserId),
+  ],
 );
 
 export const apiRequestLog = mysqlTable(
