@@ -20,10 +20,11 @@ export function createAssuranceTrashParticipant(deps: ModuleDeps): TrashParticip
       ));
       await tx.delete(assuranceChallenges).where(eq(assuranceChallenges.userId, userId));
     },
-    async purge(entity) {
+    async purge(entity, run) {
       if (entity.kind !== "customer") return { deleted: {} };
       const userId = entity.id;
       return deps.db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
         // The user row becomes a tombstone, so its cascading FKs cannot erase these rows.
         const [account] = await tx.delete(assuranceAccounts).where(eq(assuranceAccounts.userId, userId));
         const [challenges] = await tx.delete(assuranceChallenges).where(eq(assuranceChallenges.userId, userId));

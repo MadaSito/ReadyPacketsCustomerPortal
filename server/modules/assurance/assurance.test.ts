@@ -11,12 +11,13 @@ import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { liveUserPredicate } from "../identity/live.js";
 import { users, userSessions } from "../identity/schema.js";
-import { createTrashRegistry } from "../trash/ports.js";
+import { createTrashRegistry, unfencedPurgeRunForTests } from "../trash/ports.js";
 import { assessEntraSignIn, isFreshEntraAuthentication } from "./entra.js";
 import { createAssuranceModule } from "./index.js";
 import { assuranceRouter } from "./router.js";
 import * as assuranceSchema from "./schema.js";
 import { totp, totpStep } from "./store.js";
+import { createAssuranceTrashParticipant } from "./trash.js";
 import { syntheticAuthenticator } from "./webauthn.test-fixture.js";
 
 const { assuranceAccounts, assuranceChallenges, assurancePasskeys, assuranceRecoveryCodes } = assuranceSchema;
@@ -170,7 +171,7 @@ describe("assurance: isolated transactional model", () => {
     expect(registry.participants().map((participant) => participant.module)).toEqual(["assurance"]);
     const participant = registry.participants()[0]!;
     const entity = { kind: "customer", id: account.userId, publicId: account.userPublicId, batchId: ulid(+now) } as const;
-    const run = { runId: ulid(+now) };
+    const run = unfencedPurgeRunForTests(ulid(+now));
     const order = { ...entity, kind: "order" } as const;
     const admin = await fixture({ role: "admin" });
     const actor = { kind: "user", userId: admin.userId, publicId: admin.userPublicId } as const;
@@ -199,6 +200,37 @@ describe("assurance: isolated transactional model", () => {
     } });
     expect(await h.services.assurance.getAssuranceState(other.userId)).toMatchObject({ totpEnrolled: true });
     expect(await db.db.select().from(assuranceChallenges).where(eq(assuranceChallenges.userId, other.userId))).toHaveLength(1);
+  });
+
+  it("checks purge ownership before deleting any assurance rows", async () => {
+    const { account } = await enroll();
+    const now = h.clock.now();
+    const expiresAt = new Date(+now + 60_000);
+    const passkeyPublicId = ulid(+now);
+    await db.db.insert(assurancePasskeys).values({
+      publicId: passkeyPublicId, userId: account.userId, credentialId: "synthetic-fenced-credential",
+      credentialIndex: h.deps.crypto.blindIndex(passkeyPublicId, "test"), publicKey: "synthetic-public-key",
+      counter: 0, nameEnc: h.deps.crypto.encrypt("Synthetic passkey", `assurance_passkeys.name_enc:${passkeyPublicId}`),
+    });
+    await db.db.insert(assuranceChallenges).values({
+      userId: account.userId, sessionId: account.sessionId, purpose: "step_up", challengeHash: "synthetic-fenced-step", expiresAt,
+    });
+    const assertRowsIntact = async (tx: DbOrTx) => {
+      await expect(tx.select().from(assuranceAccounts).where(eq(assuranceAccounts.userId, account.userId))).resolves.toHaveLength(1);
+      await expect(tx.select().from(assurancePasskeys).where(eq(assurancePasskeys.userId, account.userId))).resolves.toHaveLength(1);
+      await expect(tx.select().from(assuranceChallenges).where(eq(assuranceChallenges.userId, account.userId))).resolves.toHaveLength(1);
+      await expect(tx.select().from(assuranceRecoveryCodes).where(eq(assuranceRecoveryCodes.userId, account.userId))).resolves.toHaveLength(10);
+    };
+    const assertCurrentInTx = vi.fn(async (tx: Tx) => {
+      await assertRowsIntact(tx);
+      throw new DomainError("CONFLICT", "PURGE_FENCE_LOST", "This worker no longer owns the purge run.");
+    });
+    const participant = createAssuranceTrashParticipant(h.deps);
+    const entity = { kind: "customer", id: account.userId, publicId: account.userPublicId, batchId: ulid(+now) } as const;
+    const run = unfencedPurgeRunForTests(ulid(+now), { assertCurrentInTx });
+    await expect(participant.purge!(entity, run)).rejects.toMatchObject({ reasonCode: "PURGE_FENCE_LOST" });
+    expect(assertCurrentInTx).toHaveBeenCalledTimes(1);
+    await assertRowsIntact(db.db);
   });
 
   it("trusts only a validated explicit MFA assertion when the trust switch is enabled", () => {
