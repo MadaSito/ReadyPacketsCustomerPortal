@@ -199,7 +199,7 @@ Existing orders keep their pinned workflow version. The start-up job `orders.inc
 
 `0009_increment_09` is additive only: new tables, new nullable columns or columns with defaults, new indexes, and enum widening. It drops and renames nothing, and does no backfill in SQL.
 
-- **Schema.** `migrations/0009_increment_09.sql` (commit 3acb20d, which replaces the earlier 8b76e87 and 2731868) has 56 statements: 6 new tables, 1 enum widening, 23 new nullable columns, 25 new indexes and 1 foreign key.
+- **Schema.** `migrations/0009_increment_09.sql` (commit d358237, which replaces the earlier 8b76e87 and 2a76f92) has 56 statements: 6 new tables, 1 enum widening, 23 new nullable columns, 25 new indexes and 1 foreign key.
   - **New tables:** `trash_purge_runs` (one row per permanent deletion, with per-module counts and a safe error code), `trash_purge_run_targets` (the fixed list of items each deletion works on), `trash_cleanup_sweeps` (retention job runs), `trash_retention_deferrals` (items the clean-up job has put off and will try again, for example an order on legal hold), `trash_idempotency_keys` and `trash_retention_state`.
   - **Foreign key:** `trash_purge_target_run_fk` links `trash_purge_run_targets.run_id` to `trash_purge_runs`.
   - **`users` and `orders`:** `trashed_at`, `trashed_by_user_id`, `trash_batch_id`, `trash_reason`, `purge_started_at` and `purged_at`, with indexes `users_trashed_idx` and `orders_trashed_idx` on `(trashed_at, id)`, and `orders_trash_batch_idx`.

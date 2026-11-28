@@ -80,7 +80,7 @@ of scope (ADR 0010).
 
   A tombstone row remains, with personal fields overwritten.
 - **Copies the portal does not control.** These are not erased: backups (until they expire), Stripe, SharePoint folders already written, delivered e-mail and SIEM copies. Restoring an older backup reintroduces deleted data, which must then be deleted again.
-- **Consent records.** On a customer's deletion, the platform unlinks the account from its consent records (`consent.forgetUser`), and the anonymous record stays until consent retention ends. This is wired as the `platform` trash participant (2a3a154).
+- **Consent records.** On a customer's deletion, the platform unlinks the account from its consent records (`consent.forgetUser`), and the anonymous record stays until consent retention ends. This is wired as the `platform` trash participant (acd4ab4).
 
 
 ## 3. Actors

@@ -1264,7 +1264,7 @@ describe("durable per-target ownership, pure row-lock participant fence, and ret
         const arr = seenByOrder.get(entity.publicId) ?? [];
         arr.push(Boolean(run.acknowledgedUnreachableCopies));
         seenByOrder.set(entity.publicId, arr);
-        // Only `reassignedChild` has unreachable external copies; stamp the per-run `storage_copy_attempts` journal (`8d4b57c`)!
+        // Only `reassignedChild` has unreachable external copies; stamp the per-run `storage_copy_attempts` journal (`21b4149`)!
         if (entity.publicId === reassignedChild.publicId && !run.acknowledgedUnreachableCopies) {
           const jNow = h.clock.now();
           for (let i = 0; i < 3; i += 1) {
