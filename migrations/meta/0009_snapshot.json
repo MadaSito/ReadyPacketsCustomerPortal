@@ -1,7 +1,7 @@
 {
   "version": "5",
   "dialect": "mysql",
-  "id": "01143084-13d7-4cc9-a8b6-73ca7e28fe04",
+  "id": "dbe9e00e-be6c-41aa-be8b-a4bdb1019c6f",
   "prevId": "8fb0b631-ab26-4073-9bc8-d8869623e54c",
   "tables": {
     "customer_ref_history": {
@@ -31125,6 +31125,14 @@
           "autoincrement": false,
           "default": "'running'"
         },
+        "fencing_token": {
+          "name": "fencing_token",
+          "type": "int unsigned",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 1
+        },
         "purged_count": {
           "name": "purged_count",
           "type": "int unsigned",
@@ -31263,7 +31271,7 @@
         },
         "response_json": {
           "name": "response_json",
-          "type": "text",
+          "type": "mediumtext",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
@@ -31299,6 +31307,170 @@
       "compositePrimaryKeys": {
         "trash_idempotency_keys_id": {
           "name": "trash_idempotency_keys_id",
+          "columns": [
+            "id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraint": {}
+    },
+    "trash_purge_run_targets": {
+      "name": "trash_purge_run_targets",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "bigint unsigned",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": true
+        },
+        "run_id": {
+          "name": "run_id",
+          "type": "bigint unsigned",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "entity_kind": {
+          "name": "entity_kind",
+          "type": "enum('order','customer')",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "entity_id": {
+          "name": "entity_id",
+          "type": "bigint unsigned",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "entity_public_id": {
+          "name": "entity_public_id",
+          "type": "char(26)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "target_reference": {
+          "name": "target_reference",
+          "type": "varchar(64)",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "batch_id": {
+          "name": "batch_id",
+          "type": "char(26)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "position": {
+          "name": "position",
+          "type": "int unsigned",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "enum('pending','running','completed')",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'pending'"
+        },
+        "checkpoint_json": {
+          "name": "checkpoint_json",
+          "type": "mediumtext",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "leave_external_copies_approved_at": {
+          "name": "leave_external_copies_approved_at",
+          "type": "datetime(3)",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "leave_external_copies_actor_user_id": {
+          "name": "leave_external_copies_actor_user_id",
+          "type": "bigint unsigned",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "tombstoned_at": {
+          "name": "tombstoned_at",
+          "type": "datetime(3)",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "datetime(3)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "CURRENT_TIMESTAMP(3)"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "datetime(3)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "CURRENT_TIMESTAMP(3)"
+        }
+      },
+      "indexes": {
+        "trash_purge_target_entity_uq": {
+          "name": "trash_purge_target_entity_uq",
+          "columns": [
+            "entity_kind",
+            "entity_id"
+          ],
+          "isUnique": true
+        },
+        "trash_purge_target_run_pos_ix": {
+          "name": "trash_purge_target_run_pos_ix",
+          "columns": [
+            "run_id",
+            "position"
+          ],
+          "isUnique": false
+        },
+        "trash_purge_target_pub_ix": {
+          "name": "trash_purge_target_pub_ix",
+          "columns": [
+            "entity_kind",
+            "entity_public_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "trash_purge_target_run_fk": {
+          "name": "trash_purge_target_run_fk",
+          "tableFrom": "trash_purge_run_targets",
+          "tableTo": "trash_purge_runs",
+          "columnsFrom": [
+            "run_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "trash_purge_run_targets_id": {
+          "name": "trash_purge_run_targets_id",
           "columns": [
             "id"
           ]
@@ -31381,23 +31553,31 @@
           "autoincrement": false,
           "default": "'running'"
         },
+        "fencing_token": {
+          "name": "fencing_token",
+          "type": "int unsigned",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 1
+        },
         "targets_json": {
           "name": "targets_json",
-          "type": "text",
+          "type": "mediumtext",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
         },
         "checkpoint_json": {
           "name": "checkpoint_json",
-          "type": "text",
+          "type": "mediumtext",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
         },
         "counts_json": {
           "name": "counts_json",
-          "type": "text",
+          "type": "mediumtext",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
@@ -31420,6 +31600,20 @@
         "failed_module": {
           "name": "failed_module",
           "type": "varchar(64)",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "failed_target_public_id": {
+          "name": "failed_target_public_id",
+          "type": "char(26)",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "next_retry_at": {
+          "name": "next_retry_at",
+          "type": "datetime(3)",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
@@ -31486,6 +31680,15 @@
           "columns": [
             "status",
             "started_at"
+          ],
+          "isUnique": false
+        },
+        "trash_purge_run_retry_ix": {
+          "name": "trash_purge_run_retry_ix",
+          "columns": [
+            "status",
+            "next_retry_at",
+            "id"
           ],
           "isUnique": false
         },

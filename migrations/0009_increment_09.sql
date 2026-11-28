@@ -2,6 +2,7 @@ CREATE TABLE `trash_cleanup_sweeps` (
 	`id` bigint unsigned AUTO_INCREMENT NOT NULL,
 	`public_id` char(26) NOT NULL,
 	`status` enum('running','completed','failed') NOT NULL DEFAULT 'running',
+	`fencing_token` int unsigned NOT NULL DEFAULT 1,
 	`purged_count` int unsigned NOT NULL DEFAULT 0,
 	`failed_count` int unsigned NOT NULL DEFAULT 0,
 	`error_code` varchar(64),
@@ -20,10 +21,30 @@ CREATE TABLE `trash_idempotency_keys` (
 	`action` varchar(48) NOT NULL,
 	`key_hash` char(64) NOT NULL,
 	`fingerprint_hash` char(64) NOT NULL,
-	`response_json` text NOT NULL,
+	`response_json` mediumtext NOT NULL,
 	`created_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 	CONSTRAINT `trash_idempotency_keys_id` PRIMARY KEY(`id`),
 	CONSTRAINT `trash_idem_actor_act_key_uq` UNIQUE(`actor_user_id`,`action`,`key_hash`)
+);
+--> statement-breakpoint
+CREATE TABLE `trash_purge_run_targets` (
+	`id` bigint unsigned AUTO_INCREMENT NOT NULL,
+	`run_id` bigint unsigned NOT NULL,
+	`entity_kind` enum('order','customer') NOT NULL,
+	`entity_id` bigint unsigned NOT NULL,
+	`entity_public_id` char(26) NOT NULL,
+	`target_reference` varchar(64),
+	`batch_id` char(26) NOT NULL,
+	`position` int unsigned NOT NULL,
+	`status` enum('pending','running','completed') NOT NULL DEFAULT 'pending',
+	`checkpoint_json` mediumtext NOT NULL,
+	`leave_external_copies_approved_at` datetime(3),
+	`leave_external_copies_actor_user_id` bigint unsigned,
+	`tombstoned_at` datetime(3),
+	`created_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+	`updated_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+	CONSTRAINT `trash_purge_run_targets_id` PRIMARY KEY(`id`),
+	CONSTRAINT `trash_purge_target_entity_uq` UNIQUE(`entity_kind`,`entity_id`)
 );
 --> statement-breakpoint
 CREATE TABLE `trash_purge_runs` (
@@ -37,12 +58,15 @@ CREATE TABLE `trash_purge_runs` (
 	`trigger` enum('manual','retention') NOT NULL,
 	`actor_user_id` bigint unsigned,
 	`status` enum('running','completed','failed') NOT NULL DEFAULT 'running',
-	`targets_json` text NOT NULL,
-	`checkpoint_json` text NOT NULL,
-	`counts_json` text NOT NULL,
+	`fencing_token` int unsigned NOT NULL DEFAULT 1,
+	`targets_json` mediumtext NOT NULL,
+	`checkpoint_json` mediumtext NOT NULL,
+	`counts_json` mediumtext NOT NULL,
 	`attempt_count` int unsigned NOT NULL DEFAULT 1,
 	`error_code` varchar(64),
 	`failed_module` varchar(64),
+	`failed_target_public_id` char(26),
+	`next_retry_at` datetime(3),
 	`correlation_id` varchar(64),
 	`started_at` datetime(3) NOT NULL,
 	`finished_at` datetime(3),
@@ -88,11 +112,15 @@ ALTER TABLE `mail_outbox` ADD `recipient_account_id` bigint unsigned;--> stateme
 ALTER TABLE `automation_runs` ADD `subject_user_id` bigint unsigned;--> statement-breakpoint
 ALTER TABLE `payment_attempts` ADD `trash_cancelled_at` datetime(3);--> statement-breakpoint
 ALTER TABLE `payment_attempts` ADD `provider_cancelled_at` datetime(3);--> statement-breakpoint
+ALTER TABLE `trash_purge_run_targets` ADD CONSTRAINT `trash_purge_target_run_fk` FOREIGN KEY (`run_id`) REFERENCES `trash_purge_runs`(`id`) ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 CREATE INDEX `trash_cleanup_sweep_status_ix` ON `trash_cleanup_sweeps` (`status`,`started_at`);--> statement-breakpoint
 CREATE INDEX `trash_cleanup_sweep_fin_ix` ON `trash_cleanup_sweeps` (`finished_at`,`id`);--> statement-breakpoint
 CREATE INDEX `trash_idem_created_ix` ON `trash_idempotency_keys` (`created_at`);--> statement-breakpoint
+CREATE INDEX `trash_purge_target_run_pos_ix` ON `trash_purge_run_targets` (`run_id`,`position`);--> statement-breakpoint
+CREATE INDEX `trash_purge_target_pub_ix` ON `trash_purge_run_targets` (`entity_kind`,`entity_public_id`);--> statement-breakpoint
 CREATE INDEX `trash_purge_run_entity_ix` ON `trash_purge_runs` (`entity_kind`,`entity_public_id`,`id`);--> statement-breakpoint
 CREATE INDEX `trash_purge_run_status_ix` ON `trash_purge_runs` (`status`,`started_at`);--> statement-breakpoint
+CREATE INDEX `trash_purge_run_retry_ix` ON `trash_purge_runs` (`status`,`next_retry_at`,`id`);--> statement-breakpoint
 CREATE INDEX `trash_purge_run_sweep_ix` ON `trash_purge_runs` (`sweep_public_id`);--> statement-breakpoint
 CREATE INDEX `users_trashed_idx` ON `users` (`trashed_at`,`id`);--> statement-breakpoint
 CREATE INDEX `orders_trashed_idx` ON `orders` (`trashed_at`,`id`);--> statement-breakpoint
