@@ -13,11 +13,13 @@ import {
   Browser, bootstrapAdmin, createSystem, enrolTotp, linkToken, registerCustomer, seedProduct, stepUp, STRONG_PASSWORD,
   type ReadyAdmin, type ReadyCustomer, type System, type TrpcResult,
 } from "./harness.js";
+import { trashAccessProbes, type TrashProbeTarget } from "./trash-probes.js";
 
 let sys: System;
 let admin: ReadyAdmin;
 let owner: ReadyCustomer;
 let staff: Browser;
+let staffSecret: string;
 let productPublicId: string;
 let apiToken: string;
 const staffEmail = "trash.staff@example.test";
@@ -120,34 +122,67 @@ beforeAll(async () => {
   staff = sys.browser();
   Browser.ok(await staff.mutate("identity.activateAccount", { token: linkToken(mail.text), password: STRONG_PASSWORD }));
   Browser.ok(await staff.mutate("identity.signIn", { email: staffEmail, password: STRONG_PASSWORD }));
-  await enrolTotp(sys, staff);
+  ({ secret: staffSecret } = await enrolTotp(sys, staff));
   owner = await registerCustomer(sys, "trash.owner@example.test", "Zeus Greene");
 }, 120_000);
 
 afterAll(async () => sys?.close());
 
 describe("trash lifecycle across modules", () => {
-  it("denies all four trash operations to full customer and staff sessions", async () => {
-    const order = await makeOrder(owner.browser, "permissions");
-    const target: Target = { kind: "order", publicId: order.publicId };
-    const customer = await customerRow(owner.browser);
+  it("denies every Trash procedure without disclosing target existence to stepped-up customer and staff sessions", async () => {
+    const liveOrder = await makeOrder(owner.browser, "permissions-live");
+    const ownCustomer = await customerRow(owner.browser);
+    const order = await makeOrder(owner.browser, "permissions-trash");
+    const orderTarget = { kind: "order", publicId: order.publicId } as const;
+    const trashedOrder = moved(orderTarget, await move(orderTarget, "permissions-order"));
+    const another = await registerCustomer(sys, "trash.permissions@example.test", "Taylor Permissions");
+    const account = await customerRow(another.browser);
+    const customerTarget = { kind: "customer", publicId: account.publicId } as const;
+    Browser.ok(await admin.browser.mutate("identity.admin.customers.setStatus", {
+      customerId: account.publicId, status: "suspended", reasonCode: "SYNTHETIC_PERMISSIONS_TEST",
+    }));
+    const trashedCustomer = moved(customerTarget, await move(customerTarget, "permissions-customer"));
     Browser.ok(await admin.browser.query("trash.list", listInput("order")));
-    for (const [role, browser] of [["customer", owner.browser], ["staff", staff]] as const) {
+    const unknownTarget = ({ kind }: TrashProbeTarget) => ({ kind, publicId: ulid(), batchId: ulid() });
+    for (const [role, browser, secret] of [["customer", owner.browser, owner.secret], ["staff", staff, staffSecret]] as const) {
       expect(Browser.ok(await browser.query("identity.me"))).toMatchObject({ state: "full", user: { role } });
-      for (const [entity, confirmation] of [[target, order.reference], [{ kind: "customer", publicId: customer.publicId }, customer.customerRef]] as const) {
-        const withBatch = { ...entity, batchId: ulid() };
-        const denied = [
-          ["list", await browser.query("trash.list", listInput(entity.kind))],
-          ["moveToTrash", await browser.mutate("trash.moveToTrash", moveInput(entity, role))],
-          ["restore", await browser.mutate("trash.restore", actionInput(withBatch, "restore", role))],
-          ["purge", await browser.mutate("trash.purge", actionInput(withBatch, "purge", role, confirmation))],
-        ] as const;
-        for (const [action, result] of denied) {
-          expect(result, `${role}/${entity.kind}/${action}`).toMatchObject({ status: 403, error: { code: "FORBIDDEN" } });
-        }
+      Browser.ok(await stepUp(sys, browser, STRONG_PASSWORD, secret));
+      for (const [target, secondTarget, livePublicId, confirmation] of [
+        [trashedOrder, trashedCustomer, liveOrder.publicId, order.reference],
+        [trashedCustomer, trashedOrder, ownCustomer.publicId, account.customerRef],
+      ] as const) {
+        const observe = async (known: boolean) => {
+          const probes = trashAccessProbes({
+            target: known ? target : unknownTarget(target),
+            secondTarget: known ? secondTarget : unknownTarget(secondTarget),
+            livePublicId: known ? livePublicId : ulid(),
+            movedByPublicId: known ? admin.publicId : ulid(),
+            orderPublicId: known ? order.publicId : ulid(),
+            confirmation: known ? confirmation : "RP-SYNTHETIC-UNKNOWN",
+          });
+          expect(Object.keys(probes).sort()).toEqual(
+            Object.keys(appRouter._def.procedures).filter((path) => path.startsWith("trash.")).sort(),
+          );
+          const results: Record<string, ReturnType<typeof safeResponse>> = {};
+          for (const [path, probe] of Object.entries(probes)) {
+            for (const [index, input] of [probe.input(), ...(probe.alternateInputs?.() ?? [])].entries()) {
+              const label = `${role}/${target.kind}/${path}${index ? "/bulk" : ""}`;
+              const result = await (probe.kind === "query" ? browser.query(path, input) : browser.mutate(path, input));
+              expect(safeResponse(result), label).toMatchObject({
+                status: 403, code: "FORBIDDEN", domain: "FORBIDDEN", reason: "CAPABILITY_NOT_GRANTED", data: undefined,
+              });
+              results[label] = safeResponse(result);
+            }
+          }
+          return results;
+        };
+        expect(await observe(true)).toEqual(await observe(false));
       }
     }
-    Browser.ok(await owner.browser.query("orders.get", { orderId: target.publicId }));
+    Browser.ok(await owner.browser.query("orders.get", { orderId: liveOrder.publicId }));
+    // Don't leave permission fixtures for the later retention sweep.
+    expectItemSuccess(await act(trashedOrder, "restore", "permissions-order"), orderTarget);
+    expectItemSuccess(await act(trashedCustomer, "restore", "permissions-customer"), customerTarget);
   });
 
   it("makes hidden and tombstoned orders indistinguishable from never-created orders across module families", async () => {
