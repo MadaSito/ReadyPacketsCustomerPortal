@@ -65,6 +65,8 @@ const row = (n: number, overrides: Record<string, unknown> = {}) => ({
   restoreBlockedReason: null,
   unreachableExternalCopies: null,
   failedRunId: null,
+  failedTargetPublicId: null,
+  failedTargetReference: null,
   ...overrides,
 });
 
@@ -274,7 +276,23 @@ describe("Trash centre", () => {
     expect(confirm).toBeDisabled();
     await user.type(within(dialog).getByLabelText(/to confirm/), "RP-2026-003");
     await user.click(confirm);
-    await waitFor(() => expect(lastCall("trash.finishLeavingExternalCopies")).toMatchObject({ runId: "01JRUNFAILED0000000000001", confirmation: "RP-2026-003", publicId: row(3).publicId }));
+    await waitFor(() => expect(lastCall("trash.finishLeavingExternalCopies")).toMatchObject({ runId: "01JRUNFAILED0000000000001", confirmation: "RP-2026-003", publicId: row(3).publicId, batchId: row(3).batchId }));
+    expect(lastCall("trash.finishLeavingExternalCopies")).not.toHaveProperty("targetOrderPublicId");
+  });
+
+  it("a halted customer cascade asks for the order number the run stopped on", async () => {
+    const user = userEvent.setup();
+    const customer = row(4, { kind: "customer", label: "RPCUS-A1B2CJJG5", reference: "RPCUS-A1B2CJJG5", ownerCustomerId: null, state: "failed", failureCode: "EXTERNAL_COPIES_UNREACHABLE", unreachableExternalCopies: 1, failedRunId: "01JRUNFAILED0000000000002", failedTargetPublicId: "01JTRASHORDER0000000000009", failedTargetReference: "RP-2026-009", canRestore: false });
+    handlers.set("trash.list", (input) => ((input as { kind: string }).kind === "customer" ? { items: [customer], nextCursor: null, total: 1 } : { items: [], nextCursor: null, total: 0 }));
+    handlers.set("trash.finishLeavingExternalCopies", () => ({ ok: true, runId: "01JRUNFAILED0000000000002", keptExternalCopies: 1 }));
+    renderPage();
+    await user.click(await screen.findByRole("tab", { name: /Customers/ }));
+    await user.click(await screen.findAllByRole("button", { name: /Finish and leave 1 external copy in place/ }).then((b) => b[0]!));
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog).toHaveTextContent("The deletion stopped on order RP-2026-009");
+    await user.type(within(dialog).getByLabelText(/to confirm/), "RP-2026-009");
+    await user.click(within(dialog).getByRole("button", { name: "Finish and leave 1 external copy in place" }));
+    await waitFor(() => expect(lastCall("trash.finishLeavingExternalCopies")).toMatchObject({ confirmation: "RP-2026-009", targetOrderPublicId: "01JTRASHORDER0000000000009", batchId: customer.batchId }));
   });
 
   it("a legal hold is explained in the move dialog", async () => {

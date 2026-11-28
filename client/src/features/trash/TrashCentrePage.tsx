@@ -43,7 +43,9 @@ export function toListInput(kind: TrashKind, f: Filters, sort: SortState, cursor
   };
 }
 
-const target = (r: TrashRow): TrashTarget => ({ kind: r.kind, publicId: r.publicId, batchId: r.batchId, label: r.label, reference: r.reference, runId: r.failedRunId ?? undefined, copies: r.unreachableExternalCopies ?? undefined });
+const target = (r: TrashRow): TrashTarget => ({ kind: r.kind, publicId: r.publicId, batchId: r.batchId, label: r.label, reference: r.reference, runId: r.failedRunId ?? undefined, copies: r.unreachableExternalCopies ?? undefined, targetOrderPublicId: r.failedTargetPublicId ?? undefined, targetReference: r.failedTargetReference ?? undefined });
+
+const finishLabel = (n: number) => `Finish and leave ${n} external ${n === 1 ? "copy" : "copies"} in place`;
 
 /** Row buttons; one instance per rendering (table and phone card), so the reason id is unique (useId). */
 function RowActions({ row: r, onRestore, onPurge, onFinish }: { row: TrashRow; onRestore: () => void; onPurge: () => void; onFinish: () => void }) {
@@ -57,8 +59,8 @@ function RowActions({ row: r, onRestore, onPurge, onFinish }: { row: TrashRow; o
         Delete permanently
       </Button>
       {r.failureCode === EXTERNAL_COPIES_UNREACHABLE && r.failedRunId ? (
-        <Button size="sm" variant="danger" onClick={onFinish} aria-label={`Finish and leave ${r.unreachableExternalCopies ?? 0} external copies in place, ${r.label}`}>
-          Finish and leave {r.unreachableExternalCopies ?? 0} external {r.unreachableExternalCopies === 1 ? "copy" : "copies"} in place
+        <Button size="sm" variant="danger" onClick={onFinish} aria-label={`${finishLabel(r.unreachableExternalCopies ?? 0)}, ${r.label}`}>
+          {finishLabel(r.unreachableExternalCopies ?? 0)}
         </Button>
       ) : null}
       {r.restoreBlockedReason ? <span id={reasonId} className="w-full text-xs break-words text-body">{r.restoreBlockedReason}</span> : null}

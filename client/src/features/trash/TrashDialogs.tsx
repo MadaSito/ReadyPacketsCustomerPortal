@@ -180,6 +180,9 @@ export interface TrashTarget extends TrashItemRef {
   /** Failed run to finish (EXTERNAL_COPIES_UNREACHABLE) and its unreachable copy count. */
   runId?: string;
   copies?: number;
+  /** Halted cascade: the order the run stopped on, and the order number to type for it. */
+  targetOrderPublicId?: string;
+  targetReference?: string;
 }
 /** Item labels are free text (project names): let long unbroken words wrap at 240 px in titles and descriptions. */
 function Wrap({ children }: { children: ReactNode }) {
@@ -309,14 +312,19 @@ export function FinishLeavingCopiesDialog({ open, onOpenChange, item, onDone, re
   const [key, setKey] = useState(newIdempotencyKey);
   const n = item?.copies ?? 0;
   const copies = n === 1 ? "1 external copy" : `${n} external copies`;
+  /** A halted cascade asks for the order the run stopped on; otherwise the item's own reference. */
+  const typed = item?.targetReference ?? item?.reference ?? "";
 
   const confirm = async () => {
-    if (!item?.runId) return;
-    const runId = item.runId;
+    if (!item?.runId || !item.batchId) return;
+    const { runId, batchId } = item;
     setError(null);
     try {
       const out = await stepUp.run(
-        () => finish.mutateAsync({ kind: item.kind, publicId: item.publicId, runId, confirmation: item.reference, idempotencyKey: key }),
+        () => finish.mutateAsync({
+          kind: item.kind, publicId: item.publicId, batchId, runId, confirmation: typed, idempotencyKey: key,
+          ...(item.targetOrderPublicId ? { targetOrderPublicId: item.targetOrderPublicId } : {}),
+        }),
         { reason: "Finishing a permanent deletion requires a fresh identity check." },
       );
       setKey(newIdempotencyKey());
@@ -337,10 +345,13 @@ export function FinishLeavingCopiesDialog({ open, onOpenChange, item, onDone, re
       description={`${copies === "1 external copy" ? "1 copy" : `${n} copies`} in a connected storage service could not be reached. If you finish now, the portal erases everything else and forgets where ${n === 1 ? "that copy is" : "those copies are"}; ${n === 1 ? "it stays" : "they stay"} in that service until someone deletes ${n === 1 ? "it" : "them"} there. This cannot be undone.`}
       confirmLabel={`Finish and leave ${copies} in place`}
       destructive
-      confirmText={item?.reference}
+      confirmText={typed}
       returnFocusRef={returnFocusRef}
       onConfirm={confirm}
     >
+      {item?.targetReference && item.targetReference !== item.reference ? (
+        <p className="[overflow-wrap:anywhere]">The deletion stopped on order <strong>{item.targetReference}</strong>, which was moved to the trash with this item. Type that order number to finish.</p>
+      ) : null}
       <p>To delete the copies too, reconnect the storage service instead; the next clean-up retries them.</p>
       <h3 className="mt-3 font-semibold text-ink">Kept</h3>
       <SummaryList lines={[`${copies} in the connected storage service (reported as kept)`, ...KEPT]} label="Kept" />
