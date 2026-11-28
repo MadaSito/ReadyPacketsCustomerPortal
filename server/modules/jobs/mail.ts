@@ -5,10 +5,13 @@ import type { DeploymentProfile } from "../../config/env.js";
 import { conflict, DomainError, notFound, validation } from "../../core/errors.js";
 import { ULID_PATTERN, ulid } from "../../core/ids.js";
 import type { AuditOutcome, ClaimedJob, JobQueue, JobResult, Mailer, MailTemplate, OutboundMail, SessionPrincipal, Tx } from "../../core/types.js";
+import { mailTextWithStandaloneLinks, plainTextToDeliveryHtml } from "../mailTemplates/sanitizer.js";
+import { buildSystemTemplateMetadata, renderShippedMail } from "../mailTemplates/systemCatalogue.js";
 import { defineSetting, readSetting } from "../platform/settingsRegistry.js";
 import { decodeMailAttachments, encodeMailAttachments, storedAttachments } from "./mailAttachments.js";
 import type { MailSenderIdentity, MailTemplateStore, MailTransport, MailTransportKey, MailTransportResult, PublishedMailTemplate } from "./mailPorts.js";
 import { HEADER_CONTROL, MAIL_AUDIT_COPY, MAIL_RETAIN_CONTENT, MAIL_RETENTION_DAYS, MAIL_ROUTING, MAIL_SENDER, mailAddress as address } from "./mailSettings.js";
+import { hasHiddenMailBinding, type createMailTrashGuard, type MailTrashScope } from "./mailTrash.js";
 import { currentCorrelation, JOB_TYPE, keyHash, validKey, type QueueDeps } from "./queue.js";
 import { POLICY_UPDATE_TEMPLATE, POLICY_WARNING_TEMPLATE } from "./policyNoticeJobs.js";
 import { PAYMENT_RECEIPT_TEMPLATE } from "./receiptMail.js";
@@ -29,6 +32,8 @@ const payloadSchema = z.strictObject({
   vars: varsSchema,
   sensitiveVars: z.array(z.string().regex(VAR_NAME)).max(40).optional(),
   attachments: storedAttachments,
+  orderId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  recipientAccountId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
 });
 const jobPayload = z.strictObject({ mailId: z.string().regex(ULID_PATTERN), generation: z.number().int().min(1).max(20) });
 const captureSchema = z.strictObject({ to: address, subject: z.string().max(255), text: z.string().max(65_536) });
@@ -40,13 +45,14 @@ type DeliverableContent = MessageContent & { attachments?: OutboundMail["attachm
 type DeliveryJob = z.infer<typeof jobPayload>;
 type MailAttemptOutcome = "accepted" | "held" | "failed" | "unknown" | "captured";
 type AttemptPurpose = typeof mailTransportAttempts.$inferSelect.purpose;
-type MailDeliveryResult = MailTransportResult | { outcome: "expired"; retryable?: never };
+type MailDeliveryResult = MailTransportResult | { outcome: "expired" | "suppressed"; retryable?: never };
 export type SmtpDeliveryResult = MailTransportResult;
 type MailDeps = QueueDeps & { jobs: JobQueue };
 type MailRecipient = { email: string; status: string; emailVerified: boolean; firstName?: string | null; preferredName?: string | null };
 type DeliveryDeps = {
   findRecipient(userId: number): Promise<MailRecipient | null>;
   getLegacySender(): Promise<MailSenderIdentity | null>;
+  trashGuard?: ReturnType<typeof createMailTrashGuard>;
 };
 
 export function allowsMailCapture(profile: DeploymentProfile): boolean {
@@ -88,10 +94,6 @@ export async function mailAudit(
 function escapeHtml(text: string): string {
   const escapes: Readonly<Record<string, string>> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
   return text.replace(/[&<>"']/g, (character) => escapes[character]!);
-}
-
-function htmlAlternative(text: string): string {
-  return `<!doctype html><html lang="en"><body><p>${escapeHtml(text).replace(/\r\n?|\n/g, "<br>")}</p></body></html>`;
 }
 
 const ORDER_CONTEXT_FIELDS = [["orderReference", "Order"], ["projectName", "Project"]] as const;
@@ -227,12 +229,14 @@ export class MailEngine implements Mailer {
 
   registerDelivery(delivery: DeliveryDeps): void {
     this.#getLegacySender = delivery.getLegacySender;
+    this.#trashGuard = delivery.trashGuard;
     this.deps.jobs.register(DELIVER, (job) => this.#deliver(job, delivery));
     this.deps.jobs.register(EXPIRE, (job) => this.#expire(job), { retrySafe: true });
     this.deps.jobs.registerSchedule({ name: EXPIRE, type: EXPIRE, everyMs: 60_000 });
   }
 
   #getLegacySender: DeliveryDeps["getLegacySender"] = async () => null;
+  #trashGuard: DeliveryDeps["trashGuard"];
 
   async getMailSenderIdentity(): Promise<MailSenderIdentity | null> {
     const configured = await readSetting(this.deps.settings, MAIL_SENDER);
@@ -282,7 +286,8 @@ export class MailEngine implements Mailer {
       };
     }
     if (!builtin) return null;
-    return { ...builtin, render: (vars) => ({ subject: builtin.subject(vars), text: builtin.text(vars) }) };
+    const metadata = buildSystemTemplateMetadata(builtin);
+    return { ...builtin, render: (vars) => renderShippedMail(builtin, metadata, vars, this.deps.config.canonicalOrigin) };
   }
 
   async enqueue(mail: OutboundMail, tx?: Tx): Promise<void> {
@@ -293,7 +298,7 @@ export class MailEngine implements Mailer {
   async #enqueue(mail: OutboundMail, tx?: Tx): Promise<void> {
     const { deps } = this;
     const template = await this.#template(mail.template, tx);
-    const parsed = payloadSchema.safeParse({ to: mail.to, vars: mail.vars });
+    const parsed = payloadSchema.safeParse({ to: mail.to, vars: mail.vars, orderId: mail.orderId });
     if (!template || !parsed.success || !validKey(mail.idempotencyKey)
       || Object.keys(parsed.data.vars).some((name) => !template.vars.includes(name))) {
       throw validation("INVALID_MAIL_INPUT", "The mail input is not valid.");
@@ -311,14 +316,18 @@ export class MailEngine implements Mailer {
     const serializedBody = JSON.stringify(body);
     if (Buffer.byteLength(serializedBody) > 96 * 1024) throw validation("INVALID_MAIL_INPUT", "The mail input is not valid.");
     const attachments = encodeMailAttachments(mail);
-    const serialized = attachments ? JSON.stringify({ ...body, attachments }) : serializedBody;
     const run = async (inner: Tx) => {
+      const recipientAccountId = "address" in body.to
+        ? await this.#trashGuard?.bindLiteralRecipient(inner, body.to.address) : body.to.userId;
+      if (await this.#trashGuard?.isSuppressed({ ...body, recipientAccountId, template: template.key }, inner)) return;
+      const serialized = JSON.stringify({ ...body, recipientAccountId, attachments });
       const publicId = ulid(now.getTime());
       const correlationId = currentCorrelation(publicId);
       const idempotencyHash = keyHash(mail.idempotencyKey);
       await inner.insert(mailOutbox).values({
         publicId, idempotencyHash, correlationId, template: template.key,
         payloadEnc: deps.crypto.encrypt(serialized, `mail_outbox.payload_enc:${publicId}`),
+        orderId: body.orderId, recipientAccountId,
         expiresAt, createdAt: now, updatedAt: now,
       }).onDuplicateKeyUpdate({ set: { id: sql`${mailOutbox.id}` } });
       const [row] = await inner.select().from(mailOutbox)
@@ -383,6 +392,7 @@ export class MailEngine implements Mailer {
     if (!await this.captureEnabled()) throw notFound();
     const [row] = await tx.select().from(mailOutbox).where(eq(mailOutbox.publicId, publicId)).limit(1).for("share");
     if (!row || row.state !== "captured" || row.captureEnc === null || row.expiresAt <= this.deps.clock.now()) throw notFound();
+    if (this.#trashGuard && await hasHiddenMailBinding(tx, row)) throw notFound();
     const value = captureSchema.parse(JSON.parse(this.deps.crypto.decrypt(row.captureEnc, `mail_outbox.capture_enc:${row.publicId}`)));
     await mailAudit(this.deps, tx, row, "job.mail.capture.viewed", "completed", undefined, false, "read");
     return value;
@@ -392,6 +402,7 @@ export class MailEngine implements Mailer {
     if (!await this.retentionDays(tx)) throw notFound();
     const [row] = await tx.select().from(mailOutbox).where(eq(mailOutbox.publicId, publicId)).limit(1).for("share");
     if (!row?.contentEnc || !row.contentExpiresAt || row.contentExpiresAt <= this.deps.clock.now()) throw notFound();
+    if (this.#trashGuard && await hasHiddenMailBinding(tx, row)) throw notFound();
     const value = contentSchema.parse(JSON.parse(this.deps.crypto.decrypt(row.contentEnc, `mail_outbox.content_enc:${row.publicId}`)));
     await mailAudit(this.deps, tx, row, "mail.content.viewed", "completed", undefined, false, "read");
     return value;
@@ -458,7 +469,10 @@ export class MailEngine implements Mailer {
 
   #content(template: PublishedMailTemplate, vars: OutboundMail["vars"]): Omit<MessageContent, "to"> {
     try {
-      const { subject, text, html = htmlAlternative(text) } = template.render(vars);
+      const rendered = template.render(vars);
+      const { subject } = rendered;
+      const text = rendered.html === undefined ? mailTextWithStandaloneLinks(rendered.text) : rendered.text;
+      const html = rendered.html ?? plainTextToDeliveryHtml(rendered.text);
       if (typeof subject === "string" && subject.length >= 1 && subject.length <= 255 && !HEADER_CONTROL.test(subject)
         && typeof text === "string" && text.length >= 1 && text.length <= 65_536 && !text.includes("\0")
         && typeof html === "string" && html.length <= 512 * 1024 && !html.includes("\0")) {
@@ -472,10 +486,10 @@ export class MailEngine implements Mailer {
     const url = new URL("/invoices?tab=receipts", this.deps.config.canonicalOrigin).href;
     const detail = attached ? "The PDF is attached. You can also download it in the portal."
       : "The PDF is not attached. Download it securely in the portal.";
-    const htmlFooter = `<p>${detail} <a href="${escapeHtml(url)}">Open Receipts in ReadyPackets</a>.</p>`;
+    const htmlFooter = `<p>${detail} <a href="${escapeHtml(url)}" data-rp-button="primary" rel="noopener noreferrer">Open Receipts in ReadyPackets</a>.</p>`;
     return {
       ...data,
-      text: `${data.text}\n\n${detail}\nOpen Receipts in ReadyPackets: ${url}`,
+      text: `${data.text}\n\n${detail}\nOpen Receipts in ReadyPackets:\n${url}`,
       html: /<\/body>\s*<\/html>\s*$/i.test(data.html)
         ? data.html.replace(/(<\/body>\s*<\/html>\s*)$/i, (_match, closing: string) => `${htmlFooter}${closing}`)
         : `${data.html}${htmlFooter}`,
@@ -500,12 +514,14 @@ export class MailEngine implements Mailer {
     let redactionFailed = false;
     let sender: MailSenderIdentity | null = null;
     let routing: { primary: MailTransportKey; secondary: "none" | MailTransportKey } = { primary: "smtp", secondary: "none" };
+    let scope: MailTrashScope;
     try {
       mode = await this.captureEnabled();
       if (mode && row.template === VERIFY_AUDIT) return this.#preSendFailure(job, ids, "MAIL_VERIFICATION_CAPTURE_BLOCKED", true);
       const template = await this.#template(row.template);
       if (!row.payloadEnc || !template) throw new Error("MAIL_PAYLOAD_UNAVAILABLE");
       const payload = payloadSchema.parse(JSON.parse(deps.crypto.decrypt(row.payloadEnc, `mail_outbox.payload_enc:${row.publicId}`)));
+      scope = { ...payload, template: row.template };
       if (Object.keys(payload.vars).some((name) => !template.vars.includes(name))) throw new Error("MAIL_TEMPLATE_VARS_CHANGED");
       const recipient = "userId" in payload.to
         ? await delivery.findRecipient(payload.to.userId)
@@ -561,6 +577,13 @@ export class MailEngine implements Mailer {
         return false;
       }
       if (mode) {
+        if (await this.#trashGuard?.isSuppressed(scope, tx)) {
+          await tx.update(mailOutbox).set({ state: "failed", reasonCode: "MAIL_SCOPE_UNAVAILABLE",
+            payloadEnc: null, captureEnc: null, contentEnc: null, contentExpiresAt: null, updatedAt: now,
+          }).where(eq(mailOutbox.id, current.id));
+          await mailAudit(deps, tx, current, "job.mail.failed", "failed", "MAIL_SCOPE_UNAVAILABLE", true);
+          return false;
+        }
         const { to, subject, text } = row.template === PAYMENT_RECEIPT_TEMPLATE
           ? { to: data.to, subject: "Your ReadyPackets payment receipt", text: "Receipt attachment omitted from development capture." }
           : data;
@@ -591,7 +614,7 @@ export class MailEngine implements Mailer {
 
     let key = routing.primary;
     let purpose: AttemptPurpose = "primary";
-    let result = await this.#send(job, key, sender, data, row.expiresAt);
+    let result = await this.#send(job, key, sender, data, row.expiresAt, scope);
     if (routing.secondary !== "none" && (result.outcome === "not_configured" || (result.outcome === "rejected" && result.retryable === true))) {
       const secondary = routing.secondary;
       const next = await deps.db.transaction(async (tx) => {
@@ -606,7 +629,7 @@ export class MailEngine implements Mailer {
       if (next) {
         key = secondary;
         purpose = "secondary";
-        result = await this.#send(job, key, sender, data, row.expiresAt);
+        result = await this.#send(job, key, sender, data, row.expiresAt, scope);
       }
     }
     const { outcome, reasonCode } = await deps.db.transaction(async (tx) => {
@@ -619,6 +642,7 @@ export class MailEngine implements Mailer {
       const reasonCode = expired ? "MAIL_EXPIRED" : status.reasonCode;
       await tx.update(mailOutbox).set({
         state: outcome, reasonCode, updatedAt: now,
+        ...(result.outcome === "suppressed" ? { captureEnc: null, contentEnc: null, contentExpiresAt: null } : {}),
         ...(outcome === "accepted" || current.expiresAt <= now
           || (outcome === "failed" && !result.retryable) ? { payloadEnc: null } : {}),
       }).where(eq(mailOutbox.id, current.id));
@@ -626,14 +650,16 @@ export class MailEngine implements Mailer {
         outcome === "accepted" ? "completed" : outcome === "held" ? "refused" : outcome === "expired" ? "canceled" : outcome, reasonCode, true);
       return { outcome, reasonCode };
     });
-    if (outcome === "accepted" && redacted) await this.#auditCopy(job, ids, key, sender, redacted);
+    if (outcome === "accepted" && redacted) await this.#auditCopy(job, ids, key, sender, redacted, scope);
+    if (result.outcome === "suppressed") return { outcome: "canceled", reasonCode };
     if (outcome === "unknown") return { outcome: "unknown", reasonCode };
     if (outcome === "failed") return { outcome: "failed", reasonCode, retryable: false };
     if (outcome === "expired") return { outcome: "canceled", reasonCode };
     return { outcome: "completed" };
   }
 
-  async #send(job: ClaimedJob, key: MailTransportKey, sender: MailSenderIdentity | null, data: DeliverableContent, expiresAt?: Date): Promise<MailDeliveryResult> {
+  async #send(job: ClaimedJob, key: MailTransportKey, sender: MailSenderIdentity | null, data: DeliverableContent,
+    expiresAt?: Date, scope?: MailTrashScope): Promise<MailDeliveryResult> {
     const adapter = this.#transports.get(key);
     if (!adapter || !sender) return { outcome: "not_configured" };
     try {
@@ -642,6 +668,12 @@ export class MailEngine implements Mailer {
     await job.assertStillOwned();
     job.signal.throwIfAborted();
     if (expiresAt && expiresAt <= this.deps.clock.now()) return { outcome: "expired" };
+    try {
+      if (scope && await this.#trashGuard?.isSuppressed(scope)) return { outcome: "suppressed" };
+    } catch {
+      return { outcome: "suppressed" }; // A failed gate cannot authorize an external effect.
+    }
+    job.signal.throwIfAborted();
     try {
       const result = await adapter.send({ ...data, sender, signal: job.signal });
       if (["accepted", "not_configured", "rejected", "unknown"].includes(result.outcome)) return result;
@@ -661,7 +693,8 @@ export class MailEngine implements Mailer {
       : result.outcome === "not_configured" ? "held" : result.outcome === "unknown" ? "unknown" : "failed";
     const reasonCode = outcome === "accepted" ? key === "smtp" ? "MAIL_SMTP_ACCEPTED" : "MAIL_GRAPH_ACCEPTED"
       : outcome === "held" ? "MAIL_NOT_CONFIGURED"
-        : outcome === "unknown" ? "MAIL_PROVIDER_OUTCOME_UNKNOWN" : result.outcome === "expired" ? "MAIL_EXPIRED" : "MAIL_PROVIDER_REJECTED";
+        : outcome === "unknown" ? "MAIL_PROVIDER_OUTCOME_UNKNOWN" : result.outcome === "expired" ? "MAIL_EXPIRED"
+          : result.outcome === "suppressed" ? "MAIL_SCOPE_UNAVAILABLE" : "MAIL_PROVIDER_REJECTED";
     await tx.update(mailTransportAttempts).set({ state: outcome, reasonCode, finishedAt: this.deps.clock.now() }).where(and(
       eq(mailTransportAttempts.mailId, mail.id), eq(mailTransportAttempts.generation, mail.generation),
       eq(mailTransportAttempts.purpose, purpose), eq(mailTransportAttempts.state, "sending"),
@@ -669,7 +702,8 @@ export class MailEngine implements Mailer {
     return { outcome, reasonCode };
   }
 
-  async #auditCopy(job: ClaimedJob, ids: DeliveryJob, key: MailTransportKey, sender: MailSenderIdentity | null, redacted: MessageContent) {
+  async #auditCopy(job: ClaimedJob, ids: DeliveryJob, key: MailTransportKey, sender: MailSenderIdentity | null,
+    redacted: MessageContent, scope: MailTrashScope) {
     const { deps } = this;
     const to = await deps.db.transaction(async (tx) => {
       const current = await this.#lockedMail(tx, job, ids, "accepted");
@@ -685,7 +719,7 @@ export class MailEngine implements Mailer {
       return setting.address;
     });
     if (!to) return;
-    const result = await this.#send(job, key, sender, { ...redacted, to });
+    const result = await this.#send(job, key, sender, { ...redacted, to }, undefined, scope);
     await deps.db.transaction(async (tx) => {
       const current = await this.#lockedMail(tx, job, ids, "accepted");
       if (!current) throw new Error("MAIL_FENCE_INCONSISTENT");

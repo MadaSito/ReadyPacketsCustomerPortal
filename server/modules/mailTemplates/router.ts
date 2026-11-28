@@ -119,6 +119,7 @@ export const mailTemplatesRouter = router({
   preview: mailManage
     .input(
       z.strictObject({
+        templateKey: templateKeySchema.optional(),
         format: z.enum(MAIL_TEMPLATE_FORMATS),
         subject: z.string().min(1).max(MAX_SUBJECT_LENGTH),
         bodyHtml: z.string().max(131_072).nullish(),

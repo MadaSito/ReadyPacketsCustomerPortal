@@ -50,3 +50,12 @@ it("keeps keyboard focus during resolve and moves it to the result when the Open
   await waitFor(() => expect(status).toHaveFocus());
   expect(screen.queryByRole("button", { name: "Resolve: Example warning" })).not.toBeInTheDocument();
 });
+
+it("filters the alert list to trash retention failures", async () => {
+  mocks.list.mockResolvedValue({ items: [], nextCursor: null });
+  const user = userEvent.setup();
+  renderUi(<OpsAlertsPage />, { path: "/admin/alerts" });
+  await user.selectOptions(screen.getByRole("combobox", { name: "Source" }), "trash");
+  expect(screen.getByRole("combobox", { name: "Source" })).toHaveValue("trash");
+  await waitFor(() => expect(mocks.list).toHaveBeenCalledWith(expect.objectContaining({ source: "trash" })));
+});

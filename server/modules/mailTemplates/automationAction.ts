@@ -17,7 +17,10 @@ import { and, asc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { newRequestContext, runWithRequestContext } from "../../core/requestContext.js";
 import type { Mailer } from "../../core/types.js";
+import { liveUserPredicate } from "../identity/live.js";
 import { users } from "../identity/schema.js";
+import { orders } from "../orders/schema.js";
+import { liveOrderPredicate } from "../orders/trashGate.js";
 import {
   registerAutomationAction,
   type AutomationActionRegistration,
@@ -35,7 +38,7 @@ import {
 const GENERIC_AUTOMATION_MAIL_TEMPLATE = "automations.generic_notice";
 const registeredGenericMailers = new WeakSet<Mailer>();
 
-function ensureGenericAutomationTemplateRegistered(mailer: Mailer): void {
+export function ensureGenericAutomationTemplateRegistered(mailer: Mailer): void {
   if (registeredGenericMailers.has(mailer)) return;
   try {
     mailer.registerTemplate({
@@ -203,7 +206,7 @@ async function resolveCatalogueUserIds(
     const rows = await ctx.deps.db
       .select({ id: users.id })
       .from(users)
-      .where(and(eq(users.status, "active"), eq(users.role, "admin")))
+      .where(and(eq(users.status, "active"), eq(users.role, "admin"), liveUserPredicate()))
       .orderBy(asc(users.id))
       .limit(50);
     return rows.map((r) => r.id);
@@ -212,7 +215,7 @@ async function resolveCatalogueUserIds(
     const rows = await ctx.deps.db
       .select({ id: users.id })
       .from(users)
-      .where(and(eq(users.status, "active"), inArray(users.role, ["admin", "staff"])))
+      .where(and(eq(users.status, "active"), inArray(users.role, ["admin", "staff"]), liveUserPredicate()))
       .orderBy(asc(users.id))
       .limit(50);
     return rows.map((r) => r.id);
@@ -237,6 +240,14 @@ async function runSendTemplateAction(
   }
 
   const { config, deps } = ctx;
+  let orderId: number | undefined;
+  if (ctx.orderPublicId) {
+    const [order] = await deps.db.select({ id: orders.id }).from(orders)
+      .where(and(eq(orders.publicId, ctx.orderPublicId), liveOrderPredicate())).limit(1);
+    if (!order) return { outcome: "skipped", reasonCode: "ORDER_NOT_FOUND", safeSummary: "The order is unavailable." };
+    orderId = order.id;
+  }
+  const scope = orderId === undefined ? {} : { orderId };
 
   if (RESERVED_INTERNAL_TEMPLATE_KEYS.has(config.templateKey)) {
     return {
@@ -279,6 +290,7 @@ async function runSendTemplateAction(
       await execWithAutomationCorrelation(() =>
         deps.mailer.enqueue({
           template: GENERIC_AUTOMATION_MAIL_TEMPLATE,
+          ...scope,
           to: { address: addr },
           vars: { subject, body, recipient_name: "" },
           idempotencyKey: `${ctx.idempotencyKey}:mail:fixed`,
@@ -308,7 +320,7 @@ async function runSendTemplateAction(
         nameEnc: users.nameEnc,
       })
       .from(users)
-      .where(inArray(users.id, uniqueUserIds));
+      .where(and(inArray(users.id, uniqueUserIds), liveUserPredicate()));
 
     let queuedCount = 0;
     for (const u of recipientRows) {
@@ -328,6 +340,7 @@ async function runSendTemplateAction(
       await execWithAutomationCorrelation(() =>
         deps.mailer.enqueue({
           template: GENERIC_AUTOMATION_MAIL_TEMPLATE,
+          ...scope,
           to: { userId: u.id },
           vars: { subject, body, recipient_name: displayName },
           idempotencyKey: `${ctx.idempotencyKey}:mail:u:${u.id}`,
@@ -440,6 +453,7 @@ async function runSendTemplateAction(
     await execWithAutomationCorrelation(() =>
       deps.mailer.enqueue({
         template: config.templateKey,
+        ...scope,
         to: { address: addr },
         vars,
         idempotencyKey: `${ctx.idempotencyKey}:mail:fixed`,
@@ -472,7 +486,7 @@ async function runSendTemplateAction(
       nameEnc: users.nameEnc,
     })
     .from(users)
-    .where(inArray(users.id, uniqueUserIds));
+    .where(and(inArray(users.id, uniqueUserIds), liveUserPredicate()));
 
   let queuedCount = 0;
   for (const u of recipientRows) {
@@ -498,6 +512,7 @@ async function runSendTemplateAction(
     await execWithAutomationCorrelation(() =>
       deps.mailer.enqueue({
         template: config.templateKey,
+        ...scope,
         to: { userId: u.id },
         vars,
         idempotencyKey: `${ctx.idempotencyKey}:mail:u:${u.id}`,
@@ -584,4 +599,3 @@ export const SEND_TEMPLATE_AUTOMATION_ACTION: AutomationActionRegistration<SendT
 export function registerMailTemplateAutomationAction(): void {
   registerAutomationAction(SEND_TEMPLATE_AUTOMATION_ACTION, { replaceBuiltIn: true });
 }
-

@@ -323,6 +323,9 @@ describe("mailTemplates client feature (Package D)", () => {
 
     // Verify inert sandboxed iframe attributes (`sandbox=""`, no scripts/same-origin, strict CSP in srcDoc)
     const iframe = await screen.findByTitle("Preview of Password reset");
+    expect(calls).toContainEqual(expect.objectContaining({
+      path: "mailTemplates.preview", input: expect.objectContaining({ templateKey: "auth.password_reset" }),
+    }));
     expect(iframe).toHaveAttribute("sandbox", "");
     expect(iframe).toHaveAttribute("referrerpolicy", "no-referrer");
     expect(iframe.getAttribute("srcdoc")).toContain(INERT_PREVIEW_CSP);

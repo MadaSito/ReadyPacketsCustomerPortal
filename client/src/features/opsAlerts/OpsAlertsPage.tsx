@@ -10,11 +10,11 @@ import AttentionReminders from "./AttentionReminders";
 
 const severities = ["critical", "error", "warning"] as const;
 const states = ["open", "acknowledged", "resolved"] as const;
-const sources = ["stage_bundle", "completion_job", "automation", "webhook", "graph", "file_sync", "payment", "certificate", "attention"] as const;
+const sources = ["stage_bundle", "completion_job", "automation", "webhook", "graph", "file_sync", "payment", "certificate", "attention", "trash"] as const;
 const titles: Record<string, string> = {
   critical: "Critical", error: "Error", warning: "Warning", open: "Open", acknowledged: "Acknowledged", resolved: "Resolved",
   stage_bundle: "Phase actions", completion_job: "Completion update", automation: "Automation", webhook: "Webhook",
-  graph: "Microsoft Graph", file_sync: "File sync", payment: "Payment", certificate: "Certificate", attention: "Waiting order",
+  graph: "Microsoft Graph", file_sync: "File sync", payment: "Payment", certificate: "Certificate", attention: "Waiting order", trash: "Trash retention",
 };
 const options = (values: readonly string[], blank: string) => [{ value: "", label: blank }, ...values.map((value) => ({ value, label: titles[value]! }))];
 

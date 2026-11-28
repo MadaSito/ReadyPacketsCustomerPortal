@@ -79,6 +79,8 @@ export const mailOutbox = mysqlTable("mail_outbox", {
   captureEnc: mediumtext("capture_enc"),
   contentEnc: mediumtext("content_enc"),
   contentExpiresAt: utcDateTime("content_expires_at"),
+  orderId: refColumn("order_id"),
+  recipientAccountId: refColumn("recipient_account_id"),
   state: mysqlEnum("state", MAIL_STATES).notNull().default("queued"),
   reasonCode: varchar("reason_code", { length: 64 }),
   jobPublicId: char("job_public_id", { length: 26 }),
@@ -92,6 +94,8 @@ export const mailOutbox = mysqlTable("mail_outbox", {
   index("mail_outbox_expiry_ix").on(t.expiresAt, t.id),
   index("mail_outbox_job_ix").on(t.jobPublicId),
   index("mail_outbox_content_expiry_ix").on(t.contentExpiresAt, t.id),
+  index("mail_outbox_order_state_ix").on(t.orderId, t.state),
+  index("mail_outbox_account_state_ix").on(t.recipientAccountId, t.state),
 ]);
 
 export const mailAttempts = mysqlTable("mail_attempts", {

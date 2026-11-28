@@ -1,16 +1,20 @@
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { forbidden } from "../../core/errors.js";
+import { ulid } from "../../core/ids.js";
 import { getRequestContext, newRequestContext, runWithRequestContext } from "../../core/requestContext.js";
 import { createCallerFactory } from "../../trpc/trpc.js";
 import { createTestDeps, fakePrincipal } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createAuditEmitter } from "../audit/emitter.js";
 import { auditEvents } from "../audit/schema.js";
+import { users } from "../identity/schema.js";
+import { orderReferences, orders } from "../orders/schema.js";
 import { createJobsAdmin } from "./admin.js";
 import { customerMaintenanceNotice } from "./customerMaintenance.js";
 import { createJobsModule } from "./index.js";
 import { MAIL_CAPTURE, mailEngineFor, type SmtpDeliveryResult } from "./mail.js";
+import { createMailTrashGuard, createMailTrashParticipant } from "./mailTrash.js";
 import type { MailTransportMessage } from "./mailPorts.js";
 import { MAIL_AUDIT_COPY, MAIL_RETAIN_CONTENT, MAIL_RETENTION_DAYS, MAIL_ROUTING, MAIL_SENDER } from "./mailSettings.js";
 import { enqueuePolicyNoticeMail, policyNoticeMailKey, registerPolicyNoticeJobs } from "./policyNoticeJobs.js";
@@ -26,11 +30,11 @@ import { startWorker } from "./worker.js";
 
 let t: TestDb;
 beforeAll(async () => {
-  t = await createTestDb({ schema: { jobRuns, jobAttempts, jobMaintenance, customerMaintenance, mailOutbox, mailAttempts, mailTransportAttempts, mailManualResends, mailAuditVerification, auditEvents } });
+  t = await createTestDb({ schema: { jobRuns, jobAttempts, jobMaintenance, customerMaintenance, mailOutbox, mailAttempts, mailTransportAttempts, mailManualResends, mailAuditVerification, auditEvents, users, orders, orderReferences } });
 });
 afterAll(async () => t?.cleanup());
 beforeEach(async () => {
-  for (const table of [jobAttempts, mailAttempts, mailTransportAttempts, mailManualResends, mailAuditVerification, mailOutbox, jobRuns, jobMaintenance, customerMaintenance, auditEvents]) {
+  for (const table of [jobAttempts, mailAttempts, mailTransportAttempts, mailManualResends, mailAuditVerification, mailOutbox, jobRuns, jobMaintenance, customerMaintenance, auditEvents, orderReferences, orders, users]) {
     await t.db.delete(table);
   }
 });
@@ -748,19 +752,96 @@ describe("MySQL transactional mail outbox", () => {
     template: "test.mail", to: { userId: 22 },
     vars: { link: "https://portal.example.test/preview-only", name: "<img onerror=example>" }, idempotencyKey: "mail-key",
   };
-  function setDelivery(f: ReturnType<typeof fixture>, outcome: SmtpDeliveryResult["outcome"], retryable?: boolean) {
+  function setDelivery(f: ReturnType<typeof fixture>, outcome: SmtpDeliveryResult["outcome"], retryable?: boolean,
+    options: Pick<Parameters<typeof f.mail.registerDelivery>[0], "trashGuard"> & { isConfigured?: () => Promise<boolean> } = {}) {
     const send = vi.fn(async (_message: MailTransportMessage): Promise<SmtpDeliveryResult> => ({ outcome, retryable }));
     const findRecipient = vi.fn(async (): Promise<{
       email: string; status: string; emailVerified: boolean; firstName?: string; preferredName?: string | null;
     }> => ({ email: "current@example.test", status: "active", emailVerified: true }));
-    f.mail.registerDelivery({ findRecipient, getLegacySender: async () => sender });
-    f.mail.registerMailTransport({ key: "smtp", isConfigured: async () => true, send });
+    f.mail.registerDelivery({ findRecipient, getLegacySender: async () => sender, ...(options.trashGuard ? { trashGuard: options.trashGuard } : {}) });
+    f.mail.registerMailTransport({ key: "smtp", isConfigured: options.isConfigured ?? (async () => true), send });
     f.mailer.registerTemplate({
       key: "test.mail", vars: ["link", "name"], sensitiveVars: ["link"],
       subject: () => "Test notification", text: ({ name, link }) => `${name}\n${link}`,
     });
     return { send, findRecipient };
   }
+
+  it("drops claimed mail when its order is trashed just before the transport would send", async () => {
+    const f = fixture();
+    const now = f.h.clock.now();
+    const [account] = await t.db.insert(users).values({
+      publicId: ulid(), role: "customer", status: "active", emailEnc: "synthetic",
+      emailIndex: f.h.deps.crypto.blindIndex("current@example.test", "users.email"),
+      nameEnc: "synthetic", createdAt: now, updatedAt: now,
+    });
+    const userId = Number(account.insertId);
+    const [order] = await t.db.insert(orders).values({
+      publicId: ulid(), reference: "RP-A1B2-ZEUGRE-ICEQUE-001", ownerUserId: userId, projectName: "Synthetic order",
+      workflowVersionId: 1, statusKey: "received", subtotalMinor: 0, totalMinor: 0, currency: "USD",
+      createdAt: now, updatedAt: now,
+    });
+    const orderId = Number(order.insertId);
+    const { send } = setDelivery(f, "accepted", undefined, {
+      trashGuard: createMailTrashGuard(f.h.deps),
+      isConfigured: async () => {
+        await t.db.update(orders).set({ trashedAt: now }).where(eq(orders.id, orderId));
+        return true;
+      },
+    });
+    await f.h.settings.set(MAIL_RETAIN_CONTENT.key, true);
+    await f.mailer.enqueue({ ...input, to: { userId }, orderId });
+    await f.engine.execute((await f.engine.claim())!);
+    const [row] = await t.db.select().from(mailOutbox);
+    expect(row).toMatchObject({
+      orderId, recipientAccountId: userId, state: "failed", reasonCode: "MAIL_SCOPE_UNAVAILABLE",
+      payloadEnc: null, contentEnc: null, captureEnc: null,
+    });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("cancels related queued mail and scrubs indexed retained copies without deleting audit references", async () => {
+    const f = fixture();
+    const participant = createMailTrashParticipant(f.h.deps);
+    const { send } = setDelivery(f, "accepted");
+    await f.h.settings.set(MAIL_RETAIN_CONTENT.key, true);
+    await f.mailer.enqueue({ ...input, orderId: 25 });
+    await f.engine.execute((await f.engine.claim())!);
+    await f.mailer.enqueue({ ...input, orderId: 25, idempotencyKey: "queued-after-first" });
+    await f.mailer.enqueue({ ...input, orderId: 30, idempotencyKey: "unrelated" });
+    const entity = { kind: "order" as const, id: 25, publicId: ulid(), batchId: ulid() };
+    await t.db.transaction((tx) => participant.onTrashedInTx!(tx, entity, { kind: "system", job: "test.trash" }));
+    expect(await participant.summarize!(entity)).toEqual({ retainedMailCopies: 1 });
+    await expect(participant.purge!(entity, { runId: ulid() })).resolves.toEqual({ deleted: { retainedMailCopies: 1 } });
+    await expect(participant.purge!(entity, { runId: ulid() })).resolves.toEqual({ deleted: { retainedMailCopies: 0 } });
+    expect(await t.db.select().from(mailOutbox).where(eq(mailOutbox.orderId, 25))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ state: "accepted", contentEnc: null }),
+      expect.objectContaining({ state: "failed", payloadEnc: null, reasonCode: "MAIL_SCOPE_UNAVAILABLE" }),
+    ]));
+    expect((await t.db.select().from(mailOutbox).where(eq(mailOutbox.orderId, 30)))[0]?.payloadEnc).toBeTruthy();
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not send a queued literal-address message to a new account after the old account is purged", async () => {
+    const f = fixture();
+    const now = f.h.clock.now();
+    const to = { address: "reserved@example.test" };
+    const emailIndex = f.h.deps.crypto.blindIndex(to.address, "users.email");
+    const account = { role: "customer" as const, status: "active" as const, emailEnc: "synthetic",
+      nameEnc: "synthetic", createdAt: now, updatedAt: now };
+    const [prior] = await t.db.insert(users).values({ ...account, publicId: ulid(), emailIndex });
+    const { send } = setDelivery(f, "accepted", undefined, { trashGuard: createMailTrashGuard(f.h.deps) });
+    await f.mailer.enqueue({ ...input, to });
+    await t.db.update(users).set({
+      purgedAt: now, trashedAt: now, status: "deactivated",
+      emailIndex: f.h.deps.crypto.blindIndex("tombstone@example.test", "users.email"),
+    }).where(eq(users.id, Number(prior.insertId)));
+    await t.db.insert(users).values({ ...account, publicId: ulid(), emailIndex });
+    await f.engine.execute((await f.engine.claim())!);
+    const [row] = await t.db.select().from(mailOutbox);
+    expect(row).toMatchObject({ recipientAccountId: Number(prior.insertId), reasonCode: "MAIL_SCOPE_UNAVAILABLE", payloadEnc: null });
+    expect(send).not.toHaveBeenCalled();
+  });
 
   it.each([
     { key: "auth.invitation", greetingVar: "name", preferredName: " Zee & Co ", expected: "Zee & Co", html: "Zee &amp; Co" },
@@ -889,8 +970,8 @@ describe("MySQL transactional mail outbox", () => {
     const url = new URL("/invoices?tab=receipts", f.h.config.canonicalOrigin).href;
     expect(send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
       subject: "Custom receipt",
-      text: expect.stringContaining(`Open Receipts in ReadyPackets: ${url}`),
-      html: expect.stringContaining(`<a href="${url}">Open Receipts in ReadyPackets</a>`),
+      text: expect.stringContaining(`Open Receipts in ReadyPackets:\n${url}`),
+      html: expect.stringContaining(`<a href="${url}" data-rp-button="primary" rel="noopener noreferrer">Open Receipts in ReadyPackets</a>`),
     }));
     expect(send.mock.calls[0]?.[0].attachments).toBeUndefined();
     expect(send.mock.calls[0]?.[0].text).toMatch(/^Order: RP-2026-000112\nProject: Advisory & design\n\nThank you\./);
@@ -1025,6 +1106,9 @@ describe("MySQL transactional mail outbox", () => {
     } as unknown as typeof f.h.services.integrations;
     const jobs = createJobsModule({ ...f.h.deps, jobs: f.jobs, mailer: f.mailer });
     expect(jobs.getBuiltinMailTemplates()).toContainEqual(expect.objectContaining({ key: REFUND_NOTICE_TEMPLATE_KEY }));
+    expect(f.engine.schedules()).toContainEqual({
+      name: "trash.retention.every_hour", type: "trash.retention_cleanup", everyMs: 3_600_000,
+    });
     await expect(jobs.getMailSenderIdentity()).resolves.toEqual(sender);
     const shared = { fromAddress: "shared@example.test", fromName: "Shared Ops", replyToAddress: "reply@example.test" };
     await f.h.settings.set(MAIL_SENDER.key, shared);

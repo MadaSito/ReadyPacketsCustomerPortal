@@ -1,5 +1,8 @@
 import type { Mailer, MailTemplate } from "../../core/types.js";
-import { escapeHtmlText } from "./sanitizer.js";
+import {
+  escapeHtmlText, isMailUrlVariable, mailTextWithStandaloneLinks, parseAllowedTemplateUrl,
+  plainTextToDeliveryHtml, renderMailTemplateVersion, resolveMailPathVariables,
+} from "./sanitizer.js";
 import type { MailTemplateCategory, MailTemplateVariableSpec } from "./schema.js";
 
 export interface SystemMailTemplateMetadata {
@@ -38,6 +41,7 @@ const DEFAULT_VAR_LABELS: Readonly<Record<string, { label: string; sample: strin
   statusLabel: { label: "Order status", sample: "In review" },
   questionnaireTitle: { label: "Questionnaire title", sample: "Entity Onboarding Questionnaire" },
   portalPath: { label: "Portal path", sample: "/orders/01J9EXAMPLE00000000000000" },
+  portalUrl: { label: "Portal URL", sample: "https://portal.readypackets.example/policies" },
   invoiceNumber: { label: "Invoice number", sample: "INV-2026-0088" },
   ticketNumber: { label: "Support ticket number", sample: "TKT-2026-0031" },
   eventLabel: { label: "Ticket update summary", sample: "Staff reply posted" },
@@ -46,6 +50,11 @@ const DEFAULT_VAR_LABELS: Readonly<Record<string, { label: string; sample: strin
   summary: { label: "Maintenance summary", sample: "Scheduled database and security maintenance" },
 };
 
+export function getShippedSecurityMailOrigin(key: string, origin: string): string | undefined {
+  return key === "auth.verify_email" || key === "auth.invitation" || key === "auth.password_reset" || key === "auth.admin_set_password"
+    ? new URL(origin).origin : undefined;
+}
+
 /** Refresh shipped previews without changing published template contracts or custom samples. */
 export function systemOrderReferenceSamples(vars: MailTemplateVariableSpec[]): MailTemplateVariableSpec[] {
   return vars.map((spec) => spec.name === "reference" || spec.name === "orderReference" || spec.name === "order_reference"
@@ -53,6 +62,24 @@ export function systemOrderReferenceSamples(vars: MailTemplateVariableSpec[]): M
 }
 
 const KNOWN_SYSTEM_SEEDS: Readonly<Record<string, CatalogueSeed>> = {
+  "referrals.invite_friend": {
+    name: "Referral invitation",
+    description: "A customer shares their ReadyPackets referral.",
+    category: "operations",
+    htmlTemplate: '<p>{{senderName}} shared a ReadyPackets referral link with you.</p><p><a href="{{referralLink}}" data-rp-button="primary">Create your account</a></p><p>Referral code: {{referralCode}}</p><p>If you did not expect this invitation, you can ignore it. ReadyPackets will never ask for your password by e-mail.</p>',
+  },
+  policy_update_notice: {
+    name: "Policy update notice",
+    description: "Notifies an account holder of a policy update.",
+    category: "operations",
+    htmlTemplate: '<p>Policy update: <strong>{{policyTitle}}</strong></p><p>{{summary}}</p><p><a href="{{portalUrl}}" data-rp-button="primary">Review updated policy</a></p>',
+  },
+  policy_enforcement_warning: {
+    name: "Policy acceptance warning",
+    description: "Reminds an account holder to accept an updated policy.",
+    category: "operations",
+    htmlTemplate: '<p>Policy: <strong>{{policyTitle}}</strong><br>Deadline: {{deadline}}</p><p>{{warningText}}</p><p><a href="{{portalUrl}}" data-rp-button="primary">Review and accept policy</a></p>',
+  },
   payment_receipt: {
     name: "Payment receipt",
     description: "Sent to the verified order owner. Order and project details are added automatically when available.",
@@ -315,7 +342,7 @@ export function buildSystemTemplateMetadata(builtin: MailTemplate): SystemMailTe
       sampleValue:
         seed?.sampleValues?.[varName] ??
         known?.sample ??
-        (varName.toLowerCase().includes("link")
+        (isMailUrlVariable(varName)
           ? "https://portal.readypackets.example"
           : `Sample ${varName}`),
     };
@@ -333,7 +360,10 @@ export function buildSystemTemplateMetadata(builtin: MailTemplate): SystemMailTe
     seed?.htmlTemplate ??
     defaultBodyText
       .split(/\n{2,}/)
-      .map((para) => `<p>${escapeHtmlText(para).replace(/\n/g, "<br>")}</p>`)
+      .map((para) => `<p>${escapeHtmlText(para).replace(/\{\{([a-zA-Z][a-zA-Z0-9_]{0,63})\}\}/g, (hole, name: string) =>
+        builtin.vars.includes(name) && isMailUrlVariable(name)
+          ? `<a href="${hole}" data-rp-button="primary">Open in ReadyPackets</a>`
+          : hole).replace(/\n/g, "<br>")}</p>`)
       .join("");
 
   return {
@@ -346,4 +376,34 @@ export function buildSystemTemplateMetadata(builtin: MailTemplate): SystemMailTe
     defaultBodyText,
     defaultBodyHtml,
   };
+}
+
+/** Live built-ins keep their original subject and text; delivery and catalogue share labelled HTML. */
+export function renderShippedMail(
+  builtin: MailTemplate,
+  metadata: SystemMailTemplateMetadata,
+  input: Readonly<Record<string, string | number | boolean>>,
+  canonicalOrigin: string,
+) {
+  const vars = resolveMailPathVariables(input, canonicalOrigin);
+  const subject = builtin.subject(vars);
+  const rawText = builtin.text(vars);
+  const lockedOrigin = getShippedSecurityMailOrigin(builtin.key, canonicalOrigin);
+  const text = mailTextWithStandaloneLinks(rawText, lockedOrigin);
+  if (!builtin.vars.some(isMailUrlVariable)) return { subject, text, html: plainTextToDeliveryHtml(rawText) };
+
+  // An optional link might be absent, or a developer may be on a local HTTP origin.
+  // In that case do not emit a broken button. The text fallback autolinks only allowed HTTPS.
+  if (!builtin.vars.filter(isMailUrlVariable).every((key) => vars[key] === "[REDACTED]"
+    || (typeof vars[key] === "string" && parseAllowedTemplateUrl(vars[key], { allowMailto: false })))) {
+    if (lockedOrigin && new URL(lockedOrigin).protocol === "https:") {
+      throw new Error("SECURITY_MAIL_LINK_INVALID");
+    }
+    return { subject, text, html: plainTextToDeliveryHtml(rawText) };
+  }
+  const { html } = renderMailTemplateVersion({
+    format: "html", subjectTemplate: metadata.defaultSubject, bodyTextTemplate: metadata.defaultBodyText,
+    bodyHtmlTemplate: metadata.defaultBodyHtml, declaredVars: builtin.vars, vars, canonicalOrigin, lockedOrigin,
+  });
+  return { subject, text, html };
 }

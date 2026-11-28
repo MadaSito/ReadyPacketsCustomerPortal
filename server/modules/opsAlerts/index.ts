@@ -1,4 +1,4 @@
-import { and, count, desc, eq, lt, sql } from "drizzle-orm";
+import { and, count, desc, eq, exists, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, forbidden, notFound, validation } from "../../core/errors.js";
@@ -7,6 +7,8 @@ import type { SessionPrincipal, Tx } from "../../core/types.js";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import { scanValue } from "../../observability/redact.js";
 import { currentCorrelation, keyHash } from "../jobs/queue.js";
+import { orders } from "../orders/schema.js";
+import { liveOrderPredicate } from "../orders/trashGate.js";
 import { createActorGuard } from "../platform/actorGuard.js";
 import { readSetting, writeSetting } from "../platform/index.js";
 import { ATTENTION_ALERT_HOURS, ATTENTION_ALERTS_ENABLED, registerAttentionReminder } from "./attention.js";
@@ -48,6 +50,13 @@ function view(row: AlertRow) {
 
 export function createOpsAlertsModule(deps: ModuleDeps) {
   const { db, clock, audit } = deps;
+  // Ledger alerts (notably money received after trashing) must stay visible.
+  const visibleAlert = or(
+    ne(operationalAlerts.source, "attention"), isNull(operationalAlerts.orderPublicId),
+    exists(db.select({ one: sql`1` }).from(orders).where(and(
+      eq(orders.publicId, operationalAlerts.orderPublicId), liveOrderPredicate(),
+    ))),
+  );
   const byIdentity = (input: OpsAlertIdentity) => and(
     eq(operationalAlerts.source, input.source), eq(operationalAlerts.dedupHash, keyHash(input.dedupKey)),
   );
@@ -115,7 +124,7 @@ export function createOpsAlertsModule(deps: ModuleDeps) {
     },
     async summary() {
       const rows = await db.select({ severity: operationalAlerts.severity, total: count() }).from(operationalAlerts)
-        .where(eq(operationalAlerts.state, "open")).groupBy(operationalAlerts.severity);
+        .where(and(eq(operationalAlerts.state, "open"), visibleAlert)).groupBy(operationalAlerts.severity);
       const result = { warning: 0, error: 0, critical: 0 };
       for (const row of rows) result[row.severity] = row.total;
       return result;
@@ -125,7 +134,7 @@ export function createOpsAlertsModule(deps: ModuleDeps) {
       if (!parsed.success) throw validation("INVALID_OPERATIONAL_ALERT_FILTER", "The alert filter is invalid.");
       const { severity, state, source, cursor, limit = 30 } = parsed.data;
       const rows = await db.select().from(operationalAlerts).where(and(
-        severity && eq(operationalAlerts.severity, severity), state && eq(operationalAlerts.state, state),
+        visibleAlert, severity && eq(operationalAlerts.severity, severity), state && eq(operationalAlerts.state, state),
         source && eq(operationalAlerts.source, source), cursor ? lt(operationalAlerts.publicId, cursor) : undefined,
       )).orderBy(desc(operationalAlerts.publicId)).limit(limit + 1);
       return { items: rows.slice(0, limit).map(view), nextCursor: rows.length > limit ? rows[limit - 1]!.publicId : null };
@@ -135,7 +144,8 @@ export function createOpsAlertsModule(deps: ModuleDeps) {
         const current = await deps.services.identity.sessions.assertCurrent(principal, tx);
         if (current.pendingSteps.length) throw new DomainError("REMEDIATION_REQUIRED", "ACCOUNT_STEP_PENDING", "Finish securing your account first.");
         if (!roleHasCapability(current.role, "ops.alerts.manage")) throw forbidden("OPS_ALERT_MANAGE_FORBIDDEN");
-        const [row] = await tx.select().from(operationalAlerts).where(eq(operationalAlerts.publicId, id)).limit(1).for("update");
+        const [row] = await tx.select().from(operationalAlerts)
+          .where(and(eq(operationalAlerts.publicId, id), visibleAlert)).limit(1).for("update");
         if (!row) throw notFound();
         return { changed: await transition(tx, row, state, { userId: principal.userId, role: current.role }) };
       });

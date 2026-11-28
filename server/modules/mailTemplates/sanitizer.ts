@@ -341,7 +341,7 @@ export function parseAllowedTemplateUrl(
   options: { allowMailto: boolean; canonicalOrigin?: string },
 ): string | null {
   const trimmed = rawUrl.trim();
-  if (!trimmed || trimmed.length > MAX_URL_LENGTH || HEADER_CONTROL_RE.test(trimmed) || /\s/u.test(trimmed)) {
+  if (!trimmed || trimmed.length > MAX_URL_LENGTH || /[\p{Cc}\p{Cf}\\]/u.test(rawUrl) || /\s/u.test(trimmed)) {
     return null;
   }
   let candidate = trimmed;
@@ -391,6 +391,104 @@ export function parseAllowedTemplateUrl(
   } catch {
     return null;
   }
+}
+
+const LINK_PREFIX = "https://";
+const LINK_DELIMITER = /[\s<>"']/u;
+const LINK_LEFT_BOUNDARY = /[\s([{<>"']/u;
+const LINK_END_PUNCTUATION = ".,;:!?";
+const URL_VARIABLE = /(?:link|url|path)$/i;
+
+export function isMailUrlVariable(name: string): boolean {
+  return URL_VARIABLE.test(name);
+}
+
+/** Recognize full HTTPS tokens once, without retrying from within a rejected token. */
+function* httpsLinks(text: string): Generator<{ start: number; end: number; href: string }> {
+  for (let i = 0; i < text.length;) {
+    if (text[i]?.toLowerCase() !== "h" || (i > 0 && !LINK_LEFT_BOUNDARY.test(text[i - 1]!))
+      || text.slice(i, i + LINK_PREFIX.length).toLowerCase() !== LINK_PREFIX) {
+      i += 1;
+      continue;
+    }
+    const start = i;
+    i += LINK_PREFIX.length;
+    let parentheses = 0;
+    let brackets = 0;
+    let braces = 0;
+    while (i < text.length && !LINK_DELIMITER.test(text[i]!)) {
+      switch (text[i]) {
+        case "(": parentheses += 1; break;
+        case ")": parentheses -= 1; break;
+        case "[": brackets += 1; break;
+        case "]": brackets -= 1; break;
+        case "{": braces += 1; break;
+        case "}": braces -= 1; break;
+      }
+      i += 1;
+    }
+    if (i - start > MAX_URL_LENGTH) continue;
+    let end = i;
+    while (end > start + LINK_PREFIX.length) {
+      const last = text[end - 1]!;
+      if (last === ")" && parentheses < 0) parentheses += 1;
+      else if (last === "]" && brackets < 0) brackets += 1;
+      else if (last === "}" && braces < 0) braces += 1;
+      else if (!LINK_END_PUNCTUATION.includes(last)) break;
+      end -= 1;
+    }
+    const href = parseAllowedTemplateUrl(text.slice(start, end), { allowMailto: false });
+    if (href) yield { start, end, href };
+  }
+}
+
+function assertMailOrigin(href: string, lockedOrigin?: string): void {
+  if (lockedOrigin && !(href.startsWith(`${lockedOrigin}/`))) {
+    throw validation("INVALID_MAIL_RENDER", "A security notice link must use the ReadyPackets portal origin.");
+  }
+}
+
+function linkifyMailTextNode(text: string, lockedOrigin?: string, destinations?: Set<string>): string {
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const { start, end, href } of httpsLinks(text)) {
+    assertMailOrigin(href, lockedOrigin);
+    destinations?.add(href);
+    parts.push(escapeHtmlText(text.slice(cursor, start)),
+      `<a href="${escapeHtmlText(href)}" rel="noopener noreferrer">${escapeHtmlText(href)}</a>`);
+    cursor = end;
+  }
+  parts.push(escapeHtmlText(text.slice(cursor)));
+  return parts.join("");
+}
+
+/** Plain-text fallback retains the entire URL, on a line that clients can recognize. */
+export function mailTextWithStandaloneLinks(text: string, lockedOrigin?: string): string {
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const { start, end, href } of httpsLinks(text)) {
+    assertMailOrigin(href, lockedOrigin);
+    parts.push(text.slice(cursor, start));
+    if (start > 0 && text[start - 1] !== "\n" && text[start - 1] !== "\r" && start > cursor) parts.push("\n");
+    parts.push(text.slice(start, end));
+    if (end < text.length && text[end] !== "\n" && text[end] !== "\r") parts.push("\n");
+    cursor = end;
+  }
+  parts.push(text.slice(cursor));
+  return parts.join("");
+}
+
+export function resolveMailPathVariables(
+  vars: Readonly<Record<string, string | number | boolean>>,
+  canonicalOrigin?: string,
+  hrefVars: readonly string[] = [],
+): Readonly<Record<string, string | number | boolean>> {
+  return Object.fromEntries(Object.entries(vars).map(([key, value]) => {
+    if (typeof value !== "string" || !value.trimStart().startsWith("/") || (!isMailUrlVariable(key) && !hrefVars.includes(key))) {
+      return [key, value];
+    }
+    return [key, parseAllowedTemplateUrl(value, { allowMailto: false, canonicalOrigin }) ?? value];
+  }));
 }
 
 interface ParseOptions {
@@ -1016,12 +1114,15 @@ function serializeDeliveryNodes(
     vars: Readonly<Record<string, string | number | boolean>>;
     canonicalOrigin?: string;
   },
+  autolink = false,
+  lockedOrigin?: string,
+  destinations?: Set<string>,
 ): string {
   const parts: string[] = [];
   for (const node of nodes) {
     if (node.kind === "text") {
       const rawText = substitutions ? substitutePlainText(node.text, substitutions.vars) : node.text;
-      parts.push(escapeHtmlText(rawText));
+      parts.push(autolink ? linkifyMailTextNode(rawText, lockedOrigin, destinations) : escapeHtmlText(rawText));
       continue;
     }
 
@@ -1070,6 +1171,10 @@ function serializeDeliveryNodes(
       }
 
       const btnAttr = attrs.buttonPrimary ? ' data-rp-button="primary"' : "";
+      if (autolink) {
+        assertMailOrigin(hrefOut, lockedOrigin);
+        if (hrefOut.startsWith(LINK_PREFIX)) destinations?.add(hrefOut);
+      }
       parts.push(`<a href="${escapeHtmlText(hrefOut)}"${btnAttr} rel="noopener noreferrer">${inner}</a>`);
       continue;
     }
@@ -1079,7 +1184,7 @@ function serializeDeliveryNodes(
     if ((tag === "th" || tag === "td") && attrs.colspan) tableAttr += ` colspan="${attrs.colspan}"`;
     if ((tag === "th" || tag === "td") && attrs.rowspan) tableAttr += ` rowspan="${attrs.rowspan}"`;
 
-    parts.push(`<${tag}${tableAttr}>${serializeDeliveryNodes(children, substitutions)}</${tag}>`);
+    parts.push(`<${tag}${tableAttr}>${serializeDeliveryNodes(children, substitutions, autolink, lockedOrigin, destinations)}</${tag}>`);
   }
   return parts.join("");
 }
@@ -1295,10 +1400,11 @@ export function wrapDeliveryHtmlDocument(sanitizedBodyHtml: string): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"></head><body>${sanitizedBodyHtml}</body></html>`;
 }
 
-export function plainTextToDeliveryHtml(renderedText: string): string {
+export function plainTextToDeliveryHtml(renderedText: string, lockedOrigin?: string): string {
   const paragraphs = renderedText
+    .replace(/\r\n?/g, "\n")
     .split(/\n{2,}/)
-    .map((para) => `<p>${escapeHtmlText(para).replace(/\n/g, "<br>")}</p>`)
+    .map((para) => `<p>${linkifyMailTextNode(para, lockedOrigin).replace(/\n/g, "<br>")}</p>`)
     .join("");
   return wrapDeliveryHtmlDocument(paragraphs || `<p>${escapeHtmlText(renderedText)}</p>`);
 }
@@ -1311,6 +1417,7 @@ export function renderMailTemplateVersion(input: {
   declaredVars: readonly string[];
   vars: Readonly<Record<string, string | number | boolean>>;
   canonicalOrigin?: string;
+  lockedOrigin?: string;
 }): { subject: string; text: string; html: string; previewHtml?: string } {
   const allowedSet = new Set(input.declaredVars);
   for (const key of Object.keys(input.vars)) {
@@ -1319,28 +1426,31 @@ export function renderMailTemplateVersion(input: {
     }
   }
 
-  const subject = substitutePlainText(input.subjectTemplate, input.vars, allowedSet).trim();
+  const ast = input.format === "html" && input.bodyHtmlTemplate
+    ? parseHtmlToAst(input.bodyHtmlTemplate, { mode: "strict", allowPlaceholders: true, declaredVars: allowedSet })
+    : null;
+  const vars = resolveMailPathVariables(input.vars, input.canonicalOrigin, ast?.hrefVars);
+  const subject = substitutePlainText(input.subjectTemplate, vars, allowedSet).trim();
   if (subject.length < 1 || subject.length > MAX_SUBJECT_LENGTH || HEADER_CONTROL_RE.test(subject)) {
     throw validation("INVALID_MAIL_RENDER", "Rendered mail subject is empty, too long, or contains control characters.");
   }
 
-  const text = substitutePlainText(input.bodyTextTemplate, input.vars, allowedSet).trim();
+  const rawText = substitutePlainText(input.bodyTextTemplate, vars, allowedSet).trim();
+  const text = mailTextWithStandaloneLinks(rawText, input.lockedOrigin);
   if (text.length < 1 || text.length > MAX_TEXT_BODY_LENGTH || text.includes("\0")) {
     throw validation("INVALID_MAIL_RENDER", "Rendered plain-text alternative is invalid.");
   }
 
-  if (input.format === "text" || !input.bodyHtmlTemplate) {
-    const html = plainTextToDeliveryHtml(text);
+  if (!ast) {
+    const html = plainTextToDeliveryHtml(rawText, input.lockedOrigin);
+    if (Buffer.byteLength(html, "utf8") > MAX_RENDERED_HTML_BYTES) {
+      throw validation("INVALID_MAIL_RENDER", "Rendered HTML exceeds maximum message size.");
+    }
     return { subject, text, html };
   }
 
-  const ast = parseHtmlToAst(input.bodyHtmlTemplate, {
-    mode: "strict",
-    allowPlaceholders: true,
-    declaredVars: allowedSet,
-  });
   const substitutedBody = serializeDeliveryNodes(ast.roots, {
-    vars: input.vars,
+    vars,
     canonicalOrigin: input.canonicalOrigin,
   });
 
@@ -1349,14 +1459,20 @@ export function renderMailTemplateVersion(input: {
     mode: "strict",
     allowPlaceholders: false,
   });
-  const finalBodyHtml = serializeDeliveryNodes(resanitizedAst.roots);
+  const htmlDestinations = new Set<string>();
+  const finalBodyHtml = serializeDeliveryNodes(resanitizedAst.roots, undefined, true, input.lockedOrigin, htmlDestinations);
   const html = wrapDeliveryHtmlDocument(finalBodyHtml);
   if (Buffer.byteLength(html, "utf8") > MAX_RENDERED_HTML_BYTES) {
     throw validation("INVALID_MAIL_RENDER", "Rendered HTML exceeds maximum message size.");
   }
 
   const previewHtml = projectInertMailPreviewHtml(html);
-  return { subject, text, html, previewHtml };
+  for (const { href } of httpsLinks(rawText)) htmlDestinations.delete(href);
+  const textWithDestinations = htmlDestinations.size ? `${text}\n\n${[...htmlDestinations].join("\n")}` : text;
+  if (textWithDestinations.length > MAX_TEXT_BODY_LENGTH) {
+    throw validation("INVALID_MAIL_RENDER", "Rendered plain-text alternative is too long.");
+  }
+  return { subject, text: textWithDestinations, html, previewHtml };
 }
 
 export function computeMailTemplateContentHash(input: {
