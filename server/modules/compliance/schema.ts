@@ -440,6 +440,11 @@ export const complianceInvoices = mysqlTable(
     memo: varchar("memo", { length: 1000 }),
     issuerNameSnapshot: varchar("issuer_name_snapshot", { length: 160 }),
     issuerAddressSnapshot: varchar("issuer_address_snapshot", { length: 500 }),
+    issuerContactSnapshot: varchar("issuer_contact_snapshot", { length: 160 }),
+    orderReferenceSnapshot: varchar("order_reference_snapshot", { length: 48 }),
+    customerRefSnapshot: varchar("customer_ref_snapshot", { length: 32 }),
+    /** Increment 09 (D2.6): AES-256-GCM encrypted JSON buyer snapshot (`compliance_invoices.buyer_snapshot:<publicId>`). */
+    buyerSnapshotEnc: text("buyer_snapshot_enc"),
     createdByUserId: refColumn("created_by_user_id"),
     issuedByUserId: refColumn("issued_by_user_id"),
     voidedByUserId: refColumn("voided_by_user_id"),
