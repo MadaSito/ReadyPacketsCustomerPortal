@@ -28,7 +28,8 @@ export { Callout, Skeleton, EmptyState, ErrorState, LoadMore, type CalloutProps,
 export { Dialog, DialogClose, ConfirmDialog, Drawer, DropdownMenu, Tooltip, type DialogProps, type ConfirmDialogProps, type DrawerProps, type DropdownMenuProps, type MenuItem, type TooltipProps } from "./Overlay";
 export { Tabs, Breadcrumbs, type TabsProps, type TabItem, type Crumb } from "./Navigation";
 export { RouteTabs, RouteTabPanel, routeTabId, routeTabPanelId, type RouteTabsProps, type RouteTabItem, type RouteTabPanelProps } from "./RouteTabs";
-export { ToastProvider, useToast, type ToastApi, type ToastInput, type ToastTone } from "./Toast";
+export { ToastProvider, useToast, TOAST_ACTION_MIN_DURATION, type ToastAction, type ToastApi, type ToastInput, type ToastTone } from "./Toast";
+export { EmailLink, mailtoHref, type EmailLinkProps } from "./EmailLink";
 export { DataTable, type Column, type DataTableProps, type DataTableSelection, type SortState } from "./DataTable";
 export { FilterBar, type FilterBarProps } from "./FilterBar";
 export { FileDropzone, type FileDropzoneProps } from "./FileDropzone";

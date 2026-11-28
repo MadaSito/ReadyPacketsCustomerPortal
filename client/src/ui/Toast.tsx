@@ -11,12 +11,21 @@ export interface ToastInput {
   title: string;
   description?: string;
   tone?: ToastTone;
-  /** ms; default 5000 (danger: 8000). 0 = stays until dismissed. */
+  /** ms; default 5000 (danger: 8000); with an action at least 10000. 0 = stays until dismissed. */
   duration?: number;
+  /** Optional inline action (e.g. Undo). A real button inside the live region; dismisses the toast on click. */
+  action?: ToastAction;
 }
-interface ToastItem extends Required<Omit<ToastInput, "description">> {
+export interface ToastAction {
+  label: string;
+  onClick: () => void | Promise<void>;
+}
+/** Minimum auto-dismiss time while a toast carries an action (WCAG 2.2.1: enough time to reach it). */
+export const TOAST_ACTION_MIN_DURATION = 10_000;
+interface ToastItem extends Required<Omit<ToastInput, "description" | "action">> {
   id: number;
   description?: string;
+  action?: ToastAction;
 }
 export interface ToastApi {
   show: (toast: ToastInput) => number;
@@ -56,8 +65,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     (input: ToastInput) => {
       const id = ++seq.current;
       const tone = input.tone ?? "info";
-      const duration = input.duration ?? (tone === "danger" ? 8000 : 5000);
-      setItems((list) => [...list.slice(-4), { id, title: input.title, description: input.description, tone, duration }]);
+      const base = input.duration ?? (tone === "danger" ? 8000 : 5000);
+      const duration = input.action && base > 0 ? Math.max(base, TOAST_ACTION_MIN_DURATION) : base;
+      setItems((list) => [...list.slice(-4), { id, title: input.title, description: input.description, tone, duration, action: input.action }]);
       schedule(id, duration);
       return id;
     },
@@ -103,6 +113,20 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               {t.title}
             </p>
             {t.description ? <p className="mt-0.5 text-sm text-body">{t.description}</p> : null}
+            {t.action ? (
+              <button
+                type="button"
+                data-testid="toast-action"
+                onClick={() => {
+                  const action = t.action;
+                  dismiss(t.id);
+                  void action?.onClick();
+                }}
+                className="mt-2 inline-flex min-h-8 min-w-11 items-center justify-center rounded-[var(--radius-control)] border border-line px-3 text-sm font-semibold text-action underline-offset-2 hover:bg-surface-sunken hover:underline rp-forced-border"
+              >
+                {t.action.label}
+              </button>
+            ) : null}
           </div>
           <button type="button" onClick={() => dismiss(t.id)} aria-label="Dismiss notification" className="inline-flex size-11 shrink-0 items-center justify-center text-muted hover:text-ink">
             <X aria-hidden="true" className="size-4" />
