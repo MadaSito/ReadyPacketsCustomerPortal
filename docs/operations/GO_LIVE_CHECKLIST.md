@@ -234,7 +234,7 @@ In Stripe, open **each** configured endpoint and compare its subscribed events w
 
 ## Mail
 
-For MAIL-09A through MAIL-09N, use two different mail clients (for example, desktop webmail and a phone mail app). Use a fresh message in each client for verification, reset and invitation links: they are single-use. Click the actual link in the received message, not a URL you copied into the browser. Use the approved test mailbox and aliases only; never record full token URLs.
+For MAIL-09A through MAIL-09P, use two different mail clients (for example, desktop webmail and a phone mail app). Use a fresh message in each client for verification, reset and invitation links: they are single-use. Click the actual link in the received message, not a URL you copied into the browser. Use the approved test mailbox and aliases only; never record full token URLs.
 
 | ID | Priority | Where and what to do | Expected | Result / evidence / tester |
 | --- | --- | --- | --- | --- |
@@ -256,6 +256,8 @@ For MAIL-09A through MAIL-09N, use two different mail clients (for example, desk
 | MAIL-09L | Blocker | Client B: open the same payment-recorded invoice message → **Download receipt**. | The matching paid invoice opens after sign-in as its owner, with a downloadable PDF. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | MAIL-09M | Blocker | Client A: send the synthetic customer a support reply as in STF-03.<br>In the message, click **View support ticket**. | The matching ticket opens after sign-in as its owner. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | MAIL-09N | Blocker | Client B: open the same support notification → **View support ticket**. | The matching ticket opens after sign-in as its owner. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09O | Important | In `/admin/email-templates/orders.confirmed` (**Order confirmation**), set **Sample: Action or portal URL** to the isolated portal's full HTTPS sign-in URL. Click **Send test to me**; don't publish. In Client A, open the `[TEST]` message → **View order**. | The configured portal sign-in page opens. This verifies the template's link, not a checkout trigger. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09P | Important | Client B: open the same `[TEST]` order confirmation → **View order**. | The configured portal sign-in page opens. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Trash, restore, and retention
 
