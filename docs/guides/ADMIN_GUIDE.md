@@ -725,7 +725,10 @@ The day settings allow 1 to 3,650 days. Changing them needs `trash.retention.man
 ### Backups, Stripe, SharePoint and other copies
 
 Permanent deletion only reaches data that the portal itself controls.
-- **Backups** keep their copy until they expire under the backup retention, see [BACKUP_AND_RESTORE.md](../operations/BACKUP_AND_RESTORE.md). **Restoring an older backup brings deleted items back.** After a restore, delete them again from the Trash centre, using the `order.purged` and `customer.purged` audit events as the list.
+- **Backups** keep their copy until they expire under the backup retention, or longer if a legal hold applies to the backup; see [BACKUP_AND_RESTORE.md](../operations/BACKUP_AND_RESTORE.md). A permanent deletion never rewrites existing backups.
+  - **Restoring an older backup brings deleted items back,** and the restored deletion records and audit tables are just as old.
+  - After a restore, use the audit copy kept outside the database (SIEM or syslog) to find the `order.purged` and `customer.purged` events recorded after the backup was taken. Delete those items again from the Trash centre **before reopening the portal**.
+- **Portable transfer.** Only an **all records** export carries items in the trash and deleted-item placeholders, so a migration keeps the trash. Exports of selected customers or orders include live items only. An export is refused while a permanent deletion is half-finished (`PORTABLE_PURGE_IN_PROGRESS`); export again when it has finished.
 - **Stripe.** Customers, payments and checkout sessions at Stripe are not changed.
 - **Storage copies.** There are four cases:
   - **A. A copy the portal recorded as its own, on a destination it can reach,** is deleted and checked. If a write to the current destination is still uncertain, the deletion stops and is retried; it never reports success early.
@@ -1272,6 +1275,10 @@ This is a business-data transfer between ReadyPackets installations, **not a bac
 - **Not transferred (increment 06)**: the business export leaves out payment receipts and receipt refund notes, policy notices and enforcement records, security incidents, order task notes and waivers, and saved reports. The package manifest lists each exclusion. Backups include all of them.
 - **Workflows** are moved separately with workflow export/import (drafts only). Portable transfer carries the
   workflow key only as inert history.
+- **Trash (increment 09)**: only an **all records** export carries items in the trash and deleted-item placeholders
+  (tombstones); exports of selected customers or orders read live items only. An export refuses while a permanent
+  deletion is half-finished (`PORTABLE_PURGE_IN_PROGRESS`). An import never brings back an item that the target has
+  already started deleting or has deleted (`IMPORT_ORDER_PURGED`).
 - **Backups** cover every table, but encrypted promo codes and keyed hashes restore correctly only with the same
   encryption and blind-index keys.
 
