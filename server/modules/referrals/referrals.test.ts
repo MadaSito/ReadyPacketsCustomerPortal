@@ -11,6 +11,7 @@ import { createCallerFactory, type SafeErrorData } from "../../trpc/trpc.js";
 import { users, userSessions } from "../identity/schema.js";
 import { platformSettings } from "../platform/schema.js";
 import { createSettingsStore } from "../platform/settingsStore.js";
+import { createTrashRegistry } from "../trash/ports.js";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { REFERRAL_CODE_REGEX, canonicalEmailIdentity, serializeSafeCsv } from "./codes.js";
@@ -1279,5 +1280,197 @@ describe("server/modules/referrals (Package G)", () => {
       }),
     );
     expect(rejectedB.status).toBe("rejected");
+  });
+
+  it("enforces D2.2 trash visibility and D2.6 referral link erasure while keeping numeric counts", async () => {
+    const trashRegistry = createTrashRegistry();
+    h.services.trash = trashRegistry;
+    mod.init?.();
+    const participant = trashRegistry
+      .participants()
+      .find((entry) => entry.module === "referrals");
+    expect(participant).toBeDefined();
+
+    const admin = await seedUserWithSession({
+      email: "admin-trash@example.test",
+      name: "Admin Trash",
+      role: "admin",
+      stepUpFresh: true,
+    });
+    await enableProgram(admin.principal, {
+      rewardMode: "fixed",
+      fixedAmountMinor: 2000,
+      currency: "USD",
+      manualApprovalRequired: false,
+    });
+
+    const referrer = await seedUserWithSession({
+      email: "zeus-referrer@example.test",
+      name: "Zeus Greene",
+      customerRef: "RPCUS-A1B2CJJG5",
+    });
+    const soloCustomer = await seedUserWithSession({
+      email: "solo-customer@example.test",
+      name: "Solo Customer",
+      customerRef: "RPCUS-SOLO12345",
+    });
+    const referred = await seedUserWithSession({
+      email: "friend-referred@example.test",
+      name: "Referred Friend",
+      customerRef: "RPCUS-FRIEND123",
+    });
+    const lateSignup = await seedUserWithSession({
+      email: "late-signup@example.test",
+      name: "Late Signup",
+      customerRef: "RPCUS-LATE12345",
+    });
+
+    const overview = await callAs(referrer.principal, (c) => c.me.overview());
+    const soloOverview = await callAs(soloCustomer.principal, (c) => c.me.overview());
+    const referrerCode = overview.code!;
+    const soloCode = soloOverview.code!;
+    expect(referrerCode).toMatch(REFERRAL_CODE_REGEX);
+    expect(soloCode).toMatch(REFERRAL_CODE_REGEX);
+
+    await callAs(referrer.principal, (c) =>
+      c.me.sendInviteEmail({ recipientEmail: "invited-contact@example.test" }),
+    );
+
+    const attr = await tdb.db.transaction((tx) =>
+      mod.attributeRegistration(referrerCode, referred.userId, tx),
+    );
+    expect(attr.attributed).toBe(true);
+
+    const paid = await tdb.db.transaction((tx) =>
+      mod.onInvoicePaid(
+        {
+          invoicePublicId: ulid(),
+          orderPublicId: ulid(),
+          customerUserId: referred.userId,
+          currency: "USD",
+          subtotalMinor: 10_000,
+          discountMinor: 0,
+          taxMinor: 0,
+          totalMinor: 10_000,
+          isFirstPaidInvoice: true,
+          paidAt: h.clock.now(),
+        },
+        { tx },
+      ),
+    );
+    expect(paid.outcome).toBe("auto_approved");
+
+    const preList = await callAs(admin.principal, (c) => c.admin.list({ limit: 10 }));
+    const refRow = preList.items.find((r) => r.referralPublicId === paid.referralPublicId)!;
+    await callAs(admin.principal, (c) =>
+      c.admin.markCredited({
+        referralPublicId: refRow.referralPublicId,
+        expectedVersion: refRow.version,
+        payoutMethod: "account_credit",
+        reference: "CRED-REF-99",
+        note: "Credited Zeus Greene account",
+      }),
+    );
+
+    // Move referrer to trash: code stops resolving with CODE_NOT_FOUND (no existence oracle),
+    // operational admin list/export exclude the trashed customer, and aggregate numbers stay intact.
+    await tdb.db
+      .update(users)
+      .set({ status: "suspended", trashedAt: h.clock.now() })
+      .where(eq(users.id, referrer.userId));
+
+    const validateTrashed = await mod.validateCode(referrerCode);
+    expect(validateTrashed.valid).toBe(false);
+    expect(validateTrashed.reasonCode).toBe("CODE_NOT_FOUND");
+
+    const attrTrashed = await tdb.db.transaction((tx) =>
+      mod.attributeRegistration(referrerCode, lateSignup.userId, tx),
+    );
+    expect(attrTrashed).toEqual({ attributed: false, reasonCode: "CODE_NOT_FOUND" });
+
+    const listWhileTrashed = await callAs(admin.principal, (c) => c.admin.list({ limit: 10 }));
+    expect(listWhileTrashed.items).toHaveLength(0);
+
+    const summaryBeforePurge = await participant!.summarize!({
+      kind: "customer",
+      id: referrer.userId,
+      publicId: referrer.userPublicId,
+    });
+    expect(summaryBeforePurge).toEqual({ referralLinks: 1 });
+
+    // Permanently delete referrer (with attribution) and soloCustomer (without attribution)
+    await tdb.db
+      .update(users)
+      .set({
+        trashedAt: null,
+        purgedAt: h.clock.now(),
+        customerRef: null,
+        emailEnc: Buffer.alloc(0),
+        nameEnc: Buffer.alloc(0),
+      })
+      .where(eq(users.id, referrer.userId));
+
+    const purgeReferrer = await participant!.purge({
+      kind: "customer",
+      id: referrer.userId,
+      publicId: referrer.userPublicId,
+    });
+    expect(purgeReferrer.deleted.referralLinks).toBe(1);
+    expect(purgeReferrer.deleted.referralEmailInvites).toBe(1);
+    expect(purgeReferrer.kept?.referralAttributions).toBe(1);
+
+    // Idempotent second purge call reports 0 newly deleted links
+    const purgeReferrerRetry = await participant!.purge({
+      kind: "customer",
+      id: referrer.userId,
+      publicId: referrer.userPublicId,
+    });
+    expect(purgeReferrerRetry.deleted.referralLinks).toBeUndefined();
+
+    // Old referral code is completely gone from DB and never resolves again
+    const validatePurged = await mod.validateCode(referrerCode);
+    expect(validatePurged.valid).toBe(false);
+    expect(validatePurged.reasonCode).toBe("CODE_NOT_FOUND");
+
+    const [storedCodeRow] = await tdb.db
+      .select()
+      .from(referralCodes)
+      .where(eq(referralCodes.userId, referrer.userId));
+    expect(storedCodeRow.code).not.toBe(referrerCode);
+    expect(storedCodeRow.code.startsWith("~")).toBe(true);
+    expect(storedCodeRow.active).toBe(false);
+
+    const [storedReferralRow] = await tdb.db
+      .select()
+      .from(referrals)
+      .where(eq(referrals.publicId, paid.referralPublicId!));
+    expect(storedReferralRow.codeSnapshot).toBe("~ERASED~~~");
+    expect(storedReferralRow.payoutReference).toBeNull();
+    expect(storedReferralRow.payoutNote).toBeNull();
+
+    // Numeric counts and money ledger figures stay as numbers without decrypting tombstoned PII
+    const adminSettingsAfterPurge = await callAs(admin.principal, (c) => c.admin.getSettings());
+    expect(adminSettingsAfterPurge.summary.totalReferrals).toBe(1);
+    expect(adminSettingsAfterPurge.summary.creditedCount).toBe(1);
+    expect(adminSettingsAfterPurge.summary.creditedAmountMinor).toBe(2000);
+
+    const ledgerAfterPurge = await callAs(admin.principal, (c) => c.admin.ledger({ limit: 10 }));
+    expect(ledgerAfterPurge.items.length).toBeGreaterThanOrEqual(1);
+    expect(ledgerAfterPurge.items[0]?.referrerName).toBe("Deleted account");
+    expect(ledgerAfterPurge.items[0]?.reference).toBeNull();
+    expect(ledgerAfterPurge.items[0]?.note).toBeNull();
+
+    // Solo customer with zero attributions has referral_codes row deleted outright
+    const purgeSolo = await participant!.purge({
+      kind: "customer",
+      id: soloCustomer.userId,
+      publicId: soloCustomer.userPublicId,
+    });
+    expect(purgeSolo.deleted.referralLinks).toBe(1);
+    const soloCodeRows = await tdb.db
+      .select()
+      .from(referralCodes)
+      .where(eq(referralCodes.userId, soloCustomer.userId));
+    expect(soloCodeRows).toHaveLength(0);
   });
 });
