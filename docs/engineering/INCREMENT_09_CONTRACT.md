@@ -116,8 +116,9 @@ text node, are affected. A relative `portalPath` value is never a link.
 #### D2.4 Retention clean-up
 
 - Settings (`trash.retention.manage`, step-up, audited), in the Trash centre:
-  `trash.autoPurge.enabled` (default **on**), `trash.retention.orderDays` (default 30) and
-  `trash.retention.customerDays` (default 30), each 1–3650.
+  `trash.auto_purge.enabled` (default **on**), `trash.retention.order_days` (default 30) and
+  `trash.retention.customer_days` (default 30), each 1–3650. Owner-write-only: the generic settings API and
+  configuration import refuse them.
 - Due date = `trashed_at` + the **current** setting (not frozen at trash time); shown on every trash row.
   Shortening retention shows how many items become due and needs the same confirmation as a permanent deletion.
 - A scheduled job (hourly, single-flight, bounded batch, resumable) purges what is due, as the system actor,
