@@ -13,12 +13,14 @@
  *  - `getForUserInTx` / `saveForUserInTx` / `clearForUserInTx` run strictly on the caller's `tx`, never open a second
  *    connection, and never enqueue mail.
  */
-import { eq, sql } from "drizzle-orm";
-import type { ModuleDeps } from "../../container.js";
+import { and, eq, isNull, sql } from "drizzle-orm";
+import type { ModuleDeps, Services } from "../../container.js";
 import { DomainError } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { DbOrTx, ModuleHealth, SessionPrincipal, Tx } from "../../core/types.js";
+import { isLiveUserRow } from "../identity/live.js";
 import { users } from "../identity/schema.js";
+import type { TrashParticipant, TrashPurgeResult } from "../trash/ports.js";
 import { customerBillingProfiles, type CustomerBillingProfileRow } from "./schema.js";
 import {
   billingDetailsSchema,
@@ -110,12 +112,14 @@ export function createBillingProfileService(deps: ModuleDeps): BillingProfileMod
         id: users.id,
         publicId: users.publicId,
         status: users.status,
+        trashedAt: users.trashedAt,
+        purgedAt: users.purgedAt,
       })
       .from(users)
       .where(eq(users.id, principal.userId));
 
     const [user] = options.forUpdate ? await base.for("update") : await base;
-    if (!user || user.publicId !== principal.userPublicId) {
+    if (!user || user.publicId !== principal.userPublicId || !isLiveUserRow(user)) {
       throw new DomainError("UNAUTHENTICATED", "SESSION_USER_MISSING", "Please sign in again.");
     }
     if (user.status !== "active") {
@@ -141,7 +145,7 @@ export function createBillingProfileService(deps: ModuleDeps): BillingProfileMod
       })
       .from(customerBillingProfiles)
       .innerJoin(users, eq(users.id, customerBillingProfiles.userId))
-      .where(eq(customerBillingProfiles.userId, userId));
+      .where(and(eq(customerBillingProfiles.userId, userId), isNull(users.purgedAt)));
 
     const [joined] = options?.forUpdate
       ? await baseQuery.for("update")
@@ -171,12 +175,21 @@ export function createBillingProfileService(deps: ModuleDeps): BillingProfileMod
     const details = parseDetailsOrThrow(detailsInput);
 
     const [user] = await tx
-      .select({ id: users.id, publicId: users.publicId })
+      .select({
+        id: users.id,
+        publicId: users.publicId,
+        trashedAt: users.trashedAt,
+        purgedAt: users.purgedAt,
+      })
       .from(users)
       .where(eq(users.id, userId))
       .for("update");
 
-    if (!user) {
+    if (
+      !user ||
+      user.purgedAt !== null ||
+      (user.trashedAt !== null && actor.via !== "portable_import")
+    ) {
       throw new DomainError("NOT_FOUND", "USER_NOT_FOUND", "Account not found.");
     }
 
@@ -556,7 +569,38 @@ export function createBillingProfileService(deps: ModuleDeps): BillingProfileMod
     }
   }
 
+  const trashParticipant: TrashParticipant = {
+    module: "billingProfile",
+    async summarize(entity): Promise<Record<string, number>> {
+      if (entity.kind !== "customer") return {};
+      if (!Number.isSafeInteger(entity.id) || entity.id <= 0) return {};
+      const [row] = await deps.db
+        .select({ count: sql<number>`count(*)` })
+        .from(customerBillingProfiles)
+        .where(eq(customerBillingProfiles.userId, entity.id));
+      const count = Number(row?.count ?? 0);
+      return count > 0 ? { billingProfiles: count } : {};
+    },
+    async purge(entity): Promise<TrashPurgeResult> {
+      if (entity.kind !== "customer") return { deleted: {} };
+      const result = await deps.db.transaction(async (tx) =>
+        clearForUserInTx(tx, entity.id, {
+          role: "system",
+          via: "account_erasure",
+        }),
+      );
+      return {
+        deleted: {
+          billingProfiles: result.cleared ? 1 : 0,
+        },
+      };
+    },
+  };
+
   return {
+    init() {
+      (deps.services as Partial<Services>).trash?.register(trashParticipant);
+    },
     get,
     save,
     clear,

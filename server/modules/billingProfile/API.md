@@ -25,6 +25,11 @@ Stores at most one saved billing contact and address per account (`customer_bill
   - Never enqueues mail; records durable audit event `billing_profile.saved` on `tx` without field values.
 - `clearForUserInTx(tx: Tx, userId: number, actor: BillingProfileWriteActor): Promise<{ cleared: boolean }>`
 
+## Trash & Retention (`TrashParticipant`: `billingProfile`)
+- `init()` registers `module: "billingProfile"` synchronously with `services.trash.register`.
+- `summarize(entity)`: returns `{ billingProfiles: 1 }` for a customer with a saved profile (`{}` otherwise).
+- `purge(entity)`: erases `customer_billing_profiles` on customer permanent deletion via `clearForUserInTx(..., { role: "system", via: "account_erasure" })` (idempotent; zero PII in audit).
+
 ## Audit Events (Zero PII)
 - `billing_profile.saved` (`category: "business"`, `action: "create" | "update"`, `outcome: "completed"`)
 - `billing_profile.cleared` (`category: "business"`, `action: "delete"`, `outcome: "completed"`)

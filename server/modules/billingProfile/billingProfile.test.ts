@@ -15,6 +15,7 @@ import { createCallerFactory, router } from "../../trpc/trpc.js";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { users } from "../identity/schema.js";
+import { createTrashRegistry, type TrashParticipant } from "../trash/ports.js";
 import {
   billingProfileDetailsAad,
   createBillingProfileModule,
@@ -56,6 +57,7 @@ describe("billingProfile module (MySQL)", () => {
   let t: TestDb;
   let h: TestHarness;
   let billingProfile: BillingProfileModule;
+  let trashParticipant: TrashParticipant | undefined;
   let userA: { id: number; publicId: string; principal: SessionPrincipal };
   let userB: { id: number; publicId: string; principal: SessionPrincipal };
   let suspendedUser: { id: number; publicId: string; principal: SessionPrincipal };
@@ -96,8 +98,12 @@ describe("billingProfile module (MySQL)", () => {
   beforeAll(async () => {
     t = await createTestDb({ schema: { users, customerBillingProfiles } });
     h = createTestDeps({ db: t.db });
+    const registry = createTrashRegistry();
+    (h.services as unknown as { trash: typeof registry }).trash = registry;
     billingProfile = createBillingProfileModule(h.deps);
     (h.services as Services & { billingProfile: BillingProfileModule }).billingProfile = billingProfile;
+    await billingProfile.init?.();
+    trashParticipant = registry.participants().find((p) => p.module === "billingProfile");
 
     userA = await seedUser("01JD8000000000000000000001", "zeus.greene@example.test", "Zeus Greene");
     userB = await seedUser("01JD8000000000000000000002", "hera.vance@example.test", "Hera Vance");
@@ -110,6 +116,14 @@ describe("billingProfile module (MySQL)", () => {
 
   beforeEach(async () => {
     await t.db.delete(customerBillingProfiles);
+    await t.db
+      .update(users)
+      .set({ trashedAt: null, purgedAt: null, trashBatchId: null })
+      .where(eq(users.id, userA.id));
+    await t.db
+      .update(users)
+      .set({ trashedAt: null, purgedAt: null, trashBatchId: null })
+      .where(eq(users.id, userB.id));
     h.audit.clear();
     h.rateLimiter.blocked.clear();
   });
@@ -502,5 +516,151 @@ describe("billingProfile module (MySQL)", () => {
       await tx.select({ id: users.id }).from(users).where(eq(users.id, userA.id)).for("update");
       expect(await billingProfile.getForUserInTx(tx, userA.id, { forUpdate: true })).toBeNull();
     });
+  });
+
+  it("gates trashed/tombstoned accounts and erases billing profile on customer purge via TrashParticipant", async () => {
+    expect(trashParticipant).toBeDefined();
+    expect(trashParticipant?.module).toBe("billingProfile");
+
+    const callerA = callerFor(userA.principal);
+    const saved = await callerA.billingProfile.save({
+      details: SYNTHETIC_BILLING_A,
+      expectedVersion: 0,
+    });
+
+    // Summarize: 1 for customer with saved profile, empty for customer without one, empty for order.
+    expect(
+      await trashParticipant!.summarize!({
+        kind: "customer",
+        id: userA.id,
+        publicId: userA.publicId,
+        batchId: "01JD9000000000000000000001",
+      }),
+    ).toEqual({ billingProfiles: 1 });
+    expect(
+      await trashParticipant!.summarize!({
+        kind: "customer",
+        id: userB.id,
+        publicId: userB.publicId,
+        batchId: "01JD9000000000000000000001",
+      }),
+    ).toEqual({});
+    expect(
+      await trashParticipant!.summarize!({
+        kind: "order",
+        id: 1,
+        publicId: "01JD9000000000000000000002",
+        batchId: "01JD9000000000000000000001",
+      }),
+    ).toEqual({});
+
+    // Move customer to trash: customer tRPC procedures fail closed, live saveForUserInTx fails closed,
+    // while portable_import and recoverable getForUserInTx remain available until purge.
+    const trashedAt = new Date("2026-11-27T12:00:00.000Z");
+    await t.db
+      .update(users)
+      .set({ trashedAt, trashBatchId: "01JD9000000000000000000001" })
+      .where(eq(users.id, userA.id));
+
+    await expect(callerA.billingProfile.get()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(
+      callerA.billingProfile.save({
+        details: SYNTHETIC_BILLING_B,
+        expectedVersion: 1,
+        expectedPublicId: saved.publicId,
+      }),
+    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(
+      callerA.billingProfile.clear({
+        expectedVersion: 1,
+        expectedPublicId: saved.publicId,
+      }),
+    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+
+    await expect(
+      t.db.transaction((tx) =>
+        billingProfile.saveForUserInTx(tx, userA.id, SYNTHETIC_BILLING_B, {
+          userId: userA.id,
+          role: "customer",
+          via: "checkout",
+        }),
+      ),
+    ).rejects.toMatchObject({ reasonCode: "USER_NOT_FOUND" });
+
+    // Full-backup portable_import can still restore a trashed customer's recoverable billing profile.
+    const importedInTrash = await t.db.transaction((tx) =>
+      billingProfile.saveForUserInTx(tx, userA.id, SYNTHETIC_BILLING_B, {
+        userId: null,
+        role: "system",
+        via: "portable_import",
+      }),
+    );
+    expect(importedInTrash.version).toBe(2);
+    expect(
+      (await t.db.transaction((tx) => billingProfile.getForUserInTx(tx, userA.id)))?.details.fullName,
+    ).toBe("Hera Vance");
+
+    h.audit.clear();
+
+    // Order purge is a no-op for billingProfile.
+    expect(
+      await trashParticipant!.purge!(
+        {
+          kind: "order",
+          id: 1,
+          publicId: "01JD9000000000000000000002",
+          batchId: "01JD9000000000000000000001",
+        },
+        { runId: "01JD9000000000000000000099" },
+      ),
+    ).toEqual({ deleted: {} });
+
+    // Customer purge deletes the billing profile, emits zero-PII audit, and is idempotent on retry.
+    const firstPurge = await trashParticipant!.purge!(
+      {
+        kind: "customer",
+        id: userA.id,
+        publicId: userA.publicId,
+        batchId: "01JD9000000000000000000001",
+      },
+      { runId: "01JD9000000000000000000099" },
+    );
+    expect(firstPurge).toEqual({ deleted: { billingProfiles: 1 } });
+
+    const secondPurge = await trashParticipant!.purge!(
+      {
+        kind: "customer",
+        id: userA.id,
+        publicId: userA.publicId,
+        batchId: "01JD9000000000000000000001",
+      },
+      { runId: "01JD9000000000000000000099" },
+    );
+    expect(secondPurge).toEqual({ deleted: { billingProfiles: 0 } });
+
+    const purgeAudit = h.audit.events.filter((e) => e.eventName === "billing_profile.cleared");
+    expect(purgeAudit).toHaveLength(1);
+    expect(purgeAudit[0]?.attributes).toEqual({
+      previous_version: 2,
+      via: "account_erasure",
+    });
+    expect(JSON.stringify(purgeAudit)).not.toContain("Hera");
+    expect(JSON.stringify(purgeAudit)).not.toContain("hera.vance");
+
+    // Tombstoned account rejects even portable_import and getForUserInTx returns null.
+    await t.db
+      .update(users)
+      .set({ purgedAt: new Date("2026-11-27T12:05:00.000Z") })
+      .where(eq(users.id, userA.id));
+    await expect(
+      t.db.transaction((tx) =>
+        billingProfile.saveForUserInTx(tx, userA.id, SYNTHETIC_BILLING_A, {
+          userId: null,
+          role: "system",
+          via: "portable_import",
+        }),
+      ),
+    ).rejects.toMatchObject({ reasonCode: "USER_NOT_FOUND" });
+    expect(await t.db.transaction((tx) => billingProfile.getForUserInTx(tx, userA.id))).toBeNull();
   });
 });
