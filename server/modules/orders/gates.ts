@@ -19,13 +19,14 @@
  * client opens the acceptance dialog and repeats the action. Staff, administrators and API v1 keys
  * (`assertSystemMayWork`) are never checked against it. Provider without `agreementStatus` ⇒ UNAVAILABLE.
  */
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { DomainError } from "../../core/errors.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import type { UserRole } from "../../../shared/domain.js";
 import type { OrderPolicy } from "./policy.js";
 import type { AgreementGateSetting } from "./settings.js";
 import { orders } from "./schema.js";
+import { liveOrderPredicate } from "./trashGate.js";
 import type { WorkflowService } from "./workflows.js";
 import type { AcceptanceGate, WorkflowDefinition } from "./workflowTypes.js";
 
@@ -140,7 +141,7 @@ export function createGatesService(deps: {
     const [row] = await tx
       .select({ id: orders.id, statusKey: orders.statusKey, workflowVersionId: orders.workflowVersionId, ownerUserId: orders.ownerUserId })
       .from(orders)
-      .where(eq(orders.id, orderId))
+      .where(and(eq(orders.id, orderId), liveOrderPredicate()))
       .limit(1);
     if (!row) throw new DomainError("NOT_FOUND", "ORDER_NOT_FOUND", "We couldn't find that order.");
     const bound = await deps.workflows.byVersionId(tx, row.workflowVersionId);

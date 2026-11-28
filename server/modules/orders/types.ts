@@ -135,6 +135,8 @@ export interface PortableOrder {
   createdAt: Date;
   updatedAt: Date;
   submittedAt: Date | null;
+  /** Increment 09 (D2): null for a live order. */
+  trash: { trashedAt: Date; batchId: string | null; reason: string | null; purgeStartedAt: Date | null; purgedAt: Date | null } | null;
   lineItems: PortableLineItem[];
   statusHistory: PortableStatusEvent[];
   customerNotes: PortableNote[];
@@ -147,6 +149,8 @@ export interface PortableSelection {
   orderIds?: number[];
   /** Increment 08 (D3): orders whose id OR group_root_order_id is in the list (whole groups). */
   groupRootIds?: number[];
+  /** Increment 09 (D2): include trashed orders and tombstones (whole-installation export only). Default: live only. */
+  includeTrashed?: boolean;
 }
 
 export type ImportOrderInput = ZodInput<typeof importOrderInputSchema>;

@@ -14,6 +14,9 @@ export type { OrderChangeEvent, OrderChangeKind, OrderChangeListener, OrderSyncV
 import { createOrderPolicy } from "./policy.js";
 import { createPortableHooks, type ImportReceipt, type PortableHooks } from "./portable.js";
 import { createSharingService, type SharingService } from "./sharing.js";
+import { createOrderTrash, type OrderTrashService } from "./trash.js";
+export type { OrderTrashRef, OrderTrashService, TrashedOrderRow, TrashListInput } from "./trash.js";
+export { liveOrderIdPredicate, liveOrderPredicate, isLiveOrderRow } from "./trashGate.js";
 import type {
   AccessibleOrderIds,
   AccessOptions,
@@ -78,6 +81,13 @@ export interface OrdersModule extends ModuleLifecycle {
   portableOrders(tx: DbOrTx, selection: PortableSelection): Promise<{ items: PortableOrder[]; nextAfter: number | null }>;
   importOrder(input: ImportOrderInput, tx: Tx): Promise<ImportReceipt>;
   findImportedOrder: PortableHooks["findImportedOrder"];
+  /** Increment 09 (D2, trusted, NOT gated): custody read of an order in any trash state (portable). */
+  portableOrderCustodyInTx: PortableHooks["orderCustodyInTx"];
+  /**
+   * Increment 09 (D2.8, trusted, NOT gated): kept-record read/lock for late money on a trashed order (compliance
+   * booking paths only). Never use on a customer-facing path; check `trashed` / `purged` yourself.
+   */
+  retainedOrderRefInTx: PortableHooks["orderCustodyInTx"];
   /** Write-free; unknown statuses are refused by importOrder (IMPORT_STATUS_UNSUPPORTED), never mapped. */
   isPortableStatusSupported: PortableHooks["isPortableStatusSupported"];
   /** Pure preflight (schema, currency, exact line math, summed total); importOrder re-runs it. */
@@ -137,6 +147,13 @@ export interface OrdersModule extends ModuleLifecycle {
   phaseWork: ReturnType<typeof createPhaseWorkServices>;
   orders: OrderService;
   sharing: SharingService;
+  /**
+   * Increment 09 (D2): central trash gate. True for a trashed, tombstoned or missing order (fails closed). Plain read
+   * in the caller's tx; for SQL use `liveOrderPredicate()` / `liveOrderIdPredicate(col)` from ./trashGate.js.
+   */
+  isTrashedInTx(tx: DbOrTx, orderId: number): Promise<boolean>;
+  /** Increment 09 (D2): owner functions for the trash coordinator (server/modules/trash). */
+  trash: OrderTrashService;
 }
 
 export function createOrdersModule(deps: ModuleDeps): OrdersModule {
@@ -215,6 +232,8 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
   const agreementGate = createAgreementGateService({ db: deps.db, audit: deps.audit, settings: deps.settings, services: deps.services, actorCheck, gates });
   const statusCatalog = createOrderStatusCatalogService({ db: deps.db, clock: deps.clock, audit: deps.audit, actorCheck });
 
+  const trash = createOrderTrash({ db: deps.db, clock: deps.clock, services: deps.services, workflows });
+
   const apiProvider = createOrdersApiProvider({ db: deps.db, services: deps.services, workflows, catalog, orders });
 
   return {
@@ -222,6 +241,8 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
       // Increment 04 (package H): /api/v1 orders provider. Absent public API module ⇒ nothing to register.
       const publicApi = (deps.services as Partial<Services>).publicApi as unknown as { registerProvider?: (key: "orders", provider: unknown) => void } | undefined;
       publicApi?.registerProvider?.("orders", apiProvider);
+      // Increment 09 (D2.5): orders-owned rows erased at the end of a purge. Absent trash module ⇒ nothing to register.
+      (deps.services as Partial<Services>).trash?.register(trash.participant);
       // Lead QA: run the increment-07 start-up work once right after boot as well (the 10-minute schedule stays), so an
       // upgraded install shows recalculated progress immediately. Per-boot idempotency key; the job itself is idempotent.
       void deps.jobs
@@ -251,6 +272,8 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     portableOrders: portable.portableOrders,
     importOrder: portable.importOrder,
     findImportedOrder: portable.findImportedOrder,
+    portableOrderCustodyInTx: portable.orderCustodyInTx,
+    retainedOrderRefInTx: portable.orderCustodyInTx,
     isPortableStatusSupported: portable.isPortableStatusSupported,
     preflightImportOrder: portable.preflightImportOrder,
     checkCatalogViability: catalog.checkViability,
@@ -281,6 +304,8 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     phaseWork,
     orders,
     sharing,
+    isTrashedInTx: trash.isTrashedInTx,
+    trash,
     async health(): Promise<ModuleHealth[]> {
       const checkedAt = deps.clock.now();
       try {

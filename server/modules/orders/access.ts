@@ -18,6 +18,7 @@ import type { ActorCheck } from "./actor.js";
 import { ORDER_NOT_FOUND, type OrderPolicy } from "./policy.js";
 import { engagementPort, identityPort } from "./ports.js";
 import { orderCustomerGrants, orderGrants, orders, type GRANT_ROLES } from "./schema.js";
+import { liveOrderPredicate } from "./trashGate.js";
 import { ORDER_CONSOLE_ACCESS_ENABLED } from "./settings.js";
 import { INVITEE_INDEX_PURPOSE, MAX_LIVE_GRANTS_PER_ORDER, normalizeEmail } from "./sharing.js";
 
@@ -152,7 +153,7 @@ export function createAccessService(deps: AccessDeps) {
     const rows = await tx
       .select({ id: orders.id })
       .from(orders)
-      .where(eq(orders.ownerUserId, ownerUserId))
+      .where(and(eq(orders.ownerUserId, ownerUserId), liveOrderPredicate()))
       .orderBy(asc(orders.id))
       .limit(MAX_CUSTOMER_GRANT_ORDERS + 1)
       .for("update");

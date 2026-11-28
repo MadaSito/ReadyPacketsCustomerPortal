@@ -16,6 +16,7 @@ import { readSetting } from "../platform/index.js";
 import { ORDER_NOT_FOUND, type OrderPolicy } from "./policy.js";
 import { identityPort } from "./ports.js";
 import { orderGrants, orders } from "./schema.js";
+import { liveOrderPredicate } from "./trashGate.js";
 import { ORDER_INVITE_TTL_DAYS } from "./settings.js";
 import type { GrantRole } from "./types.js";
 
@@ -229,7 +230,7 @@ export function createSharingService(deps: SharingDeps) {
         const [order] = await tx
           .select({ orderPublicId: orders.publicId, ownerUserId: orders.ownerUserId })
           .from(orders)
-          .where(eq(orders.id, located.orderId))
+          .where(and(eq(orders.id, located.orderId), liveOrderPredicate()))
           .limit(1)
           .for("update");
         if (!order) throw grantNotFound();

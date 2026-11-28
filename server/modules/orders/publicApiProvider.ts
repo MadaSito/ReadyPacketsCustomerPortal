@@ -16,6 +16,7 @@ import type { CatalogService } from "./catalog.js";
 import { decodeCursor, encodeCursor, type OrderService } from "./orderService.js";
 import { identityPort } from "./ports.js";
 import { orderLineItems, orders } from "./schema.js";
+import { liveOrderPredicate } from "./trashGate.js";
 import type { WorkflowService } from "./workflows.js";
 import { findState } from "./workflowTypes.js";
 
@@ -101,7 +102,7 @@ export function createOrdersApiProvider(deps: OrdersApiProviderDeps) {
 
   async function getDto(publicId: string): Promise<OrderApiDto | null> {
     if (!ULID_PATTERN.test(publicId)) return null;
-    const [row] = await deps.db.select().from(orders).where(eq(orders.publicId, publicId)).limit(1);
+    const [row] = await deps.db.select().from(orders).where(and(eq(orders.publicId, publicId), liveOrderPredicate())).limit(1);
     return row ? (await toDtos([row]))[0]! : null;
   }
 
@@ -127,6 +128,7 @@ export function createOrdersApiProvider(deps: OrdersApiProviderDeps) {
         .from(orders)
         .where(
           and(
+            liveOrderPredicate(),
             ownerId !== undefined ? eq(orders.ownerUserId, ownerId) : undefined,
             status ? eq(orders.statusKey, status) : undefined,
             query.updatedSince ? gte(orders.updatedAt, query.updatedSince) : undefined,

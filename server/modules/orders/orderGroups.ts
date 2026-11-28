@@ -13,6 +13,7 @@ import { and, asc, eq, inArray, or } from "drizzle-orm";
 import { conflict } from "../../core/errors.js";
 import type { DbOrTx, Tx } from "../../core/types.js";
 import { orderLineItems, orders } from "./schema.js";
+import { isLiveOrderRow, liveOrderPredicate } from "./trashGate.js";
 import { ORDER_NOT_FOUND } from "./policy.js";
 import { findState, isCancelState } from "./workflowTypes.js";
 import type { BoundWorkflow } from "./workflows.js";
@@ -52,24 +53,25 @@ export async function lockGroupRoot(tx: Tx, orderPublicId: string, ownerUserId: 
   const [seen] = await tx
     .select({ id: orders.id, groupRootOrderId: orders.groupRootOrderId })
     .from(orders)
-    .where(and(eq(orders.publicId, orderPublicId), eq(orders.ownerUserId, ownerUserId)))
+    .where(and(eq(orders.publicId, orderPublicId), eq(orders.ownerUserId, ownerUserId), liveOrderPredicate()))
     .limit(1);
   if (!seen) return null;
   const rootId = seen.groupRootOrderId ?? seen.id;
   if (rootId !== seen.id) {
-    const [seenRoot] = await tx.select({ id: orders.id }).from(orders).where(and(eq(orders.id, rootId), eq(orders.ownerUserId, ownerUserId))).limit(1);
+    const [seenRoot] = await tx.select({ id: orders.id }).from(orders).where(and(eq(orders.id, rootId), eq(orders.ownerUserId, ownerUserId), liveOrderPredicate())).limit(1);
     if (!seenRoot) return null;
   }
   const [root] = await tx.select().from(orders).where(and(eq(orders.id, rootId), eq(orders.ownerUserId, ownerUserId))).for("update").limit(1);
-  if (!root || root.groupRootOrderId !== null) return null;
+  // Increment 09: a trashed or tombstoned root (current read under the lock) takes no additions.
+  if (!root || root.groupRootOrderId !== null || !isLiveOrderRow(root)) return null;
   if (seen.id !== rootId) {
     const [member] = await tx
-      .select({ ownerUserId: orders.ownerUserId, groupRootOrderId: orders.groupRootOrderId })
+      .select({ ownerUserId: orders.ownerUserId, groupRootOrderId: orders.groupRootOrderId, trashedAt: orders.trashedAt, purgedAt: orders.purgedAt })
       .from(orders)
       .where(eq(orders.id, seen.id))
       .for("share")
       .limit(1);
-    if (!member || member.ownerUserId !== ownerUserId || member.groupRootOrderId !== rootId) return null;
+    if (!member || member.ownerUserId !== ownerUserId || member.groupRootOrderId !== rootId || !isLiveOrderRow(member)) return null;
   }
   const members = await groupMembers(tx, root, { locking: true });
   await packetNumbersByOrder(tx, members.map((m) => m.id), { locking: true });
@@ -88,7 +90,7 @@ export const GROUP_MEMBER_CAP = 500;
  * Orders of the group with the root's owner (root first, then by id). `locking` = authoritative current read under
  * the root fence (write path); otherwise a snapshot read for display.
  */
-export async function groupMembers(tx: DbOrTx, root: { id: number; ownerUserId: number }, opts: { locking?: boolean } = {}) {
+export async function groupMembers(tx: DbOrTx, root: { id: number; ownerUserId: number }, opts: { locking?: boolean; includeTrashed?: boolean } = {}) {
   const query = tx
     .select({
       id: orders.id,
@@ -100,7 +102,8 @@ export async function groupMembers(tx: DbOrTx, root: { id: number; ownerUserId: 
       groupRootOrderId: orders.groupRootOrderId,
     })
     .from(orders)
-    .where(and(eq(orders.ownerUserId, root.ownerUserId), or(eq(orders.id, root.id), eq(orders.groupRootOrderId, root.id))))
+    // Increment 09: trashed and tombstoned members are not part of the live group (view, packets, add-on checks).
+    .where(and(eq(orders.ownerUserId, root.ownerUserId), or(eq(orders.id, root.id), eq(orders.groupRootOrderId, root.id)), opts.includeTrashed ? undefined : liveOrderPredicate()))
     .orderBy(asc(orders.id))
     .limit(GROUP_MEMBER_CAP + 1);
   const rows = opts.locking ? await query.for("share") : await query;
@@ -164,10 +167,10 @@ export async function addOnTarget(
   const [member] = await tx
     .select({ id: orders.id, groupRootOrderId: orders.groupRootOrderId, ownerUserId: orders.ownerUserId })
     .from(orders)
-    .where(eq(orders.publicId, orderPublicId))
+    .where(and(eq(orders.publicId, orderPublicId), liveOrderPredicate()))
     .limit(1);
   if (!member || member.ownerUserId !== ownerUserId) return null;
-  const [root] = await tx.select().from(orders).where(eq(orders.id, member.groupRootOrderId ?? member.id)).limit(1);
+  const [root] = await tx.select().from(orders).where(and(eq(orders.id, member.groupRootOrderId ?? member.id), liveOrderPredicate())).limit(1);
   if (!root || root.ownerUserId !== ownerUserId) return null;
   if (await isCancelled(tx, workflows, root)) return null;
   return {

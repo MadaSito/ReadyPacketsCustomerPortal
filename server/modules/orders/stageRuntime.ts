@@ -17,6 +17,7 @@ import type { Services } from "../../container.js";
 import type { Clock, Db, DbOrTx, Tx } from "../../core/types.js";
 import { hasUnansweredStageQuestions } from "./questions.js";
 import { orders, orderStageProgress, type OrderAttention } from "./schema.js";
+import { liveOrderPredicate } from "./trashGate.js";
 import { stageHasCustomerWork, stageIndexOfStatus, stageModelOf, type StageModel } from "./stageModel.js";
 import type { BoundWorkflow, WorkflowService } from "./workflows.js";
 import { findState } from "./workflowTypes.js";
@@ -200,7 +201,7 @@ export function createStageRuntime(deps: StageRuntimeDeps) {
             const [row] = await tx
               .select({ id: orders.id })
               .from(orders)
-              .where(and(eq(orders.id, orderId), isNull(orders.progressPercent)))
+              .where(and(eq(orders.id, orderId), isNull(orders.progressPercent), liveOrderPredicate()))
               .limit(1)
               .for("update");
             if (!row) return;

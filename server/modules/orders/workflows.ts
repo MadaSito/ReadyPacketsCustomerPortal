@@ -9,6 +9,7 @@ import { ulid } from "../../core/ids.js";
 import type { ActorCheck } from "./actor.js";
 import type { AuditEmitter, Clock, Db, DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { orders, orderWorkflowDrafts, orderWorkflows, orderWorkflowVersionLayouts, orderWorkflowVersions, type WorkflowDraftSource } from "./schema.js";
+import { liveOrderPredicate } from "./trashGate.js";
 import { compileRuntimeDefinition, STANDARD_V3_DEFINITION, STANDARD_V3_WORKFLOW_KEY, STANDARD_V3_WORKFLOW_NAME } from "./stageModel.js";
 import { workflowStageSchema, type WorkflowStage } from "../../../shared/workflowStages.js";
 import { DEFAULT_WORKFLOW, usesWorkflowRules, workflowDefinitionSchema, type WorkflowDefinition } from "./workflowTypes.js";
@@ -687,7 +688,7 @@ export function createWorkflowService(deps: WorkflowDeps) {
         .limit(100);
       const ids = versions.map((version) => version.id);
       const counts = ids.length
-        ? await deps.db.select({ versionId: orders.workflowVersionId, n: count() }).from(orders).where(inArray(orders.workflowVersionId, ids)).groupBy(orders.workflowVersionId)
+        ? await deps.db.select({ versionId: orders.workflowVersionId, n: count() }).from(orders).where(and(inArray(orders.workflowVersionId, ids), liveOrderPredicate())).groupBy(orders.workflowVersionId)
         : [];
       const byId = new Map(counts.map((entry) => [entry.versionId, Number(entry.n)]));
       return {
