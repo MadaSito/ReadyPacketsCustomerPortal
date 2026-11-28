@@ -6,6 +6,7 @@ const brand = (kind = "") => `html:has(img[data-brand-lockup${kind ? `="${kind}"
 const moveDialog = '[role="alertdialog"]:has(:text-matches("^Move .* to the trash[?]$")):has(:text-matches("^(Moves with it:|Nothing else moves with it[.])$"))';
 const button = (name, options = {}) => ({ role: "button", name, ...options });
 const customer = (options = {}) => ({ route: "/admin/customers/:customerId", role: "admin", publicIdAtEnd: true, ...options });
+const nativeDate = (name) => `:has(div:has(> div > label:text-is("${name}")) > input[type="date"]:visible)`;
 
 // Dialog scenarios only open the confirmation and inspect it. They never submit it.
 export const increment09States = Object.freeze({
@@ -23,7 +24,7 @@ export const increment09States = Object.freeze({
   }),
   "trash-date-filters": trash({
     steps: [button("Filters", { maxCssWidth: 767 })],
-    ready: 'body:has(input[type="date"]:visible)',
+    ready: `body${nativeDate("Moved from")}${nativeDate("Moved until")}`,
   }),
   "trash-restore-dialog": trash({
     interactive: true, steps: [button("Restore ", { namePrefix: true, first: true })],

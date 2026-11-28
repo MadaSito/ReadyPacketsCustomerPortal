@@ -59,6 +59,8 @@ describe("Increment 09 sweep evidence", () => {
       expect(stepsForQaWidth(scenario.steps, width)).toEqual([{ role: "button", name: "Filters", maxCssWidth: 767 }]);
     }
     expect(stepsForQaWidth(scenario.steps, 768)).toEqual([]);
-    expect(scenario.ready).toContain('input[type="date"]:visible');
+    for (const name of ["Moved from", "Moved until"]) {
+      expect(scenario.ready).toContain(`label:text-is("${name}")) > input[type="date"]:visible`);
+    }
   });
 });

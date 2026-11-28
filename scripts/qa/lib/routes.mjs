@@ -293,7 +293,7 @@ async function openQaRouteOnce(page, baseUrl, scenario, theme, beforeSteps) {
     await beforeSteps?.();
     if (scenario.tab) await page.getByRole("tab", { name: scenario.tab, exact: true }).click({ timeout: 5_000 });
     const width = scenario.steps.some((step) => step.maxCssWidth !== undefined)
-      ? await page.evaluate(() => document.documentElement.clientWidth) : undefined;
+      ? await page.evaluate(() => window.innerWidth) : undefined;
     for (const step of stepsForQaWidth(scenario.steps, width)) {
       let control = step.testId ? page.getByTestId(step.testId) :
         step.label ? page.getByLabel(step.label, { exact: step.labelPrefix !== true }) :
