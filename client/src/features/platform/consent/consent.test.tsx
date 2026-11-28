@@ -16,6 +16,8 @@ import { CookieConsent } from "./CookieConsent";
 
 /** Queries every full-session shell makes (policy enforcement prompt, increment 06); empty = no prompt. */
 const SHELL_PROMPT_HANDLERS: Record<string, () => unknown> = {
+  // Console sidebar: Trash count badge (admins only).
+  "trash.counts": () => ({ orders: 0, customers: 0, dueWithin7d: 0 }),
   "compliance.policies.enforcement.pending": () => [],
   "compliance.policies.myStatus": () => ({ pendingRequired: [] }),
 };
