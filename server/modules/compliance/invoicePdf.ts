@@ -1,6 +1,7 @@
 import { closeSync, fstatSync, openSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { deflateSync, inflateSync } from "node:zlib";
+import { BRAND } from "../../../shared/brand.js";
 import type { InvoiceStatus, ReceiptNoteRefundState, ReceiptSettlementKind } from "./schema.js";
 import {
   DEFAULT_ISSUER_LOGO_SETTING,
@@ -10,11 +11,11 @@ import {
 
 export type PdfPageSize = "LETTER" | "A4";
 
-export const PDF_BRAND_SHORT_NAME = "ReadyPackets";
-export const PDF_BRAND_LEGAL_NAME = "Ready Packets Consulting LLC";
-export const PDF_BRAND_TAGLINE = "Your Business, Professionally Packeted!";
+export const PDF_BRAND_SHORT_NAME = BRAND.wordmark;
+export const PDF_BRAND_LEGAL_NAME = BRAND.companyLegalName;
+export const PDF_BRAND_TAGLINE = BRAND.tagline;
 export const PDF_BRAND_PORTAL_HOST = "my.readypackets.com";
-export const PDF_LOGO_ALT_TEXT = "ReadyPackets company logo";
+export const PDF_LOGO_ALT_TEXT = BRAND.logoAccessibleName;
 
 export interface InvoicePdfInput {
   invoicePublicId: string;
@@ -1176,42 +1177,38 @@ function drawCompanyBlock(
   logo: DecodedPdfLogoImage | null,
 ): number {
   let y = startY;
-  let textX = geo.leftX;
-  let minHeaderBottomY = y;
+  const textX = geo.leftX;
 
   if (logo) {
+    // Increment 09 (D3): full horizontal lockup (icon + ReadyPackets™ wordmark + rule + tagline).
+    // Never re-typeset separate wordmark/tagline text alongside the approved full-lockup artwork.
     const isSquareMark = logo.width / Math.max(1, logo.height) <= 2.2;
     const dims = drawLogo(
       page,
       logo,
       geo.leftX,
       y,
-      isSquareMark ? 36 : 148,
-      isSquareMark ? 36 : 28,
+      isSquareMark ? 44 : 160,
+      isSquareMark ? 44 : 48,
       true,
     );
-    if (isSquareMark) {
-      textX = Math.round(geo.leftX + dims.drawWidth + 10);
-      minHeaderBottomY = Math.round(y - dims.drawHeight + 6);
-    } else {
-      y -= Math.ceil(dims.drawHeight) + 6;
-    }
+    y = Math.round((y - dims.drawHeight + 2) * 100) / 100;
+  } else {
+    drawText(page, textX, y, PDF_BRAND_SHORT_NAME, {
+      bold: true,
+      size: 16,
+      color: BRAND_COLORS.navy,
+      tag: "H1",
+    });
+    y -= 14;
+
+    drawText(page, textX, y, PDF_BRAND_TAGLINE, {
+      bold: true,
+      size: 8.5,
+      color: BRAND_COLORS.tealText,
+    });
+    y -= 13;
   }
-
-  drawText(page, textX, y, PDF_BRAND_SHORT_NAME, {
-    bold: true,
-    size: 16,
-    color: BRAND_COLORS.navy,
-    tag: "H1",
-  });
-  y -= 14;
-
-  drawText(page, textX, y, PDF_BRAND_TAGLINE, {
-    bold: true,
-    size: 8.5,
-    color: BRAND_COLORS.tealText,
-  });
-  y -= 13;
 
   const legalName = resolveDisplayLegalName(company.name);
   for (const nameLine of wrapText(legalName, 44).slice(0, 2)) {
@@ -1223,7 +1220,7 @@ function drawCompanyBlock(
     y -= 12;
   }
 
-  y = Math.min(y, minHeaderBottomY - 4);
+  y -= 2;
 
   for (const addrLine of wrapText(company.address, 48).slice(0, 3)) {
     drawText(page, geo.leftX, y, addrLine, { size: 8.5, color: BRAND_COLORS.slateMuted });

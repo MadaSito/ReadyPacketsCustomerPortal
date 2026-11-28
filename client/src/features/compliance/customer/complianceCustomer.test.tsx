@@ -690,7 +690,7 @@ describe("customer invoices", () => {
           contact: "billing@example.test",
           taxId: "EIN 98-7654321",
           logoMode: "brand" as const,
-          logoBrandPath: "/brand/readypackets-approved-header-icon-light.png",
+          logoBrandPath: "/brand/readypackets-horizontal-light-600x180-v2026101502.png",
         },
         customer: {
           name: "María Elena García-López",

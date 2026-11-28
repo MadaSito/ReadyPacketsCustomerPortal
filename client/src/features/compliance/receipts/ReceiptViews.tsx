@@ -742,28 +742,16 @@ export function CompanyProfileDialog({ onClose }: { onClose: () => void }) {
 
 const BRAND_LOGO_OPTIONS = [
   {
-    value: "/brand/readypackets-approved-header-icon-light.png",
-    label: "Approved header brand mark (light, default)",
+    value: "/brand/readypackets-horizontal-light-600x180-v2026101502.png",
+    label: "Horizontal full lockup 600×180 (300 DPI print, default)",
   },
   {
-    value: "/brand/readypackets-approved-header-wordmark-light.png",
-    label: "Approved header wordmark (light)",
+    value: "/brand/readypackets-horizontal-light-500x150-v2026101502.png",
+    label: "Horizontal full lockup 500×150 (light)",
   },
   {
-    value: "/brand/readypackets-approved-icon-light-192.png",
-    label: "Approved icon 192px (light)",
-  },
-  {
-    value: "/brand/readypackets-approved-icon-light-512.png",
-    label: "Approved icon 512px (light)",
-  },
-  {
-    value: "/brand/readypackets-approved-icon-maskable-192.png",
-    label: "Approved maskable icon 192px",
-  },
-  {
-    value: "/brand/readypackets-approved-icon-maskable-512.png",
-    label: "Approved maskable icon 512px",
+    value: "/brand/readypackets-horizontal-light-300x90-v2026101502.png",
+    label: "Horizontal full lockup 300×90 (compact light)",
   },
 ] as const;
 

@@ -679,7 +679,7 @@ export interface AcceptanceLogExportResult {
 ## 12. Fix Pack 07.2 — Branded PDFs, Order & Project Prominence, and WinAnsi Encoding
 
 - **Out-of-the-box branded PDFs (`server/modules/compliance/invoicePdf.ts`, `settings.ts`)**:
-  - `compliance.invoices.issuer_name` defaults to `"Ready Packets Consulting LLC"` and `compliance.invoices.issuer_logo` defaults to `{ mode: "brand", brandPath: "/brand/readypackets-approved-header-icon-light.png" }`.
+  - `compliance.invoices.issuer_name` defaults to `"Ready Packets Consulting LLC"` and `compliance.invoices.issuer_logo` defaults to `{ mode: "brand", brandPath: "/brand/readypackets-horizontal-light-600x180-v2026101502.png" }`.
   - `loadAllowlistedBrandLogo` resolves allowlisted brand PNGs across `opts.staticDir`, `process.env.RP_STATIC_DIR`, `dist/public` (production Docker container layout), `client/public` (development/tests), and module-relative paths so brand logos load without admin configuration in both self-hosted containers and local runs.
   - Invoice, Payment Receipt, and Refund Note PDFs render the ReadyPackets brand mark, `"ReadyPackets"` wordmark, `"Your Business, Professionally Packeted!"` tagline, `"Ready Packets Consulting LLC"` legal issuer name, brand-token header/accent/table/totals styling (`#0D1B2A` navy, `#1A7A6E` / `#135E55` teal, `#C9A84C` decorative gold rule) with high-contrast dark text on light fills, and `my.readypackets.com` with `Page X of Y` in the footer on Letter and A4 geometries.
 - **Order & Project prominence (`invoicesService.ts`, `receiptsService.ts`, `mail.ts`, client views)**:

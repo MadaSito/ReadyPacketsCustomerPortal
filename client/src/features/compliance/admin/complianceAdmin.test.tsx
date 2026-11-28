@@ -698,7 +698,7 @@ describe("invoices", () => {
       issuerTaxId: "EIN-12-3456789",
       issuerLogo: {
         mode: "brand" as const,
-        brandPath: "/brand/readypackets-approved-header-wordmark-light.png" as const,
+        brandPath: "/brand/readypackets-horizontal-light-500x150-v2026101502.png" as const,
       },
       paymentInstructions: "Pay by wire within 30 days.",
     }));
@@ -717,7 +717,7 @@ describe("invoices", () => {
         issuerTaxId: "EIN-12-3456789",
         issuerLogo: {
           mode: "brand",
-          brandPath: "/brand/readypackets-approved-header-wordmark-light.png",
+          brandPath: "/brand/readypackets-horizontal-light-500x150-v2026101502.png",
         },
       }),
     );
@@ -738,7 +738,7 @@ describe("invoices", () => {
       issuerTaxId: "EIN 98-7654321",
       issuerLogo: {
         mode: "brand" as const,
-        brandPath: "/brand/readypackets-approved-header-icon-light.png" as const,
+        brandPath: "/brand/readypackets-horizontal-light-600x180-v2026101502.png" as const,
       },
       paymentInstructions: "Pay by wire within 30 days.",
     }));
@@ -798,7 +798,7 @@ describe("invoices", () => {
           contact: "billing@example.test",
           taxId: "EIN 98-7654321",
           logoMode: "brand",
-          logoBrandPath: "/brand/readypackets-approved-header-icon-light.png",
+          logoBrandPath: "/brand/readypackets-horizontal-light-600x180-v2026101502.png",
         },
         customer: {
           name: "Synthetic Buyer",
@@ -836,7 +836,7 @@ describe("invoices", () => {
     const logoSelect = await within(profileDialog).findByLabelText(/^PDF header logo/);
     expect(logoSelect).toHaveValue("brand");
     const assetSelect = await within(profileDialog).findByLabelText(/^Brand logo asset/);
-    expect(assetSelect).toHaveValue("/brand/readypackets-approved-header-icon-light.png");
+    expect(assetSelect).toHaveValue("/brand/readypackets-horizontal-light-600x180-v2026101502.png");
     await expectNoAxeViolations(profileDialog);
     adminListView.unmount();
 
