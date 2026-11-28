@@ -9,12 +9,13 @@ procedure.
 
 Requested by the owner on 2026-11-27 (prompt 37). See the [session log](docs/session-logs/2026-11-27-session-01.md) and the [contract](docs/engineering/INCREMENT_09_CONTRACT.md).
 - **Database migration** `0009_increment_09` (final at `d358237`), additive only: 56 statements. Details are in [UPGRADE.md](docs/operations/UPGRADE.md#increment-09-and-migration-0009).
-- **PR and merge commit:** (filled at merge).
+- **PR and merge commit:** PR #25, merge commit `5e45745` on `main`, 2026-11-28. All four workflows (ci, security, container, native-install) passed on `9ecb572`.
 
 ### Fixed
 
 - **Kept invoices and receipts for customers** (f57c510). On a kept paid invoice or receipt whose order is in the trash, customers see "Order unavailable" instead of the staff label "In trash".
 - **Trash centre request keys** (6f54429). After a failed action on one item, the next item no longer reuses the same request key and is no longer refused. A retry of the same item keeps its key, so the server resumes it.
+- **CodeQL finding in a mail template test** (9ecb572). The test built its expected link with a replace that changed only the first match (`js/incomplete-sanitization`). It now escapes every ampersand. No baseline entry was added.
 - **Links in e-mail were not clickable** (D1). Every shipped template now renders its link variables as anchors in the HTML part. Only template text and trusted link variables become links, and a URL inside a free-form value is never linked. Anchors are produced when the portal address is HTTPS. E-mail addresses in the console (customers list, customer page, reports) are `mailto` links (`EmailLink`).
 
 ### Added

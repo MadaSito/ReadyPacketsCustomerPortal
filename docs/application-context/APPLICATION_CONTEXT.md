@@ -302,7 +302,7 @@ The owner requested this on 2026-11-26 (prompt 34). The contract is [INCREMENT_0
 
 ## Increment 09: clickable e-mail links, Trash centre, new square logo
 
-The owner requested this on 2026-11-27 (prompt 37). The contract is [INCREMENT_09_CONTRACT.md](../engineering/INCREMENT_09_CONTRACT.md), decisions D1–D4. Migration `0009_increment_09` (final at `d358237`) is additive only: 56 statements, 6 new tables.
+The owner requested this on 2026-11-27 (prompt 37). The contract is [INCREMENT_09_CONTRACT.md](../engineering/INCREMENT_09_CONTRACT.md), decisions D1–D4. Migration `0009_increment_09` (final at `d358237`) is additive only: 56 statements, 6 new tables. Merged to `main` through PR #25 on 2026-11-28 (merge commit `5e45745`); `main` is at `5e45745`.
 
 - **D1 Mail links.** Shipped templates render their link variables as anchors in the HTML part. Only template literal text and trusted link variables become anchors, and free-form values are never linked (link provenance). Anchors are produced only when the portal address is HTTPS. In the client, `EmailLink` (`client/src/ui`) renders a safe, wrapping `mailto` link.
 - **D2 Trash.**
