@@ -232,3 +232,12 @@ describe("increment 09: ConfirmDialog returnFocusRef", () => {
     await waitFor(() => expect(screen.getByRole("heading", { name: "Trash" })).toHaveFocus());
   });
 });
+
+describe("increment 09: selected tab survives forced colours", () => {
+  it("marks the selected tab with a Highlight border distinct from the focus outline", () => {
+    const css = readFileSync(resolve(ROOT, "client/src/styles/index.css"), "utf8");
+    const forced = css.slice(css.indexOf("@media (forced-colors: active)"));
+    expect(forced).toMatch(/\[role="tab"\]\[aria-selected="true"\] \{ color: Highlight; border-bottom: 3px solid Highlight; \}/);
+    expect(forced).toMatch(/:focus-visible \{ outline: 3px solid CanvasText; \}/);
+  });
+});

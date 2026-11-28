@@ -100,8 +100,10 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
           <MaintenanceBanner />
           <CustomerMaintenanceSlot />
           <header className="sticky top-0 z-40 border-b border-line bg-surface/95 backdrop-blur supports-[backdrop-filter]:bg-surface/85">
-            <div className="flex h-16 items-center gap-2 px-3 sm:px-6">
-              <IconButton label="Open console navigation" icon={<Menu />} className="lg:hidden" onClick={() => setDrawerOpen(true)} />
+            {/* Below 280 px the five actions use 36 px targets (still above the 24 px minimum) and tighter gaps so
+                the row fits at 240 px without shrinking any target. */}
+            <div className="flex h-16 items-center gap-2 px-3 sm:px-6 max-[279px]:gap-1 max-[279px]:px-2 max-[279px]:[&_.size-11]:size-9" data-testid="console-header-row">
+              <IconButton label="Open console navigation" icon={<Menu />} className="shrink-0 lg:hidden" onClick={() => setDrawerOpen(true)} />
               {/* Narrow bar: the horizontal full lockup where it fits next to the actions (440-767 px). Narrower,
                   and between md and lg where the inline search takes the room, the drawer's brand tile carries it. */}
               <Link href="/admin" aria-label="ReadyPackets console home" className="hidden min-w-0 shrink rounded min-[440px]:inline-flex md:hidden" data-testid="console-header-logo">
