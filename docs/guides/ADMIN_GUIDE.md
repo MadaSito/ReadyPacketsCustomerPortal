@@ -657,6 +657,8 @@ An order on **legal hold** is protected from the trash:
 
 Release the hold first, then repeat the action.
 
+The Trash centre cannot place a legal hold. To put an order that is in the trash on legal hold, **Restore** it (one click, no two-step check), then place the hold on the order; from then on the hold blocks moving it to the trash and deleting it permanently.
+
 ### Deleting permanently
 
 **Delete permanently** needs `trash.purge` and a fresh two-step check.

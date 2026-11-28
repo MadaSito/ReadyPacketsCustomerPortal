@@ -6,6 +6,8 @@ import { sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createTestDeps, silentLogger, type TestHarness } from "../../../tests/helpers/fakes.js";
+import { createTrashRegistry, type TrashRegistry } from "../trash/ports.js";
+import { PLATFORM_TRASH_MODULE } from "./trash.js";
 import { DomainError } from "../../core/errors.js";
 import type { ModuleHealth, ModuleLifecycle } from "../../core/types.js";
 import { createPlatformModule, type PlatformModuleImpl } from "./module.js";
@@ -96,6 +98,8 @@ describe("health aggregation, readiness and setup", () => {
     const store = createSettingsStore({ db: t.db, clock: h.clock, logger: silentLogger, crypto: h.deps.crypto, audit: h.audit });
     h.deps.settings = store;
     h.services.settings = store;
+    // init() registers the platform trash participant; production always provides the registry.
+    h.services.trash = createTrashRegistry() as typeof h.services.trash;
     platform = createPlatformModule(h.deps);
     h.services.platform = platform;
   });
@@ -173,12 +177,21 @@ describe("health aggregation, readiness and setup", () => {
   it("flags the preview profile publicly and warns exactly once at startup", async () => {
     const warnings: string[] = [];
     const capture = { ...silentLogger, warn: (message: string) => void warnings.push(message), child: () => capture };
-    const previewPlatform = createPlatformModule({ ...h.deps, logger: capture, config: { ...h.deps.config, deploymentProfile: "preview" } });
+    // A second module instance needs its own registry: a duplicate participant name throws by design.
+    const previewTrash = createTrashRegistry();
+    const previewPlatform = createPlatformModule({
+      ...h.deps,
+      services: { ...h.services, trash: previewTrash as typeof h.services.trash },
+      logger: capture,
+      config: { ...h.deps.config, deploymentProfile: "preview" },
+    });
     previewPlatform.init?.();
+    expect(previewTrash.participants().map((p) => p.module)).toEqual([PLATFORM_TRASH_MODULE]);
     expect(warnings).toEqual(["preview profile active: relaxed framing/CORS, in-memory session transport, synthetic data only"]);
     expect(await previewPlatform.setupStatus()).toMatchObject({ preview: true });
     expect(await previewPlatform.presentation()).toMatchObject({ preview: true });
     platform.init?.();
+    expect((h.services.trash as unknown as TrashRegistry).participants().map((p) => p.module)).toEqual([PLATFORM_TRASH_MODULE]);
     expect(await platform.presentation()).toMatchObject({ preview: false });
   });
 
