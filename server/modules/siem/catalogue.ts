@@ -30,7 +30,7 @@ export interface SiemCatalogueEntry {
   readonly withheldLocalKeys: readonly string[];
   /** True when eligible for outbound SIEM delivery when destination category + minSeverity match. */
   readonly forwardable: boolean;
-  readonly increment: "baseline" | "05" | "06" | "07";
+  readonly increment: "baseline" | "05" | "06" | "07" | "08" | "09";
 }
 
 /**
@@ -52,6 +52,12 @@ export const SIEM_NEVER_FORWARDED_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set(
   "code_public_id",
   "redemption_public_id",
   "order_public_id",
+  "user_public_id",
+  "customer_public_id",
+  "batch_id",
+  "trash_batch_id",
+  "run_id",
+  "typed_confirmation",
   "definition_public_id",
   "task_note_public_id",
   "waiver_public_id",
@@ -1268,6 +1274,159 @@ export const SIEM_EVENT_CATALOGUE: readonly SiemCatalogueEntry[] = [
     withheldLocalKeys: ["order_public_id", "target_public_id", "remote_path"],
     forwardable: true,
     increment: "07",
+  },
+
+  /* --------------------------------------------------- Increment 09 D2.3: Trash & permanent deletion */
+  {
+    eventName: "order.trashed",
+    category: "business",
+    defaultSeverity: "INFO",
+    resourceType: "order",
+    description:
+      "Order moved to the Trash centre (local batch_id and free-text reason withheld; forwards reason_present and safe counts only).",
+    forwardedAttributes: ["reason_present", "cascaded_orders"],
+    forwardedSafeCounts: ["cascaded_orders", "orders", "files"],
+    withheldLocalKeys: ["batch_id", "trash_batch_id", "order_public_id", "reason"],
+    forwardable: true,
+    increment: "09",
+  },
+  {
+    eventName: "order.restored",
+    category: "business",
+    defaultSeverity: "INFO",
+    resourceType: "order",
+    description: "Order restored from the Trash centre.",
+    forwardedAttributes: ["cascaded_orders"],
+    forwardedSafeCounts: ["cascaded_orders", "orders"],
+    withheldLocalKeys: ["batch_id", "trash_batch_id", "order_public_id"],
+    forwardable: true,
+    increment: "09",
+  },
+  {
+    eventName: "order.purge_started",
+    category: "business",
+    defaultSeverity: "WARN",
+    resourceType: "order",
+    description:
+      "Permanent deletion run claimed for a trashed order (step-up and automatic flags forwarded; local batch_id, run_id, and typed confirmation withheld).",
+    forwardedAttributes: ["step_up_verified", "automatic"],
+    forwardedSafeCounts: ["participants"],
+    withheldLocalKeys: ["batch_id", "trash_batch_id", "run_id", "order_public_id", "typed_confirmation"],
+    forwardable: true,
+    increment: "09",
+  },
+  {
+    eventName: "order.purged",
+    category: "business",
+    defaultSeverity: "WARN",
+    resourceType: "order",
+    description:
+      "Permanent deletion completed for a trashed order (forwards erased/kept numeric counts only; never names, addresses, or content).",
+    forwardedAttributes: ["automatic"],
+    forwardedSafeCounts: ["deleted", "kept", "deleted_total", "kept_total", "participants"],
+    withheldLocalKeys: ["batch_id", "trash_batch_id", "run_id", "order_public_id"],
+    forwardable: true,
+    increment: "09",
+  },
+  {
+    eventName: "customer.trashed",
+    category: "identity",
+    defaultSeverity: "WARN",
+    resourceType: "user",
+    description:
+      "Suspended customer account (and cascaded orders) moved to the Trash centre (local batch_id and free-text reason withheld).",
+    forwardedAttributes: ["reason_present", "cascaded_orders"],
+    forwardedSafeCounts: ["cascaded_orders", "orders", "sessions_revoked"],
+    withheldLocalKeys: ["batch_id", "trash_batch_id", "user_public_id", "customer_public_id", "reason"],
+    forwardable: true,
+    increment: "09",
+  },
+  {
+    eventName: "customer.restored",
+    category: "identity",
+    defaultSeverity: "INFO",
+    resourceType: "user",
+    description: "Customer account (and same-batch orders) restored from the Trash centre to suspended state.",
+    forwardedAttributes: ["cascaded_orders"],
+    forwardedSafeCounts: ["cascaded_orders", "orders"],
+    withheldLocalKeys: ["batch_id", "trash_batch_id", "user_public_id", "customer_public_id"],
+    forwardable: true,
+    increment: "09",
+  },
+  {
+    eventName: "customer.purge_started",
+    category: "identity",
+    defaultSeverity: "WARN",
+    resourceType: "user",
+    description:
+      "Permanent deletion run claimed for a trashed customer account (local batch_id, run_id, and typed confirmation withheld).",
+    forwardedAttributes: ["step_up_verified", "automatic", "cascaded_orders"],
+    forwardedSafeCounts: ["cascaded_orders", "participants"],
+    withheldLocalKeys: [
+      "batch_id",
+      "trash_batch_id",
+      "run_id",
+      "user_public_id",
+      "customer_public_id",
+      "typed_confirmation",
+    ],
+    forwardable: true,
+    increment: "09",
+  },
+  {
+    eventName: "customer.purged",
+    category: "identity",
+    defaultSeverity: "WARN",
+    resourceType: "user",
+    description:
+      "Permanent deletion completed for a trashed customer account and its orders (forwards erased/kept numeric counts only; never personal data).",
+    forwardedAttributes: ["automatic", "cascaded_orders"],
+    forwardedSafeCounts: ["deleted", "kept", "deleted_total", "kept_total", "cascaded_orders", "participants"],
+    withheldLocalKeys: ["batch_id", "trash_batch_id", "run_id", "user_public_id", "customer_public_id"],
+    forwardable: true,
+    increment: "09",
+  },
+  {
+    eventName: "trash.retention_changed",
+    category: "admin",
+    defaultSeverity: "WARN",
+    resourceType: "setting",
+    description:
+      "Administrator updated Trash centre auto-clean-up or order/customer retention days (forwards retention days, due count, and step-up flag).",
+    forwardedAttributes: [
+      "auto_cleanup_enabled",
+      "order_retention_days",
+      "customer_retention_days",
+      "retention_days",
+      "due_count",
+      "step_up_verified",
+    ],
+    forwardedSafeCounts: ["due", "due_orders", "due_customers"],
+    withheldLocalKeys: ["typed_confirmation"],
+    forwardable: true,
+    increment: "09",
+  },
+  {
+    eventName: "trash.cleanup_completed",
+    category: "job",
+    defaultSeverity: "INFO",
+    resourceType: "trash_cleanup",
+    description:
+      "Scheduled Trash centre retention sweep completed (forwards numeric due, purged, failed, and skipped counts only).",
+    forwardedAttributes: ["auto_cleanup_enabled"],
+    forwardedSafeCounts: [
+      "due",
+      "due_orders",
+      "due_customers",
+      "purged",
+      "purged_orders",
+      "purged_customers",
+      "failed",
+      "skipped",
+    ],
+    withheldLocalKeys: ["run_id"],
+    forwardable: true,
+    increment: "09",
   },
 
   /* ------------------------------------------------------- Baseline auth, audit & SIEM events */

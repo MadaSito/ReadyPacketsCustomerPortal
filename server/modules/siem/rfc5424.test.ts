@@ -735,4 +735,137 @@ describe("RFC 5424 & RFC 5425 golden vectors", () => {
     expect(wireText).not.toContain("Sensitive customer medical disclosure");
     expect(wireText).not.toContain("<saml:Assertion>");
   });
+
+  it("projects Increment 09 D2.3 trash, restore, purge, retention, and cleanup events without leaking batch_id, run_id, reason, or customer PII", () => {
+    const inc09Events: readonly [string, string, string | null][] = [
+      ["order.trashed", "business", "order"],
+      ["order.restored", "business", "order"],
+      ["order.purge_started", "business", "order"],
+      ["order.purged", "business", "order"],
+      ["customer.trashed", "identity", "user"],
+      ["customer.restored", "identity", "user"],
+      ["customer.purge_started", "identity", "user"],
+      ["customer.purged", "identity", "user"],
+      ["trash.retention_changed", "admin", "setting"],
+      ["trash.cleanup_completed", "job", "trash_cleanup"],
+    ];
+
+    for (const [name, expectedCat, expectedResource] of inc09Events) {
+      const entry = findSiemCatalogueEntry(name);
+      expect(entry, `missing catalogue entry for ${name}`).not.toBeNull();
+      expect(entry!.eventName).toBe(name);
+      expect(entry!.category).toBe(expectedCat);
+      expect(entry!.resourceType).toBe(expectedResource);
+      expect(entry!.forwardable).toBe(true);
+      expect(entry!.increment).toBe("09");
+    }
+
+    const customerTrashed = sanitizeProjectedEvent({
+      ...sampleEvent({
+        category: "identity",
+        severity_text: "WARN",
+        event_name: "customer.trashed",
+        action: "trash",
+        outcome: "completed",
+        resource_type: "user",
+      }),
+      safe_counts: {
+        cascaded_orders: 2,
+        sessions_revoked: 3,
+      },
+      attributes: {
+        reason_present: true,
+        cascaded_orders: 2,
+        batch_id: "01JETRASHBATCH000000000001",
+        user_public_id: "01JEUSER000000000000000001",
+        reason: "Zeus Greene requested closure of Ice Queen account RPCUS-A1B2CJJG5",
+      },
+    });
+    expect(customerTrashed.attributes).toEqual({
+      reason_present: true,
+      cascaded_orders: 2,
+    });
+    expect(customerTrashed.safe_counts).toEqual({
+      cascaded_orders: 2,
+      sessions_revoked: 3,
+    });
+    expect(customerTrashed.dropped_attributes).toBe(3);
+
+    const customerPurged = sanitizeProjectedEvent({
+      ...sampleEvent({
+        category: "identity",
+        severity_text: "WARN",
+        event_name: "customer.purged",
+        action: "purge",
+        outcome: "completed",
+        resource_type: "user",
+      }),
+      safe_counts: {
+        deleted_files: 5,
+        deleted_api_keys: 1,
+        kept_paid_invoices: 2,
+        cascaded_orders: 2,
+      },
+      attributes: {
+        automatic: false,
+        cascaded_orders: 2,
+        batch_id: "01JETRASHBATCH000000000001",
+        run_id: "01JEPURGERUN00000000000001",
+        typed_confirmation: "RPCUS-A1B2CJJG5",
+      },
+    });
+    expect(customerPurged.attributes).toEqual({
+      automatic: false,
+      cascaded_orders: 2,
+    });
+    expect(customerPurged.safe_counts).toEqual({
+      deleted_files: 5,
+      deleted_api_keys: 1,
+      kept_paid_invoices: 2,
+      cascaded_orders: 2,
+    });
+
+    const retentionChanged = sanitizeProjectedEvent({
+      ...sampleEvent({
+        category: "admin",
+        severity_text: "WARN",
+        event_name: "trash.retention_changed",
+        action: "update",
+        outcome: "completed",
+        resource_type: "setting",
+      }),
+      safe_counts: { due: 4, due_orders: 3, due_customers: 1 },
+      attributes: {
+        auto_cleanup_enabled: true,
+        order_retention_days: 30,
+        customer_retention_days: 60,
+        due_count: 4,
+        step_up_verified: true,
+        typed_confirmation: "DELETE 4",
+      },
+    });
+    expect(retentionChanged.attributes).toEqual({
+      auto_cleanup_enabled: true,
+      order_retention_days: 30,
+      customer_retention_days: 60,
+      due_count: 4,
+      step_up_verified: true,
+    });
+    expect(retentionChanged.safe_counts).toEqual({
+      due: 4,
+      due_orders: 3,
+      due_customers: 1,
+    });
+
+    const wireText = [
+      formatRfc5424Message(customerTrashed).text,
+      formatJsonlRecord(customerPurged).toString("utf8"),
+      formatCefSyslogFrame(retentionChanged).cefText,
+    ].join("\n");
+    expect(wireText).not.toContain("01JETRASHBATCH000000000001");
+    expect(wireText).not.toContain("01JEPURGERUN00000000000001");
+    expect(wireText).not.toContain("Zeus Greene");
+    expect(wireText).not.toContain("RPCUS-A1B2CJJG5");
+    expect(wireText).not.toContain("DELETE 4");
+  });
 });
