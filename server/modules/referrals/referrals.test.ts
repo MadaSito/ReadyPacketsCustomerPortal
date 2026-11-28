@@ -1408,8 +1408,8 @@ describe("server/modules/referrals (Package G)", () => {
         trashedAt: null,
         purgedAt: h.clock.now(),
         customerRef: null,
-        emailEnc: Buffer.alloc(0),
-        nameEnc: Buffer.alloc(0),
+        emailEnc: "",
+        nameEnc: "",
       })
       .where(eq(users.id, referrer.userId));
 
@@ -1471,17 +1471,17 @@ describe("server/modules/referrals (Package G)", () => {
       .select()
       .from(referralCodes)
       .where(eq(referralCodes.userId, referrer.userId));
-    expect(storedCodeRow.code).not.toBe(referrerCode);
-    expect(storedCodeRow.code.startsWith("~")).toBe(true);
-    expect(storedCodeRow.active).toBe(false);
+    expect(storedCodeRow!.code).not.toBe(referrerCode);
+    expect(storedCodeRow!.code.startsWith("~")).toBe(true);
+    expect(storedCodeRow!.active).toBe(false);
 
     const [storedReferralRow] = await tdb.db
       .select()
       .from(referrals)
       .where(eq(referrals.publicId, paid.referralPublicId!));
-    expect(storedReferralRow.codeSnapshot).toBe("~ERASED~~~");
-    expect(storedReferralRow.payoutReference).toBeNull();
-    expect(storedReferralRow.payoutNote).toBeNull();
+    expect(storedReferralRow!.codeSnapshot).toBe("~ERASED~~~");
+    expect(storedReferralRow!.payoutReference).toBeNull();
+    expect(storedReferralRow!.payoutNote).toBeNull();
 
     // Numeric counts and money ledger figures stay as numbers without decrypting tombstoned PII
     const adminSettingsAfterPurge = await callAs(admin.principal, (c) => c.admin.getSettings());

@@ -414,7 +414,7 @@ export async function previewOrderStageBundle(
       ownerUserId: orders.ownerUserId,
     })
     .from(orders)
-    .where(and(eq(orders.publicId, access.publicId), liveOrderPredicate(orders)))
+    .where(and(eq(orders.publicId, access.publicId), liveOrderPredicate()))
     .limit(1);
   if (!orderRow) {
     throw notFound("Order not found.");
@@ -1186,7 +1186,7 @@ export async function listOrderStageBundleRuns(
   const [orderRow] = await deps.db
     .select({ id: orders.id })
     .from(orders)
-    .where(and(eq(orders.publicId, input.orderPublicId), liveOrderPredicate(orders)))
+    .where(and(eq(orders.publicId, input.orderPublicId), liveOrderPredicate()))
     .limit(1);
   if (!orderRow) {
     throw notFound("Order not found.");

@@ -846,7 +846,7 @@ export async function listOrderCompletionJobsForOrder(
   const [activeOrderRow] = await deps.db
     .select({ id: orders.id })
     .from(orders)
-    .where(and(eq(orders.publicId, input.orderPublicId), liveOrderPredicate(orders)))
+    .where(and(eq(orders.publicId, input.orderPublicId), liveOrderPredicate()))
     .limit(1);
 
   if (!activeOrderRow) {

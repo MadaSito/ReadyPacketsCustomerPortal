@@ -1356,7 +1356,7 @@ async function resolveStageSubmittedTriggerContext({
       workflowVersionId: orders.workflowVersionId,
     })
     .from(orders)
-    .where(and(eq(orders.publicId, rawOrderPublicId), liveOrderPredicate(orders)))
+    .where(and(eq(orders.publicId, rawOrderPublicId), liveOrderPredicate()))
     .limit(1);
   if (!orderRow) return {};
 
