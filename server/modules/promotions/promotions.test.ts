@@ -17,6 +17,7 @@ import { orders, orderWorkflowVersions } from "../orders/schema.js";
 import { DEFAULT_WORKFLOW, type WorkflowDefinition } from "../orders/workflowTypes.js";
 import { platformSettings } from "../platform/schema.js";
 import { createSettingsStore } from "../platform/settingsStore.js";
+import { createTrashRegistry } from "../trash/ports.js";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { PROMO_CODE_ALPHABET } from "./codes.js";
@@ -1620,5 +1621,181 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
         }
       }
     });
+  });
+
+  it("Increment 09 D2.2/D2.6: registers promotions TrashParticipant, excludes trashed/tombstoned orders & customers from lists/exports/checks, and keeps redemption counts as numbers on purge", async () => {
+    const registry = createTrashRegistry();
+    (h.services as unknown as { trash: typeof registry }).trash = registry;
+    mod.init?.();
+    const participant = registry.participants().find((p) => p.module === "promotions");
+    expect(participant).toBeDefined();
+
+    const admin = await seedUser({ email: "admin-inc09@synthetic.test", role: "admin", stepUp: true });
+    const zeus = await seedUser({
+      email: "zeus.greene@synthetic.test",
+      role: "customer",
+      customerRef: "RPCUS-A1B2CJJG5",
+    });
+    const liveCust = await seedUser({
+      email: "live.cust@synthetic.test",
+      role: "customer",
+      customerRef: "RPCUS-LIVE00001",
+    });
+
+    const adminCall = callerFor(admin.principal);
+    await adminCall.caller.admin.updateSettings({ enabled: true, maxDiscountPercent: 50 });
+
+    const created = await adminCall.caller.admin.create({
+      name: "Ice Queen Launch",
+      label: "Launch 10%",
+      type: "percent",
+      percentBps: 1_000,
+      maxRedemptions: 10,
+      maxPerCustomer: 2,
+      allowCustomerPublicIds: [zeus.publicId, liveCust.publicId],
+      scope: { kind: "all" },
+      code: "ICEQUEEN10",
+    });
+
+    const ordZeus = await seedOrderRow({ ownerUserId: zeus.id });
+    const ordLive = await seedOrderRow({ ownerUserId: liveCust.id });
+
+    await tdb.db.transaction((tx) =>
+      mod.redeemInTx(tx, {
+        code: "ICEQUEEN10",
+        customerUserId: zeus.id,
+        actorUserId: zeus.id,
+        currency: "USD",
+        lines: [{ productPublicId: sampleProductA, packetNumber: 1, tierKey: "Basic", lineTotalMinor: 10_000 }],
+        subtotalMinor: 10_000,
+        bundleDiscountMinor: 0,
+        bundleLabel: null,
+        orderPublicId: ordZeus,
+        correlationId: "corr-zeus-inc09",
+      }),
+    );
+    await tdb.db.transaction((tx) =>
+      mod.redeemInTx(tx, {
+        code: "ICEQUEEN10",
+        customerUserId: liveCust.id,
+        actorUserId: liveCust.id,
+        currency: "USD",
+        lines: [{ productPublicId: sampleProductA, packetNumber: 1, tierKey: "Basic", lineTotalMinor: 10_000 }],
+        subtotalMinor: 10_000,
+        bundleDiscountMinor: 0,
+        bundleLabel: null,
+        orderPublicId: ordLive,
+        correlationId: "corr-live-inc09",
+      }),
+    );
+
+    // Seed check-attempt row and a release note on Zeus's redemption to verify purge scrubbing.
+    await tdb.db.insert(promoCheckAttempts).values({
+      userId: zeus.id,
+      failedCount: 2,
+      windowStartedAt: h.clock.now(),
+      blockedUntil: null,
+    });
+    await tdb.db
+      .update(promoRedemptions)
+      .set({ releaseNote: "Operator note mentioning Ice Queen" })
+      .where(eq(promoRedemptions.orderPublicId, ordZeus));
+
+    // Move Zeus and Zeus's order to trash -> absent from admin redemptions list/export and ineligible for checks.
+    const trashedAt = h.clock.now();
+    await tdb.db
+      .update(orders)
+      .set({ trashedAt, trashBatchId: "01JTRASHBATCHZEUS000000001" })
+      .where(eq(orders.publicId, ordZeus));
+    await tdb.db
+      .update(users)
+      .set({ status: "suspended", trashedAt, trashBatchId: "01JTRASHBATCHZEUS000000001" })
+      .where(eq(users.id, zeus.id));
+
+    await expect(
+      mod.preview({
+        code: "ICEQUEEN10",
+        customerUserId: zeus.id,
+        actorUserId: zeus.id,
+        currency: "USD",
+        lines: [{ productPublicId: sampleProductA, packetNumber: 1, tierKey: "Basic", lineTotalMinor: 10_000 }],
+        subtotalMinor: 10_000,
+        bundleDiscountMinor: 0,
+        bundleLabel: null,
+      }),
+    ).rejects.toMatchObject({ reasonCode: "PROMO_NOT_APPLICABLE" });
+
+    const listedWhileTrashed = await adminCall.caller.admin.redemptions({
+      promotionPublicId: created.promotion.publicId,
+    });
+    expect(listedWhileTrashed.items).toHaveLength(1);
+    expect(listedWhileTrashed.items[0]?.orderPublicId).toBe(ordLive);
+
+    const exportedWhileTrashed = await adminCall.caller.admin.exportRedemptions({
+      promotionPublicId: created.promotion.publicId,
+    });
+    expect(exportedWhileTrashed.rowCount).toBe(1);
+    expect(exportedWhileTrashed.csv).not.toContain(ordZeus);
+    expect(exportedWhileTrashed.csv).not.toContain("RPCUS-A1B2CJJG5");
+
+    // Summarize + permanent purge (order then customer, matching coordinator order).
+    const [ordRow] = await tdb.db.select().from(orders).where(eq(orders.publicId, ordZeus));
+    const ordSummary = await participant!.summarize!({
+      kind: "order",
+      id: ordRow!.id,
+      publicId: ordZeus,
+      batchId: "01JTRASHBATCHZEUS000000001",
+    });
+    expect(ordSummary).toEqual({ promoRedemptions: 1 });
+
+    const ordPurge = await participant!.purge!(
+      { kind: "order", id: ordRow!.id, publicId: ordZeus, batchId: "01JTRASHBATCHZEUS000000001" },
+      { runId: "01JPURGERUNZEUS00000000001" },
+    );
+    expect(ordPurge.deleted).toEqual({ promoReleaseNotes: 1 });
+    expect(ordPurge.kept).toEqual({ promoRedemptions: 1 });
+
+    const custPurge = await participant!.purge!(
+      { kind: "customer", id: zeus.id, publicId: zeus.publicId, batchId: "01JTRASHBATCHZEUS000000001" },
+      { runId: "01JPURGERUNZEUS00000000001" },
+    );
+    expect(custPurge.deleted).toEqual({
+      promoCheckAttempts: 1,
+      promoAllowListEntries: 1,
+    });
+    expect(custPurge.kept).toEqual({ promoRedemptions: 1 });
+
+    // Idempotent retry:
+    const custPurgeRetry = await participant!.purge!(
+      { kind: "customer", id: zeus.id, publicId: zeus.publicId, batchId: "01JTRASHBATCHZEUS000000001" },
+      { runId: "01JPURGERUNZEUS00000000001" },
+    );
+    expect(custPurgeRetry.deleted).toEqual({});
+    expect(custPurgeRetry.kept).toEqual({ promoRedemptions: 1 });
+
+    // Verify numeric redemption counts stay as numbers!
+    const [batchAfter] = await tdb.db
+      .select()
+      .from(promoBatches)
+      .where(eq(promoBatches.publicId, created.promotion.publicId));
+    expect(batchAfter?.redemptionCount).toBe(2);
+    expect(batchAfter?.allowCustomerPublicIds).toEqual([liveCust.publicId]);
+
+    const [codeAfter] = await tdb.db
+      .select()
+      .from(promoCodes)
+      .where(eq(promoCodes.batchId, batchAfter!.id));
+    expect(codeAfter?.redemptionCount).toBe(2);
+
+    const statsAfter = await adminCall.caller.admin.stats({
+      promotionPublicId: created.promotion.publicId,
+    });
+    expect(statsAfter.redemptions).toBe(2);
+
+    const [zeusRedemptionAfter] = await tdb.db
+      .select()
+      .from(promoRedemptions)
+      .where(eq(promoRedemptions.orderPublicId, ordZeus));
+    expect(zeusRedemptionAfter?.releaseNote).toBeNull();
   });
 });

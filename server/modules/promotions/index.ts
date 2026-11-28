@@ -5,6 +5,7 @@ import "./settings.js";
 import type { ModuleDeps } from "../../container.js";
 import type { ModuleHealth, ModuleLifecycle } from "../../core/types.js";
 import { createPromotionsService, type PromotionsService } from "./service.js";
+import { createPromotionsTrashParticipant } from "./trash.js";
 
 export * from "./settings.js";
 export * from "./contracts.js";
@@ -23,6 +24,9 @@ export function createPromotionsModule(deps: ModuleDeps): PromotionsModule {
 
   return {
     ...service,
+    init() {
+      deps.services.trash?.register(createPromotionsTrashParticipant(deps));
+    },
     async health(): Promise<ModuleHealth[]> {
       const checkedAt = deps.clock.now();
       try {
