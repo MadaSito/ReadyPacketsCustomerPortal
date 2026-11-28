@@ -113,9 +113,10 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
       <header className="sticky top-0 z-40 border-b border-line bg-surface/95 pt-[env(safe-area-inset-top)] backdrop-blur supports-[backdrop-filter]:bg-surface/85">
         <div className="flex h-16 items-center gap-2 pr-[max(0.75rem,env(safe-area-inset-right))] pl-[max(0.75rem,env(safe-area-inset-left))] sm:px-6">
           <IconButton label="Open navigation menu" icon={<Menu />} className="lg:hidden" onClick={() => setMenuOpen(true)} />
-          <Link href="/" aria-label="ReadyPackets home" className="mr-2 inline-flex min-w-0 shrink items-center rounded max-[299px]:hidden">
-            <BrandLogo label="" className="hidden w-48 sm:inline-flex" />
-            <BrandLogo label="" variant="icon" className="h-9 sm:hidden" />
+          {/* Narrow bar: the horizontal full lockup. From lg the sidebar's square brand tile replaces it; below
+              340 px it yields its room to the actions (the menu drawer shows the brand tile). */}
+          <Link href="/" aria-label="ReadyPackets home" className="mr-2 inline-flex min-w-0 shrink items-center rounded max-[339px]:hidden lg:hidden" data-testid="customer-header-logo">
+            <BrandLogo lockup="horizontal" label="" className="w-28 sm:w-44" />
           </Link>
           <div className="ml-auto flex shrink-0 items-center gap-1">
             {staff ? <PortalSwitch area="customer" role={user.role} className="mr-1 hidden md:inline-flex" /> : null}
@@ -132,6 +133,11 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
           aria-label="Customer navigation"
           className={cn("rp-nav-panel rp-nav-edge sticky top-16 hidden h-[calc(100dvh-4rem)] shrink-0 flex-col rp-on-navy lg:flex", collapsed ? "w-20" : "w-64")}
         >
+          <div className={cn("flex justify-center px-4 pt-4", collapsed && "px-2")} data-testid="customer-brand-tile">
+            <Link href="/" aria-label="ReadyPackets home" className="inline-flex rounded">
+              <BrandLogo appearance="dark" lockup="square" label="" className={collapsed ? "w-14" : "w-32"} />
+            </Link>
+          </div>
           <div className="rp-nav-scroll min-h-0 flex-1 overflow-y-auto px-3 py-4">
             <SectionNav sections={sections} label="Customer" collapsed={collapsed} isCurrent={isCurrent} />
           </div>
@@ -190,6 +196,9 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
 
       <Drawer open={menuOpen} onOpenChange={setMenuOpen} title="Menu" side="left" width="sm">
         <div className="rp-nav-panel -mx-4 -mt-4 p-4 rp-on-navy">
+          <div className="mb-4 flex justify-center border-b border-navy-border pb-4" data-testid="drawer-brand-tile">
+            <BrandLogo appearance="dark" lockup="square" label="" className="w-28" />
+          </div>
           {staff ? (
             <div className="mb-4 border-b border-navy-border pb-4" data-testid="drawer-portal-switch">
               <PortalSwitch area="customer" role={user.role} appearance="nav" onNavigate={() => setMenuOpen(false)} />

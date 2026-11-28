@@ -316,8 +316,10 @@ html:not(.dark) {
   .rp-nav-bar-top { border-top: 1px solid CanvasText; }
   .rp-nav-item[aria-current="page"] { outline: 2px solid Highlight; outline-offset: -2px; border-left: 4px solid Highlight; }
   .rp-nav-tab[aria-current="page"], .rp-nav-tab[data-current] { outline: 2px solid Highlight; outline-offset: -2px; }
-  /* Logo artwork is a fixed-colour image: keep its navy backdrop so the white wordmark stays legible. */
-  .rp-brand-on-dark { forced-color-adjust: none; background-color: var(--color-navy); border-radius: 0.375rem; }
+  /* Logo artwork is a fixed-colour image whatever the system Canvas is: each lockup keeps a backplate in its
+     own surface colour (navy for the dark file, white for the light file) so no part of it can vanish. */
+  .rp-brand-plate-dark, .rp-brand-on-dark { forced-color-adjust: none; background-color: var(--color-navy); border-radius: 0.375rem; }
+  .rp-brand-plate-light { forced-color-adjust: none; background-color: var(--color-white); border-radius: 0.375rem; }
 }
 
 /*

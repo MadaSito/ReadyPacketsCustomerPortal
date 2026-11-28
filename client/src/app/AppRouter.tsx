@@ -82,7 +82,7 @@ function RouteGate({ route }: { route: RouteDef }) {
   if (decision.kind === "not-found") {
     return (
       <Frame kind={user ? (user.role === "customer" ? "customer" : "console") : "public"} user={user}>
-        <NotFoundPage />
+        <NotFoundPage brand={!user} />
         <RouteFocus title="Page not found" path={location} />
       </Frame>
     );
@@ -109,7 +109,7 @@ function FallbackGate() {
   const user = view.status === "full" ? me?.user : undefined;
   return (
     <Frame kind={user ? (location.startsWith("/admin") && user.role !== "customer" ? "console" : "customer") : "public"} user={user}>
-      <NotFoundPage />
+      <NotFoundPage brand={!user} />
       <RouteFocus title="Page not found" path={location} />
     </Frame>
   );

@@ -1,7 +1,8 @@
 import { BRAND } from "@shared/brand";
 import { ThemeToggle } from "@/app/shell/common";
 import { useSession } from "@/lib/session";
-import { Card, PageHeader, Section } from "@/ui";
+import { Link } from "wouter";
+import { BrandLogo, Card, EmailLink, PageHeader, Section } from "@/ui";
 
 const EMAIL = "info@readypackets.com";
 const linkClass = "inline-flex min-h-6 max-w-full items-center text-action underline underline-offset-2 [overflow-wrap:anywhere]";
@@ -10,6 +11,11 @@ export default function AccessibilityPage() {
   const { view } = useSession();
   return (
     <article className="mx-auto w-full min-w-0 max-w-3xl space-y-6 px-4 py-8 sm:px-6 sm:py-12">
+      {view.status === "anonymous" ? (
+        <Link href="/sign-in" aria-label="ReadyPackets sign in" className="inline-flex rounded">
+          <BrandLogo lockup="square" label="" className="w-24 sm:w-28" />
+        </Link>
+      ) : null}
       <PageHeader
         title="Accessibility"
         description="Our accessibility target for the ReadyPackets customer portal and how to get help if something gets in your way."
@@ -18,7 +24,7 @@ export default function AccessibilityPage() {
       <Card as="section" aria-labelledby="accessibility-report" className="space-y-3">
         <h2 id="accessibility-report" className="text-lg font-semibold text-ink">Report an accessibility barrier</h2>
         <p className="text-body">
-          Email <a className={linkClass} href={`mailto:${EMAIL}`}>{EMAIL}</a> or use the{" "}
+          Email <EmailLink email={EMAIL} className="inline-flex min-h-6 max-w-full items-center" /> or use the{" "}
           <a className={linkClass} href={`${BRAND.marketingUrl}/contact.html`}>ReadyPackets contact page</a>. You do not need to sign in to report a barrier.
         </p>
         <p className="mt-3 text-body">

@@ -1,10 +1,20 @@
 import { Compass, ServerCrash } from "lucide-react";
 import { Link } from "wouter";
-import { Button, EmptyState } from "@/ui";
+import { BrandLogo, Button, EmptyState } from "@/ui";
 
-export function NotFoundPage() {
+/** Square full lockup above an error screen shown without a shell (public frame). Decorative: the h1 names the page. */
+function ErrorBrand() {
+  return (
+    <div className="mb-6 flex justify-center" data-testid="error-brand">
+      <BrandLogo lockup="square" label="" className="w-28 sm:w-32" />
+    </div>
+  );
+}
+
+export function NotFoundPage({ brand = false }: { brand?: boolean }) {
   return (
     <div className="mx-auto w-full max-w-xl px-4 py-12">
+      {brand ? <ErrorBrand /> : null}
       <h1 className="sr-only">Page not found</h1>
       <EmptyState
         icon={Compass}
@@ -23,6 +33,7 @@ export function NotFoundPage() {
 export function ServiceUnavailablePage() {
   return (
     <div className="mx-auto w-full max-w-xl px-4 py-12">
+      <ErrorBrand />
       <h1 className="sr-only">Service unavailable</h1>
       <EmptyState
         icon={ServerCrash}

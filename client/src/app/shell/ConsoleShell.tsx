@@ -72,9 +72,10 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
       <div className="flex min-h-0 flex-1">
         {/* Desktop sidebar (always navy; uses on-navy tokens and the dark logo set) */}
         <aside aria-label="Console navigation" className={cn("rp-nav-panel rp-nav-edge sticky top-0 hidden h-dvh shrink-0 flex-col rp-on-navy lg:flex", collapsed ? "w-20" : "w-64")}>
-          <div className={cn("flex h-16 items-center px-4", collapsed && "justify-center px-2")}>
+          {/* Brand tile: the square full lockup (dark file on the navy panel), smaller when collapsed. */}
+          <div className={cn("flex items-center justify-center px-4 py-3", collapsed && "px-2")} data-testid="console-brand-tile">
             <Link href="/admin" aria-label="ReadyPackets console home" className="inline-flex rounded">
-              {collapsed ? <BrandLogo appearance="dark" variant="icon" label="" className="h-9" /> : <BrandLogo appearance="dark" label="" className="w-44" />}
+              <BrandLogo appearance="dark" lockup="square" label="" className={collapsed ? "w-14" : "w-32"} />
             </Link>
           </div>
           <div className="rp-nav-scroll min-h-0 flex-1 overflow-y-auto px-3 py-4">
@@ -101,9 +102,10 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
           <header className="sticky top-0 z-40 border-b border-line bg-surface/95 backdrop-blur supports-[backdrop-filter]:bg-surface/85">
             <div className="flex h-16 items-center gap-2 px-3 sm:px-6">
               <IconButton label="Open console navigation" icon={<Menu />} className="lg:hidden" onClick={() => setDrawerOpen(true)} />
-              {/* Below 300 px the header logo yields its space so the actions fit (the menu still links home). */}
-              <Link href="/admin" aria-label="ReadyPackets console home" className="inline-flex shrink-0 rounded max-[299px]:hidden lg:hidden">
-                <BrandLogo variant="icon" label="" className="h-9" />
+              {/* Narrow bar: the horizontal full lockup where it fits next to the actions (440-767 px). Narrower,
+                  and between md and lg where the inline search takes the room, the drawer's brand tile carries it. */}
+              <Link href="/admin" aria-label="ReadyPackets console home" className="hidden min-w-0 shrink rounded min-[440px]:inline-flex md:hidden" data-testid="console-header-logo">
+                <BrandLogo lockup="horizontal" label="" className="w-32" />
               </Link>
               {/* Inline search from md up (min width keeps the placeholder whole); a single icon link below md. */}
               <div className="hidden min-w-[20rem] flex-1 px-1 md:block md:max-w-md" data-testid="console-search-inline">
@@ -133,6 +135,9 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
 
       <Drawer open={drawerOpen} onOpenChange={setDrawerOpen} title="Console navigation" side="left" width="sm">
         <div className="rp-nav-panel -m-4 min-h-full p-4 rp-on-navy">
+          <div className="mb-4 flex justify-center border-b border-navy-border pb-4" data-testid="drawer-brand-tile">
+            <BrandLogo appearance="dark" lockup="square" label="" className="w-28" />
+          </div>
           <div className="mb-4 border-b border-navy-border pb-4" data-testid="drawer-portal-switch">
             <PortalSwitch area="console" role={user.role} appearance="nav" onNavigate={() => setDrawerOpen(false)} />
           </div>

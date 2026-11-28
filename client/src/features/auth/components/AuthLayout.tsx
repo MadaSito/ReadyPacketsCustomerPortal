@@ -38,7 +38,7 @@ export function AuthLayout({ title, description, children, below, showcase = fal
       <div className="flex min-w-0 flex-1 flex-col">
         <div className="flex items-center justify-between gap-3 px-4 pt-4 sm:px-8 sm:pt-6">
           <Link href="/sign-in" aria-label="ReadyPackets sign in" className={cn("inline-flex rounded", showcase && "lg:invisible")}>
-            <BrandLogo label="" className="w-44 sm:w-52" />
+            <BrandLogo lockup="square" label="" className="w-24 sm:w-28" />
           </Link>
           <ThemeControl className="hidden sm:inline-flex" />
           <ThemeToggle className="sm:hidden" />

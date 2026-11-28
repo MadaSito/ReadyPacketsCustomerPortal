@@ -136,14 +136,16 @@ export interface ConfirmDialogProps {
   onConfirm: () => void | Promise<void>;
   /** Require typing this exact text before confirm is enabled (high-impact actions). */
   confirmText?: string;
+  /** Element to focus on close instead of the opener (e.g. a list heading after the row it opened from is gone). */
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }
 
 /** Accessible replacement for window.confirm. */
-export function ConfirmDialog({ open, onOpenChange, title, description, children, confirmLabel = "Confirm", cancelLabel = "Cancel", destructive, onConfirm, confirmText }: ConfirmDialogProps) {
+export function ConfirmDialog({ open, onOpenChange, title, description, children, confirmLabel = "Confirm", cancelLabel = "Cancel", destructive, onConfirm, confirmText, returnFocusRef }: ConfirmDialogProps) {
   const [busy, setBusy] = useState(false);
   const [typed, setTyped] = useState("");
   const blocked = confirmText !== undefined && typed !== confirmText;
-  const onCloseAutoFocus = useReturnFocus(open);
+  const onCloseAutoFocus = useReturnFocus(open, returnFocusRef);
   const run = async () => {
     setBusy(true);
     try {
