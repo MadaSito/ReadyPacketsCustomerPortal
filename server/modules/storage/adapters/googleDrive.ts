@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { validation } from "../../../core/errors.js";
 import type { EgressFetchOptions } from "../../integrations/egress.js";
-import { StorageAdapterError, type StorageAdapterDefinition } from "../contracts.js";
+import { StorageAdapterError, verifyRemoval, type StorageAdapterDefinition } from "../contracts.js";
 import {
   accessFor, dataError, dataRequest, integrityError, oauthConfigSchema, oauthCredentialsSchema, parseResponse, pathParts,
   safeObjectName, testResult, verifiedChunks, type OAuthStorageConfig, type OAuthStorageCredentials,
@@ -188,11 +188,18 @@ export function googleDriveAdapter(request: StorageRequest, reserveFolder: Reser
           const path = `/drive/v3/files/${remoteId}`;
           const existing = await api(apiUrl(path, { fields: "id,mimeType,appProperties" }), { signal });
           if (existing.status === 404) return;
-          const details = parseResponse(existing,
-            z.object({ id, mimeType: z.string(), appProperties: z.object({ rpConnection: z.literal(publicId) }) }));
-          if (details.id !== remoteId || details.mimeType === FOLDER) throw dataError(403);
-          const rsp = await api(apiUrl(path), { method: "DELETE", signal });
-          if (rsp.status !== 204 && rsp.status !== 404) throw dataError(rsp.status);
+          const metadata = z.object({ id, mimeType: z.string(), appProperties: z.object({ rpConnection: z.literal(publicId) }) });
+          const details = existing.status === 200 ?
+            await verifyRemoval(async () => parseResponse(existing, metadata)) : parseResponse(existing, metadata);
+          if (details.id !== remoteId || details.mimeType === FOLDER) throw integrityError();
+          const rsp = await verifyRemoval(() => api(apiUrl(path), { method: "DELETE", signal }, undefined, true));
+          if (rsp.status === 404) return;
+          if (rsp.status === 401 || rsp.status === 403) throw dataError(rsp.status);
+          await verifyRemoval(async () => {
+            if (rsp.status !== 204 || (await api(apiUrl(path, { fields: "id" }), { signal })).status !== 404) {
+              throw integrityError();
+            }
+          });
         },
       };
     },

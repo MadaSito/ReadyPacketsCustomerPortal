@@ -66,8 +66,17 @@ export interface StorageAdapter {
   inspectExact?(path: readonly string[], name: string, signal: AbortSignal): Promise<"missing" | "present">;
   ensureFolder(path: readonly string[], signal?: AbortSignal, beforeWrite?: () => Promise<void>): Promise<void>;
   put(input: StoragePutInput): Promise<StoragePutResult>;
-  /** Explicit removal only. Never called by an automatic copy, retry, retention or assignment change. */
+  /**
+   * Explicit removal only, including a permanent Trash purge. Availability errors may be raised only
+   * before a delete can take effect; use OUTCOME_UNKNOWN if submission or verification is ambiguous.
+   */
   remove(remoteId: string, signal?: AbortSignal): Promise<void | { providerRecycleBin: true }>;
+}
+
+/** At this point a mutation could have occurred, so no availability error can justify abandoning verification. */
+export async function verifyRemoval<T>(verify: () => Promise<T>): Promise<T> {
+  try { return await verify(); }
+  catch { throw new StorageAdapterError("OUTCOME_UNKNOWN"); }
 }
 
 export type StorageConfig = Record<string, string | number | boolean>;
@@ -137,9 +146,9 @@ export interface StorageCopyInput extends StoragePutInput {
 
 export interface StorageModule extends ModuleLifecycle {
   trashOrderCopiesInTx(tx: Tx, orderId: number, orderPublicId: string): Promise<void>;
-  purgeOrderCopies(orderId: number, orderPublicId: string): Promise<{
+  purgeOrderCopies(orderId: number, orderPublicId: string, run: { runId: string; acknowledgedUnreachableCopies?: boolean }): Promise<{
     deleted: number; external: number; shared: number; receipts: number; providerRecycleBin: number;
-    unverifiedExternalCopies: Record<string, number>;
+    unverifiedExternalCopies: Record<string, number>; acknowledgedExternalCopies: Record<string, number>;
   }>;
   copies: CopyLogService;
   orderCopies: OrderCopiesService;

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { validation } from "../../../core/errors.js";
-import type { StorageAdapterDefinition, StoragePutInput } from "../contracts.js";
+import { verifyRemoval, type StorageAdapterDefinition, type StoragePutInput } from "../contracts.js";
 import {
   accessFor, dataError, dataRequest, integrityError, oauthConfigSchema, oauthCredentialsSchema, parseResponse, pathParts,
   safeObjectName, testResult, verifiedChunks, type OAuthStorageConfig, type OAuthStorageCredentials,
@@ -114,11 +114,15 @@ export function dropboxAdapter(request: StorageRequest): StorageAdapterDefinitio
           const path = { path: remoteId };
           const before = await rpc("files/get_metadata", path, signal);
           if (!absent(before)) {
-            const { id: foundId } = parseResponse(before, file);
+            const { id: foundId } = before.status === 200 ?
+              await verifyRemoval(async () => parseResponse(before, file)) : parseResponse(before, file);
             if (foundId !== remoteId) throw integrityError();
-            const result = await rpc("files/delete_v2", path, signal);
-            if (!absent(result)) parseResponse(result, z.object({ metadata: z.object({ id: z.literal(remoteId) }) }));
-            if (!absent(await rpc("files/get_metadata", path, signal))) throw integrityError();
+            const result = await verifyRemoval(() => rpc("files/delete_v2", path, signal));
+            if (result.status === 401 || result.status === 403) parseResponse(result, file);
+            await verifyRemoval(async () => {
+              if (!absent(result)) parseResponse(result, z.object({ metadata: z.object({ id: z.literal(remoteId) }) }));
+              if (!absent(await rpc("files/get_metadata", path, signal))) throw integrityError();
+            });
           }
           // This connector is a user app; Dropbox Business-only permanent-delete is not within its scope.
           return { providerRecycleBin: true as const };

@@ -22,7 +22,7 @@
  */
 import type { Readable } from "node:stream";
 import { z } from "zod";
-import type { StorageAdapter, StorageAdapterDefinition, StoragePutInput, StoragePutResult, StorageTestResult } from "../contracts.js";
+import { verifyRemoval, type StorageAdapter, type StorageAdapterDefinition, type StoragePutInput, type StoragePutResult, type StorageTestResult } from "../contracts.js";
 import { StorageAdapterError, fromStatus, toAdapterError } from "./graphDriveErrors.js";
 import type { GraphCredentials, GraphHttpPort, GraphResponse } from "./graphDrivePort.js";
 import { QuickXorHash } from "./graphDriveQuickXor.js";
@@ -496,10 +496,13 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
       if (found.status === 404) return;
       const item = expectOk(found, 200);
       if (str(item.id) !== remoteId || !item.file || item.folder) throw new StorageAdapterError("OUTCOME_UNKNOWN");
-      const res = await call({ method: "POST", path: `${path}/permanentDelete`, signal });
+      const res = await verifyRemoval(() => call({ method: "POST", path: `${path}/permanentDelete`, signal }));
       if (res.status === 404) return;
-      expectOk(res, 204);
-      if ((await call({ method: "GET", path, signal })).status !== 404) throw new StorageAdapterError("OUTCOME_UNKNOWN");
+      if (res.status === 401 || res.status === 403) expectOk(res, 204);
+      await verifyRemoval(async () => {
+        expectOk(res, 204);
+        if ((await call({ method: "GET", path, signal })).status !== 404) throw new StorageAdapterError("OUTCOME_UNKNOWN");
+      });
     },
   };
 }

@@ -225,6 +225,22 @@ describe("graph drive adapter (against the local Graph fake)", () => {
     expect(graph.findByPath(graph.libraryDrive, ["Portal", "Orders", "AvExample_CUST-1", "RP-1 Demo", "file.pdf"])).toBeNull();
   });
 
+  it("distinguishes a denied preflight from a verification failure after submitting the delete", async () => {
+    const { adapter, graph } = setup();
+    const { remoteId } = await adapter.put(putInput(randomBytes(10)));
+    const denied = { status: 403, headers: {}, body: null };
+    graph.intercept(() => denied);
+    await rejectsWith(adapter.remove(remoteId), "DESTINATION_DENIED");
+    graph.clearInterceptors();
+    let submitted = false;
+    graph.intercept(({ method, path }) => {
+      if (method === "POST" && path.endsWith("/permanentDelete")) submitted = true;
+      if (submitted && method === "GET") return denied;
+      return undefined;
+    });
+    await rejectsWith(adapter.remove(remoteId), "OUTCOME_UNKNOWN");
+  });
+
   it("discovers a site, its document libraries, a OneDrive and folders", async () => {
     const graph = new FakeGraph();
     const d = graphDriveDiscovery(graph);

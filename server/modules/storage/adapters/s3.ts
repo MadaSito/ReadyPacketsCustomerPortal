@@ -2,7 +2,7 @@ import { createHash, createHmac } from "node:crypto";
 import { z } from "zod";
 import type { Clock } from "../../../core/types.js";
 import type { EgressPolicy } from "../../integrations/egress.js";
-import { StorageAdapterError, type StorageAdapterDefinition } from "../contracts.js";
+import { StorageAdapterError, verifyRemoval, type StorageAdapterDefinition } from "../contracts.js";
 import {
   encodeSegment, fromStatus, MAX_OBJECT_BYTES, measuredBody, objectKey, objectRequest, observedEtag, observedSize, pathFor,
   prefixParts, prefixSchema, readObjectRef, removeKey, statusError, testError, versionedObjectRef, WRITE_TIMEOUT_MS,
@@ -156,12 +156,15 @@ export function s3Adapter(egress: () => Pick<EgressPolicy, "fetchPinned">, clock
           if (etag) {
             const before = await request("HEAD", target, { signal });
             if (before.status === 404) return;
-            if (before.status !== 200 || observedEtag(before.headers) !== etag ||
+            if (before.status !== 200) throw statusError(before.status);
+            if (observedEtag(before.headers) !== etag ||
               before.headers["x-amz-version-id"] !== version) throw new StorageAdapterError("OUTCOME_UNKNOWN");
           }
           const result = await request("DELETE", target, { signal, ...(etag ? { headers: { "if-match": etag } } : {}) });
           if (result.status !== 204 && result.status !== 404) throw statusError(result.status, true);
-          if (etag && (await request("HEAD", target, { signal })).status !== 404) throw new StorageAdapterError("OUTCOME_UNKNOWN");
+          if (etag) await verifyRemoval(async () => {
+            if ((await request("HEAD", target, { signal })).status !== 404) throw new StorageAdapterError("OUTCOME_UNKNOWN");
+          });
         },
       };
     },

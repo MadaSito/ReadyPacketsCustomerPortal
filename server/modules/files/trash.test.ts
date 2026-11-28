@@ -10,6 +10,8 @@ import { knowledgeArticleAttachments } from "../knowledge/schema.js";
 import { orders } from "../orders/schema.js";
 import { platformPresentationImages } from "../platform/schema.js";
 import { portableExports } from "../portable/schema.js";
+import { StorageAdapterError } from "../storage/contracts.js";
+import { COPY_OWNED } from "../storage/fileCopies.js";
 import { createTrashCopies } from "../storage/trashCopies.js";
 import { storageConnections, storageCopyAttempts, storageFileCopies, storageManagedFileCopies, storageManagedOrderRoots } from "../storage/schema.js";
 import type { TrashEntityRef } from "../trash/ports.js";
@@ -25,7 +27,7 @@ let h: TestHarness;
 let trash: ReturnType<typeof createFilesTrashParticipant>;
 let a: TrashEntityRef;
 let b: TrashEntityRef;
-let remove: ReturnType<typeof vi.fn<(remoteId: string) => Promise<void>>>;
+let remove: ReturnType<typeof vi.fn<(remoteId: string) => Promise<void | { providerRecycleBin: true }>>>;
 const run = () => ({ runId: ulid() });
 const hook = (entity: TrashEntityRef) => t.db.transaction((tx) => trash.onTrashedInTx!(tx, entity, { kind: "system", job: "test" }));
 
@@ -44,7 +46,7 @@ beforeEach(async () => {
     workflowVersionId: 1, statusKey: "intake", subtotalMinor: 0, totalMinor: 0, currency: "USD" as const,
     ...(o === a ? { trashedAt: now, purgeStartedAt: now, trashBatchId: a.batchId } : {}),
   })));
-  remove = vi.fn(async () => {});
+  remove = vi.fn<(remoteId: string) => Promise<void | { providerRecycleBin: true }>>(async () => {});
   h.services.storageConnections = createTrashCopies(h.deps, () => ({ remove }) as never) as never;
   trash = createFilesTrashParticipant(h.deps);
 });
@@ -125,14 +127,21 @@ describe("Files trash participant", () => {
         role: "originals", state: "copied", targetEnc: "synthetic", createdAt: now, updatedAt: now,
         remoteIdEnc: h.deps.crypto.encrypt("keep-copy", `storage_managed_file_copies.remote_id_enc:${otherId}`) },
     ]);
-    await expect(trash.purge!(a, run())).rejects.toMatchObject({ reasonCode: "STORAGE_TRASH_WORK_IN_FLIGHT" });
+    await expect(trash.purge!(a, { ...run(), acknowledgedUnreachableCopies: true }))
+      .rejects.toMatchObject({ reasonCode: "STORAGE_TRASH_WORK_IN_FLIGHT" });
     expect(remove).not.toHaveBeenCalled();
     expect(await h.storage.stat(f.key)).not.toBeNull();
     await t.db.update(storageManagedFileCopies).set({ state: "copied", remoteIdEnc: h.deps.crypto.encrypt(remoteId,
       `storage_managed_file_copies.remote_id_enc:${id}`) }).where(eq(storageManagedFileCopies.publicId, id));
-    remove.mockRejectedValueOnce(new Error("synthetic provider failure"));
-    await expect(trash.purge!(a, run())).rejects.toMatchObject({ reasonCode: "STORAGE_TRASH_DELETE_UNVERIFIED" });
+    remove.mockRejectedValueOnce(new StorageAdapterError("OUTCOME_UNKNOWN"));
+    await expect(trash.purge!(a, { ...run(), acknowledgedUnreachableCopies: true }))
+      .rejects.toMatchObject({ reasonCode: "STORAGE_TRASH_DELETE_UNVERIFIED" });
     expect(await t.db.select().from(storageManagedFileCopies).where(eq(storageManagedFileCopies.publicId, id))).toHaveLength(1);
+    await t.db.update(storageConnections).set({ credentialsEnc: null }).where(eq(storageConnections.publicId, connectionPublicId));
+    await expect(trash.purge!(a, { ...run(), acknowledgedUnreachableCopies: true }))
+      .rejects.toMatchObject({ reasonCode: "STORAGE_TRASH_DELETE_UNVERIFIED" });
+    expect(remove).toHaveBeenCalledTimes(1);
+    await t.db.update(storageConnections).set({ credentialsEnc: "synthetic" }).where(eq(storageConnections.publicId, connectionPublicId));
     await expect(trash.purge!(a, run())).resolves.toMatchObject({ deleted: { storageCopies: 1, files: 1 } });
     expect(remove.mock.calls.map(([key]) => key)).toEqual([remoteId, remoteId]);
     expect(await h.storage.stat(other.key)).not.toBeNull();
@@ -160,5 +169,79 @@ describe("Files trash participant", () => {
       kept: { unverifiedExternalCopies: 1, [`unverifiedExternalCopies.${connectionPublicId}`]: 1 },
     });
     expect(remove).not.toHaveBeenCalled();
+  });
+
+  it("holds known-owned locators across failed retries and journals an explicit leave-behind by connection", async () => {
+    const f = await file(a), now = h.clock.now();
+    const rotated = ulid(), offline = ulid();
+    await t.db.insert(storageConnections).values([rotated, offline].map((publicId, i) => ({
+      publicId, kind: "sharepoint" as const, name: `Synthetic destination ${i}`, config: {},
+      credentialsEnc: "synthetic", createdAt: now, updatedAt: now, destinationVersion: i === 0 ? 2 : 1,
+    })));
+    const leg = ulid(), man = ulid(), remoteId = "synthetic-remote";
+    const legacyEnc = h.deps.crypto.encrypt("do-not-send-to-rotated-destination", `storage_file_copies.remote_id_enc:${leg}`);
+    const managedEnc = h.deps.crypto.encrypt(remoteId, `storage_managed_file_copies.remote_id_enc:${man}`);
+    await t.db.insert(storageFileCopies).values({ publicId: leg, filePublicId: f.publicId,
+      connectionPublicId: rotated, destinationVersion: 1, state: "copied", reasonCode: COPY_OWNED,
+      createdAt: now, updatedAt: now, remoteIdEnc: legacyEnc });
+    await t.db.insert(storageManagedFileCopies).values({ publicId: man, orderPublicId: a.publicId,
+      sourcePublicId: f.publicId, connectionPublicId: offline, destinationVersion: 1, role: "originals",
+      state: "copied", remoteIdEnc: managedEnc, targetEnc: "synthetic", createdAt: now, updatedAt: now });
+    remove.mockRejectedValue(new StorageAdapterError("PROVIDER_UNAVAILABLE"));
+    const ref = run();
+    for (let i = 0; i < 2; i++) {
+      await expect(trash.purge!(a, ref)).rejects.toMatchObject({
+        reasonCode: "EXTERNAL_COPIES_UNREACHABLE",
+        details: { unreachableCopies: 2, unreachableCopyCounts: [`${rotated}:1`, `${offline}:1`].sort() },
+      });
+      expect(await t.db.select().from(storageFileCopies)).toMatchObject([{ remoteIdEnc: legacyEnc }]);
+      expect(await t.db.select().from(storageManagedFileCopies)).toMatchObject([{ remoteIdEnc: managedEnc }]);
+      expect(await h.storage.stat(f.key)).not.toBeNull();
+    }
+    const late = ulid(), lateFile = await file(a);
+    const lateEnc = h.deps.crypto.encrypt("late-copy", `storage_file_copies.remote_id_enc:${late}`);
+    await t.db.insert(storageFileCopies).values({ publicId: late, filePublicId: lateFile.publicId,
+      connectionPublicId: rotated, destinationVersion: 1, state: "copied", reasonCode: COPY_OWNED,
+      createdAt: now, updatedAt: now, remoteIdEnc: lateEnc });
+    await expect(trash.purge!(a, { ...ref, acknowledgedUnreachableCopies: true })).rejects.toMatchObject({
+      reasonCode: "EXTERNAL_COPIES_UNREACHABLE",
+      details: { unreachableCopies: 1, unreachableCopyCounts: [`${rotated}:1`] },
+    });
+    expect(await t.db.select().from(storageFileCopies)).toMatchObject([{ remoteIdEnc: lateEnc }]);
+    const unlink = h.storage.delete.bind(h.storage);
+    vi.spyOn(h.storage, "delete").mockImplementationOnce(async (key) => { await unlink(key); throw new Error("synthetic crash"); });
+    await expect(trash.purge!(a, { ...ref, acknowledgedUnreachableCopies: true })).rejects.toThrow("synthetic crash");
+    expect(await t.db.select().from(storageFileCopies)).toHaveLength(0);
+    expect(await t.db.select().from(storageManagedFileCopies)).toHaveLength(0);
+    expect(remove.mock.calls.map(([id]) => id)).toEqual([remoteId, remoteId, remoteId]);
+    await expect(trash.purge!(a, ref)).resolves.toMatchObject({ deleted: { storageCopies: 0, files: 2 },
+      kept: { unverifiedExternalCopies: 0, acknowledgedExternalCopies: 3,
+        [`acknowledgedExternalCopies.${rotated}`]: 2, [`acknowledgedExternalCopies.${offline}`]: 1 } });
+    expect(await t.db.select().from(storageCopyAttempts)).toMatchObject([
+      { targetPathEnc: null, phaseLabelEnc: null, connectionPublicId: rotated },
+      { targetPathEnc: null, phaseLabelEnc: null, connectionPublicId: offline },
+      { targetPathEnc: null, phaseLabelEnc: null, connectionPublicId: rotated },
+    ]);
+  });
+
+  it("reports only verified active removal to a provider bin and preserves statutory receipts", async () => {
+    const f = await file(a), now = h.clock.now(), connectionPublicId = ulid();
+    await t.db.insert(storageConnections).values({ publicId: connectionPublicId, kind: "dropbox", name: "Synthetic destination",
+      config: {}, credentialsEnc: "synthetic", createdAt: now, updatedAt: now });
+    for (const role of ["originals", "receipt"] as const) {
+      const publicId = ulid();
+      await t.db.insert(storageManagedFileCopies).values({ publicId, orderPublicId: a.publicId, sourcePublicId: f.publicId,
+        connectionPublicId, destinationVersion: 1, role, state: "copied", targetEnc: "synthetic", createdAt: now, updatedAt: now,
+        remoteIdEnc: h.deps.crypto.encrypt(`synthetic-${role}`, `storage_managed_file_copies.remote_id_enc:${publicId}`) });
+    }
+    remove.mockResolvedValueOnce({ providerRecycleBin: true });
+    await expect(trash.purge!(a, run())).resolves.toMatchObject({
+      deleted: { storageCopies: 1 }, kept: { providerRecycleBin: 1, receiptCopies: 1, acknowledgedExternalCopies: 0 },
+    });
+    expect(remove.mock.calls.map(([id]) => id)).toEqual(["synthetic-originals"]);
+    expect(await t.db.select().from(storageManagedFileCopies)).toMatchObject([{ role: "receipt" }]);
+    await expect(trash.purge!(a, run())).resolves.toMatchObject({
+      deleted: { storageCopies: 0 }, kept: { providerRecycleBin: 1, receiptCopies: 1 },
+    });
   });
 });

@@ -107,7 +107,7 @@ export function createFilesTrashParticipant(deps: ModuleDeps): TrashParticipant 
           isNull(orderFiles.supersededAt), isNull(orderFiles.derivedFromPublicId)));
       return { files: rows?.files ?? 0, recordings: rows?.recordings ?? 0, archives: archive?.total ?? 0 };
     },
-    async purge(entity) {
+    async purge(entity, run) {
       const table = entity.kind === "order" ? orders : users;
       const [fence] = await db.select({ id: table.id }).from(table).where(and(eq(table.id, Number(entity.id)),
         eq(table.publicId, entity.publicId), eq(table.trashBatchId, entity.batchId),
@@ -116,9 +116,10 @@ export function createFilesTrashParticipant(deps: ModuleDeps): TrashParticipant 
       await db.transaction((tx) => revoke(tx, entity));
       const zip = await purgeArchives(entity);
       let deletedFiles = 0, recordings = 0, sharedObjects = zip.sharedObjects;
-      let copies = { deleted: 0, external: 0, shared: 0, receipts: 0, providerRecycleBin: 0, unverifiedExternalCopies: {} as Record<string, number> };
+      let copies = { deleted: 0, external: 0, shared: 0, receipts: 0, providerRecycleBin: 0,
+        unverifiedExternalCopies: {} as Record<string, number>, acknowledgedExternalCopies: {} as Record<string, number> };
       if (entity.kind === "order") {
-        copies = await services.storageConnections.purgeOrderCopies(Number(entity.id), entity.publicId);
+        copies = await services.storageConnections.purgeOrderCopies(Number(entity.id), entity.publicId, run);
         for (;;) {
           const rows = await db.select().from(orderFiles).where(files(entity)).orderBy(orderFiles.id).limit(batchSize);
           if (!rows.length) break;
@@ -142,10 +143,13 @@ export function createFilesTrashParticipant(deps: ModuleDeps): TrashParticipant 
         }
       }
       const destinations = Object.entries(copies.unverifiedExternalCopies);
+      const acknowledged = Object.entries(copies.acknowledgedExternalCopies);
       return { deleted: { files: deletedFiles, recordings, archives: zip.archives, storageCopies: copies.deleted },
         kept: { sharedFileObjects: sharedObjects, externalCopies: copies.external, sharedCopies: copies.shared, receiptCopies: copies.receipts,
           providerRecycleBin: copies.providerRecycleBin, unverifiedExternalCopies: destinations.reduce((total, [, count]) => total + count, 0),
-          ...Object.fromEntries(destinations.map(([id, count]) => [`unverifiedExternalCopies.${id}`, count])) } };
+          acknowledgedExternalCopies: acknowledged.reduce((total, [, count]) => total + count, 0),
+          ...Object.fromEntries(destinations.map(([id, count]) => [`unverifiedExternalCopies.${id}`, count])),
+          ...Object.fromEntries(acknowledged.map(([id, count]) => [`acknowledgedExternalCopies.${id}`, count])) } };
     },
   };
 }

@@ -1,12 +1,12 @@
-import { and, count, eq, gt, inArray, isNotNull, ne, sql } from "drizzle-orm";
+import { and, count, eq, gt, inArray, isNotNull, like, ne, sql } from "drizzle-orm";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError } from "../../core/errors.js";
-import { ulid } from "../../core/ids.js";
+import { ULID_PATTERN, ulid } from "../../core/ids.js";
 import type { Tx } from "../../core/types.js";
 import { orderFiles } from "../files/schema.js";
 import { jobRuns } from "../jobs/schema.js";
 import { readObjectRef } from "./adapters/objectProtocol.js";
-import type { StorageAdapter } from "./contracts.js";
+import { StorageAdapterError, type StorageAdapter, type StorageAdapterErrorCode } from "./contracts.js";
 import { COPY_EXTERNAL, COPY_OWNED, COPY_TRASHED } from "./fileCopies.js";
 import { storageConnections as connections, storageCopyAttempts as attempts, storageFileCopies as legacy, storageManagedFileCopies as managed, storageManagedOrderRoots } from "./schema.js";
 
@@ -22,7 +22,14 @@ const legacyNotWritten = new Set(["STORAGE_COPY_SOURCE_INACTIVE", "STORAGE_ASSIG
 const managedNotWritten = new Set(["STORAGE_COPY_SOURCE_INACTIVE", "STORAGE_FILE_SYNC_TARGET_INACTIVE",
   "STORAGE_FILE_SYNC_FOLDER_INVALID", "STORAGE_FILE_SYNC_DESTINATION_CONFLICT", COPY_TRASHED]);
 const unverifiedExternal = "STORAGE_TRASH_EXTERNAL_UNVERIFIED";
+const acknowledgedExternal = "STORAGE_TRASH_EXTERNAL_ACKNOWLEDGED";
+const blockedExternal = "EXTERNAL_COPIES_UNREACHABLE";
 const providerRecycleBin = "STORAGE_TRASH_PROVIDER_RECYCLE_BIN";
+const deleteUnverified = "STORAGE_TRASH_DELETE_UNVERIFIED";
+const unavailableProvider = new Set<StorageAdapterErrorCode>(["NOT_CONFIGURED", "AUTH_FAILED", "DESTINATION_NOT_FOUND",
+  "DESTINATION_DENIED", "EGRESS_DENIED", "PROVIDER_UNAVAILABLE"]);
+type Removal = "deleted" | "external" | "shared" | "providerRecycleBin" | "unverifiedExternal" | "unreachable" | "deleteUnverified";
+type BlockedCopy = { copy: string; source: string; connection: string };
 
 export function createTrashCopies(deps: ModuleDeps, adapterFor: (row: Connection) => StorageAdapter) {
   const { clock, db, crypto } = deps;
@@ -60,7 +67,7 @@ export function createTrashCopies(deps: ModuleDeps, adapterFor: (row: Connection
     return false;
   }
 
-  async function remove(tx: Tx, row: Legacy | Managed): Promise<"deleted" | "external" | "shared" | "providerRecycleBin" | "unverifiedExternal"> {
+  async function remove(tx: Tx, row: Legacy | Managed): Promise<Removal> {
     const isLegacy = !("role" in row);
     if (!row.remoteIdEnc) {
       if (row.state === "copying") throw unavailable("STORAGE_TRASH_WORK_IN_FLIGHT");
@@ -68,34 +75,45 @@ export function createTrashCopies(deps: ModuleDeps, adapterFor: (row: Connection
       if ((isLegacy ? legacyNotWritten : managedNotWritten).has(row.reasonCode ?? "")) return "deleted";
       throw unavailable("STORAGE_TRASH_OUTCOME_UNVERIFIED");
     }
+    if (row.state !== "copied") throw unavailable("STORAGE_TRASH_OUTCOME_UNVERIFIED");
     if (isLegacy && row.reasonCode === COPY_EXTERNAL) return "external";
+    // Historical rows without a recorded ownership outcome must never justify an outbound DELETE.
+    if (isLegacy && row.reasonCode !== COPY_OWNED && row.reasonCode !== deleteUnverified) return "unverifiedExternal";
+    const ifUnreachable = () => row.reasonCode === deleteUnverified ? "deleteUnverified" : "unreachable";
     const [connection] = await tx.select().from(connections).where(eq(connections.publicId, row.connectionPublicId)).for("update");
-    if (!connection || connection.destinationVersion !== row.destinationVersion) return "unverifiedExternal";
-    if (!connection.credentialsEnc) throw unavailable("STORAGE_TRASH_DESTINATION_UNAVAILABLE");
-    // Historical S3 and Graph copies could adopt a pre-existing matching object without recording ownership.
-    if (isLegacy && row.reasonCode !== COPY_OWNED && ["s3", "azure_blob", "dropbox", "sharepoint", "onedrive"].includes(connection.kind)) {
-      return "unverifiedExternal";
-    }
+    if (!connection?.credentialsEnc || connection.destinationVersion !== row.destinationVersion) return ifUnreachable();
     const remoteId = decode(row);
+    if ((connection.kind === "s3" || connection.kind === "azure_blob") && !readObjectRef(remoteId).etag) {
+      // A pre-versioning reference does not authorize deleting whatever now occupies the key.
+      return "deleteUnverified";
+    }
     if (await isShared(tx, row, remoteId, connection)) return "shared";
     try {
       const result = await adapterFor(connection).remove(remoteId, AbortSignal.timeout(30_000));
       if (result?.providerRecycleBin) return "providerRecycleBin";
-    } catch {
-      throw unavailable("STORAGE_TRASH_DELETE_UNVERIFIED");
+    } catch (error) {
+      if (error instanceof StorageAdapterError && unavailableProvider.has(error.code)) return ifUnreachable();
+      if (error instanceof DomainError && ["STORAGE_ADAPTER_UNAVAILABLE", "STORAGE_FILE_SYNC_TARGET_INACTIVE",
+        "STORAGE_OAUTH_APP_REQUIRED", "STORAGE_OAUTH_AUTHORIZATION_REJECTED",
+        "STORAGE_DESTINATION_DENIED", "STORAGE_DESTINATION_NOT_FOUND"].includes(error.reasonCode)) {
+        return ifUnreachable();
+      }
+      return "deleteUnverified";
     }
     return "deleted";
   }
 
-  async function recordKept(tx: Tx, orderPublicId: string, row: Legacy | Managed, outcome: Awaited<ReturnType<typeof remove>>) {
-    if (outcome !== "unverifiedExternal" && outcome !== "providerRecycleBin") return;
+  async function recordKept(tx: Tx, orderPublicId: string, row: Legacy | Managed, outcome: Removal) {
+    if (outcome !== "unverifiedExternal" && outcome !== "providerRecycleBin" && outcome !== "unreachable") return;
+    if (!ULID_PATTERN.test(row.connectionPublicId)) throw unavailable("STORAGE_TRASH_CONNECTION_INVALID");
     const now = clock.now();
     // Commit the non-content disposition with the pointer removal so a resumed purge cannot lose the
     // operational handoff. No provider path, locator, filename or credentials are retained.
     await tx.insert(attempts).values({ publicId: ulid(now.getTime()), kind: "order_file",
       sourcePublicId: "role" in row ? row.sourcePublicId : row.filePublicId, orderPublicId,
       connectionPublicId: row.connectionPublicId, jobPublicId: `trash-copy:${row.publicId}`, attempt: 1,
-      state: "not_written", errorCode: outcome === "unverifiedExternal" ? unverifiedExternal : providerRecycleBin,
+      state: "not_written", errorCode: outcome === "unverifiedExternal" ? unverifiedExternal :
+        outcome === "unreachable" ? acknowledgedExternal : providerRecycleBin,
       createdAt: now, finishedAt: now,
     });
   }
@@ -110,17 +128,44 @@ export function createTrashCopies(deps: ModuleDeps, adapterFor: (row: Connection
         .where(and(eq(managed.orderPublicId, orderPublicId), eq(managed.state, "queued"),
           sql`NOT EXISTS (SELECT 1 FROM ${jobRuns} WHERE ${jobRuns.publicId} = ${managed.jobPublicId} AND ${jobRuns.state} IN ('running','unknown'))`));
     },
-    async purgeOrderCopies(orderId: number, orderPublicId: string) {
-      const result = { deleted: 0, external: 0, shared: 0, receipts: 0, providerRecycleBin: 0, unverifiedExternalCopies: {} as Record<string, number> };
-      function track(outcome: Awaited<ReturnType<typeof remove>> | undefined) {
-        if (!outcome || outcome === "unverifiedExternal") return;
+    async purgeOrderCopies(orderId: number, orderPublicId: string, run: { runId: string; acknowledgedUnreachableCopies?: boolean }) {
+      if (!ULID_PATTERN.test(run.runId)) throw unavailable("STORAGE_TRASH_RUN_INVALID");
+      const result = { deleted: 0, external: 0, shared: 0, receipts: 0, providerRecycleBin: 0,
+        unverifiedExternalCopies: {} as Record<string, number>, acknowledgedExternalCopies: {} as Record<string, number> };
+      const unreachable = new Map<string, number>();
+      const pending: BlockedCopy[] = [];
+      const prefix = `trash-un:${run.runId}:`;
+      const proofScope = and(eq(attempts.kind, "order_file"), eq(attempts.orderPublicId, orderPublicId),
+        eq(attempts.errorCode, blockedExternal), like(attempts.jobPublicId, `${prefix}%`));
+      const proofId = (copy: string, source: string, connection: string) => `${copy}:${source}:${connection}`;
+      const approved = new Set(run.acknowledgedUnreachableCopies === true ?
+        (await db.select({ journalId: attempts.jobPublicId, source: attempts.sourcePublicId, connection: attempts.connectionPublicId })
+          .from(attempts).where(proofScope))
+          .map((row) => proofId(row.journalId.slice(prefix.length), row.source, row.connection)) : []);
+      function track(disposition: { outcome: Removal; blocked?: BlockedCopy } | undefined) {
+        if (!disposition || disposition.outcome === "unverifiedExternal") return;
+        const { outcome, blocked } = disposition;
+        if (outcome === "deleteUnverified") throw unavailable(deleteUnverified);
+        if (outcome === "unreachable") {
+          if (blocked) {
+            if (![blocked.copy, blocked.source, blocked.connection].every((id) => ULID_PATTERN.test(id))) {
+              throw unavailable("STORAGE_TRASH_CONNECTION_INVALID");
+            }
+            pending.push(blocked);
+            unreachable.set(blocked.connection, (unreachable.get(blocked.connection) ?? 0) + 1);
+          }
+          return;
+        }
         if (outcome === "providerRecycleBin") result.deleted += 1;
         else result[outcome] += 1;
       }
+      let after = 0;
       for (;;) {
         const rows = await db.select({ id: legacy.id }).from(legacy)
-          .where(inArray(legacy.filePublicId, scopedFiles(db, orderId, orderPublicId))).orderBy(legacy.id).limit(batchSize);
+          .where(and(gt(legacy.id, after), inArray(legacy.filePublicId, scopedFiles(db, orderId, orderPublicId))))
+          .orderBy(legacy.id).limit(batchSize);
         if (!rows.length) break;
+        after = rows.at(-1)!.id;
         for (const { id } of rows) {
           const disposition = await db.transaction(async (tx) => {
             const [row] = await tx.select().from(legacy)
@@ -134,16 +179,27 @@ export function createTrashCopies(deps: ModuleDeps, adapterFor: (row: Connection
               if (inFlight) throw unavailable("STORAGE_TRASH_WORK_IN_FLIGHT");
             }
             const outcome = await remove(tx, row);
+            const disposition = { outcome };
+            if (outcome === "deleteUnverified") {
+              await tx.update(legacy).set({ reasonCode: deleteUnverified, updatedAt: clock.now() }).where(eq(legacy.id, id));
+              return disposition;
+            }
+            if (outcome === "unreachable" && !approved.has(proofId(row.publicId, row.filePublicId, row.connectionPublicId))) {
+              return { outcome, blocked: { copy: row.publicId, source: row.filePublicId, connection: row.connectionPublicId } };
+            }
             await recordKept(tx, orderPublicId, row, outcome);
             await tx.delete(legacy).where(eq(legacy.id, id));
-            return outcome;
+            return disposition;
           }, { isolationLevel: "read committed" });
           track(disposition);
         }
       }
+      after = 0;
       for (;;) {
-        const rows = await db.select({ id: managed.id }).from(managed).where(managedScope(orderPublicId)).orderBy(managed.id).limit(batchSize);
+        const rows = await db.select({ id: managed.id }).from(managed).where(and(gt(managed.id, after), managedScope(orderPublicId)))
+          .orderBy(managed.id).limit(batchSize);
         if (!rows.length) break;
+        after = rows.at(-1)!.id;
         for (const { id } of rows) {
           const disposition = await db.transaction(async (tx) => {
             const [row] = await tx.select().from(managed).where(and(eq(managed.id, id), managedScope(orderPublicId))).for("update");
@@ -154,12 +210,40 @@ export function createTrashCopies(deps: ModuleDeps, adapterFor: (row: Connection
               if (job?.state === "unknown" && row.reasonCode !== COPY_TRASHED) throw unavailable("STORAGE_TRASH_OUTCOME_UNVERIFIED");
             }
             const outcome = await remove(tx, row);
+            const disposition = { outcome };
+            if (outcome === "deleteUnverified") {
+              await tx.update(managed).set({ reasonCode: deleteUnverified, updatedAt: clock.now() }).where(eq(managed.id, id));
+              return disposition;
+            }
+            if (outcome === "unreachable" && !approved.has(proofId(row.publicId, row.sourcePublicId, row.connectionPublicId))) {
+              return { outcome, blocked: { copy: row.publicId, source: row.sourcePublicId, connection: row.connectionPublicId } };
+            }
             await recordKept(tx, orderPublicId, row, outcome);
             await tx.delete(managed).where(eq(managed.id, id));
-            return outcome;
+            return disposition;
           }, { isolationLevel: "read committed" });
           track(disposition);
         }
+      }
+      // Save the exact blocked set reported by this failure, not a blanket permission for the whole run.
+      // Proofs contain no locators and are separate from the durable dispositions for pointers already erased.
+      await db.transaction(async (tx) => {
+        await tx.delete(attempts).where(proofScope);
+        const now = clock.now();
+        for (let i = 0; i < pending.length; i += batchSize) {
+          await tx.insert(attempts).values(pending.slice(i, i + batchSize).map(({ copy, source, connection }) => ({
+            publicId: ulid(now.getTime()), kind: "order_file", sourcePublicId: source, orderPublicId,
+            connectionPublicId: connection, jobPublicId: prefix + copy, attempt: 1,
+            state: "not_written", errorCode: blockedExternal, createdAt: now, finishedAt: now,
+          })));
+        }
+      });
+      if (pending.length) {
+        const entries = [...unreachable].sort(([a], [b]) => a.localeCompare(b));
+        throw new DomainError("UNAVAILABLE", blockedExternal, "A destination for a known copy is unreachable. Recover the destination or explicitly leave the copies in place.", {
+          unreachableCopies: pending.length,
+          unreachableCopyCounts: entries.map(([connection, count]) => `${connection}:${count}`),
+        });
       }
       const receipts = await db.select({ id: managed.id }).from(managed)
         .where(and(eq(managed.orderPublicId, orderPublicId), eq(managed.role, "receipt")));
@@ -170,10 +254,12 @@ export function createTrashCopies(deps: ModuleDeps, adapterFor: (row: Connection
         .where(and(eq(attempts.kind, "order_file"),
           sql`(${attempts.orderPublicId} = ${orderPublicId} OR ${attempts.sourcePublicId} IN (${scopedFiles(db, orderId, orderPublicId)}))`));
       const retained = await db.select({ connection: attempts.connectionPublicId, reason: attempts.errorCode, total: count() })
-        .from(attempts).where(and(eq(attempts.orderPublicId, orderPublicId), inArray(attempts.errorCode, [unverifiedExternal, providerRecycleBin])))
+        .from(attempts).where(and(eq(attempts.orderPublicId, orderPublicId),
+          inArray(attempts.errorCode, [unverifiedExternal, acknowledgedExternal, providerRecycleBin])))
         .groupBy(attempts.connectionPublicId, attempts.errorCode);
       for (const row of retained) {
         if (row.reason === unverifiedExternal) result.unverifiedExternalCopies[row.connection] = row.total;
+        else if (row.reason === acknowledgedExternal) result.acknowledgedExternalCopies[row.connection] = row.total;
         else result.providerRecycleBin += row.total;
       }
       return result;
