@@ -203,6 +203,15 @@ export interface TrashCoordinatorOptions {
    * In full container startup, defaults to the complete 20-module destructive participant manifest.
    */
   expectedParticipants?: readonly string[];
+  /**
+   * Explicit manifest exceptions for modules that intentionally own zero order or customer rows,
+   * mapped to their documented reason. Any manifest module without a `purge` handler and not in
+   * this map fails closed (`TRASH_PARTICIPANT_NO_PURGE_HANDLER`).
+   */
+  manifestNoDataToPurge?: Readonly<Record<string, string>>;
+  runLeaseMs?: number;
+  runHeartbeatMs?: number;
+  sweepLeaseMs?: number;
 }
 
 export interface TrashService extends ModuleLifecycle, TrashRegistry {
