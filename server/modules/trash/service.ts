@@ -167,8 +167,18 @@ interface StoredIdempotencyEnvelope<T> {
   status: "in_progress" | "completed" | "failed";
   fingerprintHash: string;
   batchBindings: Record<string, string | null>;
+  attemptOwner?: string;
+  leaseExpiresAtMs?: number;
+  claimedRunPublicIds?: string[];
+  restoredItems?: Record<string, TrashItemResult>;
   payload?: T;
   failedError?: StoredFailedDomainError;
+}
+
+class RetryRunFirstSignal extends Error {
+  constructor() {
+    super("RETRY_RUN_FIRST");
+  }
 }
 
 interface ExternalCopyProof {
@@ -630,7 +640,17 @@ export function createTrashCoordinator(
     initialBatchBindings?: Record<string, string | null>;
     verifyBatchGenerations: boolean;
     resumablePurgeOperation?: boolean;
-  }): Promise<{ hit: true; payload: T } | { hit: false; rowId: number; hadCommittedClaim: boolean }> {
+    resumableRestoreOperation?: boolean;
+  }): Promise<
+    | { hit: true; payload: T }
+    | {
+        hit: false;
+        rowId: number;
+        attemptOwner: string;
+        hadCommittedClaim: boolean;
+        priorRestoredItems: Record<string, TrashItemResult>;
+      }
+  > {
     const {
       principal,
       capability,
@@ -640,271 +660,515 @@ export function createTrashCoordinator(
       initialBatchBindings = {},
       verifyBatchGenerations,
       resumablePurgeOperation = false,
+      resumableRestoreOperation = false,
     } = params;
     const actionKey = `${capability}:${operation}`.slice(0, 48);
     const kHash = keyHash(`trash.idem:${actionKey}:${idempotencyKey}`);
 
-    return deps.db.transaction(async (tx) => {
-      // Lock order: users/sessions (guardActorInTx) -> orders/users (currentBatchOf) -> trash_purge_runs -> trash_idempotency_keys.
-      await guardActorInTx(tx, principal, capability);
-      const now = deps.clock.now();
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return await deps.db.transaction(async (tx) => {
+          // Canonical lock order: actor user/session -> trash_purge_runs (FOR SHARE, id ASC) -> trash_idempotency_keys (FOR UPDATE).
+          await guardActorInTx(tx, principal, capability);
+          const now = deps.clock.now();
+          const nowMs = now.getTime();
+          const nextAttemptOwner = ulid(nowMs);
+          const nextLeaseExpiresAtMs = nowMs + runLeaseMs;
 
-      const [preExisting] = await tx
-        .select()
-        .from(trashIdempotencyKeys)
-        .where(
-          and(
-            eq(trashIdempotencyKeys.actorUserId, principal.userId),
-            eq(trashIdempotencyKeys.action, actionKey),
-            eq(trashIdempotencyKeys.keyHash, kHash),
-          ),
-        )
-        .limit(1);
-
-      const preParsed = preExisting
-        ? (JSON.parse(preExisting.responseJson) as StoredIdempotencyEnvelope<T>)
-        : null;
-      const liveBatches = new Map<string, string | null>();
-      if (preParsed && verifyBatchGenerations) {
-        for (const bindingKey of Object.keys(preParsed.batchBindings ?? {})) {
-          const sep = bindingKey.indexOf(":");
-          if (sep <= 0) continue;
-          const kind = bindingKey.slice(0, sep) as TrashEntityKind;
-          const publicId = bindingKey.slice(sep + 1);
-          liveBatches.set(bindingKey, await currentBatchOf(tx, { kind, publicId }));
-        }
-      }
-
-      let linkedRun:
-        | { status: "running" | "completed" | "failed"; leaseExpiresAt: Date | null }
-        | undefined;
-      if (preExisting?.claimedRunPublicId) {
-        const [rRow] = await tx
-          .select({
-            status: trashPurgeRuns.status,
-            leaseExpiresAt: trashPurgeRuns.leaseExpiresAt,
-          })
-          .from(trashPurgeRuns)
-          .where(eq(trashPurgeRuns.publicId, preExisting.claimedRunPublicId))
-          .for("share")
-          .limit(1);
-        linkedRun = rRow;
-      }
-
-      const [existing] = await tx
-        .select()
-        .from(trashIdempotencyKeys)
-        .where(
-          and(
-            eq(trashIdempotencyKeys.actorUserId, principal.userId),
-            eq(trashIdempotencyKeys.action, actionKey),
-            eq(trashIdempotencyKeys.keyHash, kHash),
-          ),
-        )
-        .for("update")
-        .limit(1);
-
-      if (existing) {
-        if (existing.claimedRunPublicId && existing.claimedRunPublicId !== preExisting?.claimedRunPublicId) {
-          const [rRow] = await tx
-            .select({
-              status: trashPurgeRuns.status,
-              leaseExpiresAt: trashPurgeRuns.leaseExpiresAt,
-            })
-            .from(trashPurgeRuns)
-            .where(eq(trashPurgeRuns.publicId, existing.claimedRunPublicId))
-            .for("share")
+          const [preExisting] = await tx
+            .select()
+            .from(trashIdempotencyKeys)
+            .where(
+              and(
+                eq(trashIdempotencyKeys.actorUserId, principal.userId),
+                eq(trashIdempotencyKeys.action, actionKey),
+                eq(trashIdempotencyKeys.keyHash, kHash),
+              ),
+            )
             .limit(1);
-          linkedRun = rRow;
-        }
 
-        const parsed = JSON.parse(existing.responseJson) as StoredIdempotencyEnvelope<T>;
-        const ttlElapsed = existing.createdAt.getTime() + IDEM_TTL_MS <= now.getTime();
-        // A reservation with any committed claim/effect is NEVER dropped by 24 h clean-up while its run is incomplete!
-        const hasIncompleteCommittedClaim =
-          existing.claimedRunPublicId !== null
-            ? !linkedRun || linkedRun.status !== "completed"
-            : existing.status === "claimed" || existing.status === "failed";
-        const canRecycleByTtl =
-          ttlElapsed &&
-          !hasIncompleteCommittedClaim &&
-          existing.status === "completed";
-
-        if (canRecycleByTtl) {
-          await tx.delete(trashIdempotencyKeys).where(eq(trashIdempotencyKeys.id, existing.id));
-        } else {
-          if (existing.fingerprintHash !== fingerprintHash) {
-            throw conflict("IDEMPOTENCY_KEY_REUSED", "This request key was already used for a different action.");
-          }
-          if (verifyBatchGenerations) {
-            for (const [bindingKey, recordedBatch] of Object.entries(parsed.batchBindings ?? {})) {
+          const preParsed = preExisting
+            ? (JSON.parse(preExisting.responseJson) as StoredIdempotencyEnvelope<T>)
+            : null;
+          const liveBatches = new Map<string, string | null>();
+          if (preParsed && verifyBatchGenerations) {
+            for (const bindingKey of Object.keys(preParsed.batchBindings ?? {})) {
               const sep = bindingKey.indexOf(":");
               if (sep <= 0) continue;
               const kind = bindingKey.slice(0, sep) as TrashEntityKind;
               const publicId = bindingKey.slice(sep + 1);
-              const liveBatch = liveBatches.has(bindingKey)
-                ? (liveBatches.get(bindingKey) ?? null)
-                : await currentBatchOf(tx, { kind, publicId });
-              if (liveBatch !== null && recordedBatch !== null && liveBatch !== recordedBatch) {
-                throw conflict("IDEMPOTENCY_KEY_REUSED", "This item moved into a new trash batch since that request.");
-              }
+              liveBatches.set(bindingKey, await currentBatchOf(tx, { kind, publicId }));
             }
           }
 
-          if (existing.status === "completed" || parsed.status === "completed") {
-            return { hit: true as const, payload: parsed.payload as T };
-          }
-
-          // Same-fingerprint retry on a purge/ack reservation whose run was claimed resumes that run!
-          if (
-            resumablePurgeOperation &&
-            (existing.claimedRunPublicId !== null || existing.status === "claimed" || existing.status === "failed")
-          ) {
-            if (
-              linkedRun?.status === "running" &&
-              linkedRun.leaseExpiresAt !== null &&
-              linkedRun.leaseExpiresAt.getTime() > now.getTime()
-            ) {
-              throw conflict("REQUEST_IN_PROGRESS", "This request is already being processed.");
-            }
-            const resumingEnvelope: StoredIdempotencyEnvelope<T> = {
-              status: "in_progress",
-              fingerprintHash,
-              batchBindings: parsed.batchBindings ?? { ...initialBatchBindings },
-            };
-            await tx
-              .update(trashIdempotencyKeys)
-              .set({
-                status: "claimed",
-                responseJson: JSON.stringify(resumingEnvelope),
-                updatedAt: now,
+          const preRunPubIds = [
+            ...new Set([
+              ...(preParsed?.claimedRunPublicIds ?? []),
+              ...(preExisting?.claimedRunPublicId ? [preExisting.claimedRunPublicId] : []),
+            ]),
+          ];
+          const linkedRunsByPubId = new Map<
+            string,
+            { id: number; publicId: string; status: "running" | "completed" | "failed"; leaseExpiresAt: Date | null }
+          >();
+          if (preRunPubIds.length > 0) {
+            const runRows = await tx
+              .select({
+                id: trashPurgeRuns.id,
+                publicId: trashPurgeRuns.publicId,
+                status: trashPurgeRuns.status,
+                leaseExpiresAt: trashPurgeRuns.leaseExpiresAt,
               })
-              .where(eq(trashIdempotencyKeys.id, existing.id));
-            return { hit: false as const, rowId: existing.id, hadCommittedClaim: true };
+              .from(trashPurgeRuns)
+              .where(inArray(trashPurgeRuns.publicId, preRunPubIds))
+              .orderBy(asc(trashPurgeRuns.id))
+              .for("share");
+            for (const r of runRows) {
+              linkedRunsByPubId.set(r.publicId, r);
+            }
           }
 
-          if (existing.status === "in_progress" || parsed.status === "in_progress") {
-            throw conflict("REQUEST_IN_PROGRESS", "This request is already being processed.");
+          const [existing] = await tx
+            .select()
+            .from(trashIdempotencyKeys)
+            .where(
+              and(
+                eq(trashIdempotencyKeys.actorUserId, principal.userId),
+                eq(trashIdempotencyKeys.action, actionKey),
+                eq(trashIdempotencyKeys.keyHash, kHash),
+              ),
+            )
+            .for("update")
+            .limit(1);
+
+          if (existing) {
+            const parsed = JSON.parse(existing.responseJson) as StoredIdempotencyEnvelope<T>;
+            const allRunPubIds = [
+              ...new Set([
+                ...(parsed.claimedRunPublicIds ?? []),
+                ...(existing.claimedRunPublicId ? [existing.claimedRunPublicId] : []),
+              ]),
+            ];
+            if (allRunPubIds.some((pid) => !preRunPubIds.includes(pid))) {
+              // Never lock `trash_purge_runs` after `trash_idempotency_keys`; restart tx to lock runs FOR SHARE first.
+              throw new RetryRunFirstSignal();
+            }
+
+            const priorRestored = parsed.restoredItems ?? {};
+            const hasPriorRestored = Object.keys(priorRestored).length > 0;
+            const ttlElapsed = existing.createdAt.getTime() + IDEM_TTL_MS <= nowMs;
+            // Never recycle by 24h TTL while ANY linked purge run or committed partial restore is incomplete!
+            const hasIncompleteCommittedClaim =
+              allRunPubIds.length > 0
+                ? allRunPubIds.some((pid) => {
+                    const r = linkedRunsByPubId.get(pid);
+                    return !r || r.status !== "completed";
+                  })
+                : existing.status === "claimed" || existing.status === "failed" || hasPriorRestored;
+            const canRecycleByTtl =
+              ttlElapsed &&
+              !hasIncompleteCommittedClaim &&
+              (existing.status === "completed" ||
+                (existing.status === "in_progress" &&
+                  (parsed.leaseExpiresAtMs ?? existing.updatedAt.getTime() + runLeaseMs) <= nowMs));
+
+            if (canRecycleByTtl) {
+              await tx.delete(trashIdempotencyKeys).where(eq(trashIdempotencyKeys.id, existing.id));
+            } else {
+              if (existing.fingerprintHash !== fingerprintHash) {
+                throw conflict("IDEMPOTENCY_KEY_REUSED", "This request key was already used for a different action.");
+              }
+              if (verifyBatchGenerations) {
+                for (const [bindingKey, recordedBatch] of Object.entries(parsed.batchBindings ?? {})) {
+                  const sep = bindingKey.indexOf(":");
+                  if (sep <= 0) continue;
+                  const kind = bindingKey.slice(0, sep) as TrashEntityKind;
+                  const publicId = bindingKey.slice(sep + 1);
+                  const liveBatch = liveBatches.has(bindingKey)
+                    ? (liveBatches.get(bindingKey) ?? null)
+                    : await currentBatchOf(tx, { kind, publicId });
+                  if (liveBatch !== null && recordedBatch !== null && liveBatch !== recordedBatch) {
+                    throw conflict("IDEMPOTENCY_KEY_REUSED", "This item moved into a new trash batch since that request.");
+                  }
+                }
+              }
+
+              if (existing.status === "completed" || parsed.status === "completed") {
+                return { hit: true as const, payload: parsed.payload as T };
+              }
+
+              // Same-fingerprint retry on a claimed/failed purge orack reservation resumes once no linked run has an active lease!
+              if (
+                resumablePurgeOperation &&
+                (allRunPubIds.length > 0 || existing.status === "claimed" || existing.status === "failed")
+              ) {
+                const anyActiveRunLease = allRunPubIds.some((pid) => {
+                  const r = linkedRunsByPubId.get(pid);
+                  return (
+                    r?.status === "running" &&
+                    r.leaseExpiresAt !== null &&
+                    r.leaseExpiresAt.getTime() > nowMs
+                  );
+                });
+                const unlinkedAttemptStillLive =
+                  allRunPubIds.length === 0 &&
+                  existing.status !== "failed" &&
+                  (parsed.leaseExpiresAtMs ?? existing.updatedAt.getTime() + runLeaseMs) > nowMs;
+                if (anyActiveRunLease || unlinkedAttemptStillLive) {
+                  throw conflict("REQUEST_IN_PROGRESS", "This request is already being processed.");
+                }
+                const resumingEnvelope: StoredIdempotencyEnvelope<T> = {
+                  status: "in_progress",
+                  fingerprintHash,
+                  batchBindings: parsed.batchBindings ?? { ...initialBatchBindings },
+                  attemptOwner: nextAttemptOwner,
+                  leaseExpiresAtMs: nextLeaseExpiresAtMs,
+                  claimedRunPublicIds: allRunPubIds,
+                };
+                await tx
+                  .update(trashIdempotencyKeys)
+                  .set({
+                    status: "claimed",
+                    responseJson: JSON.stringify(resumingEnvelope),
+                    updatedAt: now,
+                  })
+                  .where(eq(trashIdempotencyKeys.id, existing.id));
+                return {
+                  hit: false as const,
+                  rowId: existing.id,
+                  attemptOwner: nextAttemptOwner,
+                  hadCommittedClaim: true,
+                  priorRestoredItems: {},
+                };
+              }
+
+              // Same-fingerprint retry on a partially-committed bulk restore resumes remaining items!
+              if (
+                resumableRestoreOperation &&
+                (hasPriorRestored || existing.status === "claimed" || existing.status === "failed")
+              ) {
+                const attemptStillLive =
+                  existing.status !== "failed" &&
+                  (parsed.leaseExpiresAtMs ?? existing.updatedAt.getTime() + runLeaseMs) > nowMs;
+                if (attemptStillLive) {
+                  throw conflict("REQUEST_IN_PROGRESS", "This request is already being processed.");
+                }
+                const resumingRestoreEnv: StoredIdempotencyEnvelope<T> = {
+                  status: "in_progress",
+                  fingerprintHash,
+                  batchBindings: parsed.batchBindings ?? { ...initialBatchBindings },
+                  attemptOwner: nextAttemptOwner,
+                  leaseExpiresAtMs: nextLeaseExpiresAtMs,
+                  restoredItems: priorRestored,
+                };
+                await tx
+                  .update(trashIdempotencyKeys)
+                  .set({
+                    status: "claimed",
+                    responseJson: JSON.stringify(resumingRestoreEnv),
+                    updatedAt: now,
+                  })
+                  .where(eq(trashIdempotencyKeys.id, existing.id));
+                return {
+                  hit: false as const,
+                  rowId: existing.id,
+                  attemptOwner: nextAttemptOwner,
+                  hadCommittedClaim: hasPriorRestored,
+                  priorRestoredItems: priorRestored,
+                };
+              }
+
+              // Pre-claim `in_progress`: if the worker's reservation lease is still active, reject concurrent duplicate;
+              // once the pre-claim lease expires (crashed worker with zero committed effects), recover cleanly!
+              if (existing.status === "in_progress" || parsed.status === "in_progress") {
+                const inProgressExpiresAtMs =
+                  parsed.leaseExpiresAtMs ?? existing.updatedAt.getTime() + runLeaseMs;
+                if (inProgressExpiresAtMs > nowMs) {
+                  throw conflict("REQUEST_IN_PROGRESS", "This request is already being processed.");
+                }
+                const recoveredEnvelope: StoredIdempotencyEnvelope<T> = {
+                  status: "in_progress",
+                  fingerprintHash,
+                  batchBindings: { ...initialBatchBindings },
+                  attemptOwner: nextAttemptOwner,
+                  leaseExpiresAtMs: nextLeaseExpiresAtMs,
+                  claimedRunPublicIds: [],
+                  restoredItems: {},
+                };
+                await tx
+                  .update(trashIdempotencyKeys)
+                  .set({
+                    status: "in_progress",
+                    responseJson: JSON.stringify(recoveredEnvelope),
+                    updatedAt: now,
+                  })
+                  .where(eq(trashIdempotencyKeys.id, existing.id));
+                return {
+                  hit: false as const,
+                  rowId: existing.id,
+                  attemptOwner: nextAttemptOwner,
+                  hadCommittedClaim: false,
+                  priorRestoredItems: {},
+                };
+              }
+
+              if (parsed.status === "failed" && parsed.failedError) {
+                throw new DomainError(
+                  parsed.failedError.code,
+                  parsed.failedError.reasonCode,
+                  parsed.failedError.safeMessage,
+                );
+              }
+              return { hit: true as const, payload: parsed.payload as T };
+            }
           }
-          if (parsed.status === "failed" && parsed.failedError) {
-            throw new DomainError(
-              parsed.failedError.code,
-              parsed.failedError.reasonCode,
-              parsed.failedError.safeMessage,
-            );
-          }
-          return { hit: true as const, payload: parsed.payload as T };
+
+          const initial: StoredIdempotencyEnvelope<T> = {
+            status: "in_progress",
+            fingerprintHash,
+            batchBindings: { ...initialBatchBindings },
+            attemptOwner: nextAttemptOwner,
+            leaseExpiresAtMs: nextLeaseExpiresAtMs,
+            claimedRunPublicIds: [],
+            restoredItems: {},
+          };
+          const [ins] = await tx.insert(trashIdempotencyKeys).values({
+            actorUserId: principal.userId,
+            action: actionKey,
+            keyHash: kHash,
+            status: "in_progress",
+            claimedRunPublicId: null,
+            fingerprintHash,
+            responseJson: JSON.stringify(initial),
+            createdAt: now,
+            updatedAt: now,
+          });
+          return {
+            hit: false as const,
+            rowId: Number(ins.insertId),
+            attemptOwner: nextAttemptOwner,
+            hadCommittedClaim: false,
+            priorRestoredItems: {},
+          };
+        });
+      } catch (err) {
+        if (err instanceof RetryRunFirstSignal && attempt < 2) {
+          continue;
         }
+        throw err;
       }
-
-      const initial: StoredIdempotencyEnvelope<T> = {
-        status: "in_progress",
-        fingerprintHash,
-        batchBindings: { ...initialBatchBindings },
-      };
-      const [ins] = await tx.insert(trashIdempotencyKeys).values({
-        actorUserId: principal.userId,
-        action: actionKey,
-        keyHash: kHash,
-        status: "in_progress",
-        claimedRunPublicId: null,
-        fingerprintHash,
-        responseJson: JSON.stringify(initial),
-        createdAt: now,
-        updatedAt: now,
-      });
-      return { hit: false as const, rowId: Number(ins.insertId), hadCommittedClaim: false };
-    });
+    }
+    throw conflict("REQUEST_IN_PROGRESS", "This request is already being processed.");
   }
 
-  async function bindIdempotencyClaimInTx(
-    tx: Tx,
-    idempotencyRowId: number | undefined,
-    runPublicId: string,
-    now: Date,
-  ): Promise<void> {
+  async function bindIdempotencyClaimInTx(params: {
+    tx: Tx;
+    idempotencyRowId: number | undefined;
+    attemptOwner: string | undefined;
+    runPublicId: string;
+    bindingKey?: string;
+    batchId?: string;
+    now: Date;
+  }): Promise<void> {
+    const { tx, idempotencyRowId, attemptOwner, runPublicId, bindingKey, batchId, now } = params;
     if (idempotencyRowId === undefined) return;
+    const [row] = await tx
+      .select()
+      .from(trashIdempotencyKeys)
+      .where(eq(trashIdempotencyKeys.id, idempotencyRowId))
+      .for("update")
+      .limit(1);
+    if (!row || row.status === "completed") return;
+    const parsed = JSON.parse(row.responseJson) as StoredIdempotencyEnvelope<unknown>;
+    if (parsed.status === "completed") return;
+    if (attemptOwner && parsed.attemptOwner && parsed.attemptOwner !== attemptOwner) {
+      throw conflict("PURGE_FENCE_LOST", "Idempotency reservation attempt was superseded.");
+    }
+    const mergedRuns = [
+      ...new Set([
+        ...(parsed.claimedRunPublicIds ?? []),
+        ...(row.claimedRunPublicId ? [row.claimedRunPublicId] : []),
+        runPublicId,
+      ]),
+    ];
+    const mergedBindings: Record<string, string | null> = {
+      ...(parsed.batchBindings ?? {}),
+      ...(bindingKey && batchId ? { [bindingKey]: batchId } : {}),
+    };
+    const nextEnv: StoredIdempotencyEnvelope<unknown> = {
+      ...parsed,
+      status: "in_progress",
+      attemptOwner: attemptOwner ?? parsed.attemptOwner,
+      leaseExpiresAtMs: now.getTime() + runLeaseMs,
+      batchBindings: mergedBindings,
+      claimedRunPublicIds: mergedRuns,
+    };
     await tx
       .update(trashIdempotencyKeys)
       .set({
         status: "claimed",
-        claimedRunPublicId: sql`COALESCE(${trashIdempotencyKeys.claimedRunPublicId}, ${runPublicId})`,
+        claimedRunPublicId: runPublicId,
+        responseJson: JSON.stringify(nextEnv),
         updatedAt: now,
       })
       .where(eq(trashIdempotencyKeys.id, idempotencyRowId));
   }
 
-  async function completeIdempotency<T>(
-    rowId: number,
-    fingerprintHash: string,
-    batchBindings: Record<string, string | null>,
-    payload: T,
-    tx?: Tx,
-  ): Promise<void> {
-    const dbOrTx = tx ?? deps.db;
-    const now = deps.clock.now();
-    const envelope: StoredIdempotencyEnvelope<T> = {
-      status: "completed",
-      fingerprintHash,
-      batchBindings,
-      payload,
+  async function recordRestoreProgressInTx(params: {
+    tx: Tx;
+    rowId: number;
+    attemptOwner: string;
+    itemKey: string;
+    batchId: string;
+    itemResult: TrashItemResult;
+    now: Date;
+  }): Promise<void> {
+    const { tx, rowId, attemptOwner, itemKey, batchId, itemResult, now } = params;
+    const [row] = await tx
+      .select()
+      .from(trashIdempotencyKeys)
+      .where(eq(trashIdempotencyKeys.id, rowId))
+      .for("update")
+      .limit(1);
+    if (!row || row.status === "completed") return;
+    const parsed = JSON.parse(row.responseJson) as StoredIdempotencyEnvelope<unknown>;
+    if (parsed.status === "completed") return;
+    if (parsed.attemptOwner && parsed.attemptOwner !== attemptOwner) {
+      throw conflict("REQUEST_IN_PROGRESS", "Restore reservation attempt was superseded.");
+    }
+    const nextEnv: StoredIdempotencyEnvelope<unknown> = {
+      ...parsed,
+      status: "in_progress",
+      attemptOwner,
+      leaseExpiresAtMs: now.getTime() + runLeaseMs,
+      batchBindings: { ...(parsed.batchBindings ?? {}), [itemKey]: batchId },
+      restoredItems: { ...(parsed.restoredItems ?? {}), [itemKey]: itemResult },
     };
-    await dbOrTx
+    await tx
       .update(trashIdempotencyKeys)
       .set({
-        status: "completed",
-        responseJson: JSON.stringify(envelope),
+        status: "claimed",
+        responseJson: JSON.stringify(nextEnv),
         updatedAt: now,
       })
       .where(eq(trashIdempotencyKeys.id, rowId));
   }
 
+  async function completeIdempotency<T>(
+    rowId: number,
+    attemptOwner: string,
+    fingerprintHash: string,
+    batchBindings: Record<string, string | null>,
+    payload: T,
+    tx?: Tx,
+  ): Promise<void> {
+    const applyInTx = async (innerTx: Tx): Promise<void> => {
+      const [row] = await innerTx
+        .select()
+        .from(trashIdempotencyKeys)
+        .where(eq(trashIdempotencyKeys.id, rowId))
+        .for("update")
+        .limit(1);
+      if (!row || row.status === "completed") return;
+      const parsed = JSON.parse(row.responseJson) as StoredIdempotencyEnvelope<T>;
+      if (parsed.status === "completed") return;
+      if (parsed.attemptOwner && parsed.attemptOwner !== attemptOwner) return;
+      const now = deps.clock.now();
+      const envelope: StoredIdempotencyEnvelope<T> = {
+        status: "completed",
+        fingerprintHash,
+        batchBindings: { ...(parsed.batchBindings ?? {}), ...batchBindings },
+        attemptOwner,
+        claimedRunPublicIds: parsed.claimedRunPublicIds,
+        restoredItems: parsed.restoredItems,
+        payload,
+      };
+      await innerTx
+        .update(trashIdempotencyKeys)
+        .set({
+          status: "completed",
+          responseJson: JSON.stringify(envelope),
+          updatedAt: now,
+        })
+        .where(eq(trashIdempotencyKeys.id, rowId));
+    };
+    if (tx) {
+      await applyInTx(tx);
+    } else {
+      await deps.db.transaction(applyInTx);
+    }
+  }
+
   /**
-   * Retains the idempotency key and records the failed outcome whenever a durable purge claim or mutation
-   * has already committed (D2.8: never release an idempotency key after any committed effect).
+   * Retains the idempotency key and records the failed outcome ONLY if this `attemptOwner` still owns
+   * the reservation and it has not already transitioned to terminal `completed`.
    */
   async function failIdempotency(
     rowId: number,
+    attemptOwner: string,
     fingerprintHash: string,
     batchBindings: Record<string, string | null>,
     err: unknown,
   ): Promise<void> {
-    const now = deps.clock.now();
     const domErr =
       err instanceof DomainError
         ? err
         : unavailable("TRASH_PURGE_FAILED", "Permanent deletion did not finish cleanly and can be retried.");
-    const envelope: StoredIdempotencyEnvelope<never> = {
-      status: "failed",
-      fingerprintHash,
-      batchBindings,
-      failedError: {
-        code: domErr.code,
-        reasonCode: domErr.reasonCode,
-        safeMessage: domErr.safeMessage,
-      },
-    };
     await deps.db
-      .update(trashIdempotencyKeys)
-      .set({
-        status: "failed",
-        responseJson: JSON.stringify(envelope),
-        updatedAt: now,
+      .transaction(async (tx) => {
+        const [row] = await tx
+          .select()
+          .from(trashIdempotencyKeys)
+          .where(eq(trashIdempotencyKeys.id, rowId))
+          .for("update")
+          .limit(1);
+        if (!row || row.status === "completed") return;
+        const parsed = JSON.parse(row.responseJson) as StoredIdempotencyEnvelope<never>;
+        if (parsed.status === "completed") return;
+        if (parsed.attemptOwner && parsed.attemptOwner !== attemptOwner) return;
+        const now = deps.clock.now();
+        const envelope: StoredIdempotencyEnvelope<never> = {
+          status: "failed",
+          fingerprintHash,
+          batchBindings: { ...(parsed.batchBindings ?? {}), ...batchBindings },
+          attemptOwner,
+          claimedRunPublicIds: parsed.claimedRunPublicIds,
+          restoredItems: parsed.restoredItems,
+          failedError: {
+            code: domErr.code,
+            reasonCode: domErr.reasonCode,
+            safeMessage: domErr.safeMessage,
+          },
+        };
+        await tx
+          .update(trashIdempotencyKeys)
+          .set({
+            status: "failed",
+            responseJson: JSON.stringify(envelope),
+            updatedAt: now,
+          })
+          .where(eq(trashIdempotencyKeys.id, rowId));
       })
-      .where(eq(trashIdempotencyKeys.id, rowId))
       .catch(() => undefined);
   }
 
-  async function releaseUnmutatedIdempotency(rowId: number): Promise<void> {
+  async function releaseUnmutatedIdempotency(rowId: number, attemptOwner: string): Promise<void> {
     await deps.db
-      .delete(trashIdempotencyKeys)
-      .where(
-        and(
-          eq(trashIdempotencyKeys.id, rowId),
-          isNull(trashIdempotencyKeys.claimedRunPublicId),
-          eq(trashIdempotencyKeys.status, "in_progress"),
-        ),
-      )
+      .transaction(async (tx) => {
+        const [row] = await tx
+          .select()
+          .from(trashIdempotencyKeys)
+          .where(eq(trashIdempotencyKeys.id, rowId))
+          .for("update")
+          .limit(1);
+        if (!row || row.status !== "in_progress" || row.claimedRunPublicId !== null) return;
+        const parsed = JSON.parse(row.responseJson) as StoredIdempotencyEnvelope<unknown>;
+        if (parsed.status === "completed") return;
+        if (parsed.attemptOwner && parsed.attemptOwner !== attemptOwner) return;
+        if ((parsed.claimedRunPublicIds?.length ?? 0) > 0) return;
+        if (Object.keys(parsed.restoredItems ?? {}).length > 0) return;
+        await tx.delete(trashIdempotencyKeys).where(eq(trashIdempotencyKeys.id, rowId));
+      })
       .catch(() => undefined);
   }
 
@@ -1323,11 +1587,31 @@ export function createTrashCoordinator(
 
     if (item.kind === "order") {
       const [peekOwner] = await tx
-        .select({ ownerUserId: orders.ownerUserId })
+        .select({ id: orders.id, ownerUserId: orders.ownerUserId })
         .from(orders)
         .where(eq(orders.publicId, item.publicId))
         .limit(1);
       if (!peekOwner) throw notFound("ORDER_NOT_FOUND");
+
+      // Lock `trash_purge_run_targets` BEFORE `users -> orders` to preserve strict global lock ordering!
+      const [ownedTarget] = await tx
+        .select({ id: trashPurgeRunTargets.id })
+        .from(trashPurgeRunTargets)
+        .where(
+          and(
+            eq(trashPurgeRunTargets.entityKind, "order"),
+            eq(trashPurgeRunTargets.entityId, peekOwner.id),
+          ),
+        )
+        .for("share")
+        .limit(1);
+      if (ownedTarget) {
+        throw conflict(
+          "PURGE_IN_PROGRESS",
+          "Permanent deletion has started for this order, so it can no longer be restored.",
+        );
+      }
+
       await tx
         .select({ id: users.id })
         .from(users)
@@ -1354,23 +1638,6 @@ export function createTrashCoordinator(
         throw conflict("NOT_IN_TRASH", "This order is not in the trash.");
       }
       if (lockedOrder.purgeStartedAt) {
-        throw conflict(
-          "PURGE_IN_PROGRESS",
-          "Permanent deletion has started for this order, so it can no longer be restored.",
-        );
-      }
-      const [ownedTarget] = await tx
-        .select({ id: trashPurgeRunTargets.id })
-        .from(trashPurgeRunTargets)
-        .where(
-          and(
-            eq(trashPurgeRunTargets.entityKind, "order"),
-            eq(trashPurgeRunTargets.entityId, lockedOrder.id),
-          ),
-        )
-        .for("share")
-        .limit(1);
-      if (ownedTarget) {
         throw conflict(
           "PURGE_IN_PROGRESS",
           "Permanent deletion has started for this order, so it can no longer be restored.",
@@ -1433,6 +1700,32 @@ export function createTrashCoordinator(
       return { batchId };
     }
 
+    const [peekCust] = await tx
+      .select({ id: users.id })
+      .from(users)
+      .where(and(eq(users.publicId, item.publicId), eq(users.role, "customer")))
+      .limit(1);
+    if (!peekCust) throw notFound("CUSTOMER_NOT_FOUND");
+
+    // Lock `trash_purge_run_targets` BEFORE `users -> orders` to preserve strict global lock ordering!
+    const [ownedCustTarget] = await tx
+      .select({ id: trashPurgeRunTargets.id })
+      .from(trashPurgeRunTargets)
+      .where(
+        and(
+          eq(trashPurgeRunTargets.entityKind, "customer"),
+          eq(trashPurgeRunTargets.entityId, peekCust.id),
+        ),
+      )
+      .for("share")
+      .limit(1);
+    if (ownedCustTarget) {
+      throw conflict(
+        "PURGE_IN_PROGRESS",
+        "Permanent deletion has started for this customer account, so it can no longer be restored.",
+      );
+    }
+
     const [lockedCust] = await tx
       .select({
         id: users.id,
@@ -1443,7 +1736,7 @@ export function createTrashCoordinator(
         purgedAt: users.purgedAt,
       })
       .from(users)
-      .where(and(eq(users.publicId, item.publicId), eq(users.role, "customer")))
+      .where(and(eq(users.id, peekCust.id), eq(users.role, "customer")))
       .for("update")
       .limit(1);
 
@@ -1470,23 +1763,6 @@ export function createTrashCoordinator(
       throw conflict("NOT_IN_TRASH", "This customer account is not in the trash.");
     }
     if (lockedCust.purgeStartedAt) {
-      throw conflict(
-        "PURGE_IN_PROGRESS",
-        "Permanent deletion has started for this customer account, so it can no longer be restored.",
-      );
-    }
-    const [ownedCustTarget] = await tx
-      .select({ id: trashPurgeRunTargets.id })
-      .from(trashPurgeRunTargets)
-      .where(
-        and(
-          eq(trashPurgeRunTargets.entityKind, "customer"),
-          eq(trashPurgeRunTargets.entityId, lockedCust.id),
-        ),
-      )
-      .for("share")
-      .limit(1);
-    if (ownedCustTarget) {
       throw conflict(
         "PURGE_IN_PROGRESS",
         "Permanent deletion has started for this customer account, so it can no longer be restored.",
@@ -1583,7 +1859,9 @@ export function createTrashCoordinator(
   }
 
   /**
-   * Re-locks and re-validates an existing owning run's targets in strict `users -> orders` ascending order,
+   * Locks `trash_purge_runs FOR UPDATE` FIRST (so takeover waits for any in-flight participant transaction
+   * holding `FOR SHARE` BEFORE touching `users` or `orders`), then locks `trash_purge_run_targets`,
+   * `users`, `orders`, and `trash_idempotency_keys` in strict canonical order, revalidates targets,
    * optionally records per-target typed external-copy acknowledgment, increments `fencingToken`, and resumes.
    */
   async function resumeExistingPurgeRunInTx(params: {
@@ -1594,6 +1872,12 @@ export function createTrashCoordinator(
     now: Date;
     workerLeaseOwner: string;
     idempotencyRowId?: number;
+    attemptOwner?: string;
+    bindingKey?: string;
+    expectedPrimary?: {
+      item: TrashItemRef;
+      expectedSingleConfirmation?: string;
+    };
     acknowledgeExternal?: {
       targetOrderPublicId?: string;
       confirmation: string;
@@ -1620,13 +1904,17 @@ export function createTrashCoordinator(
       now,
       workerLeaseOwner,
       idempotencyRowId,
+      attemptOwner,
+      bindingKey,
+      expectedPrimary,
       acknowledgeExternal,
     } = params;
     const ordersTrash = requireOrdersTrash();
     const idTrash = requireIdentityTrash();
+    const nowMs = now.getTime();
 
     // Lock the run row FOR UPDATE FIRST inside this transaction: if an in-flight participant transaction
-    // currently holds FOR SHARE via `run.assertCurrentInTx(tx)`, MySQL blocks here until that participant tx finishes!
+    // currently holds FOR SHARE via `run.assertCurrentInTx(tx)`, MySQL blocks here BEFORE we touch `users`/`orders`!
     const [lockedRun] = await tx
       .select()
       .from(trashPurgeRuns)
@@ -1635,7 +1923,38 @@ export function createTrashCoordinator(
       .limit(1);
     if (!lockedRun) throw notFound("PURGE_RUN_NOT_FOUND");
     if (lockedRun.status === "completed") {
-      await bindIdempotencyClaimInTx(tx, idempotencyRowId, lockedRun.publicId, now);
+      if (expectedPrimary?.item.batchId && lockedRun.batchId !== expectedPrimary.item.batchId) {
+        if (expectedPrimary.item.kind === "order") {
+          const [ord] = await tx
+            .select({ trashBatchId: orders.trashBatchId })
+            .from(orders)
+            .where(eq(orders.id, lockedRun.entityId))
+            .for("share")
+            .limit(1);
+          if (ord?.trashBatchId !== expectedPrimary.item.batchId) {
+            throw conflict("STALE", "This order changed meanwhile. Review again.");
+          }
+        } else {
+          const [cust] = await tx
+            .select({ trashBatchId: users.trashBatchId })
+            .from(users)
+            .where(eq(users.id, lockedRun.entityId))
+            .for("share")
+            .limit(1);
+          if (cust?.trashBatchId !== expectedPrimary.item.batchId) {
+            throw conflict("STALE", "This customer account changed meanwhile. Review again.");
+          }
+        }
+      }
+      await bindIdempotencyClaimInTx({
+        tx,
+        idempotencyRowId,
+        attemptOwner,
+        runPublicId: lockedRun.publicId,
+        bindingKey,
+        batchId: lockedRun.batchId,
+        now,
+      });
       const c = parseCounts(lockedRun.countsJson);
       return {
         alreadyCompleted: true,
@@ -1648,7 +1967,7 @@ export function createTrashCoordinator(
     if (
       lockedRun.status === "running" &&
       lockedRun.leaseExpiresAt !== null &&
-      lockedRun.leaseExpiresAt.getTime() > now.getTime()
+      lockedRun.leaseExpiresAt.getTime() > nowMs
     ) {
       throw conflict(
         "PURGE_IN_PROGRESS",
@@ -1660,7 +1979,7 @@ export function createTrashCoordinator(
       actor.kind === "system" &&
       lockedRun.status === "failed" &&
       lockedRun.nextRetryAt &&
-      lockedRun.nextRetryAt.getTime() > now.getTime()
+      lockedRun.nextRetryAt.getTime() > nowMs
     ) {
       throw conflict("PURGE_RETRY_BACKOFF", "Deletion run is waiting for retry backoff.");
     }
@@ -1671,6 +1990,33 @@ export function createTrashCoordinator(
       .where(eq(trashPurgeRunTargets.runId, lockedRun.id))
       .orderBy(asc(trashPurgeRunTargets.position))
       .for("update");
+
+    if (expectedPrimary !== undefined) {
+      if (actor.kind === "user" && !expectedPrimary.item.batchId) {
+        throw validation("BATCH_ID_REQUIRED", "Include the trash batch identifier.");
+      }
+      if (expectedPrimary.item.batchId && lockedRun.batchId !== expectedPrimary.item.batchId) {
+        throw conflict(
+          "STALE",
+          expectedPrimary.item.kind === "order"
+            ? "This order changed meanwhile. Review again."
+            : "This customer account changed meanwhile. Review again.",
+        );
+      }
+      const primaryTarget = targetRows.find(
+        (t) => t.entityKind === lockedRun.entityKind && t.entityId === lockedRun.entityId,
+      );
+      if (
+        expectedPrimary.expectedSingleConfirmation !== undefined &&
+        primaryTarget?.targetReference &&
+        expectedPrimary.expectedSingleConfirmation.trim() !== primaryTarget.targetReference
+      ) {
+        throw validation(
+          "CONFIRMATION_MISMATCH",
+          "The confirmation you typed doesn't match. Nothing was deleted.",
+        );
+      }
+    }
 
     let acknowledgedOrderPublicId: string | null = null;
 
@@ -1808,7 +2154,21 @@ export function createTrashCoordinator(
       );
     }
 
-    // Re-lock customer targets FIRST (`users -> orders` ascending order), then order targets.
+    // If system retention sweep is resuming an order run, read its ownerUserId (unlocked) so we lock `users` BEFORE `orders`.
+    let primaryOrderOwnerSnapshot:
+      | { id: number; trashedAt: Date | null; trashBatchId: string | null; purgedAt: Date | null }
+      | undefined;
+    let primaryOrderOwnerId: number | null = null;
+    if (actor.kind === "system" && lockedRun.entityKind === "order") {
+      const [ordOwner] = await tx
+        .select({ ownerUserId: orders.ownerUserId })
+        .from(orders)
+        .where(eq(orders.id, lockedRun.entityId))
+        .limit(1);
+      primaryOrderOwnerId = ordOwner?.ownerUserId ?? null;
+    }
+
+    // Re-lock customer targets (and any primary order owner) FIRST (`users -> orders` ascending order), then order targets.
     const customerTargets = targetRows
       .filter((t) => t.entityKind === "customer")
       .sort((a, b) => a.entityId - b.entityId);
@@ -1816,35 +2176,98 @@ export function createTrashCoordinator(
       .filter((t) => t.entityKind === "order")
       .sort((a, b) => a.entityId - b.entityId);
 
-    for (const ct of customerTargets) {
-      const [cRow] = await tx
-        .select({
-          id: users.id,
-          trashBatchId: users.trashBatchId,
-          purgedAt: users.purgedAt,
-        })
-        .from(users)
-        .where(eq(users.id, ct.entityId))
-        .for("update")
-        .limit(1);
-      if (!cRow) throw notFound("CUSTOMER_NOT_FOUND");
-      if (!cRow.purgedAt && cRow.trashBatchId !== ct.batchId) {
-        throw conflict("STALE", "Customer trash generation changed meanwhile. Review again.");
-      }
-      if (!cRow.purgedAt) {
-        await idTrash.markPurgeStartedInTx(tx, ct.entityId, {
-          batchId: ct.batchId,
-          runId: lockedRun.publicId,
-          actor,
-        });
+    const customerTargetById = new Map(customerTargets.map((ct) => [ct.entityId, ct]));
+    const allUserIdsToLock = [
+      ...new Set([
+        ...customerTargets.map((ct) => ct.entityId),
+        ...(primaryOrderOwnerId !== null ? [primaryOrderOwnerId] : []),
+      ]),
+    ].sort((a, b) => a - b);
+
+    const lockedCustomerRows = new Map<
+      number,
+      { id: number; trashedAt: Date | null; trashBatchId: string | null; purgedAt: Date | null; customerRef: string | null; publicId: string }
+    >();
+    for (const uid of allUserIdsToLock) {
+      const ct = customerTargetById.get(uid);
+      if (ct) {
+        const [cRow] = await tx
+          .select({
+            id: users.id,
+            trashedAt: users.trashedAt,
+            trashBatchId: users.trashBatchId,
+            purgedAt: users.purgedAt,
+            customerRef: users.customerRef,
+            publicId: users.publicId,
+          })
+          .from(users)
+          .where(eq(users.id, ct.entityId))
+          .for("update")
+          .limit(1);
+        if (!cRow) throw notFound("CUSTOMER_NOT_FOUND");
+        if (!cRow.purgedAt && (!cRow.trashedAt || !cRow.trashBatchId)) {
+          throw conflict("NOT_IN_TRASH", "This customer account is no longer in the trash.");
+        }
+        if (!cRow.purgedAt && cRow.trashBatchId !== ct.batchId) {
+          throw conflict("STALE", "Customer trash generation changed meanwhile. Review again.");
+        }
+        if (
+          expectedPrimary?.expectedSingleConfirmation !== undefined &&
+          lockedRun.entityKind === "customer" &&
+          ct.entityId === lockedRun.entityId
+        ) {
+          const expectedRef = cRow.customerRef ?? cRow.publicId;
+          if (expectedPrimary.expectedSingleConfirmation.trim() !== expectedRef) {
+            throw validation(
+              "CONFIRMATION_MISMATCH",
+              "The confirmation you typed doesn't match. Nothing was deleted.",
+            );
+          }
+        }
+        if (!cRow.purgedAt) {
+          await idTrash.markPurgeStartedInTx(tx, ct.entityId, {
+            batchId: ct.batchId,
+            runId: lockedRun.publicId,
+            actor,
+          });
+        }
+        lockedCustomerRows.set(uid, cRow);
+      } else {
+        const [oUser] = await tx
+          .select({
+            id: users.id,
+            trashedAt: users.trashedAt,
+            trashBatchId: users.trashBatchId,
+            purgedAt: users.purgedAt,
+          })
+          .from(users)
+          .where(eq(users.id, uid))
+          .for("share")
+          .limit(1);
+        if (oUser) primaryOrderOwnerSnapshot = oUser;
       }
     }
 
+    const lockedOrderRows = new Map<
+      number,
+      {
+        id: number;
+        reference: string;
+        groupRootOrderId: number | null;
+        lockState: string;
+        trashedAt: Date | null;
+        trashBatchId: string | null;
+        purgedAt: Date | null;
+      }
+    >();
     if (orderTargets.length > 0) {
       const lockedOrders = await tx
         .select({
           id: orders.id,
+          reference: orders.reference,
+          groupRootOrderId: orders.groupRootOrderId,
           lockState: orders.lockState,
+          trashedAt: orders.trashedAt,
           trashBatchId: orders.trashBatchId,
           purgedAt: orders.purgedAt,
         })
@@ -1857,8 +2280,22 @@ export function createTrashCoordinator(
         const oRow = byId.get(ot.entityId);
         if (!oRow) throw notFound("ORDER_NOT_FOUND");
         if (oRow.lockState === "legal_hold") throw legalHoldError();
+        if (!oRow.purgedAt && (!oRow.trashedAt || !oRow.trashBatchId)) {
+          throw conflict("NOT_IN_TRASH", "This order is no longer in the trash.");
+        }
         if (!oRow.purgedAt && oRow.trashBatchId !== ot.batchId) {
           throw conflict("STALE", "Order trash generation changed meanwhile. Review again.");
+        }
+        if (
+          expectedPrimary?.expectedSingleConfirmation !== undefined &&
+          lockedRun.entityKind === "order" &&
+          ot.entityId === lockedRun.entityId &&
+          expectedPrimary.expectedSingleConfirmation.trim() !== oRow.reference
+        ) {
+          throw validation(
+            "CONFIRMATION_MISMATCH",
+            "The confirmation you typed doesn't match. Nothing was deleted.",
+          );
         }
         if (!oRow.purgedAt) {
           await ordersTrash.markPurgeStartedInTx(tx, {
@@ -1867,6 +2304,80 @@ export function createTrashCoordinator(
             actor,
           });
         }
+        lockedOrderRows.set(ot.entityId, oRow);
+      }
+    }
+
+    // Revalidate live/held additions or live/held customer orders and system due cutoff under target locks.
+    if (lockedRun.entityKind === "order") {
+      const primaryOrd = lockedOrderRows.get(lockedRun.entityId);
+      if (primaryOrd && primaryOrd.groupRootOrderId === null) {
+        const [badAdd] = await tx
+          .select({ id: orders.id, lockState: orders.lockState, trashedAt: orders.trashedAt })
+          .from(orders)
+          .where(
+            and(
+              eq(orders.groupRootOrderId, primaryOrd.id),
+              isNull(orders.purgedAt),
+              or(isNull(orders.trashedAt), eq(orders.lockState, "legal_hold")),
+            ),
+          )
+          .for("share")
+          .limit(1);
+        if (badAdd?.lockState === "legal_hold") throw legalHoldError();
+        if (badAdd && badAdd.trashedAt === null) {
+          throw conflict(
+            "ROOT_HAS_LIVE_ADDITIONS",
+            "Move all add-on orders in this project to the trash before deleting the first order permanently.",
+          );
+        }
+      }
+      if (actor.kind === "system" && primaryOrd && !primaryOrd.purgedAt && primaryOrd.trashedAt) {
+        const retention = await readRetentionValues(tx, true);
+        const { dueAt, movedWithCustomer } = computeOrderDueAt(
+          primaryOrd.trashedAt,
+          lockedRun.batchId,
+          primaryOrderOwnerSnapshot && !primaryOrderOwnerSnapshot.purgedAt
+            ? {
+                trashedAt: primaryOrderOwnerSnapshot.trashedAt,
+                trashBatchId: primaryOrderOwnerSnapshot.trashBatchId,
+              }
+            : undefined,
+          retention,
+        );
+        if (movedWithCustomer || !dueAt || dueAt.getTime() > nowMs) {
+          throw conflict("NOT_DUE", "This order is not yet due for automatic clean-up.");
+        }
+      }
+    } else {
+      const primaryCust = lockedCustomerRows.get(lockedRun.entityId);
+      const [badCustOrd] = await tx
+        .select({ id: orders.id, lockState: orders.lockState, trashedAt: orders.trashedAt })
+        .from(orders)
+        .where(
+          and(
+            eq(orders.ownerUserId, lockedRun.entityId),
+            isNull(orders.purgedAt),
+            or(isNull(orders.trashedAt), eq(orders.lockState, "legal_hold")),
+          ),
+        )
+        .for("share")
+        .limit(1);
+      if (badCustOrd?.lockState === "legal_hold") throw legalHoldError();
+      if (badCustOrd && badCustOrd.trashedAt === null) {
+        throw conflict(
+          "CUSTOMER_HAS_LIVE_ORDERS",
+          "Move all live orders of this customer account to the trash before deleting the account permanently.",
+        );
+      }
+      if (actor.kind === "system" && primaryCust && !primaryCust.purgedAt && primaryCust.trashedAt) {
+        const retention = await readRetentionValues(tx, true);
+        const dueAt = retention.autoPurgeEnabled
+          ? addDays(primaryCust.trashedAt, retention.customerDays)
+          : null;
+        if (!dueAt || dueAt.getTime() > nowMs) {
+          throw conflict("NOT_DUE", "This customer account is not yet due for automatic clean-up.");
+        }
       }
     }
 
@@ -1874,7 +2385,7 @@ export function createTrashCoordinator(
     const parsedCounts = parseCounts(lockedRun.countsJson);
     const meta = parseRunMeta(lockedRun.checkpointJson);
 
-    const leaseExpiresAt = new Date(now.getTime() + runLeaseMs);
+    const leaseExpiresAt = new Date(nowMs + runLeaseMs);
     await tx
       .update(trashPurgeRuns)
       .set({
@@ -1892,7 +2403,15 @@ export function createTrashCoordinator(
       })
       .where(and(eq(trashPurgeRuns.id, lockedRun.id), eq(trashPurgeRuns.fencingToken, lockedRun.fencingToken)));
 
-    await bindIdempotencyClaimInTx(tx, idempotencyRowId, lockedRun.publicId, now);
+    await bindIdempotencyClaimInTx({
+      tx,
+      idempotencyRowId,
+      attemptOwner,
+      runPublicId: lockedRun.publicId,
+      bindingKey,
+      batchId: lockedRun.batchId,
+      now,
+    });
 
     return {
       alreadyCompleted: false,
@@ -1917,7 +2436,14 @@ export function createTrashCoordinator(
     bulkCount: number;
     expectedSingleConfirmation?: string;
     sweepPublicId?: string;
+    sweepFence?: {
+      sweepRowId: number;
+      sweepToken: number;
+      sweepLeaseOwner: string;
+      jobFence?: TrashCleanupJobFence;
+    };
     idempotencyRowId?: number;
+    attemptOwner?: string;
     acknowledgeExternal?: {
       runPublicId: string;
       targetOrderPublicId?: string;
@@ -1932,7 +2458,9 @@ export function createTrashCoordinator(
       bulkCount,
       expectedSingleConfirmation,
       sweepPublicId,
+      sweepFence,
       idempotencyRowId,
+      attemptOwner,
       acknowledgeExternal,
       onClaimCommitted,
     } = params;
@@ -1940,222 +2468,309 @@ export function createTrashCoordinator(
     const ordersTrash = requireOrdersTrash();
     const idTrash = requireIdentityTrash();
     const workerLeaseOwner = ulid(deps.clock.now().getTime());
-      // Phase 1: Synchronized lock + durable per-target ownership claim / resume inside TX.
-      const claimed = await deps.db.transaction(async (tx) => {
-        if (auditPrincipal) {
-          await guardActorInTx(tx, auditPrincipal, "trash.purge");
-          const maint = await isMaintenanceBlockingCleanup(tx);
-          if (maint === "WORKER_DRAINING") {
-            throw conflict("MAINTENANCE_ACTIVE", "Workers are draining for maintenance. Try again shortly.");
-          }
-        } else {
-          await shareLockRetentionCohortInTx(tx);
-          const retention = await readRetentionValues(tx, true);
-          if (!retention.autoPurgeEnabled) {
-            throw conflict("AUTO_PURGE_DISABLED", "Automatic clean-up is disabled.");
-          }
-          const maint = await isMaintenanceBlockingCleanup(tx);
-          if (maint) {
-            throw conflict("MAINTENANCE_ACTIVE", "Maintenance mode is active.");
-          }
-        }
+    const bindingKey = `${item.kind}:${item.publicId}`;
 
-        // Fail closed BEFORE claiming or mutating any run row if the current manifest is incomplete or missing a purge handler!
-        resolveParticipantsOrFail(computeExpectedModules());
+    type PhaseOneClaimResult = Awaited<ReturnType<typeof resumeExistingPurgeRunInTx>>;
+    let claimed: PhaseOneClaimResult | undefined;
 
-        const now = deps.clock.now();
-        const nowMs = now.getTime();
-
-        // Explicit `finishLeavingExternalCopies` resumption by `runPublicId`
-        if (acknowledgeExternal !== undefined) {
-          const [targetRun] = await tx
-            .select()
-            .from(trashPurgeRuns)
-            .where(eq(trashPurgeRuns.publicId, acknowledgeExternal.runPublicId))
-            .limit(1);
-          if (!targetRun) throw notFound("PURGE_RUN_NOT_FOUND");
-
-          const runTargets = await tx
-            .select()
-            .from(trashPurgeRunTargets)
-            .where(eq(trashPurgeRunTargets.runId, targetRun.id))
-            .orderBy(asc(trashPurgeRunTargets.position));
-
-          const matchesPrimary =
-            targetRun.entityKind === item.kind &&
-            targetRun.entityPublicId === item.publicId &&
-            (!item.batchId || targetRun.batchId === item.batchId);
-          const matchesTarget = runTargets.some(
-            (t) =>
-              t.entityKind === item.kind &&
-              t.entityPublicId === item.publicId &&
-              (!item.batchId || t.batchId === item.batchId),
-          );
-          if (!matchesPrimary && !matchesTarget) {
-            throw conflict("STALE", "The failed deletion run does not match this item or trash batch.");
+    for (let claimAttempt = 0; claimAttempt < 3; claimAttempt += 1) {
+      try {
+        // Phase 1: Synchronized lock + durable per-target ownership claim / resume inside TX.
+        // Canonical lock order:
+        //   trash_cleanup_sweeps (if sweep) -> trash_purge_runs -> trash_purge_run_targets -> users (id ASC) -> orders (id ASC) -> trash_idempotency_keys.
+        claimed = await deps.db.transaction(async (tx) => {
+          if (sweepFence) {
+            const sNow = deps.clock.now();
+            const [currSweep] = await tx
+              .select({
+                status: trashCleanupSweeps.status,
+                activeSlot: trashCleanupSweeps.activeSlot,
+                fencingToken: trashCleanupSweeps.fencingToken,
+                leaseOwner: trashCleanupSweeps.leaseOwner,
+                leaseExpiresAt: trashCleanupSweeps.leaseExpiresAt,
+              })
+              .from(trashCleanupSweeps)
+              .where(eq(trashCleanupSweeps.id, sweepFence.sweepRowId))
+              .for("update")
+              .limit(1);
+            if (
+              !currSweep ||
+              currSweep.status !== "running" ||
+              currSweep.activeSlot !== 1 ||
+              currSweep.fencingToken !== sweepFence.sweepToken ||
+              currSweep.leaseOwner !== sweepFence.sweepLeaseOwner ||
+              currSweep.leaseExpiresAt === null ||
+              currSweep.leaseExpiresAt.getTime() <= sNow.getTime()
+            ) {
+              throw conflict("SWEEP_FENCE_LOST", "Retention clean-up sweep lost its lease.");
+            }
+            if (sweepFence.jobFence) {
+              if (sweepFence.jobFence.signal.aborted) {
+                throw conflict("SWEEP_FENCE_LOST", "Retention clean-up job was aborted.");
+              }
+              try {
+                await sweepFence.jobFence.assertStillOwned();
+              } catch {
+                throw conflict("SWEEP_FENCE_LOST", "Retention clean-up job lost ownership.");
+              }
+            }
+            await tx
+              .update(trashCleanupSweeps)
+              .set({ leaseExpiresAt: new Date(sNow.getTime() + sweepLeaseMs) })
+              .where(eq(trashCleanupSweeps.id, sweepFence.sweepRowId));
           }
 
-          // Pre-lock customer & order targets in canonical `users -> orders` ascending order BEFORE locking `trash_purge_runs`!
-          const preCustIds = runTargets
-            .filter((t) => t.entityKind === "customer")
-            .map((t) => t.entityId)
-            .sort((a, b) => a - b);
-          const preOrdIds = runTargets
-            .filter((t) => t.entityKind === "order")
-            .map((t) => t.entityId)
-            .sort((a, b) => a - b);
-          if (preCustIds.length > 0) {
-            await tx.select({ id: users.id }).from(users).where(inArray(users.id, preCustIds)).orderBy(asc(users.id)).for("update");
-          }
-          if (preOrdIds.length > 0) {
-            await tx.select({ id: orders.id }).from(orders).where(inArray(orders.id, preOrdIds)).orderBy(asc(orders.id)).for("update");
-          }
-
-          return resumeExistingPurgeRunInTx({
-            tx,
-            existingRun: targetRun,
-            actor,
-            auditPrincipal,
-            now,
-            workerLeaseOwner,
-            idempotencyRowId,
-            acknowledgeExternal: {
-              targetOrderPublicId: acknowledgeExternal.targetOrderPublicId,
-              confirmation: acknowledgeExternal.confirmation,
-            },
-          });
-        }
-
-        if (item.kind === "order") {
-          const [preOrder] = await tx
-            .select({
-              id: orders.id,
-              ownerUserId: orders.ownerUserId,
-              groupRootOrderId: orders.groupRootOrderId,
-            })
-            .from(orders)
-            .where(eq(orders.publicId, item.publicId))
-            .limit(1);
-          if (!preOrder) throw notFound("ORDER_NOT_FOUND");
-
-          // Pre-read group additions (including cross-owner reassigned additions) so we lock ALL `users` BEFORE `orders`.
-          const preAdditions =
-            preOrder.groupRootOrderId === null
-              ? await tx
-                  .select({ id: orders.id, ownerUserId: orders.ownerUserId })
-                  .from(orders)
-                  .where(and(eq(orders.groupRootOrderId, preOrder.id), isNull(orders.purgedAt)))
-                  .orderBy(asc(orders.id))
-                  .limit(MAX_CASCADE_TARGETS + 1)
-              : [];
-          if (preAdditions.length > MAX_CASCADE_TARGETS) {
-            throw conflict("CASCADE_TOO_LARGE", "This order group has too many additions to delete at once.");
+          if (auditPrincipal) {
+            const maint = await isMaintenanceBlockingCleanup(tx);
+            if (maint === "WORKER_DRAINING") {
+              throw conflict("MAINTENANCE_ACTIVE", "Workers are draining for maintenance. Try again shortly.");
+            }
+            await guardActorInTx(tx, auditPrincipal, "trash.purge");
+          } else {
+            await shareLockRetentionCohortInTx(tx);
+            const retention = await readRetentionValues(tx, true);
+            if (!retention.autoPurgeEnabled) {
+              throw conflict("AUTO_PURGE_DISABLED", "Automatic clean-up is disabled.");
+            }
+            const maint = await isMaintenanceBlockingCleanup(tx);
+            if (maint) {
+              throw conflict("MAINTENANCE_ACTIVE", "Maintenance mode is active.");
+            }
           }
 
-          const allOwnerIds = [
-            ...new Set([preOrder.ownerUserId, ...preAdditions.map((a) => a.ownerUserId)]),
-          ].sort((a, b) => a - b);
-          const lockedOwners = await tx
-            .select({
-              id: users.id,
-              trashedAt: users.trashedAt,
-              trashBatchId: users.trashBatchId,
-              purgedAt: users.purgedAt,
-            })
-            .from(users)
-            .where(inArray(users.id, allOwnerIds))
-            .orderBy(asc(users.id))
-            .for("share");
-          const lockedOwner = lockedOwners.find((u) => u.id === preOrder.ownerUserId);
+          // Fail closed BEFORE claiming or mutating any run row if the current manifest is incomplete or missing a purge handler!
+          resolveParticipantsOrFail(computeExpectedModules());
 
-          const candidateIds = [preOrder.id, ...preAdditions.map((a) => a.id)].sort((a, b) => a - b);
-          const lockedOrders = await tx
-            .select()
-            .from(orders)
-            .where(inArray(orders.id, candidateIds))
-            .orderBy(asc(orders.id))
-            .for("update");
-          const lockedPrimary = lockedOrders.find((o) => o.id === preOrder.id);
-          if (!lockedPrimary) throw notFound("ORDER_NOT_FOUND");
+          const now = deps.clock.now();
+          const nowMs = now.getTime();
 
-          if (lockedPrimary.purgedAt) {
-            const [ownedTarget] = await tx
+          // Explicit `finishLeavingExternalCopies` resumption by `runPublicId` (`run-first`: locks `trash_purge_runs` BEFORE `users`/`orders`!)
+          if (acknowledgeExternal !== undefined) {
+            const [targetRun] = await tx
+              .select()
+              .from(trashPurgeRuns)
+              .where(eq(trashPurgeRuns.publicId, acknowledgeExternal.runPublicId))
+              .limit(1);
+            if (!targetRun) throw notFound("PURGE_RUN_NOT_FOUND");
+
+            const runTargets = await tx
+              .select()
+              .from(trashPurgeRunTargets)
+              .where(eq(trashPurgeRunTargets.runId, targetRun.id))
+              .orderBy(asc(trashPurgeRunTargets.position));
+
+            const matchesPrimary =
+              targetRun.entityKind === item.kind &&
+              targetRun.entityPublicId === item.publicId &&
+              (!item.batchId || targetRun.batchId === item.batchId);
+            const matchesTarget = runTargets.some(
+              (t) =>
+                t.entityKind === item.kind &&
+                t.entityPublicId === item.publicId &&
+                (!item.batchId || t.batchId === item.batchId),
+            );
+            if (!matchesPrimary && !matchesTarget) {
+              throw conflict("STALE", "The failed deletion run does not match this item or trash batch.");
+            }
+
+            return resumeExistingPurgeRunInTx({
+              tx,
+              existingRun: targetRun,
+              actor,
+              auditPrincipal,
+              now,
+              workerLeaseOwner,
+              idempotencyRowId,
+              attemptOwner,
+              bindingKey,
+              acknowledgeExternal: {
+                targetOrderPublicId: acknowledgeExternal.targetOrderPublicId,
+                confirmation: acknowledgeExternal.confirmation,
+              },
+            });
+          }
+
+          if (item.kind === "order") {
+            const [preOrder] = await tx
+              .select({
+                id: orders.id,
+                ownerUserId: orders.ownerUserId,
+                groupRootOrderId: orders.groupRootOrderId,
+              })
+              .from(orders)
+              .where(eq(orders.publicId, item.publicId))
+              .limit(1);
+            if (!preOrder) throw notFound("ORDER_NOT_FOUND");
+
+            const preAdditions =
+              preOrder.groupRootOrderId === null
+                ? await tx
+                    .select({ id: orders.id, ownerUserId: orders.ownerUserId })
+                    .from(orders)
+                    .where(and(eq(orders.groupRootOrderId, preOrder.id), isNull(orders.purgedAt)))
+                    .orderBy(asc(orders.id))
+                    .limit(MAX_CASCADE_TARGETS + 1)
+                : [];
+            if (preAdditions.length > MAX_CASCADE_TARGETS) {
+              throw conflict("CASCADE_TOO_LARGE", "This order group has too many additions to delete at once.");
+            }
+
+            const candidateIds = [preOrder.id, ...preAdditions.map((a) => a.id)].sort((a, b) => a - b);
+
+            // Unlocked check for existing target ownership BEFORE acquiring any `users`/`orders` locks!
+            const preExistingTargets = await tx
               .select({ runId: trashPurgeRunTargets.runId })
               .from(trashPurgeRunTargets)
               .where(
                 and(
                   eq(trashPurgeRunTargets.entityKind, "order"),
-                  eq(trashPurgeRunTargets.entityId, lockedPrimary.id),
+                  inArray(trashPurgeRunTargets.entityId, candidateIds),
+                ),
+              );
+
+            if (preExistingTargets.length > 0) {
+              const distinctRunIds = [...new Set(preExistingTargets.map((t) => t.runId))].sort(
+                (a, b) => a - b,
+              );
+              const preOwningRuns = await tx
+                .select()
+                .from(trashPurgeRuns)
+                .where(inArray(trashPurgeRuns.id, distinctRunIds))
+                .orderBy(asc(trashPurgeRuns.id));
+
+              if (
+                preOwningRuns.length === 1 &&
+                preOwningRuns[0]!.entityKind === "order" &&
+                preOwningRuns[0]!.entityId === preOrder.id
+              ) {
+                return resumeExistingPurgeRunInTx({
+                  tx,
+                  existingRun: preOwningRuns[0]!,
+                  actor,
+                  auditPrincipal,
+                  now,
+                  workerLeaseOwner,
+                  idempotencyRowId,
+                  attemptOwner,
+                  bindingKey,
+                  expectedPrimary: { item, expectedSingleConfirmation },
+                });
+              }
+
+              if (preOwningRuns.length > 0) {
+                const lockedConflictRuns = await tx
+                  .select()
+                  .from(trashPurgeRuns)
+                  .where(inArray(trashPurgeRuns.id, distinctRunIds))
+                  .orderBy(asc(trashPurgeRuns.id))
+                  .for("share");
+                const conflictingRun = lockedConflictRuns[0];
+                if (conflictingRun) {
+                  throw new DomainError(
+                    "CONFLICT",
+                    "PURGE_ALREADY_OWNED",
+                    "Permanent deletion is already owned by an existing deletion run. Resume that run first.",
+                    {
+                      owningRunPublicId: conflictingRun.publicId,
+                      owningEntityKind: conflictingRun.entityKind,
+                      owningEntityPublicId: conflictingRun.entityPublicId,
+                    },
+                  );
+                }
+              }
+            }
+
+            // Initial claim path (no owning run existed on unlocked read): lock `users -> orders` in `id ASC`.
+            const allOwnerIds = [
+              ...new Set([preOrder.ownerUserId, ...preAdditions.map((a) => a.ownerUserId)]),
+            ].sort((a, b) => a - b);
+            const lockedOwners = await tx
+              .select({
+                id: users.id,
+                trashedAt: users.trashedAt,
+                trashBatchId: users.trashBatchId,
+                purgedAt: users.purgedAt,
+              })
+              .from(users)
+              .where(inArray(users.id, allOwnerIds))
+              .orderBy(asc(users.id))
+              .for("share");
+            const lockedOwner = lockedOwners.find((u) => u.id === preOrder.ownerUserId);
+
+            const lockedOrders = await tx
+              .select()
+              .from(orders)
+              .where(inArray(orders.id, candidateIds))
+              .orderBy(asc(orders.id))
+              .for("update");
+            const lockedPrimary = lockedOrders.find((o) => o.id === preOrder.id);
+            if (!lockedPrimary) throw notFound("ORDER_NOT_FOUND");
+
+            // Re-verify complete group additions under lock (including cross-batch or reassigned additions).
+            let groupAdditions: (typeof orders.$inferSelect)[] = [];
+            if (!lockedPrimary.purgedAt && lockedPrimary.groupRootOrderId === null) {
+              const liveCheck = await tx
+                .select({ id: orders.id })
+                .from(orders)
+                .where(and(eq(orders.groupRootOrderId, lockedPrimary.id), isNull(orders.purgedAt)))
+                .orderBy(asc(orders.id))
+                .limit(MAX_CASCADE_TARGETS + 1);
+              if (liveCheck.length > MAX_CASCADE_TARGETS) {
+                throw conflict("CASCADE_TOO_LARGE", "This order group has too many additions to delete at once.");
+              }
+              if (liveCheck.length > 0) {
+                groupAdditions = await tx
+                  .select()
+                  .from(orders)
+                  .where(inArray(orders.id, liveCheck.map((r) => r.id)))
+                  .orderBy(asc(orders.id))
+                  .for("update");
+              }
+            }
+
+            const allOrderIdsForRaceCheck = [
+              ...new Set([lockedPrimary.id, ...groupAdditions.map((o) => o.id)]),
+            ];
+            const racedTargets = await tx
+              .select({ id: trashPurgeRunTargets.id })
+              .from(trashPurgeRunTargets)
+              .where(
+                and(
+                  eq(trashPurgeRunTargets.entityKind, "order"),
+                  inArray(trashPurgeRunTargets.entityId, allOrderIdsForRaceCheck),
                 ),
               )
               .limit(1);
-            if (ownedTarget) {
-              const [doneRun] = await tx
-                .select()
-                .from(trashPurgeRuns)
-                .where(eq(trashPurgeRuns.id, ownedTarget.runId))
-                .limit(1);
-              if (doneRun && doneRun.status === "completed") {
-                if (item.batchId && doneRun.batchId !== item.batchId && lockedPrimary.trashBatchId !== item.batchId) {
-                  throw conflict("STALE", "This order changed meanwhile. Review again.");
-                }
-                await bindIdempotencyClaimInTx(tx, idempotencyRowId, doneRun.publicId, now);
-                const c = parseCounts(doneRun.countsJson);
-                return {
-                  alreadyCompleted: true as const,
-                  runId: doneRun.publicId,
-                  batchId: lockedPrimary.trashBatchId ?? doneRun.batchId,
-                  keptExternalCopies: c.kept.acknowledgedExternalCopies ?? 0,
-                };
-              }
+            if (racedTargets.length > 0) {
+              // Concurrent claim created a run while we were locking `users`/`orders`; never lock `trash_purge_runs` after `orders`!
+              throw new RetryRunFirstSignal();
             }
-            throw notFound("ORDER_NOT_FOUND");
-          }
 
-          if (!lockedPrimary.trashedAt || !lockedPrimary.trashBatchId) {
-            throw conflict("NOT_IN_TRASH", "This order is no longer in the trash.");
-          }
-          if (lockedPrimary.lockState === "legal_hold") {
-            throw legalHoldError();
-          }
-          if (actor.kind === "user" && !item.batchId) {
-            throw validation("BATCH_ID_REQUIRED", "Include the trash batch identifier.");
-          }
-          if (item.batchId && lockedPrimary.trashBatchId !== item.batchId) {
-            throw conflict("STALE", "This order changed meanwhile. Review again.");
-          }
-          if (
-            expectedSingleConfirmation !== undefined &&
-            expectedSingleConfirmation.trim() !== lockedPrimary.reference
-          ) {
-            throw validation(
-              "CONFIRMATION_MISMATCH",
-              "The confirmation you typed doesn't match. Nothing was deleted.",
-            );
-          }
-
-          const expectedBatchId = lockedPrimary.trashBatchId;
-
-          // Re-verify complete group additions under lock (including cross-batch or reassigned additions).
-          let groupAdditions: (typeof orders.$inferSelect)[] = [];
-          if (lockedPrimary.groupRootOrderId === null) {
-            const liveCheck = await tx
-              .select({ id: orders.id })
-              .from(orders)
-              .where(and(eq(orders.groupRootOrderId, lockedPrimary.id), isNull(orders.purgedAt)))
-              .orderBy(asc(orders.id))
-              .limit(MAX_CASCADE_TARGETS + 1);
-            if (liveCheck.length > MAX_CASCADE_TARGETS) {
-              throw conflict("CASCADE_TOO_LARGE", "This order group has too many additions to delete at once.");
+            if (lockedPrimary.purgedAt) {
+              throw notFound("ORDER_NOT_FOUND");
             }
-            if (liveCheck.length > 0) {
-              groupAdditions = await tx
-                .select()
-                .from(orders)
-                .where(inArray(orders.id, liveCheck.map((r) => r.id)))
-                .orderBy(asc(orders.id))
-                .for("update");
+            if (!lockedPrimary.trashedAt || !lockedPrimary.trashBatchId) {
+              throw conflict("NOT_IN_TRASH", "This order is no longer in the trash.");
             }
+            if (lockedPrimary.lockState === "legal_hold") {
+              throw legalHoldError();
+            }
+            if (actor.kind === "user" && !item.batchId) {
+              throw validation("BATCH_ID_REQUIRED", "Include the trash batch identifier.");
+            }
+            if (item.batchId && lockedPrimary.trashBatchId !== item.batchId) {
+              throw conflict("STALE", "This order changed meanwhile. Review again.");
+            }
+            if (
+              expectedSingleConfirmation !== undefined &&
+              expectedSingleConfirmation.trim() !== lockedPrimary.reference
+            ) {
+              throw validation(
+                "CONFIRMATION_MISMATCH",
+                "The confirmation you typed doesn't match. Nothing was deleted.",
+              );
+            }
+
             for (const add of groupAdditions) {
               if (add.lockState === "legal_hold") throw legalHoldError();
               if (!add.trashedAt || !add.trashBatchId) {
@@ -2165,76 +2780,370 @@ export function createTrashCoordinator(
                 );
               }
             }
-          }
 
-          if (actor.kind === "system") {
-            const retention = await readRetentionValues(tx, true);
-            const { dueAt, movedWithCustomer } = computeOrderDueAt(
-              lockedPrimary.trashedAt,
-              expectedBatchId,
-              lockedOwner && !lockedOwner.purgedAt
-                ? { trashedAt: lockedOwner.trashedAt, trashBatchId: lockedOwner.trashBatchId }
-                : undefined,
-              retention,
-            );
-            if (movedWithCustomer || !dueAt || dueAt.getTime() > nowMs) {
-              throw conflict("NOT_DUE", "This order is not yet due for automatic clean-up.");
+            const expectedBatchId = lockedPrimary.trashBatchId;
+
+            if (actor.kind === "system") {
+              const retention = await readRetentionValues(tx, true);
+              const { dueAt, movedWithCustomer } = computeOrderDueAt(
+                lockedPrimary.trashedAt,
+                expectedBatchId,
+                lockedOwner && !lockedOwner.purgedAt
+                  ? { trashedAt: lockedOwner.trashedAt, trashBatchId: lockedOwner.trashBatchId }
+                  : undefined,
+                retention,
+              );
+              if (movedWithCustomer || !dueAt || dueAt.getTime() > nowMs) {
+                throw conflict("NOT_DUE", "This order is not yet due for automatic clean-up.");
+              }
             }
+
+            const allOrderRows = [
+              ...groupAdditions.sort((a, b) => a.id - b.id),
+              lockedPrimary,
+            ];
+
+            const runId = ulid(nowMs);
+            const expectedModules = computeExpectedModules();
+            const meta: PersistedRunMeta = { expectedModules };
+            const counts: PersistedCounts = { deleted: {}, kept: {} };
+
+            const [ins] = await tx.insert(trashPurgeRuns).values({
+              publicId: runId,
+              trigger: actor.kind === "user" ? "manual" : "retention",
+              actorUserId: actor.kind === "user" ? actor.userId : null,
+              sweepPublicId: sweepPublicId ?? null,
+              entityKind: "order",
+              entityId: lockedPrimary.id,
+              entityPublicId: lockedPrimary.publicId,
+              batchId: expectedBatchId,
+              status: "running",
+              fencingToken: 1,
+              leaseOwner: workerLeaseOwner,
+              leaseExpiresAt: new Date(nowMs + runLeaseMs),
+              targetsJson: "[]",
+              checkpointJson: JSON.stringify(meta),
+              countsJson: JSON.stringify(counts),
+              attemptCount: 1,
+              correlationId: expectedBatchId,
+              startedAt: now,
+              updatedAt: now,
+            });
+            const runRowId = Number(ins.insertId);
+
+            const insertedTargets: TrashPurgeRunTargetRow[] = [];
+            try {
+              for (let idx = 0; idx < allOrderRows.length; idx++) {
+                const ord = allOrderRows[idx]!;
+                const [tIns] = await tx.insert(trashPurgeRunTargets).values({
+                  runId: runRowId,
+                  entityKind: "order",
+                  entityId: ord.id,
+                  entityPublicId: ord.publicId,
+                  targetReference: ord.reference,
+                  batchId: ord.trashBatchId!,
+                  position: idx,
+                  status: "pending",
+                  checkpointJson: "{}",
+                  createdAt: now,
+                  updatedAt: now,
+                });
+                insertedTargets.push({
+                  id: Number(tIns.insertId),
+                  runId: runRowId,
+                  entityKind: "order",
+                  entityId: ord.id,
+                  entityPublicId: ord.publicId,
+                  targetReference: ord.reference,
+                  batchId: ord.trashBatchId!,
+                  position: idx,
+                  status: "pending",
+                  checkpointJson: "{}",
+                  leaveExternalCopiesApprovedAt: null,
+                  leaveExternalCopiesActorUserId: null,
+                  leaveExternalCopiesProofJson: null,
+                  tombstonedAt: null,
+                  createdAt: now,
+                  updatedAt: now,
+                });
+              }
+            } catch (err) {
+              if (isMysqlDupEntry(err)) {
+                throw new RetryRunFirstSignal();
+              }
+              throw err;
+            }
+
+            await bindIdempotencyClaimInTx({
+              tx,
+              idempotencyRowId,
+              attemptOwner,
+              runPublicId: runId,
+              bindingKey,
+              batchId: expectedBatchId,
+              now,
+            });
+
+            for (const ord of allOrderRows) {
+              await ordersTrash.markPurgeStartedInTx(tx, { orderId: ord.id, runId, actor });
+              await deps.audit.record(
+                {
+                  category: "admin",
+                  eventName: "order.purge_started",
+                  action: "delete",
+                  outcome: "attempted",
+                  severity: "WARN",
+                  actor:
+                    actor.kind === "user" && auditPrincipal
+                      ? { userId: auditPrincipal.userId, role: auditPrincipal.role }
+                      : { role: "system" },
+                  resource: { type: "order", id: ord.id, publicId: ord.publicId },
+                  orderPublicId: ord.publicId,
+                  correlationId: ord.trashBatchId!,
+                  attributes: {
+                    order_public_id: ord.publicId,
+                    trash_batch_id: ord.trashBatchId!,
+                    run_public_id: runId,
+                    trigger: triggerLabel,
+                    bulk_count: bulkCount,
+                  },
+                },
+                tx,
+              );
+            }
+
+            return {
+              alreadyCompleted: false as const,
+              runRowId,
+              runId,
+              batchId: expectedBatchId,
+              fencingToken: 1,
+              expectedModules,
+              targets: insertedTargets,
+              counts,
+              acknowledgedOrderPublicId: null,
+            };
           }
 
-          const allOrderRows = [
-            ...groupAdditions.sort((a, b) => a.id - b.id),
-            lockedPrimary,
+          // Customer target: unlocked pre-read of customer + cascaded orders to check existing run ownership FIRST!
+          const [preCust] = await tx
+            .select({ id: users.id })
+            .from(users)
+            .where(and(eq(users.publicId, item.publicId), eq(users.role, "customer")))
+            .limit(1);
+          if (!preCust) throw notFound("CUSTOMER_NOT_FOUND");
+
+          const preOwnedOrders = await tx
+            .select({ id: orders.id, ownerUserId: orders.ownerUserId, groupRootOrderId: orders.groupRootOrderId })
+            .from(orders)
+            .where(and(eq(orders.ownerUserId, preCust.id), isNull(orders.purgedAt)))
+            .orderBy(asc(orders.id))
+            .limit(MAX_CASCADE_TARGETS + 1);
+          if (preOwnedOrders.length > MAX_CASCADE_TARGETS) {
+            throw conflict("CASCADE_TOO_LARGE", "This customer account has too many orders to delete at once.");
+          }
+
+          const ownedRootIds = preOwnedOrders
+            .filter((o) => o.groupRootOrderId === null)
+            .map((o) => o.id);
+          const preReassignedAdditions =
+            ownedRootIds.length > 0
+              ? await tx
+                  .select({ id: orders.id, ownerUserId: orders.ownerUserId })
+                  .from(orders)
+                  .where(
+                    and(
+                      inArray(orders.groupRootOrderId, ownedRootIds),
+                      ne(orders.ownerUserId, preCust.id),
+                      isNull(orders.purgedAt),
+                    ),
+                  )
+                  .orderBy(asc(orders.id))
+                  .limit(MAX_CASCADE_TARGETS + 1)
+              : [];
+          if (preOwnedOrders.length + preReassignedAdditions.length > MAX_CASCADE_TARGETS) {
+            throw conflict("CASCADE_TOO_LARGE", "This customer account has too many orders to delete at once.");
+          }
+
+          const preCascadeIds = [
+            ...new Set([
+              ...preOwnedOrders.map((o) => o.id),
+              ...preReassignedAdditions.map((a) => a.id),
+            ]),
           ];
-          const allOrderIds = allOrderRows.map((o) => o.id);
+          const preCustLookupPredicates = [
+            and(
+              eq(trashPurgeRunTargets.entityKind, "customer"),
+              eq(trashPurgeRunTargets.entityId, preCust.id),
+            ),
+            ...(preCascadeIds.length > 0
+              ? [
+                  and(
+                    eq(trashPurgeRunTargets.entityKind, "order"),
+                    inArray(trashPurgeRunTargets.entityId, preCascadeIds),
+                  ),
+                ]
+              : []),
+          ];
 
-          const existingTargets = await tx
-            .select()
+          const preExistingCustTargets = await tx
+            .select({ runId: trashPurgeRunTargets.runId })
             .from(trashPurgeRunTargets)
-            .where(
-              and(
-                eq(trashPurgeRunTargets.entityKind, "order"),
-                inArray(trashPurgeRunTargets.entityId, allOrderIds),
-              ),
-            )
-            .for("update");
+            .where(or(...preCustLookupPredicates));
 
-          if (existingTargets.length > 0) {
-            const distinctRunIds = [...new Set(existingTargets.map((t) => t.runId))];
-            const owningRuns = await tx
+          if (preExistingCustTargets.length > 0) {
+            const distinctRunIds = [...new Set(preExistingCustTargets.map((t) => t.runId))].sort(
+              (a, b) => a - b,
+            );
+            const preOwningRuns = await tx
               .select()
               .from(trashPurgeRuns)
               .where(inArray(trashPurgeRuns.id, distinctRunIds))
-              .for("update");
+              .orderBy(asc(trashPurgeRuns.id));
 
             if (
-              owningRuns.length === 1 &&
-              owningRuns[0]!.entityKind === "order" &&
-              owningRuns[0]!.entityId === lockedPrimary.id &&
-              owningRuns[0]!.batchId === expectedBatchId
+              preOwningRuns.length === 1 &&
+              preOwningRuns[0]!.entityKind === "customer" &&
+              preOwningRuns[0]!.entityId === preCust.id
             ) {
               return resumeExistingPurgeRunInTx({
                 tx,
-                existingRun: owningRuns[0]!,
+                existingRun: preOwningRuns[0]!,
                 actor,
                 auditPrincipal,
                 now,
                 workerLeaseOwner,
                 idempotencyRowId,
+                attemptOwner,
+                bindingKey,
+                expectedPrimary: { item, expectedSingleConfirmation },
               });
             }
 
-            const conflictingRun = owningRuns[0]!;
-            throw new DomainError(
-              "CONFLICT",
-              "PURGE_ALREADY_OWNED",
-              "Permanent deletion is already owned by an existing deletion run. Resume that run first.",
-              {
-                owningRunPublicId: conflictingRun.publicId,
-                owningEntityKind: conflictingRun.entityKind,
-                owningEntityPublicId: conflictingRun.entityPublicId,
-              },
+            if (preOwningRuns.length > 0) {
+              const lockedConflictRuns = await tx
+                .select()
+                .from(trashPurgeRuns)
+                .where(inArray(trashPurgeRuns.id, distinctRunIds))
+                .orderBy(asc(trashPurgeRuns.id))
+                .for("share");
+              const conflictingRun = lockedConflictRuns[0];
+              if (conflictingRun) {
+                throw new DomainError(
+                  "CONFLICT",
+                  "PURGE_ALREADY_OWNED",
+                  "An associated order or account already has an unfinished permanent deletion run. Resume that run first.",
+                  {
+                    owningRunPublicId: conflictingRun.publicId,
+                    owningEntityKind: conflictingRun.entityKind,
+                    owningEntityPublicId: conflictingRun.entityPublicId,
+                  },
+                );
+              }
+            }
+          }
+
+          // Initial claim path: lock `users` (`id ASC`) BEFORE `orders` (`id ASC`).
+          const otherOwnerIds = [...new Set(preReassignedAdditions.map((a) => a.ownerUserId))].sort(
+            (a, b) => a - b,
+          );
+          const allUserIdsSorted = [...new Set([preCust.id, ...otherOwnerIds])].sort((a, b) => a - b);
+
+          let lockedCust: typeof users.$inferSelect | undefined;
+          for (const uid of allUserIdsSorted) {
+            if (uid === preCust.id) {
+              const [cRow] = await tx
+                .select()
+                .from(users)
+                .where(and(eq(users.id, uid), eq(users.role, "customer")))
+                .for("update")
+                .limit(1);
+              lockedCust = cRow;
+            } else {
+              await tx.select({ id: users.id }).from(users).where(eq(users.id, uid)).for("share").limit(1);
+            }
+          }
+          if (!lockedCust) throw notFound("CUSTOMER_NOT_FOUND");
+
+          const lockedCascadeOrders =
+            preCascadeIds.length > 0
+              ? await tx
+                  .select()
+                  .from(orders)
+                  .where(inArray(orders.id, preCascadeIds))
+                  .orderBy(asc(orders.id))
+                  .for("update")
+              : [];
+
+          const nonPurgedOrders = lockedCascadeOrders.filter((o) => o.purgedAt === null);
+          const orderedCascadeOrders = [...nonPurgedOrders].sort((a, b) => a.id - b.id);
+          const raceLookupPredicates = [
+            and(
+              eq(trashPurgeRunTargets.entityKind, "customer"),
+              eq(trashPurgeRunTargets.entityId, lockedCust.id),
+            ),
+            ...(orderedCascadeOrders.length > 0
+              ? [
+                  and(
+                    eq(trashPurgeRunTargets.entityKind, "order"),
+                    inArray(
+                      trashPurgeRunTargets.entityId,
+                      orderedCascadeOrders.map((o) => o.id),
+                    ),
+                  ),
+                ]
+              : []),
+          ];
+          const racedCustTargets = await tx
+            .select({ id: trashPurgeRunTargets.id })
+            .from(trashPurgeRunTargets)
+            .where(or(...raceLookupPredicates))
+            .limit(1);
+          if (racedCustTargets.length > 0) {
+            // Concurrent claim inserted target rows while we locked `users`/`orders`; restart to lock `trash_purge_runs` FIRST!
+            throw new RetryRunFirstSignal();
+          }
+
+          if (lockedCust.purgedAt) {
+            throw notFound("CUSTOMER_NOT_FOUND");
+          }
+          if (!lockedCust.trashedAt || !lockedCust.trashBatchId) {
+            throw conflict("NOT_IN_TRASH", "This customer account is no longer in the trash.");
+          }
+          if (actor.kind === "user" && !item.batchId) {
+            throw validation("BATCH_ID_REQUIRED", "Include the trash batch identifier.");
+          }
+          if (item.batchId && lockedCust.trashBatchId !== item.batchId) {
+            throw conflict("STALE", "This customer account changed meanwhile. Review again.");
+          }
+          const expectedRef = lockedCust.customerRef ?? lockedCust.publicId;
+          if (expectedSingleConfirmation !== undefined && expectedSingleConfirmation.trim() !== expectedRef) {
+            throw validation(
+              "CONFIRMATION_MISMATCH",
+              "The confirmation you typed doesn't match. Nothing was deleted.",
             );
+          }
+
+          if (nonPurgedOrders.some((o) => o.lockState === "legal_hold")) {
+            throw legalHoldError();
+          }
+          if (nonPurgedOrders.some((o) => o.trashedAt === null || !o.trashBatchId)) {
+            throw conflict(
+              "CUSTOMER_HAS_LIVE_ORDERS",
+              "Move all live orders of this customer account to the trash before deleting the account permanently.",
+            );
+          }
+
+          const expectedBatchId = lockedCust.trashBatchId;
+
+          if (actor.kind === "system") {
+            const retention = await readRetentionValues(tx, true);
+            const dueAt = retention.autoPurgeEnabled
+              ? addDays(lockedCust.trashedAt, retention.customerDays)
+              : null;
+            if (!dueAt || dueAt.getTime() > nowMs) {
+              throw conflict("NOT_DUE", "This customer account is not yet due for automatic clean-up.");
+            }
           }
 
           const runId = ulid(nowMs);
@@ -2247,9 +3156,9 @@ export function createTrashCoordinator(
             trigger: actor.kind === "user" ? "manual" : "retention",
             actorUserId: actor.kind === "user" ? actor.userId : null,
             sweepPublicId: sweepPublicId ?? null,
-            entityKind: "order",
-            entityId: lockedPrimary.id,
-            entityPublicId: lockedPrimary.publicId,
+            entityKind: "customer",
+            entityId: lockedCust.id,
+            entityPublicId: lockedCust.publicId,
             batchId: expectedBatchId,
             status: "running",
             fencingToken: 1,
@@ -2267,8 +3176,8 @@ export function createTrashCoordinator(
 
           const insertedTargets: TrashPurgeRunTargetRow[] = [];
           try {
-            for (let idx = 0; idx < allOrderRows.length; idx++) {
-              const ord = allOrderRows[idx]!;
+            let pos = 0;
+            for (const ord of orderedCascadeOrders) {
               const [tIns] = await tx.insert(trashPurgeRunTargets).values({
                 runId: runRowId,
                 entityKind: "order",
@@ -2276,7 +3185,7 @@ export function createTrashCoordinator(
                 entityPublicId: ord.publicId,
                 targetReference: ord.reference,
                 batchId: ord.trashBatchId!,
-                position: idx,
+                position: pos,
                 status: "pending",
                 checkpointJson: "{}",
                 createdAt: now,
@@ -2290,7 +3199,7 @@ export function createTrashCoordinator(
                 entityPublicId: ord.publicId,
                 targetReference: ord.reference,
                 batchId: ord.trashBatchId!,
-                position: idx,
+                position: pos,
                 status: "pending",
                 checkpointJson: "{}",
                 leaveExternalCopiesApprovedAt: null,
@@ -2300,313 +3209,16 @@ export function createTrashCoordinator(
                 createdAt: now,
                 updatedAt: now,
               });
+              pos += 1;
             }
-          } catch (err) {
-            if (isMysqlDupEntry(err)) {
-              throw conflict(
-                "PURGE_ALREADY_OWNED",
-                "Permanent deletion is already owned by an existing deletion run.",
-              );
-            }
-            throw err;
-          }
 
-          await bindIdempotencyClaimInTx(tx, idempotencyRowId, runId, now);
-
-          for (const ord of allOrderRows) {
-            await ordersTrash.markPurgeStartedInTx(tx, { orderId: ord.id, runId, actor });
-            await deps.audit.record(
-              {
-                category: "admin",
-                eventName: "order.purge_started",
-                action: "delete",
-                outcome: "attempted",
-                severity: "WARN",
-                actor:
-                  actor.kind === "user" && auditPrincipal
-                    ? { userId: auditPrincipal.userId, role: auditPrincipal.role }
-                    : { role: "system" },
-                resource: { type: "order", id: ord.id, publicId: ord.publicId },
-                orderPublicId: ord.publicId,
-                correlationId: ord.trashBatchId!,
-                attributes: {
-                  order_public_id: ord.publicId,
-                  trash_batch_id: ord.trashBatchId!,
-                  run_public_id: runId,
-                  trigger: triggerLabel,
-                  bulk_count: bulkCount,
-                },
-              },
-              tx,
-            );
-          }
-
-          return {
-            alreadyCompleted: false as const,
-            runRowId,
-            runId,
-            batchId: expectedBatchId,
-            fencingToken: 1,
-            expectedModules,
-            targets: insertedTargets,
-            counts,
-            acknowledgedOrderPublicId: null,
-          };
-        }
-
-        // Customer target: pre-read customer + all owned orders + reassigned group additions of owned root orders
-        // so we acquire ALL `users` locks in `id ASC` BEFORE ANY `orders` locks!
-        const [preCust] = await tx
-          .select({ id: users.id })
-          .from(users)
-          .where(and(eq(users.publicId, item.publicId), eq(users.role, "customer")))
-          .limit(1);
-        if (!preCust) throw notFound("CUSTOMER_NOT_FOUND");
-
-        const preOwnedOrders = await tx
-          .select({ id: orders.id, ownerUserId: orders.ownerUserId, groupRootOrderId: orders.groupRootOrderId })
-          .from(orders)
-          .where(and(eq(orders.ownerUserId, preCust.id), isNull(orders.purgedAt)))
-          .orderBy(asc(orders.id))
-          .limit(MAX_CASCADE_TARGETS + 1);
-        if (preOwnedOrders.length > MAX_CASCADE_TARGETS) {
-          throw conflict("CASCADE_TOO_LARGE", "This customer account has too many orders to delete at once.");
-        }
-
-        const ownedRootIds = preOwnedOrders
-          .filter((o) => o.groupRootOrderId === null)
-          .map((o) => o.id);
-        const preReassignedAdditions =
-          ownedRootIds.length > 0
-            ? await tx
-                .select({ id: orders.id, ownerUserId: orders.ownerUserId })
-                .from(orders)
-                .where(
-                  and(
-                    inArray(orders.groupRootOrderId, ownedRootIds),
-                    ne(orders.ownerUserId, preCust.id),
-                    isNull(orders.purgedAt),
-                  ),
-                )
-                .orderBy(asc(orders.id))
-                .limit(MAX_CASCADE_TARGETS + 1)
-            : [];
-        if (preOwnedOrders.length + preReassignedAdditions.length > MAX_CASCADE_TARGETS) {
-          throw conflict("CASCADE_TOO_LARGE", "This customer account has too many orders to delete at once.");
-        }
-
-        const otherOwnerIds = [...new Set(preReassignedAdditions.map((a) => a.ownerUserId))].sort(
-          (a, b) => a - b,
-        );
-        const allUserIdsSorted = [...new Set([preCust.id, ...otherOwnerIds])].sort((a, b) => a - b);
-
-        let lockedCust: typeof users.$inferSelect | undefined;
-        for (const uid of allUserIdsSorted) {
-          if (uid === preCust.id) {
-            const [cRow] = await tx
-              .select()
-              .from(users)
-              .where(and(eq(users.id, uid), eq(users.role, "customer")))
-              .for("update")
-              .limit(1);
-            lockedCust = cRow;
-          } else {
-            await tx.select({ id: users.id }).from(users).where(eq(users.id, uid)).for("share").limit(1);
-          }
-        }
-        if (!lockedCust) throw notFound("CUSTOMER_NOT_FOUND");
-
-        const allCascadeOrderIdSet = new Set<number>([
-          ...preOwnedOrders.map((o) => o.id),
-          ...preReassignedAdditions.map((a) => a.id),
-        ]);
-        const lockedCascadeOrders =
-          allCascadeOrderIdSet.size > 0
-            ? await tx
-                .select()
-                .from(orders)
-                .where(inArray(orders.id, [...allCascadeOrderIdSet]))
-                .orderBy(asc(orders.id))
-                .for("update")
-            : [];
-
-        if (lockedCust.purgedAt) {
-          const [ownedCustTarget] = await tx
-            .select({ runId: trashPurgeRunTargets.runId })
-            .from(trashPurgeRunTargets)
-            .where(
-              and(
-                eq(trashPurgeRunTargets.entityKind, "customer"),
-                eq(trashPurgeRunTargets.entityId, lockedCust.id),
-              ),
-            )
-            .limit(1);
-          if (ownedCustTarget) {
-            const [doneRun] = await tx
-              .select()
-              .from(trashPurgeRuns)
-              .where(eq(trashPurgeRuns.id, ownedCustTarget.runId))
-              .limit(1);
-            if (doneRun && doneRun.status === "completed") {
-              if (item.batchId && doneRun.batchId !== item.batchId && lockedCust.trashBatchId !== item.batchId) {
-                throw conflict("STALE", "This customer account changed meanwhile. Review again.");
-              }
-              await bindIdempotencyClaimInTx(tx, idempotencyRowId, doneRun.publicId, now);
-              const c = parseCounts(doneRun.countsJson);
-              return {
-                alreadyCompleted: true as const,
-                runId: doneRun.publicId,
-                batchId: lockedCust.trashBatchId ?? doneRun.batchId,
-                keptExternalCopies: c.kept.acknowledgedExternalCopies ?? 0,
-              };
-            }
-          }
-          throw notFound("CUSTOMER_NOT_FOUND");
-        }
-
-        if (!lockedCust.trashedAt || !lockedCust.trashBatchId) {
-          throw conflict("NOT_IN_TRASH", "This customer account is no longer in the trash.");
-        }
-        if (actor.kind === "user" && !item.batchId) {
-          throw validation("BATCH_ID_REQUIRED", "Include the trash batch identifier.");
-        }
-        if (item.batchId && lockedCust.trashBatchId !== item.batchId) {
-          throw conflict("STALE", "This customer account changed meanwhile. Review again.");
-        }
-        const expectedRef = lockedCust.customerRef ?? lockedCust.publicId;
-        if (expectedSingleConfirmation !== undefined && expectedSingleConfirmation.trim() !== expectedRef) {
-          throw validation(
-            "CONFIRMATION_MISMATCH",
-            "The confirmation you typed doesn't match. Nothing was deleted.",
-          );
-        }
-
-        const nonPurgedOrders = lockedCascadeOrders.filter((o) => o.purgedAt === null);
-        if (nonPurgedOrders.some((o) => o.lockState === "legal_hold")) {
-          throw legalHoldError();
-        }
-        if (nonPurgedOrders.some((o) => o.trashedAt === null || !o.trashBatchId)) {
-          throw conflict(
-            "CUSTOMER_HAS_LIVE_ORDERS",
-            "Move all live orders of this customer account to the trash before deleting the account permanently.",
-          );
-        }
-
-        const expectedBatchId = lockedCust.trashBatchId;
-
-        if (actor.kind === "system") {
-          const retention = await readRetentionValues(tx, true);
-          const dueAt = retention.autoPurgeEnabled
-            ? addDays(lockedCust.trashedAt, retention.customerDays)
-            : null;
-          if (!dueAt || dueAt.getTime() > nowMs) {
-            throw conflict("NOT_DUE", "This customer account is not yet due for automatic clean-up.");
-          }
-        }
-
-        // Order additions before roots (`groupRootOrderId !== null` first, or `id ASC` for participants, tombstoned additions-first).
-        const orderedCascadeOrders = [...nonPurgedOrders].sort((a, b) => a.id - b.id);
-        const targetLookupPredicates = [
-          and(
-            eq(trashPurgeRunTargets.entityKind, "customer"),
-            eq(trashPurgeRunTargets.entityId, lockedCust.id),
-          ),
-          ...(orderedCascadeOrders.length > 0
-            ? [
-                and(
-                  eq(trashPurgeRunTargets.entityKind, "order"),
-                  inArray(
-                    trashPurgeRunTargets.entityId,
-                    orderedCascadeOrders.map((o) => o.id),
-                  ),
-                ),
-              ]
-            : []),
-        ];
-
-        const existingTargets = await tx
-          .select()
-          .from(trashPurgeRunTargets)
-          .where(or(...targetLookupPredicates))
-          .for("update");
-
-        if (existingTargets.length > 0) {
-          const distinctRunIds = [...new Set(existingTargets.map((t) => t.runId))];
-          const owningRuns = await tx
-            .select()
-            .from(trashPurgeRuns)
-            .where(inArray(trashPurgeRuns.id, distinctRunIds))
-            .for("update");
-
-          if (
-            owningRuns.length === 1 &&
-            owningRuns[0]!.entityKind === "customer" &&
-            owningRuns[0]!.entityId === lockedCust.id &&
-            owningRuns[0]!.batchId === expectedBatchId
-          ) {
-            return resumeExistingPurgeRunInTx({
-              tx,
-              existingRun: owningRuns[0]!,
-              actor,
-              auditPrincipal,
-              now,
-              workerLeaseOwner,
-              idempotencyRowId,
-            });
-          }
-
-          const conflictingRun = owningRuns[0]!;
-          throw new DomainError(
-            "CONFLICT",
-            "PURGE_ALREADY_OWNED",
-            "An associated order or account already has an unfinished permanent deletion run. Resume that run first.",
-            {
-              owningRunPublicId: conflictingRun.publicId,
-              owningEntityKind: conflictingRun.entityKind,
-              owningEntityPublicId: conflictingRun.entityPublicId,
-            },
-          );
-        }
-
-        const runId = ulid(nowMs);
-        const expectedModules = computeExpectedModules();
-        const meta: PersistedRunMeta = { expectedModules };
-        const counts: PersistedCounts = { deleted: {}, kept: {} };
-
-        const [ins] = await tx.insert(trashPurgeRuns).values({
-          publicId: runId,
-          trigger: actor.kind === "user" ? "manual" : "retention",
-          actorUserId: actor.kind === "user" ? actor.userId : null,
-          sweepPublicId: sweepPublicId ?? null,
-          entityKind: "customer",
-          entityId: lockedCust.id,
-          entityPublicId: lockedCust.publicId,
-          batchId: expectedBatchId,
-          status: "running",
-          fencingToken: 1,
-          leaseOwner: workerLeaseOwner,
-          leaseExpiresAt: new Date(nowMs + runLeaseMs),
-          targetsJson: "[]",
-          checkpointJson: JSON.stringify(meta),
-          countsJson: JSON.stringify(counts),
-          attemptCount: 1,
-          correlationId: expectedBatchId,
-          startedAt: now,
-          updatedAt: now,
-        });
-        const runRowId = Number(ins.insertId);
-
-        const insertedTargets: TrashPurgeRunTargetRow[] = [];
-        try {
-          let pos = 0;
-          for (const ord of orderedCascadeOrders) {
-            const [tIns] = await tx.insert(trashPurgeRunTargets).values({
+            const [custTargetIns] = await tx.insert(trashPurgeRunTargets).values({
               runId: runRowId,
-              entityKind: "order",
-              entityId: ord.id,
-              entityPublicId: ord.publicId,
-              targetReference: ord.reference,
-              batchId: ord.trashBatchId!,
+              entityKind: "customer",
+              entityId: lockedCust.id,
+              entityPublicId: lockedCust.publicId,
+              targetReference: expectedRef,
+              batchId: expectedBatchId,
               position: pos,
               status: "pending",
               checkpointJson: "{}",
@@ -2614,13 +3226,13 @@ export function createTrashCoordinator(
               updatedAt: now,
             });
             insertedTargets.push({
-              id: Number(tIns.insertId),
+              id: Number(custTargetIns.insertId),
               runId: runRowId,
-              entityKind: "order",
-              entityId: ord.id,
-              entityPublicId: ord.publicId,
-              targetReference: ord.reference,
-              batchId: ord.trashBatchId!,
+              entityKind: "customer",
+              entityId: lockedCust.id,
+              entityPublicId: lockedCust.publicId,
+              targetReference: expectedRef,
+              batchId: expectedBatchId,
               position: pos,
               status: "pending",
               checkpointJson: "{}",
@@ -2631,51 +3243,22 @@ export function createTrashCoordinator(
               createdAt: now,
               updatedAt: now,
             });
-            pos += 1;
+          } catch (err) {
+            if (isMysqlDupEntry(err)) {
+              throw new RetryRunFirstSignal();
+            }
+            throw err;
           }
 
-          const [custTargetIns] = await tx.insert(trashPurgeRunTargets).values({
-            runId: runRowId,
-            entityKind: "customer",
-            entityId: lockedCust.id,
-            entityPublicId: lockedCust.publicId,
-            targetReference: expectedRef,
+          await bindIdempotencyClaimInTx({
+            tx,
+            idempotencyRowId,
+            attemptOwner,
+            runPublicId: runId,
+            bindingKey,
             batchId: expectedBatchId,
-            position: pos,
-            status: "pending",
-            checkpointJson: "{}",
-            createdAt: now,
-            updatedAt: now,
+            now,
           });
-          insertedTargets.push({
-            id: Number(custTargetIns.insertId),
-            runId: runRowId,
-            entityKind: "customer",
-            entityId: lockedCust.id,
-            entityPublicId: lockedCust.publicId,
-            targetReference: expectedRef,
-            batchId: expectedBatchId,
-            position: pos,
-            status: "pending",
-            checkpointJson: "{}",
-            leaveExternalCopiesApprovedAt: null,
-            leaveExternalCopiesActorUserId: null,
-            leaveExternalCopiesProofJson: null,
-            tombstonedAt: null,
-            createdAt: now,
-            updatedAt: now,
-          });
-        } catch (err) {
-          if (isMysqlDupEntry(err)) {
-            throw conflict(
-              "PURGE_ALREADY_OWNED",
-              "Permanent deletion is already owned by an existing deletion run.",
-            );
-          }
-          throw err;
-        }
-
-        await bindIdempotencyClaimInTx(tx, idempotencyRowId, runId, now);
 
         for (const ord of orderedCascadeOrders) {
           await ordersTrash.markPurgeStartedInTx(tx, { orderId: ord.id, runId, actor });
@@ -2737,20 +3320,32 @@ export function createTrashCoordinator(
           tx,
         );
 
-        return {
-          alreadyCompleted: false as const,
-          runRowId,
-          runId,
-          batchId: expectedBatchId,
-          fencingToken: 1,
-          expectedModules,
-          targets: insertedTargets,
-          counts,
-          acknowledgedOrderPublicId: null,
-        };
-      });
+          return {
+            alreadyCompleted: false as const,
+            runRowId,
+            runId,
+            batchId: expectedBatchId,
+            fencingToken: 1,
+            expectedModules,
+            targets: insertedTargets,
+            counts,
+            acknowledgedOrderPublicId: null,
+          };
+        });
+        break;
+      } catch (err) {
+        if (err instanceof RetryRunFirstSignal && claimAttempt < 2) {
+          continue;
+        }
+        throw err;
+      }
+    }
 
-      onClaimCommitted?.(claimed.batchId);
+    if (!claimed) {
+      throw conflict("PURGE_IN_PROGRESS", "Permanent deletion is already running for this item.");
+    }
+
+    onClaimCommitted?.(claimed.batchId);
 
       if (claimed.alreadyCompleted) {
         return {
@@ -3015,8 +3610,10 @@ export function createTrashCoordinator(
           activeTargetPublicId = null;
         }
 
-        // Phase 3: Lock `users -> orders -> trash_purge_runs` in canonical order, verify row fence, generations & legal holds, write tombstones.
+        // Phase 3: Lock `trash_purge_runs -> users -> orders -> trash_purge_run_targets` in strict `run-first` canonical order!
         await deps.db.transaction(async (tx) => {
+          await assertFencedRunInTx(tx);
+
           const orderTargetRows = targets
             .filter((t) => t.entityKind === "order")
             .sort((a, b) => a.entityId - b.entityId);
@@ -3063,8 +3660,6 @@ export function createTrashCoordinator(
               }
             }
           }
-
-          await assertFencedRunInTx(tx);
 
           for (const ct of customerTargetRows) {
             const [extraOrder] = await tx
@@ -3838,6 +4433,7 @@ export function createTrashCoordinator(
             const cascadedOrders = Math.max(0, entities.length - 1);
             await completeIdempotency(
               reservation.rowId,
+              reservation.attemptOwner,
               fingerprintHash,
               { [`order:${input.publicId}`]: effectiveBatchId },
               {
@@ -3927,6 +4523,7 @@ export function createTrashCoordinator(
           const cascadedOrders = orderEntities.length;
           await completeIdempotency(
             reservation.rowId,
+            reservation.attemptOwner,
             fingerprintHash,
             { [`customer:${input.publicId}`]: batchId },
             {
@@ -3939,7 +4536,7 @@ export function createTrashCoordinator(
           return { batchId, dueAt, cascadedOrders };
         });
       } catch (err) {
-        await releaseUnmutatedIdempotency(reservation.rowId);
+        await releaseUnmutatedIdempotency(reservation.rowId, reservation.attemptOwner);
         throw err;
       }
     },
@@ -3964,6 +4561,7 @@ export function createTrashCoordinator(
         fingerprintHash,
         initialBatchBindings,
         verifyBatchGenerations: true,
+        resumableRestoreOperation: true,
       });
       if (reservation.hit) return reservation.payload;
 
@@ -3980,13 +4578,30 @@ export function createTrashCoordinator(
 
       try {
         for (const item of input.items) {
+          const itemKey = `${item.kind}:${item.publicId}`;
+          const priorOk = reservation.priorRestoredItems[itemKey];
+          if (priorOk?.ok) {
+            restored += 1;
+            results.push(priorOk);
+            continue;
+          }
           try {
             const one = await deps.db.transaction(async (tx) => {
               await guardActorInTx(tx, principal, "trash.manage");
-              return restoreSingleInTx(tx, item, actor, principal);
+              const res = await restoreSingleInTx(tx, item, actor, principal);
+              await recordRestoreProgressInTx({
+                tx,
+                rowId: reservation.rowId,
+                attemptOwner: reservation.attemptOwner,
+                itemKey,
+                batchId: res.batchId,
+                itemResult: { ...item, ok: true },
+                now: deps.clock.now(),
+              });
+              return res;
             });
             restored += 1;
-            batchBindings[`${item.kind}:${item.publicId}`] = one.batchId;
+            batchBindings[itemKey] = one.batchId;
             results.push({ ...item, ok: true });
           } catch (err) {
             const normalized = normalizeRestoreError(err);
@@ -4031,16 +4646,28 @@ export function createTrashCoordinator(
           }
         }
       } catch (err) {
-        if (restored > 0) {
-          await failIdempotency(reservation.rowId, fingerprintHash, batchBindings, err);
+        if (restored > 0 || reservation.hadCommittedClaim) {
+          await failIdempotency(
+            reservation.rowId,
+            reservation.attemptOwner,
+            fingerprintHash,
+            batchBindings,
+            err,
+          );
         } else {
-          await releaseUnmutatedIdempotency(reservation.rowId);
+          await releaseUnmutatedIdempotency(reservation.rowId, reservation.attemptOwner);
         }
         throw err;
       }
 
       const output: TrashRestoreOutput = { restored, results };
-      await completeIdempotency(reservation.rowId, fingerprintHash, batchBindings, output);
+      await completeIdempotency(
+        reservation.rowId,
+        reservation.attemptOwner,
+        fingerprintHash,
+        batchBindings,
+        output,
+      );
       return output;
     },
 
@@ -4100,6 +4727,7 @@ export function createTrashCoordinator(
               bulkCount: input.items.length,
               expectedSingleConfirmation: single ? trimmedConfirmation : undefined,
               idempotencyRowId: reservation.rowId,
+              attemptOwner: reservation.attemptOwner,
               onClaimCommitted: (claimedBatchId) => {
                 anyClaimCommitted = true;
                 batchBindings[`${item.kind}:${item.publicId}`] = claimedBatchId;
@@ -4121,9 +4749,15 @@ export function createTrashCoordinator(
         }
       } catch (err) {
         if (anyClaimCommitted) {
-          await failIdempotency(reservation.rowId, fingerprintHash, batchBindings, err);
+          await failIdempotency(
+            reservation.rowId,
+            reservation.attemptOwner,
+            fingerprintHash,
+            batchBindings,
+            err,
+          );
         } else {
-          await releaseUnmutatedIdempotency(reservation.rowId);
+          await releaseUnmutatedIdempotency(reservation.rowId, reservation.attemptOwner);
         }
         throw err;
       }
@@ -4133,13 +4767,20 @@ export function createTrashCoordinator(
         const firstErr = results.find((r) => !r.ok);
         await failIdempotency(
           reservation.rowId,
+          reservation.attemptOwner,
           fingerprintHash,
           batchBindings,
           conflict(firstErr?.reasonCode ?? "TRASH_PURGE_FAILED", firstErr?.safeMessage ?? "Some items could not be deleted."),
         );
         return output;
       }
-      await completeIdempotency(reservation.rowId, fingerprintHash, batchBindings, output);
+      await completeIdempotency(
+        reservation.rowId,
+        reservation.attemptOwner,
+        fingerprintHash,
+        batchBindings,
+        output,
+      );
       return output;
     },
 
@@ -4192,6 +4833,7 @@ export function createTrashCoordinator(
           auditPrincipal: principal,
           bulkCount: 1,
           idempotencyRowId: reservation.rowId,
+          attemptOwner: reservation.attemptOwner,
           acknowledgeExternal: {
             runPublicId: input.runId,
             targetOrderPublicId: input.targetOrderPublicId,
@@ -4207,13 +4849,25 @@ export function createTrashCoordinator(
           runId: done.runId,
           keptExternalCopies: done.keptExternalCopies,
         };
-        await completeIdempotency(reservation.rowId, fingerprintHash, initialBatchBindings, output);
+        await completeIdempotency(
+          reservation.rowId,
+          reservation.attemptOwner,
+          fingerprintHash,
+          initialBatchBindings,
+          output,
+        );
         return output;
       } catch (err) {
         if (claimCommitted) {
-          await failIdempotency(reservation.rowId, fingerprintHash, initialBatchBindings, err);
+          await failIdempotency(
+            reservation.rowId,
+            reservation.attemptOwner,
+            fingerprintHash,
+            initialBatchBindings,
+            err,
+          );
         } else {
-          await releaseUnmutatedIdempotency(reservation.rowId);
+          await releaseUnmutatedIdempotency(reservation.rowId, reservation.attemptOwner);
         }
         throw err;
       }
@@ -4339,6 +4993,7 @@ export function createTrashCoordinator(
 
           await completeIdempotency(
             reservation.rowId,
+            reservation.attemptOwner,
             fingerprintHash,
             {},
             { savedVersion: nextVersion },
@@ -4346,7 +5001,7 @@ export function createTrashCoordinator(
           );
         });
       } catch (err) {
-        await releaseUnmutatedIdempotency(reservation.rowId);
+        await releaseUnmutatedIdempotency(reservation.rowId, reservation.attemptOwner);
         throw err;
       }
 
@@ -4729,10 +5384,20 @@ export function createTrashCoordinator(
 
             try {
               await executePurgeOne({
-                item: { kind: nextCandidate.kind, publicId: nextCandidate.publicId },
+                item: {
+                  kind: nextCandidate.kind,
+                  publicId: nextCandidate.publicId,
+                  batchId: nextCandidate.batchId,
+                },
                 actor,
                 bulkCount: 1,
                 sweepPublicId,
+                sweepFence: {
+                  sweepRowId,
+                  sweepToken,
+                  sweepLeaseOwner,
+                  jobFence,
+                },
               });
               dueEvaluated += 1;
               purged += 1;
@@ -4768,7 +5433,9 @@ export function createTrashCoordinator(
               }
               if (
                 err instanceof DomainError &&
-                (err.reasonCode === "MAINTENANCE_ACTIVE" || err.reasonCode === "AUTO_PURGE_DISABLED")
+                (err.reasonCode === "MAINTENANCE_ACTIVE" ||
+                  err.reasonCode === "AUTO_PURGE_DISABLED" ||
+                  err.reasonCode === "SWEEP_FENCE_LOST")
               ) {
                 stoppedEarly = true;
                 break;
@@ -4777,6 +5444,7 @@ export function createTrashCoordinator(
                 err instanceof DomainError &&
                 (err.reasonCode === "NOT_IN_TRASH" ||
                   err.reasonCode === "NOT_DUE" ||
+                  err.reasonCode === "STALE" ||
                   err.reasonCode === "PURGE_IN_PROGRESS" ||
                   err.reasonCode === "PURGE_ALREADY_OWNED" ||
                   err.reasonCode === "PURGE_RETRY_BACKOFF" ||

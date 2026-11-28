@@ -5,7 +5,7 @@
  */
 import mysql from "mysql2/promise";
 import { drizzle } from "drizzle-orm/mysql2";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestDeps, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
@@ -814,7 +814,7 @@ describe("idempotency cross-batch protection, retention CAS, and router step-up"
         stepUpAt: laterNow,
         absoluteExpiresAt: new Date(laterNow.getTime() + 60 * 86_400_000),
       })
-      .where(eq(userSessions.publicId, adminStepUpPrincipal.sessionId));
+      .where(inArray(userSessions.publicId, [adminStepUpPrincipal.sessionId, adminPrincipal.sessionId]));
     adminStepUpPrincipal = { ...adminStepUpPrincipal, stepUpAt: laterNow };
 
     // Reusing the same key for a different item/batch even after 25 hours STILL fails `IDEMPOTENCY_KEY_REUSED`!
@@ -835,6 +835,203 @@ describe("idempotency cross-batch protection, retention CAS, and router step-up"
     });
     expect(resumedSameKey.results[0]?.ok).toBe(true);
     expect(resumedSameKey.runIds[0]).toBe(linkedIdem?.claimedRunPublicId);
+
+    // Multi-run bulk idempotency: item 1 completes (`ordOther`), item 2 fails (`ordBulk2`) -> BOTH runs tracked in `claimedRunPublicIds`!
+    const ordBulk2 = await seedOrder({ id: 504, ownerUserId: cust.id, reference: "ORD-2026-0504" });
+    const movedBulk2 = await failingTrash.moveToTrash(adminPrincipal, {
+      kind: "order",
+      publicId: ordBulk2.publicId,
+      idempotencyKey: "idem-fail-move-bulk-2",
+    });
+    let failSecondOnly = true;
+    const bulkTrash = createTrashModule(h.deps, {
+      expectedParticipants: ["identity", "orders", "selectiveBulkMod"],
+      runLeaseMs: 10_000,
+    });
+    for (const p of trash.participants()) {
+      if (p.module === "identity" || p.module === "orders") bulkTrash.register(p);
+    }
+    bulkTrash.register({
+      module: "selectiveBulkMod",
+      purge: async (entity, run) => {
+        await t.db.transaction(async (tx) => {
+          await run.assertCurrentInTx(tx);
+        });
+        if (failSecondOnly && entity.publicId === ordBulk2.publicId) {
+          throw new DomainError("UNAVAILABLE", "SECOND_BULK_FAILED", "Second item failed.");
+        }
+        return { deleted: { rows: 1 } };
+      },
+    });
+    bulkTrash.init?.();
+
+    const bulkPartial = await bulkTrash.purge(adminStepUpPrincipal, {
+      items: [
+        { kind: "order", publicId: ordOther.publicId, batchId: moved2.batchId },
+        { kind: "order", publicId: ordBulk2.publicId, batchId: movedBulk2.batchId },
+      ],
+      confirmation: "DELETE 2",
+      idempotencyKey: "idem-bulk-multi-run",
+    });
+    expect(bulkPartial.results[0]?.ok).toBe(true);
+    expect(bulkPartial.results[1]?.ok).toBe(false);
+
+    // Advance 25h: even though run 1 is `completed`, run 2 is `failed`, so 24h TTL MUST NOT drop `idem-bulk-multi-run`!
+    h.clock.advance(25 * 3_600_000);
+    const bulkLater = h.clock.now();
+    await t.db
+      .update(userSessions)
+      .set({
+        authenticatedAt: bulkLater,
+        lastSeenAt: bulkLater,
+        stepUpAt: bulkLater,
+        absoluteExpiresAt: new Date(bulkLater.getTime() + 60 * 86_400_000),
+      })
+      .where(inArray(userSessions.publicId, [adminStepUpPrincipal.sessionId, adminPrincipal.sessionId]));
+    adminStepUpPrincipal = { ...adminStepUpPrincipal, stepUpAt: bulkLater };
+
+    // Cross-fingerprint reuse after 25h STILL rejected because run 2 is incomplete!
+    await expect(
+      bulkTrash.purge(adminStepUpPrincipal, {
+        items: [{ kind: "order", publicId: ordBulk2.publicId, batchId: movedBulk2.batchId }],
+        confirmation: ordBulk2.reference,
+        idempotencyKey: "idem-bulk-multi-run",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "IDEMPOTENCY_KEY_REUSED" });
+
+    // If run 2 currently has a live lease (`status = running`), `reserveIdempotency` assesses ALL linked runs (not just run 1!) and rejects `REQUEST_IN_PROGRESS`!
+    const [secondRunRow] = await t.db
+      .select()
+      .from(trashPurgeRuns)
+      .where(eq(trashPurgeRuns.entityPublicId, ordBulk2.publicId));
+    await t.db
+      .update(trashPurgeRuns)
+      .set({ status: "running", leaseExpiresAt: new Date(bulkLater.getTime() + 10_000) })
+      .where(eq(trashPurgeRuns.id, secondRunRow!.id));
+    await expect(
+      bulkTrash.purge(adminStepUpPrincipal, {
+        items: [
+          { kind: "order", publicId: ordOther.publicId, batchId: moved2.batchId },
+          { kind: "order", publicId: ordBulk2.publicId, batchId: movedBulk2.batchId },
+        ],
+        confirmation: "DELETE 2",
+        idempotencyKey: "idem-bulk-multi-run",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "REQUEST_IN_PROGRESS" });
+
+    // Once run 2's lease expires and downstream recovers, same-fingerprint retry resumes run 2 and completes BOTH!
+    h.clock.advance(15_000);
+    const bulkRecoveredAt = h.clock.now();
+    await t.db
+      .update(userSessions)
+      .set({
+        authenticatedAt: bulkRecoveredAt,
+        lastSeenAt: bulkRecoveredAt,
+        stepUpAt: bulkRecoveredAt,
+        absoluteExpiresAt: new Date(bulkRecoveredAt.getTime() + 60 * 86_400_000),
+      })
+      .where(inArray(userSessions.publicId, [adminStepUpPrincipal.sessionId, adminPrincipal.sessionId]));
+    adminStepUpPrincipal = { ...adminStepUpPrincipal, stepUpAt: bulkRecoveredAt };
+    failSecondOnly = false;
+    const bulkCompleted = await bulkTrash.purge(adminStepUpPrincipal, {
+      items: [
+        { kind: "order", publicId: ordOther.publicId, batchId: moved2.batchId },
+        { kind: "order", publicId: ordBulk2.publicId, batchId: movedBulk2.batchId },
+      ],
+      confirmation: "DELETE 2",
+      idempotencyKey: "idem-bulk-multi-run",
+    });
+    expect(bulkCompleted.results.every((r) => r.ok)).toBe(true);
+
+    // Pre-claim `in_progress` crash recovery: simulate a worker that crashed right after `reserveIdempotency` (before any claim tx committed)!
+    const ordPreCrash = await seedOrder({ id: 505, ownerUserId: cust.id, reference: "ORD-2026-0505" });
+    let crashBeforeClaim = true;
+    const preCrashTrash = createTrashModule(h.deps, {
+      expectedParticipants: ["identity", "orders"],
+      runLeaseMs: 5_000,
+    });
+    for (const p of trash.participants()) {
+      if (p.module === "identity" || p.module === "orders") preCrashTrash.register(p);
+    }
+    preCrashTrash.init?.();
+    const movedPreCrash = await preCrashTrash.moveToTrash(adminPrincipal, {
+      kind: "order",
+      publicId: ordPreCrash.publicId,
+      idempotencyKey: "idem-move-pre-crash",
+    });
+
+    // Inject a transient error in `isDraining` and simulate `releaseUnmutatedIdempotency` NOT running (hard process crash) by re-inserting/keeping `in_progress`!
+    const origJobAdmin = h.services.jobAdmin;
+    let holdPreClaimGate!: () => void;
+    const preClaimEntered = new Promise<void>((resolve) => {
+      holdPreClaimGate = resolve;
+    });
+    let releasePreClaimHang!: () => void;
+    const preClaimHang = new Promise<void>((resolve) => {
+      releasePreClaimHang = resolve;
+    });
+    h.services.jobAdmin = {
+      isDraining: async () => {
+        if (crashBeforeClaim) {
+          holdPreClaimGate();
+          await preClaimHang;
+          throw new Error("SIMULATED_PRE_CLAIM_CRASH");
+        }
+        return false;
+      },
+      maintenance: origJobAdmin!.maintenance,
+    } as never;
+
+    const hungPreClaim = preCrashTrash.purge(adminStepUpPrincipal, {
+      items: [{ kind: "order", publicId: ordPreCrash.publicId, batchId: movedPreCrash.batchId }],
+      confirmation: ordPreCrash.reference,
+      idempotencyKey: "idem-pre-claim-crash-key",
+    });
+    await preClaimEntered;
+
+    // While pre-claim `in_progress` lease is active (< 5_000ms), duplicate retry is rejected with `REQUEST_IN_PROGRESS`!
+    await expect(
+      preCrashTrash.purge(adminStepUpPrincipal, {
+        items: [{ kind: "order", publicId: ordPreCrash.publicId, batchId: movedPreCrash.batchId }],
+        confirmation: ordPreCrash.reference,
+        idempotencyKey: "idem-pre-claim-crash-key",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "REQUEST_IN_PROGRESS" });
+
+    // Advance past `runLeaseMs` (6_000ms) while Worker A is still hung pre-claim (simulating dead worker whose cleanup never ran!):
+    // Same-fingerprint retry recovers the expired `in_progress` reservation, purges cleanly, and Worker A's late failure cannot delete/overwrite `completed`!
+    h.clock.advance(6_000);
+    const afterPreCrash = h.clock.now();
+    await t.db
+      .update(userSessions)
+      .set({
+        authenticatedAt: afterPreCrash,
+        lastSeenAt: afterPreCrash,
+        stepUpAt: afterPreCrash,
+        absoluteExpiresAt: new Date(afterPreCrash.getTime() + 60 * 86_400_000),
+      })
+      .where(eq(userSessions.publicId, adminStepUpPrincipal.sessionId));
+    adminStepUpPrincipal = { ...adminStepUpPrincipal, stepUpAt: afterPreCrash };
+    crashBeforeClaim = false;
+
+    const recoveredPreClaim = await preCrashTrash.purge(adminStepUpPrincipal, {
+      items: [{ kind: "order", publicId: ordPreCrash.publicId, batchId: movedPreCrash.batchId }],
+      confirmation: ordPreCrash.reference,
+      idempotencyKey: "idem-pre-claim-crash-key",
+    });
+    expect(recoveredPreClaim.results[0]?.ok).toBe(true);
+
+    releasePreClaimHang();
+    await expect(hungPreClaim).rejects.toThrow("SIMULATED_PRE_CLAIM_CRASH");
+    h.services.jobAdmin = origJobAdmin;
+
+    // Replaying `idem-pre-claim-crash-key` STILL returns the `completed` result (Worker A's late `releaseUnmutatedIdempotency` was fenced by `attemptOwner`!)
+    const replayRecovered = await preCrashTrash.purge(adminStepUpPrincipal, {
+      items: [{ kind: "order", publicId: ordPreCrash.publicId, batchId: movedPreCrash.batchId }],
+      confirmation: ordPreCrash.reference,
+      idempotencyKey: "idem-pre-claim-crash-key",
+    });
+    expect(replayRecovered).toEqual(recoveredPreClaim);
   });
 
   it("enforces exact preview counts, DELETE <N> confirmation, cohort STALE check, and tRPC step-up", async () => {
@@ -1225,7 +1422,7 @@ describe("durable per-target ownership, pure row-lock participant fence, and ret
     expect(seenByOrder.get(plainOrderA.publicId)).toEqual([false]);
   });
 
-  it("fences takeover on FOR SHARE / FOR UPDATE row locks during a destructive step and renews lease via heartbeat", async () => {
+  it("fences takeover in run-first lock order without opposite-lock deadlock and prevents stale worker from overwriting completed idempotency", async () => {
     const cust = await seedCustomer({ id: 80, status: "active" });
     const ord = await seedOrder({ id: 800, ownerUserId: cust.id, reference: "RP-2026-0800" });
 
@@ -1233,15 +1430,16 @@ describe("durable per-target ownership, pure row-lock participant fence, and ret
     const w1HoldingSharePromise = new Promise<void>((resolve) => {
       notifyW1HoldingShare = resolve;
     });
-    let releaseW1FirstTx!: () => void;
+    let releaseW1ToLockTarget!: () => void;
     const w1FirstTxGate = new Promise<void>((resolve) => {
-      releaseW1FirstTx = resolve;
+      releaseW1ToLockTarget = resolve;
     });
     let releaseW1BeforeSecondTx!: () => void;
     const w1SecondTxGate = new Promise<void>((resolve) => {
       releaseW1BeforeSecondTx = resolve;
     });
 
+    let w1LockedTargetRow = false;
     let secondDestructiveWriteCommitted = false;
     let participantAttempt = 0;
 
@@ -1255,16 +1453,26 @@ describe("durable per-target ownership, pure row-lock participant fence, and ret
     }
     raceTrash.register({
       module: "destructiveMod",
-      purge: async (_entity, run) => {
+      purge: async (entity, run) => {
         const myAttempt = ++participantAttempt;
         if (myAttempt === 1) {
-          // Worker 1 opens an in-flight destructive DB transaction holding `FOR SHARE` on `trash_purge_runs`!
+          // Worker 1 opens an in-flight destructive DB transaction holding `FOR SHARE` on `trash_purge_runs` (`run S`),
+          // waits until takeover Worker 2 enters Phase 1 (`run X`), and THEN locks `orders FOR UPDATE` (`target X`)!
+          // If Worker 2 had locked `orders` BEFORE `trash_purge_runs`, MySQL would deadlock (`ER_LOCK_DEADLOCK`) right here!
           await t.db.transaction(async (tx) => {
             await run.assertCurrentInTx(tx);
             notifyW1HoldingShare();
             await w1FirstTxGate;
+            const [lockedOrd] = await tx
+              .select({ id: orders.id })
+              .from(orders)
+              .where(eq(orders.id, Number(entity.id)))
+              .for("update");
+            expect(lockedOrd?.id).toBe(ord.id);
+            w1LockedTargetRow = true;
           });
-          // Wait until Worker 2 finishes taking over, then attempt a second local DB mutation — MUST fail `PURGE_FENCE_LOST`!
+          // Wait until Worker 2 finishes taking over and storing `completed` on the shared idempotency key,
+          // then attempt a second local DB mutation — MUST fail `PURGE_FENCE_LOST`!
           await w1SecondTxGate;
           await t.db.transaction(async (tx) => {
             await run.assertCurrentInTx(tx);
@@ -1272,9 +1480,14 @@ describe("durable per-target ownership, pure row-lock participant fence, and ret
           });
           return { deleted: { rows: 1 } };
         }
-        // Worker 2 (takeover worker): executes cleanly under `fencingToken = 2`!
+        // Worker 2 (takeover worker): locks `run S` -> `target X` cleanly under `fencingToken = 2`!
         await t.db.transaction(async (tx) => {
           await run.assertCurrentInTx(tx);
+          await tx
+            .select({ id: orders.id })
+            .from(orders)
+            .where(eq(orders.id, Number(entity.id)))
+            .for("update");
         });
         return { deleted: { rows: 1 } };
       },
@@ -1287,15 +1500,17 @@ describe("durable per-target ownership, pure row-lock participant fence, and ret
       idempotencyKey: "idem-race-move",
     });
 
+    const sharedIdemKey = "idem-race-shared-retry-key";
+
     const worker1Promise = raceTrash.purge(adminStepUpPrincipal, {
       items: [{ kind: "order", publicId: ord.publicId, batchId: moved.batchId }],
       confirmation: ord.reference,
-      idempotencyKey: "idem-race-worker-1",
+      idempotencyKey: sharedIdemKey,
     });
 
     await w1HoldingSharePromise;
 
-    // Advance fake clock past `runLeaseMs` while Worker 1 STILL holds `FOR SHARE` in MySQL!
+    // Advance fake clock past `runLeaseMs` while Worker 1 STILL holds `FOR SHARE` on `trash_purge_runs`!
     h.clock.advance(5_000);
     const later = h.clock.now();
     await t.db
@@ -1309,37 +1524,153 @@ describe("durable per-target ownership, pure row-lock participant fence, and ret
       .where(eq(userSessions.publicId, adminStepUpPrincipal.sessionId));
     adminStepUpPrincipal = { ...adminStepUpPrincipal, stepUpAt: later };
 
-    // Start Worker 2 takeover NOW while Worker 1's `FOR SHARE` tx is STILL open on another connection!
+    // Start Worker 2 takeover NOW with the SAME `idempotencyKey` while Worker 1's `FOR SHARE` tx is STILL open!
     let worker2Settled = false;
     const worker2Promise = raceTrash
       .purge(adminStepUpPrincipal, {
         items: [{ kind: "order", publicId: ord.publicId, batchId: moved.batchId }],
         confirmation: ord.reference,
-        idempotencyKey: "idem-race-worker-2",
+        idempotencyKey: sharedIdemKey,
       })
       .then((res) => {
         worker2Settled = true;
         return res;
       });
 
-    // Give MySQL 60ms: Worker 2 MUST still be waiting on InnoDB `FOR UPDATE` because Worker 1 holds `FOR SHARE`!
+    // Give MySQL 60ms: Worker 2 MUST be waiting on `trash_purge_runs FOR UPDATE` (NOT holding `orders FOR UPDATE`)!
     await new Promise((r) => setTimeout(r, 60));
     expect(worker2Settled).toBe(false);
     expect(participantAttempt).toBe(1);
 
-    // Release Worker 1's first transaction -> Worker 2 acquires `FOR UPDATE`, increments `fencingToken` to 2, and finishes!
-    releaseW1FirstTx();
+    // Release Worker 1 to acquire `orders FOR UPDATE` (`target X`) and commit -> zero deadlock, then Worker 2 completes!
+    releaseW1ToLockTarget();
     const w2Done = await worker2Promise;
+    expect(w1LockedTargetRow).toBe(true);
     expect(w2Done.results[0]?.ok).toBe(true);
 
     const [runAfterTakeover] = await t.db.select().from(trashPurgeRuns);
     expect(runAfterTakeover?.fencingToken).toBe(2);
     expect(runAfterTakeover?.status).toBe("completed");
 
-    // Unblock Worker 1's second transaction: `run.assertCurrentInTx(tx)` sees superseded token/status and fails `PURGE_FENCE_LOST`!
+    // Unblock Worker 1's second transaction: `run.assertCurrentInTx(tx)` fails `PURGE_FENCE_LOST`, and Worker 1 enters `catch -> failIdempotency`!
     releaseW1BeforeSecondTx();
     await expect(worker1Promise).rejects.toMatchObject({ reasonCode: "PURGE_FENCE_LOST" });
     expect(secondDestructiveWriteCommitted).toBe(false);
+
+    // CRITICAL: Verify stale Worker 1's `failIdempotency` did NOT overwrite Worker 2's `completed` reservation, and replaying `sharedIdemKey` succeeds!
+    const idemAfterRace = await t.db.select().from(trashIdempotencyKeys);
+    const sharedRow = idemAfterRace.find((r) => r.claimedRunPublicId === runAfterTakeover?.publicId);
+    expect(sharedRow?.status).toBe("completed");
+
+    const replayedSharedKey = await raceTrash.purge(adminStepUpPrincipal, {
+      items: [{ kind: "order", publicId: ord.publicId, batchId: moved.batchId }],
+      confirmation: ord.reference,
+      idempotencyKey: sharedIdemKey,
+    });
+    expect(replayedSharedKey).toEqual(w2Done);
+    expect(replayedSharedKey.results[0]?.ok).toBe(true);
+
+    // Also verify `finishLeavingExternalCopies` (`ack` resume path) obeys `run-first` lock order when an external reader/tx holds `run S` -> `orders X`!
+    const ordAckRace = await seedOrder({ id: 802, ownerUserId: cust.id, reference: "RP-2026-0802" });
+    const ackConnPubId = ulid(h.clock.now().getTime() + 90);
+    const ackTrash = createTrashModule(h.deps, {
+      expectedParticipants: ["identity", "orders", "files"],
+      runLeaseMs: 1_000,
+    });
+    for (const part of trash.participants()) {
+      if (part.module === "identity" || part.module === "orders") ackTrash.register(part);
+    }
+    ackTrash.register({
+      module: "files",
+      purge: async (entity, run) => {
+        await t.db.transaction(async (tx) => {
+          await run.assertCurrentInTx(tx);
+        });
+        if (!run.acknowledgedUnreachableCopies) {
+          const jNow = h.clock.now();
+          await t.db.insert(storageCopyAttempts).values({
+            publicId: ulid(jNow.getTime() + 91),
+            kind: "order_file",
+            sourcePublicId: ulid(jNow.getTime() + 92),
+            orderPublicId: entity.publicId,
+            connectionPublicId: ackConnPubId,
+            jobPublicId: `trash-un:${run.runId}:${ulid(jNow.getTime() + 93)}`,
+            attempt: 1,
+            state: "not_written",
+            errorCode: "EXTERNAL_COPIES_UNREACHABLE",
+            createdAt: jNow,
+            finishedAt: jNow,
+          });
+          throw new DomainError(
+            "UNAVAILABLE",
+            "EXTERNAL_COPIES_UNREACHABLE",
+            "External copy unreachable.",
+            { unreachableCopies: 1, unreachableCopyCounts: [`${ackConnPubId}:1`] },
+          );
+        }
+        return { deleted: { files: 1 }, kept: { acknowledgedExternalCopies: 1 } };
+      },
+    });
+    ackTrash.init?.();
+    const movedAck = await ackTrash.moveToTrash(adminPrincipal, {
+      kind: "order",
+      publicId: ordAckRace.publicId,
+      idempotencyKey: "idem-ack-race-move",
+    });
+    await expect(
+      ackTrash.purge(adminStepUpPrincipal, {
+        items: [{ kind: "order", publicId: ordAckRace.publicId, batchId: movedAck.batchId }],
+        confirmation: ordAckRace.reference,
+        idempotencyKey: "idem-ack-race-fail",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "EXTERNAL_COPIES_UNREACHABLE" });
+
+    const [ackRunRow] = await t.db
+      .select()
+      .from(trashPurgeRuns)
+      .where(eq(trashPurgeRuns.entityPublicId, ordAckRace.publicId));
+
+    let notifyAckShareHeld!: () => void;
+    const ackShareHeld = new Promise<void>((resolve) => {
+      notifyAckShareHeld = resolve;
+    });
+    let releaseAckShareTx!: () => void;
+    const ackShareGate = new Promise<void>((resolve) => {
+      releaseAckShareTx = resolve;
+    });
+    const holdRunThenOrderTx = t.db.transaction(async (tx) => {
+      await tx
+        .select({ id: trashPurgeRuns.id })
+        .from(trashPurgeRuns)
+        .where(eq(trashPurgeRuns.id, ackRunRow!.id))
+        .for("share");
+      notifyAckShareHeld();
+      await ackShareGate;
+      await tx.select({ id: orders.id }).from(orders).where(eq(orders.id, ordAckRace.id)).for("update");
+    });
+    await ackShareHeld;
+
+    let ackSettled = false;
+    const ackResumePromise = ackTrash
+      .finishLeavingExternalCopies(adminStepUpPrincipal, {
+        kind: "order",
+        publicId: ordAckRace.publicId,
+        batchId: movedAck.batchId,
+        runId: ackRunRow!.publicId,
+        targetOrderPublicId: ordAckRace.publicId,
+        confirmation: ordAckRace.reference,
+        idempotencyKey: "idem-ack-race-resume",
+      })
+      .then((res) => {
+        ackSettled = true;
+        return res;
+      });
+    await new Promise((r) => setTimeout(r, 60));
+    expect(ackSettled).toBe(false);
+    releaseAckShareTx();
+    await holdRunThenOrderTx;
+    const ackFinished = await ackResumePromise;
+    expect(ackFinished).toMatchObject({ ok: true, runId: ackRunRow!.publicId, keptExternalCopies: 1 });
 
     // Also verify background heartbeat timer extends `leaseExpiresAt` during a long step so an active worker is NOT stolen!
     const ordHb = await seedOrder({ id: 801, ownerUserId: cust.id, reference: "RP-2026-0801" });
@@ -1577,5 +1908,38 @@ describe("durable per-target ownership, pure row-lock participant fence, and ret
     await sweepTrash.runRetentionCleanup("job-fair-sweep-3");
     const legalHoldAlertsAfterSweep3 = opsEmitted.filter((a) => a.code === "ORDER_ON_LEGAL_HOLD");
     expect(legalHoldAlertsAfterSweep3).toHaveLength(heldItems.length);
+
+    // 6. Phase 1 atomic sweep lease + exact candidate batch check: if sweep lease is lost right inside Phase 1 (after pre-loop check), claim rolls back cleanly!
+    const fencedItem = await seedOrder({ id: 1000, ownerUserId: cust.id, reference: "RP-2026-1000" });
+    const latestAdminNow = h.clock.now();
+    await t.db
+      .update(userSessions)
+      .set({
+        authenticatedAt: latestAdminNow,
+        lastSeenAt: latestAdminNow,
+        absoluteExpiresAt: new Date(latestAdminNow.getTime() + 60 * 86_400_000),
+      })
+      .where(eq(userSessions.publicId, adminPrincipal.sessionId));
+    await sweepTrash.moveToTrash(adminPrincipal, {
+      kind: "order",
+      publicId: fencedItem.publicId,
+      idempotencyKey: "idem-sweep-phase1-fence",
+    });
+    h.clock.advance(31 * 86_400_000);
+    let callNum = 0;
+    const fencedSweep = await sweepTrash.runRetentionCleanup("job-phase1-fence-lost", {
+      signal: abortCtrl.signal,
+      assertStillOwned: async () => {
+        callNum += 1;
+        // Pass the outer pre-loop check (`callNum === 1`), then fail inside `executePurgeOne` Phase 1 (`callNum === 2`)!
+        if (callNum >= 2) {
+          throw new Error("JOB_LEASE_STOLEN_BEFORE_CLAIM");
+        }
+      },
+    });
+    expect(fencedSweep.purged).toBe(0);
+    const [fencedItemAfter] = await t.db.select().from(orders).where(eq(orders.id, fencedItem.id));
+    expect(fencedItemAfter?.purgeStartedAt).toBeNull();
+    expect(fencedItemAfter?.purgedAt).toBeNull();
   });
 });
