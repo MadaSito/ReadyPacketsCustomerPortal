@@ -138,7 +138,7 @@ describe("mailTemplates module (Package D)", () => {
     expect(preview.text).toBe(test.text);
     expect(preview.text.split("\n")).toContain(url);
     expect(preview.previewHtml).not.toContain("href=");
-    expect(test.html).toContain(`href="${url.replace("&", "&amp;")}"`);
+    expect(test.html).toContain(`href="${url.replaceAll("&", "&amp;")}"`);
   });
   it("limits phase actions to the approved contracts and compatible published custom mail", async () => {
     async function create(templateKey: string, name: string, variable: string, sensitive = false) {
