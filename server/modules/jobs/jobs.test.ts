@@ -1,6 +1,6 @@
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { forbidden } from "../../core/errors.js";
+import { conflict, forbidden } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import { getRequestContext, newRequestContext, runWithRequestContext } from "../../core/requestContext.js";
 import { createCallerFactory } from "../../trpc/trpc.js";
@@ -12,6 +12,7 @@ import { IDENTITY_MAIL_TEMPLATES } from "../identity/mail.js";
 import { users } from "../identity/schema.js";
 import { orderReferences, orders } from "../orders/schema.js";
 import { TRASH_JOB_RETENTION_CLEANUP } from "../trash/jobNames.js";
+import { unfencedPurgeRunForTests } from "../trash/ports.js";
 import { createJobsAdmin } from "./admin.js";
 import { customerMaintenanceNotice } from "./customerMaintenance.js";
 import { createJobsModule } from "./index.js";
@@ -981,14 +982,36 @@ describe("MySQL transactional mail outbox", () => {
     const entity = { kind: "order" as const, id: 25, publicId: ulid(), batchId: ulid() };
     await t.db.transaction((tx) => participant.onTrashedInTx!(tx, entity, { kind: "system", job: "test.trash" }));
     expect(await participant.summarize!(entity)).toEqual({ retainedMailCopies: 1 });
-    await expect(participant.purge!(entity, { runId: ulid() })).resolves.toEqual({ deleted: { retainedMailCopies: 1 } });
-    await expect(participant.purge!(entity, { runId: ulid() })).resolves.toEqual({ deleted: { retainedMailCopies: 0 } });
+    const run = unfencedPurgeRunForTests(ulid());
+    await expect(participant.purge!(entity, run)).resolves.toEqual({ deleted: { retainedMailCopies: 1 } });
+    await expect(participant.purge!(entity, run)).resolves.toEqual({ deleted: { retainedMailCopies: 0 } });
     expect(await t.db.select().from(mailOutbox).where(eq(mailOutbox.orderId, 25))).toEqual(expect.arrayContaining([
       expect.objectContaining({ state: "accepted", contentEnc: null }),
       expect.objectContaining({ state: "failed", payloadEnc: null, reasonCode: "MAIL_SCOPE_UNAVAILABLE" }),
     ]));
     expect((await t.db.select().from(mailOutbox).where(eq(mailOutbox.orderId, 30)))[0]?.payloadEnc).toBeTruthy();
     expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves retained mail unchanged when the purge worker has lost its fence", async () => {
+    const f = fixture();
+    const participant = createMailTrashParticipant(f.h.deps);
+    setDelivery(f, "accepted");
+    await f.h.settings.set(MAIL_RETAIN_CONTENT.key, true);
+    const entity = { kind: "order" as const, id: 25, publicId: ulid(), batchId: ulid() };
+    await f.mailer.enqueue({ ...input, orderId: entity.id });
+    await f.engine.execute((await f.engine.claim())!);
+    const rows = () => t.db.select().from(mailOutbox).where(eq(mailOutbox.orderId, entity.id));
+    const before = await rows();
+    expect(before).toEqual([expect.objectContaining({ state: "accepted", contentEnc: expect.any(String) })]);
+
+    const assertCurrentInTx = vi.fn(async () => {
+      throw conflict("PURGE_FENCE_LOST", "Permanent deletion claim was superseded.");
+    });
+    const run = unfencedPurgeRunForTests(ulid(), { assertCurrentInTx });
+    await expect(participant.purge!(entity, run)).rejects.toMatchObject({ reasonCode: "PURGE_FENCE_LOST" });
+    expect(assertCurrentInTx).toHaveBeenCalledTimes(1);
+    expect(await rows()).toEqual(before);
   });
 
   it("does not send a queued literal-address message to a new account after the old account is purged", async () => {

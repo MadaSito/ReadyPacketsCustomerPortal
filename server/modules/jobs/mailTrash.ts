@@ -153,10 +153,13 @@ export function createMailTrashParticipant(deps: Pick<ModuleDeps, "db" | "clock"
       const [row] = await deps.db.select({ total: count() }).from(mailOutbox).where(and(matchingEntity(entity), hasContent));
       return { retainedMailCopies: row?.total ?? 0 };
     },
-    async purge(entity) {
-      const [result] = await deps.db.update(mailOutbox).set({ ...eraseContent, updatedAt: deps.clock.now() })
-        .where(and(matchingEntity(entity), hasContent));
-      return { deleted: { retainedMailCopies: result.affectedRows } };
+    async purge(entity, run) {
+      return deps.db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
+        const [result] = await tx.update(mailOutbox).set({ ...eraseContent, updatedAt: deps.clock.now() })
+          .where(and(matchingEntity(entity), hasContent));
+        return { deleted: { retainedMailCopies: result.affectedRows } };
+      });
     },
   };
 }
