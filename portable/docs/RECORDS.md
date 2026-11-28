@@ -27,6 +27,7 @@ File `records/customers.jsonl` · schema `schemas/v3/records/customers.schema.js
 | `marketingOptIn` | yes | boolean |
 | `customFields` | no | array of object |
 | `billingProfile` | no | object \| null |
+| `trash` | no | object \| null |
 | `createdAt` | yes | UTC time \| null |
 | `updatedAt` | yes | UTC time \| null |
 
@@ -59,6 +60,7 @@ File `records/orders.jsonl` · schema `schemas/v3/records/orders.schema.json`
 | `dueAt` | yes | UTC time \| null |
 | `deliveredAt` | yes | UTC time \| null |
 | `closedAt` | yes | UTC time \| null |
+| `trash` | no | object \| null |
 | `createdAt` | yes | UTC time |
 | `updatedAt` | yes | UTC time \| null |
 

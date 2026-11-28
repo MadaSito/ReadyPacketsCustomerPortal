@@ -31,6 +31,17 @@ const base = {
   heldUnknown: HeldUnknown.optional(),
 };
 
+/** Trash state of a customer or an order (optional in 3.0; absent or null = live). `purgedAt` set = tombstone: the
+ *  record then carries only what a tombstone holds. `purgeStartedAt` set without `purgedAt` is a half-finished
+ *  permanent deletion; producers must not export it and importers refuse it. */
+const TrashState = z.strictObject({
+  trashedAt: UtcTime,
+  batchId: PublicId.nullable(),
+  reason: text(200).nullable(),
+  purgeStartedAt: UtcTime.nullable(),
+  purgedAt: UtcTime.nullable(),
+});
+
 export const CustomerRecord = z.strictObject({
   ...base,
   /** Mutable human-facing customer number (not identity). */
@@ -67,6 +78,8 @@ export const CustomerRecord = z.strictObject({
     postalCode: text(32, 1),
     taxId: text(64),
   }).nullable().optional(),
+  /** Trash state (increment 09). Optional in 3.0. */
+  trash: TrashState.nullable().optional(),
   /** null = unknown (legacy v1/v2 packages did not carry it). */
   createdAt: UtcTime.nullable(),
   updatedAt: UtcTime.nullable(),
@@ -105,6 +118,8 @@ export const OrderRecord = z.strictObject({
   dueAt: UtcTime.nullable(),
   deliveredAt: UtcTime.nullable(),
   closedAt: UtcTime.nullable(),
+  /** Trash state (increment 09). Optional in 3.0. A tombstone has no items, history or files in the package. */
+  trash: TrashState.nullable().optional(),
   createdAt: UtcTime,
   updatedAt: UtcTime.nullable(),
 });
