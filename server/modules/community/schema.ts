@@ -85,6 +85,7 @@ export const communityTopics = mysqlTable(
   (t) => [
     index("community_topics_list_idx").on(t.categoryId, t.pinned, t.lastPostAt),
     index("community_topics_recent_idx").on(t.visible, t.lastPostAt),
+    index("community_topics_author_idx").on(t.authorUserId, t.id),
   ],
 );
 
@@ -163,6 +164,7 @@ export const communityReports = mysqlTable(
   (t) => [
     uniqueIndex("community_reports_open_uq").on(t.postId, t.openReporterUserId),
     index("community_reports_state_idx").on(t.state, t.id),
+    index("community_reports_reporter_idx").on(t.reporterUserId, t.id),
   ],
 );
 
