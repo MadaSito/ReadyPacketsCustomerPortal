@@ -257,6 +257,37 @@ describe("Trash centre", () => {
     expect(await within(still).findByRole("alert")).toHaveTextContent("Identity check cancelled. Nothing was deleted.");
   });
 
+  it("a failed attempt on one item does not reuse its request key for the next item, and a retry keeps it", async () => {
+    const user = userEvent.setup();
+    handlers.set("trash.purge", () => { throw safe("STORAGE_UNSAFE", "Private storage is unavailable.", "UNAVAILABLE"); });
+    renderPage();
+    await heading();
+    const keysFor = (id: string) => calls
+      .filter((c) => c.path === "trash.purge" && (c.input as { items: { publicId: string }[] }).items[0]?.publicId === id)
+      .map((c) => (c.input as { idempotencyKey: string }).idempotencyKey);
+    const attempt = async (reference: string) => {
+      const dialog = await screen.findByRole("alertdialog");
+      const box = within(dialog).getByLabelText(/to confirm/);
+      await user.clear(box);
+      await user.type(box, reference);
+      await user.click(within(dialog).getByRole("button", { name: "Delete permanently" }));
+      return dialog;
+    };
+    await user.click(firstButton(/Delete permanently RP-2026-001/));
+    const dialog = await attempt("RP-2026-001");
+    expect(await within(dialog).findByRole("alert")).not.toBeEmptyDOMElement();
+    await attempt("RP-2026-001");
+    await waitFor(() => expect(keysFor(row(1).publicId)).toHaveLength(2));
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
+    await user.click(firstButton(/Delete permanently RP-2026-002/));
+    await attempt("RP-2026-002");
+    await waitFor(() => expect(keysFor(row(2).publicId)).toHaveLength(1));
+    const [first, retry] = keysFor(row(1).publicId);
+    expect(retry).toBe(first);
+    expect(keysFor(row(2).publicId)[0]).not.toBe(first);
+  });
+
   it("server-side failure keeps the dialog open and returns focus to the opener after cancel", async () => {
     const user = userEvent.setup();
     handlers.set("trash.restore", () => { throw safe("RESTORE_CONFLICT", "Conflict."); });

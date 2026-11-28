@@ -42,6 +42,24 @@ function useRefreshTrash() {
 }
 
 
+/**
+ * One request key per target: a retry for the same item reuses the key (the server resumes the same request);
+ * a different item, or a new attempt after success, gets a fresh one. The dialogs stay mounted between uses,
+ * so a key kept in plain state would be sent again for the next item and refused as "already used".
+ */
+function useActionKey(signature: string): [string, () => void] {
+  const [state, setState] = useState(() => ({ signature, key: newIdempotencyKey() }));
+  let current = state;
+  if (signature !== "" && state.signature !== signature) {
+    current = { signature, key: newIdempotencyKey() };
+    setState(current);
+  }
+  const renew = useCallback(() => setState((s) => ({ signature: s.signature, key: newIdempotencyKey() })), []);
+  return [current.key, renew];
+}
+
+const targetsSignature = (items: readonly TrashTarget[]) => items.map((i) => `${i.kind}:${i.publicId}:${i.batchId ?? ""}`).join("|");
+
 export interface MoveToTrashDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -70,7 +88,7 @@ export function MoveToTrashDialog({ open, onOpenChange, kind, publicId, itemLabe
   const move = useMutation(api.moveToTrash.mutationOptions());
   const [reason, setReason] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [key] = useState(newIdempotencyKey);
+  const [key, renewKey] = useActionKey(`${kind}:${publicId}:${reason.trim()}`);
   const noun = KIND_NOUN[kind].one;
   const tooLong = reason.length > REASON_MAX;
   /** The success toast waits until the modal is gone: while it is open the toast live region is hidden. */
@@ -111,6 +129,7 @@ export function MoveToTrashDialog({ open, onOpenChange, kind, publicId, itemLabe
     setError(null);
     try {
       const out = await move.mutateAsync({ kind, publicId, reason: reason.trim() || undefined, idempotencyKey: key });
+      renewKey();
       setReason("");
       pendingToast.current = {
         tone: "success",
@@ -202,14 +221,14 @@ export function RestoreDialog({ open, onOpenChange, kind, items, onDone, returnF
   const single = items.length === 1 ? items[0]! : null;
   const summary = useQuery({ ...api.summarize.queryOptions({ kind, publicId: single?.publicId ?? "" }), enabled: open && Boolean(single) });
   const [error, setError] = useState<string | null>(null);
-  const [key, setKey] = useState(newIdempotencyKey);
+  const [key, renewKey] = useActionKey(targetsSignature(items));
   const lines = summary.data ? summaryLines(summary.data.counts) : [];
 
   const confirm = async () => {
     setError(null);
     try {
       const out = await restore.mutateAsync({ items: items.map(({ kind: k, publicId, batchId }) => ({ kind: k, publicId, batchId })), idempotencyKey: key });
-      setKey(newIdempotencyKey());
+      renewKey();
       await refresh();
       onDone(resultSentence(kind, "restored", out.results, labelsOf(items)));
     } catch (e) {
@@ -251,7 +270,7 @@ export function PurgeDialog({ open, onOpenChange, kind, items, onDone, returnFoc
   const single = items.length === 1 ? items[0]! : null;
   const confirmation = single ? single.reference : bulkConfirmation(items.length);
   const [error, setError] = useState<string | null>(null);
-  const [key, setKey] = useState(newIdempotencyKey);
+  const [key, renewKey] = useActionKey(targetsSignature(items));
 
   const confirm = async () => {
     setError(null);
@@ -260,7 +279,7 @@ export function PurgeDialog({ open, onOpenChange, kind, items, onDone, returnFoc
         () => purge.mutateAsync({ items: items.map(({ kind: k, publicId, batchId }) => ({ kind: k, publicId, batchId })), confirmation, idempotencyKey: key }),
         { reason: "Deleting permanently requires a fresh identity check." },
       );
-      setKey(newIdempotencyKey());
+      renewKey();
       await refresh();
       onDone(resultSentence(kind, "deleted permanently", out.results, labelsOf(items)));
     } catch (e) {
@@ -309,7 +328,7 @@ export function FinishLeavingCopiesDialog({ open, onOpenChange, item, onDone, re
   const refresh = useRefreshTrash();
   const finish = useMutation(api.finishLeavingExternalCopies.mutationOptions());
   const [error, setError] = useState<string | null>(null);
-  const [key, setKey] = useState(newIdempotencyKey);
+  const [key, renewKey] = useActionKey(item ? `finish:${item.kind}:${item.publicId}:${item.runId ?? ""}:${item.targetOrderPublicId ?? ""}` : "");
   const n = item?.copies ?? 0;
   const copies = n === 1 ? "1 external copy" : `${n} external copies`;
   /** A halted cascade asks for the order the run stopped on; otherwise the item's own reference. */
@@ -327,7 +346,7 @@ export function FinishLeavingCopiesDialog({ open, onOpenChange, item, onDone, re
         }),
         { reason: "Finishing a permanent deletion requires a fresh identity check." },
       );
-      setKey(newIdempotencyKey());
+      renewKey();
       await refresh();
       onDone(`${item.label} deleted permanently. ${out.keptExternalCopies === 1 ? "1 external copy was" : `${out.keptExternalCopies} external copies were`} left in place.`);
     } catch (e) {
