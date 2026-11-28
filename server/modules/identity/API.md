@@ -512,7 +512,7 @@ Identity owns the `users` trash columns (`trashed_at`, `trashed_by_user_id`, `tr
 ### Participant
 `init()` calls `deps.services.trash?.register?.(trash.participant())` with module `identity`.
 - `summarize` returns `{ sessions, ssoLinks }`.
-- `purge` erases sessions, tokens and SSO data.
+- `purge(entity, run)` erases sessions, tokens and SSO data in a single transaction. Its first statement is `run.assertCurrentInTx(tx)`, the D2.8 fence: a lost fence throws `PURGE_FENCE_LOST` and changes nothing. It makes no external provider calls and is idempotent.
 - MFA, recovery codes and passkeys are erased by the assurance participant, never here.
 
 ### Portable ports

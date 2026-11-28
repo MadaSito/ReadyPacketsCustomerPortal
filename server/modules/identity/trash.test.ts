@@ -29,7 +29,7 @@ import {
   users,
   userSessions,
 } from "./schema.js";
-import type { TrashActor } from "../trash/ports.js";
+import { unfencedPurgeRunForTests, type TrashActor } from "../trash/ports.js";
 
 const PW = "copper lantern drifts beyond quiet harbor";
 
@@ -116,7 +116,7 @@ describe("identity trash (MySQL)", () => {
     const s = await trashed();
     const runId = ulid(h.clock.now().getTime());
     await tx((t) => identity.trash.markPurgeStartedInTx(t, s.customer.id, { actor: actorFor(s.admin), batchId: s.batchId, runId }));
-    await identity.trash.participant().purge!({ kind: "customer", id: s.customer.id, publicId: s.customer.publicId, batchId: s.batchId }, { runId });
+    await identity.trash.participant().purge!({ kind: "customer", id: s.customer.id, publicId: s.customer.publicId, batchId: s.batchId }, unfencedPurgeRunForTests(runId));
     await tx((t) => identity.trash.tombstoneCustomerInTx(t, s.customer.id, { actor: actorFor(s.admin), runId }));
     h.audit.clear();
     return { ...s, runId };
@@ -317,15 +317,39 @@ describe("identity trash (MySQL)", () => {
   });
 
   describe("permanent deletion (tombstone)", () => {
+    it("a lost purge fence leaves every credential in place (fence is checked first, inside the transaction)", async () => {
+      const s = await trashed();
+      const runId = ulid();
+      await tx((t) => identity.trash.markPurgeStartedInTx(t, s.customer.id, { actor: actorFor(s.admin), batchId: s.batchId, runId }));
+      const ref = { kind: "customer" as const, id: s.customer.id, publicId: s.customer.publicId, batchId: s.batchId };
+      const sessionsBefore = await db.db.select().from(userSessions).where(eq(userSessions.userId, s.customer.id));
+      const tokensBefore = await db.db.select().from(identityTokens).where(eq(identityTokens.userId, s.customer.id));
+      const before = await row(s.customer.id);
+      let fenced = 0;
+      const lost = unfencedPurgeRunForTests(runId, {
+        assertCurrentInTx: async () => {
+          fenced += 1;
+          throw new DomainError("CONFLICT", "PURGE_FENCE_LOST", "Another worker took over this deletion.");
+        },
+      });
+      await expect(identity.trash.participant().purge!(ref, lost)).rejects.toMatchObject({ reasonCode: "PURGE_FENCE_LOST" });
+      expect(fenced).toBe(1);
+      expect(await db.db.select().from(userSessions).where(eq(userSessions.userId, s.customer.id))).toEqual(sessionsBefore);
+      expect(await db.db.select().from(identityTokens).where(eq(identityTokens.userId, s.customer.id))).toEqual(tokensBefore);
+      expect(await row(s.customer.id)).toEqual(before);
+      // The current worker then succeeds (still idempotent).
+      expect((await identity.trash.participant().purge!(ref, unfencedPurgeRunForTests(runId))).deleted).toBeDefined();
+    });
+
     it("overwrites personal data, erases credentials, frees the address and keeps the customer ID; idempotent", async () => {
       const s = await trashed();
       const before = await row(s.customer.id);
       const runId = ulid();
       await tx((t) => identity.trash.markPurgeStartedInTx(t, s.customer.id, { actor: actorFor(s.admin), batchId: s.batchId, runId }));
       const ref = { kind: "customer" as const, id: s.customer.id, publicId: s.customer.publicId, batchId: s.batchId };
-      const p1 = await identity.trash.participant().purge!(ref, { runId });
+      const p1 = await identity.trash.participant().purge!(ref, unfencedPurgeRunForTests(runId));
       expect(p1.deleted.sessions).toBeGreaterThan(0);
-      expect((await identity.trash.participant().purge!(ref, { runId })).deleted).toMatchObject({ sessions: 0, tokens: 0 });
+      expect((await identity.trash.participant().purge!(ref, unfencedPurgeRunForTests(runId))).deleted).toMatchObject({ sessions: 0, tokens: 0 });
       const done = await tx((t) => identity.trash.tombstoneCustomerInTx(t, s.customer.id, { actor: actorFor(s.admin), runId }));
       expect(done.changed).toBe(true);
       const r = await row(s.customer.id);
@@ -382,7 +406,7 @@ describe("identity trash (MySQL)", () => {
       await tx((t) => identity.trash.trashCustomerInTx(t, s.customer.id, { actor: actorFor(s.admin), batchId }));
       const runId = ulid();
       await tx((t) => identity.trash.markPurgeStartedInTx(t, s.customer.id, { batchId, runId }));
-      await identity.trash.participant().purge!({ kind: "customer", id: s.customer.id, publicId: s.customer.publicId, batchId }, { runId });
+      await identity.trash.participant().purge!({ kind: "customer", id: s.customer.id, publicId: s.customer.publicId, batchId }, unfencedPurgeRunForTests(runId));
       await tx((t) => identity.trash.tombstoneCustomerInTx(t, s.customer.id, { runId }));
       await identity.auth.register({ email: s.customer.email, nameParts: { firstName: "Ice", lastName: "Queen", preferredName: null }, password: PW }, {});
       const fresh = (await identity.findUserIdByEmail(s.customer.email))!;

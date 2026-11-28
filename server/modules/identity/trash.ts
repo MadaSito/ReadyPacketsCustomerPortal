@@ -308,9 +308,11 @@ export function createIdentityTrash(i: { deps: ModuleDeps; sessions: SessionServ
           if (!isCustomer(entity)) return {};
           return sessionAndLinkCounts(deps.db, Number(entity.id));
         },
-        async purge(entity) {
+        async purge(entity, run) {
           if (!isCustomer(entity)) return { deleted: {} };
           const deleted = await deps.db.transaction(async (tx) => {
+            // D2.8 fence: FIRST statement of the only data-changing transaction (no external provider calls here).
+            await run.assertCurrentInTx(tx);
             const row = await lockCustomer(tx, Number(entity.id));
             if (row.publicId !== entity.publicId) throw notFound("CUSTOMER_NOT_FOUND");
             if (row.purgedAt) return {};

@@ -57,7 +57,7 @@ profile cases use production parameters). Fakes: audit, mailer, jobs, rate limit
 
 All of the following were run on 27 Nov 2026, one file per run.
 
-### Server: `trash.test.ts` (19 tests, MySQL, synthetic data)
+### Server: `trash.test.ts` (20 tests, MySQL, synthetic data)
 - Refusals: an account that is not suspended gets a 409 with a plain message; an account that is not a customer gets not-found.
 - Trash: the columns are set, sessions and tokens are revoked, and the call is idempotent per batch.
 - `cleanTrashReason` bounds.
@@ -76,6 +76,7 @@ All of the following were run on 27 Nov 2026, one file per run.
   - A tombstone never appears anywhere. A purged address registers again as a new account that inherits nothing.
 - Locking check (follow-up): with a lock, an unknown id counts as trashed while the plain read still returns false; `lockGoneInTx` dedupes and sorts; a held `FOR SHARE` makes the coordinator's `FOR UPDATE` trash time out (lock wait) until commit.
 - Reset jobs: a job queued before the purge does nothing after re-registration (no token, no mail); a new request serves the new account; a job without a bound id or with a wrong id is refused.
+- Purge fence: when the fence throws, sessions, tokens and the user row are unchanged; it is called once, first; the current worker then succeeds.
 - Sign-in log: a trashed account's events show `user: null`, and its ID filter returns `[]`, like an unknown ID.
 - Lists and portable ports:
   - `listTrashedCustomers` returns no names or e-mail.
