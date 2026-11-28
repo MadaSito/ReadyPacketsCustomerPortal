@@ -62,7 +62,13 @@ import {
   type PacketTierName,
   type RestoreCheckoutResult,
 } from "./types.js";
-import { createCartTrashParticipant, isCheckoutOrderLive } from "./trash.js";
+import {
+  createCartTrashParticipant,
+  isCheckoutOrderLive,
+  isMysqlDeadlockError,
+  lockRestoreOrdersFenceInTx,
+  shareLockLiveAddOnTargetInTx,
+} from "./trash.js";
 import { createCartUpsellService } from "./upsell.js";
 import type { z } from "zod";
 
@@ -1057,43 +1063,81 @@ export function createCartService(deps: ModuleDeps): CartModule {
         }
       }
 
+      const RETRY_ADD_ITEMS_TARGET_SENTINEL = Symbol("RETRY_ADD_ITEMS_TARGET_SENTINEL");
       let deniedTargetOrderPublicId: string | null = null;
       try {
-        await deps.db.transaction(async (tx) => {
-          const liveActor = await actorCheck(principal, tx, "orders.create");
-          if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
-          await assertCartEnabled(tx);
+        let sentinelRetries = 0;
+        let deadlockRetries = 0;
+        for (;;) {
+          deniedTargetOrderPublicId = null;
+          try {
+            await deps.db.transaction(async (tx) => {
+              const liveActor = await actorCheck(principal, tx, "orders.create");
+              if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
+              await assertCartEnabled(tx);
 
-          const now = deps.clock.now();
-          const cart = await getOrCreateOpenCartInTx(tx, principal.userId, now);
-          const existingItems = await tx
-            .select()
-            .from(cartItems)
-            .where(eq(cartItems.cartId, cart.id))
-            .orderBy(asc(cartItems.position), asc(cartItems.id))
-            .for("update");
+              let peekedOpenAddTo: string | null = null;
+              if (input.addToOrderPublicId === undefined) {
+                const [peekOpen] = await tx
+                  .select({ addToOrderPublicId: carts.addToOrderPublicId })
+                  .from(carts)
+                  .where(and(eq(carts.ownerUserId, principal.userId), eq(carts.activeOwnerSlot, principal.userId)))
+                  .limit(1);
+                peekedOpenAddTo = peekOpen?.addToOrderPublicId ?? null;
+              }
 
-          let activeTarget: CartAddOnTarget | null = null;
-          let nextAddToOrderPublicId: string | null | undefined;
-          if (input.addToOrderPublicId === null) {
-            activeTarget = null;
-            nextAddToOrderPublicId = null;
-          } else if (typeof input.addToOrderPublicId === "string") {
-            const resolved = await ordersSvc.addOnTargetInTx(tx, principal.userId, input.addToOrderPublicId);
-            if (!resolved) {
-              deniedTargetOrderPublicId = input.addToOrderPublicId;
-              throw notFound("ORDER_NOT_FOUND");
-            }
-            activeTarget = resolved;
-            nextAddToOrderPublicId = resolved.rootPublicId;
-          } else if (cart.addToOrderPublicId) {
-            const resolved = await ordersSvc.addOnTargetInTx(tx, principal.userId, cart.addToOrderPublicId);
-            if (!resolved) {
-              throw conflict("ADD_ON_TARGET_UNAVAILABLE", "Packets can no longer be added to this project.");
-            }
-            activeTarget = resolved;
-            nextAddToOrderPublicId = resolved.rootPublicId;
-          }
+              const candidateTargetPublicId =
+                input.addToOrderPublicId === null
+                  ? null
+                  : typeof input.addToOrderPublicId === "string"
+                    ? input.addToOrderPublicId
+                    : peekedOpenAddTo;
+
+              const lockedAddOn = candidateTargetPublicId
+                ? await shareLockLiveAddOnTargetInTx(tx, principal.userId, candidateTargetPublicId)
+                : null;
+
+              const now = deps.clock.now();
+              const cart = await getOrCreateOpenCartInTx(tx, principal.userId, now);
+              if (
+                input.addToOrderPublicId === undefined &&
+                peekedOpenAddTo !== (cart.addToOrderPublicId ?? null)
+              ) {
+                throw RETRY_ADD_ITEMS_TARGET_SENTINEL;
+              }
+
+              const existingItems = await tx
+                .select()
+                .from(cartItems)
+                .where(eq(cartItems.cartId, cart.id))
+                .orderBy(asc(cartItems.position), asc(cartItems.id))
+                .for("update");
+
+              let activeTarget: CartAddOnTarget | null = null;
+              let nextAddToOrderPublicId: string | null | undefined;
+              if (input.addToOrderPublicId === null) {
+                activeTarget = null;
+                nextAddToOrderPublicId = null;
+              } else if (typeof input.addToOrderPublicId === "string") {
+                const resolved = lockedAddOn
+                  ? await ordersSvc.addOnTargetInTx(tx, principal.userId, input.addToOrderPublicId)
+                  : null;
+                if (!resolved || resolved.rootPublicId !== lockedAddOn?.rootPublicId) {
+                  deniedTargetOrderPublicId = input.addToOrderPublicId;
+                  throw notFound("ORDER_NOT_FOUND");
+                }
+                activeTarget = resolved;
+                nextAddToOrderPublicId = resolved.rootPublicId;
+              } else if (cart.addToOrderPublicId) {
+                const resolved = lockedAddOn
+                  ? await ordersSvc.addOnTargetInTx(tx, principal.userId, cart.addToOrderPublicId)
+                  : null;
+                if (!resolved || resolved.rootPublicId !== lockedAddOn?.rootPublicId) {
+                  throw conflict("ADD_ON_TARGET_UNAVAILABLE", "Packets can no longer be added to this project.");
+                }
+                activeTarget = resolved;
+                nextAddToOrderPublicId = resolved.rootPublicId;
+              }
 
           if (activeTarget) {
             const targetPackets = new Set(activeTarget.packetNumbers);
@@ -1220,7 +1264,22 @@ export function createCartService(deps: ModuleDeps): CartModule {
             },
             tx,
           );
-        });
+            });
+            break;
+          } catch (innerErr) {
+            if (innerErr === RETRY_ADD_ITEMS_TARGET_SENTINEL) {
+              if (sentinelRetries >= 2) throw staleCartVersion();
+              sentinelRetries += 1;
+              continue;
+            }
+            if (isMysqlDeadlockError(innerErr) && deadlockRetries < 3) {
+              deadlockRetries += 1;
+              await new Promise((resolve) => setTimeout(resolve, 10 * deadlockRetries));
+              continue;
+            }
+            throw innerErr;
+          }
+        }
       } catch (err) {
         if (deniedTargetOrderPublicId) {
           await denyCartAuthz(principal, "ADD_ON_TARGET_NOT_AUTHORIZED", {
@@ -1433,48 +1492,65 @@ export function createCartService(deps: ModuleDeps): CartModule {
 
       let deniedTargetOrderPublicId: string | null = null;
       try {
-        await deps.db.transaction(async (tx) => {
-          const liveActor = await actorCheck(principal, tx, "orders.create");
-          if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
-          await assertCartEnabled(tx);
+        let deadlockRetries = 0;
+        for (;;) {
+          deniedTargetOrderPublicId = null;
+          try {
+            await deps.db.transaction(async (tx) => {
+              const liveActor = await actorCheck(principal, tx, "orders.create");
+              if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
+              await assertCartEnabled(tx);
 
-          const now = deps.clock.now();
-          const cart =
-            input.expectedVersion !== undefined
-              ? await requireOpenCartWithVersionInTx(tx, principal.userId, input.expectedVersion)
-              : await getOrCreateOpenCartInTx(tx, principal.userId, now);
+              let nextAddToOrderPublicId: string | null = null;
+              let resolvedTarget: CartAddOnTarget | null = null;
+              if (input.addToOrderPublicId !== null) {
+                const lockedAddOn = await shareLockLiveAddOnTargetInTx(tx, principal.userId, input.addToOrderPublicId);
+                resolvedTarget = lockedAddOn
+                  ? await ordersSvc.addOnTargetInTx(tx, principal.userId, input.addToOrderPublicId)
+                  : null;
+                if (!resolvedTarget || resolvedTarget.rootPublicId !== lockedAddOn?.rootPublicId) {
+                  deniedTargetOrderPublicId = input.addToOrderPublicId;
+                  throw notFound("ORDER_NOT_FOUND");
+                }
+                nextAddToOrderPublicId = resolvedTarget.rootPublicId;
+              }
 
-          let nextAddToOrderPublicId: string | null = null;
-          let resolvedTarget: CartAddOnTarget | null = null;
-          if (input.addToOrderPublicId !== null) {
-            resolvedTarget = await ordersSvc.addOnTargetInTx(tx, principal.userId, input.addToOrderPublicId);
-            if (!resolvedTarget) {
-              deniedTargetOrderPublicId = input.addToOrderPublicId;
-              throw notFound("ORDER_NOT_FOUND");
+              const now = deps.clock.now();
+              const cart =
+                input.expectedVersion !== undefined
+                  ? await requireOpenCartWithVersionInTx(tx, principal.userId, input.expectedVersion)
+                  : await getOrCreateOpenCartInTx(tx, principal.userId, now);
+
+              await bumpCartVersionInTx(tx, cart, now, {
+                addToOrderPublicId: nextAddToOrderPublicId,
+                ...(resolvedTarget ? { projectName: resolvedTarget.projectName } : {}),
+              });
+
+              await deps.audit.record(
+                {
+                  category: "business",
+                  eventName: "cart.target_updated",
+                  action: "update",
+                  outcome: "completed",
+                  actor: { userId: principal.userId, role: liveActor.role },
+                  resource: { type: "cart", publicId: cart.publicId },
+                  attributes: {
+                    add_to_order_public_id: nextAddToOrderPublicId,
+                  },
+                },
+                tx,
+              );
+            });
+            break;
+          } catch (innerErr) {
+            if (isMysqlDeadlockError(innerErr) && deadlockRetries < 3) {
+              deadlockRetries += 1;
+              await new Promise((resolve) => setTimeout(resolve, 10 * deadlockRetries));
+              continue;
             }
-            nextAddToOrderPublicId = resolvedTarget.rootPublicId;
+            throw innerErr;
           }
-
-          await bumpCartVersionInTx(tx, cart, now, {
-            addToOrderPublicId: nextAddToOrderPublicId,
-            ...(resolvedTarget ? { projectName: resolvedTarget.projectName } : {}),
-          });
-
-          await deps.audit.record(
-            {
-              category: "business",
-              eventName: "cart.target_updated",
-              action: "update",
-              outcome: "completed",
-              actor: { userId: principal.userId, role: liveActor.role },
-              resource: { type: "cart", publicId: cart.publicId },
-              attributes: {
-                add_to_order_public_id: nextAddToOrderPublicId,
-              },
-            },
-            tx,
-          );
-        });
+        }
       } catch (err) {
         if (deniedTargetOrderPublicId) {
           await denyCartAuthz(principal, "ADD_ON_TARGET_NOT_AUTHORIZED", {
@@ -1495,67 +1571,123 @@ export function createCartService(deps: ModuleDeps): CartModule {
       const input = parseCartInput(saveDraftDetailsInputSchema, rawInput);
       const ordersSvc = cartOrdersPort(deps.services);
 
+      const RETRY_DRAFT_TARGET_SENTINEL = Symbol("RETRY_DRAFT_TARGET_SENTINEL");
       let deniedTargetOrderPublicId: string | null = null;
       try {
-        await deps.db.transaction(async (tx) => {
-          const liveActor = await actorCheck(principal, tx, "orders.create");
-          if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
-          await assertCartEnabled(tx);
+        let sentinelRetries = 0;
+        let deadlockRetries = 0;
+        for (;;) {
+          deniedTargetOrderPublicId = null;
+          try {
+            await deps.db.transaction(async (tx) => {
+              const liveActor = await actorCheck(principal, tx, "orders.create");
+              if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
+              await assertCartEnabled(tx);
 
-          const now = deps.clock.now();
-          const cart = await requireOpenCartWithVersionInTx(tx, principal.userId, input.expectedVersion);
+              let peekedOpenAddTo: string | null = null;
+              if (input.addToOrderPublicId === undefined) {
+                const [peekOpen] = await tx
+                  .select({ addToOrderPublicId: carts.addToOrderPublicId })
+                  .from(carts)
+                  .where(and(eq(carts.ownerUserId, principal.userId), eq(carts.activeOwnerSlot, principal.userId)))
+                  .limit(1);
+                peekedOpenAddTo = peekOpen?.addToOrderPublicId ?? null;
+              }
 
-          let activeTarget: CartAddOnTarget | null = null;
-          let nextAddToOrderPublicId: string | null | undefined;
-          if (input.addToOrderPublicId === null) {
-            nextAddToOrderPublicId = null;
-          } else if (typeof input.addToOrderPublicId === "string") {
-            const resolved = await ordersSvc.addOnTargetInTx(tx, principal.userId, input.addToOrderPublicId);
-            if (!resolved) {
-              deniedTargetOrderPublicId = input.addToOrderPublicId;
-              throw notFound("ORDER_NOT_FOUND");
+              const candidateTargetPublicId =
+                input.addToOrderPublicId === null
+                  ? null
+                  : typeof input.addToOrderPublicId === "string"
+                    ? input.addToOrderPublicId
+                    : peekedOpenAddTo;
+
+              const lockedAddOn = candidateTargetPublicId
+                ? await shareLockLiveAddOnTargetInTx(tx, principal.userId, candidateTargetPublicId)
+                : null;
+
+              const now = deps.clock.now();
+              const cart = await requireOpenCartWithVersionInTx(tx, principal.userId, input.expectedVersion);
+              if (
+                input.addToOrderPublicId === undefined &&
+                peekedOpenAddTo !== (cart.addToOrderPublicId ?? null)
+              ) {
+                throw RETRY_DRAFT_TARGET_SENTINEL;
+              }
+
+              let activeTarget: CartAddOnTarget | null = null;
+              let nextAddToOrderPublicId: string | null | undefined;
+              if (input.addToOrderPublicId === null) {
+                nextAddToOrderPublicId = null;
+              } else if (typeof input.addToOrderPublicId === "string") {
+                const resolved = lockedAddOn
+                  ? await ordersSvc.addOnTargetInTx(tx, principal.userId, input.addToOrderPublicId)
+                  : null;
+                if (!resolved || resolved.rootPublicId !== lockedAddOn?.rootPublicId) {
+                  deniedTargetOrderPublicId = input.addToOrderPublicId;
+                  throw notFound("ORDER_NOT_FOUND");
+                }
+                activeTarget = resolved;
+                nextAddToOrderPublicId = resolved.rootPublicId;
+              } else if (cart.addToOrderPublicId) {
+                const resolved = lockedAddOn
+                  ? await ordersSvc.addOnTargetInTx(tx, principal.userId, cart.addToOrderPublicId)
+                  : null;
+                activeTarget = resolved && resolved.rootPublicId === lockedAddOn?.rootPublicId ? resolved : null;
+                if (!activeTarget) {
+                  nextAddToOrderPublicId = null;
+                }
+              }
+
+              const billingUpdates: Partial<typeof carts.$inferInsert> =
+                input.billing === undefined
+                  ? {}
+                  : input.billing === null
+                    ? { billingEnc: null, billingCountry: null, billingRegion: null }
+                    : {
+                        billingEnc: encryptBilling(input.billing, cart.publicId),
+                        billingCountry: input.billing.country,
+                        billingRegion: input.billing.region || null,
+                      };
+
+              await bumpCartVersionInTx(tx, cart, now, {
+                projectName: activeTarget ? activeTarget.projectName : (input.projectName || null),
+                ...(nextAddToOrderPublicId !== undefined ? { addToOrderPublicId: nextAddToOrderPublicId } : {}),
+                noteEnc: encryptNote(input.note ?? "", cart.publicId),
+                ...billingUpdates,
+              });
+
+              await deps.audit.record(
+                {
+                  category: "business",
+                  eventName: "cart.details_saved",
+                  action: "update",
+                  outcome: "completed",
+                  actor: { userId: principal.userId, role: liveActor.role },
+                  resource: { type: "cart", publicId: cart.publicId },
+                  attributes: {
+                    has_billing: input.billing !== null && input.billing !== undefined,
+                    add_to_order_public_id:
+                      nextAddToOrderPublicId !== undefined ? nextAddToOrderPublicId : (cart.addToOrderPublicId ?? null),
+                  },
+                },
+                tx,
+              );
+            });
+            break;
+          } catch (innerErr) {
+            if (innerErr === RETRY_DRAFT_TARGET_SENTINEL) {
+              if (sentinelRetries >= 2) throw staleCartVersion();
+              sentinelRetries += 1;
+              continue;
             }
-            activeTarget = resolved;
-            nextAddToOrderPublicId = resolved.rootPublicId;
-          } else if (cart.addToOrderPublicId) {
-            activeTarget = await ordersSvc.addOnTargetInTx(tx, principal.userId, cart.addToOrderPublicId);
+            if (isMysqlDeadlockError(innerErr) && deadlockRetries < 3) {
+              deadlockRetries += 1;
+              await new Promise((resolve) => setTimeout(resolve, 10 * deadlockRetries));
+              continue;
+            }
+            throw innerErr;
           }
-
-          const billingUpdates: Partial<typeof carts.$inferInsert> =
-            input.billing === undefined
-              ? {}
-              : input.billing === null
-                ? { billingEnc: null, billingCountry: null, billingRegion: null }
-                : {
-                    billingEnc: encryptBilling(input.billing, cart.publicId),
-                    billingCountry: input.billing.country,
-                    billingRegion: input.billing.region || null,
-                  };
-
-          await bumpCartVersionInTx(tx, cart, now, {
-            projectName: activeTarget ? activeTarget.projectName : (input.projectName || null),
-            ...(nextAddToOrderPublicId !== undefined ? { addToOrderPublicId: nextAddToOrderPublicId } : {}),
-            noteEnc: encryptNote(input.note ?? "", cart.publicId),
-            ...billingUpdates,
-          });
-
-          await deps.audit.record(
-            {
-              category: "business",
-              eventName: "cart.details_saved",
-              action: "update",
-              outcome: "completed",
-              actor: { userId: principal.userId, role: liveActor.role },
-              resource: { type: "cart", publicId: cart.publicId },
-              attributes: {
-                has_billing: input.billing !== null && input.billing !== undefined,
-                add_to_order_public_id:
-                  nextAddToOrderPublicId !== undefined ? nextAddToOrderPublicId : (cart.addToOrderPublicId ?? null),
-              },
-            },
-            tx,
-          );
-        });
+        }
       } catch (err) {
         if (deniedTargetOrderPublicId) {
           await denyCartAuthz(principal, "ADD_ON_TARGET_NOT_AUTHORIZED", {
@@ -1896,7 +2028,14 @@ export function createCartService(deps: ModuleDeps): CartModule {
 
         try {
           let txOutcome: typeof committed | null = null;
-          for (let attempt = 0; attempt < 2; attempt += 1) {
+          let sentinelRetries = 0;
+          let deadlockRetries = 0;
+          for (;;) {
+            deniedOtherCustomerCart = false;
+            deniedAddOnTargetOrderId = null;
+            hadAppliedPromoOnCart = false;
+            invalidatedPromoPublicId = null;
+            invalidatedPromoLabel = null;
             try {
               txOutcome = await deps.db.transaction(async (tx) => {
                 // 1. If this cart targets an existing project, lock the group root `orders` row BEFORE `actorCheck`
@@ -2334,9 +2473,15 @@ export function createCartService(deps: ModuleDeps): CartModule {
               break;
             } catch (innerErr) {
               if (innerErr === RETRY_ROOT_LOCK_SENTINEL) {
-                if (attempt === 1) {
+                if (sentinelRetries >= 1) {
                   throw staleCartVersion();
                 }
+                sentinelRetries += 1;
+                continue;
+              }
+              if (isMysqlDeadlockError(innerErr) && deadlockRetries < 3) {
+                deadlockRetries += 1;
+                await new Promise((resolve) => setTimeout(resolve, 10 * deadlockRetries));
                 continue;
               }
               throw innerErr;
@@ -3124,15 +3269,26 @@ export function createCartService(deps: ModuleDeps): CartModule {
       const RETRY_RESTORE_LOCK_SENTINEL = Symbol("RETRY_RESTORE_LOCK_SENTINEL");
       let deniedOtherCustomer = false;
       let targetCartPublicIdForAudit: string | null = input.cartPublicId ?? null;
-      let alreadyRestoredFlag = false;
+      let alreadyRestoredFlag: boolean;
 
       try {
-        for (let attempt = 0; attempt < 2; attempt += 1) {
+        let sentinelRetries = 0;
+        let deadlockRetries = 0;
+        for (;;) {
+          deniedOtherCustomer = false;
+          targetCartPublicIdForAudit = input.cartPublicId ?? null;
+          alreadyRestoredFlag = false;
           try {
             await deps.db.transaction(async (tx) => {
-              // 1. Pre-read candidate cart (unlocked) so `orders -> users -> user_sessions -> compliance_invoices ->
-              //    payment_attempts` locks are acquired BEFORE `carts FOR UPDATE`, and never call pool-level
-              //    `paymentsSvc.getCheckoutStatus` inside `tx`.
+              // 1. Re-validate live actor FIRST (`users FOR UPDATE -> user_sessions FOR UPDATE` via `assertCurrent`) so
+              //    customer suspend + `trash.moveToTrash(customer)` (`users FOR UPDATE -> orders FOR UPDATE`) never inverts
+              //    with `restoreCheckout` (`users FOR UPDATE -> orders FOR UPDATE/SHARE -> compliance_invoices -> payment_attempts -> carts`).
+              const liveActor = await actorCheck(principal, tx, "orders.create");
+              if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
+              await assertCartEnabled(tx);
+
+              // 2. Unlocked peeks on candidate `sourceCart` and any existing `openCart` so all `orders` rows are locked
+              //    in a single `orders.id ASC` pass BEFORE `compliance_invoices` / `payment_attempts` / `carts FOR UPDATE`.
               const [preCart] = input.cartPublicId
                 ? await tx.select().from(carts).where(eq(carts.publicId, input.cartPublicId)).limit(1)
                 : resolvedRetryInvoicePublicId
@@ -3148,48 +3304,90 @@ export function createCartService(deps: ModuleDeps): CartModule {
                       .where(eq(carts.paymentAttemptPublicId, input.attemptPublicId!))
                       .limit(1);
 
-              let preResolvedAddOnRootPublicId: string | null = null;
-              if (
-                preCart &&
-                preCart.ownerUserId === principal.userId &&
-                preCart.status !== "open" &&
-                preCart.addToOrderPublicId
-              ) {
-                const liveTarget = await ordersSvc.addOnTargetInTx(
-                  tx,
-                  principal.userId,
-                  preCart.addToOrderPublicId,
-                );
-                preResolvedAddOnRootPublicId = liveTarget ? liveTarget.rootPublicId : null;
-              }
+              const [preOpenCart] = await tx
+                .select({ id: carts.id, addToOrderPublicId: carts.addToOrderPublicId })
+                .from(carts)
+                .where(and(eq(carts.ownerUserId, principal.userId), eq(carts.activeOwnerSlot, principal.userId)))
+                .limit(1);
 
-              // 2. Verify live order + authoritative invoice status and cancel unpaid attempt transactionally (`tx`)
-              //    BEFORE `actorCheck` / `carts FOR UPDATE`, matching canonical
-              //    `orders -> compliance_invoices -> users -> user_sessions -> payment_attempts -> carts` lock order.
-              let preVerifiedInvoiceId: string | null = null;
-              if (
+              const candidateCheckoutCart =
                 preCart &&
                 preCart.ownerUserId === principal.userId &&
                 preCart.status !== "open" &&
                 preCart.checkoutInvoicePublicId
-              ) {
+                  ? preCart
+                  : null;
+              const candidateSourceAddTo =
+                preCart &&
+                preCart.ownerUserId === principal.userId &&
+                preCart.status !== "open" &&
+                preCart.status !== "restored"
+                  ? (preCart.addToOrderPublicId ?? null)
+                  : null;
+              const candidateOpenAddTo = preOpenCart?.addToOrderPublicId ?? null;
+
+              // 3. Ordered `orders` lock fence (`orders.id ASC`: `checkoutOrder FOR UPDATE`, `sourceAddOn`/`openAddOn` `FOR SHARE`).
+              const ordersFence = await lockRestoreOrdersFenceInTx(tx, {
+                ownerUserId: principal.userId,
+                checkoutCart: candidateCheckoutCart,
+                sourceAddToOrderPublicId: candidateSourceAddTo,
+                openAddToOrderPublicId: candidateOpenAddTo,
+              });
+
+              let fencedSourceAddOnRootPublicId: string | null = null;
+              if (ordersFence.liveSourceRootPublicId && candidateSourceAddTo) {
+                const liveSourceTarget = await ordersSvc.addOnTargetInTx(
+                  tx,
+                  principal.userId,
+                  candidateSourceAddTo,
+                );
+                fencedSourceAddOnRootPublicId =
+                  liveSourceTarget && liveSourceTarget.rootPublicId === ordersFence.liveSourceRootPublicId
+                    ? liveSourceTarget.rootPublicId
+                    : null;
+              }
+
+              let fencedOpenAddOnRootPublicId: string | null = null;
+              if (ordersFence.liveOpenRootPublicId && candidateOpenAddTo) {
+                const liveOpenTarget = await ordersSvc.addOnTargetInTx(
+                  tx,
+                  principal.userId,
+                  candidateOpenAddTo,
+                );
+                fencedOpenAddOnRootPublicId =
+                  liveOpenTarget && liveOpenTarget.rootPublicId === ordersFence.liveOpenRootPublicId
+                    ? liveOpenTarget.rootPublicId
+                    : null;
+              }
+
+              // 4. Verify live checkout order + authoritative invoice status and cancel unpaid attempt transactionally (`tx`)
+              //    BEFORE `carts FOR UPDATE`.
+              let preVerifiedInvoiceId: string | null = null;
+              if (candidateCheckoutCart) {
                 if (
                   input.attemptPublicId &&
-                  preCart.paymentAttemptPublicId !== input.attemptPublicId &&
+                  candidateCheckoutCart.paymentAttemptPublicId !== input.attemptPublicId &&
                   !resolvedRetryInvoicePublicId &&
                   !verifiedRetryAttemptForCart
                 ) {
                   throw cartNotFound();
                 }
 
+                if (!ordersFence.checkoutOrderLive) {
+                  throw cartNotFound();
+                }
+
                 let lockedInvoiceStatus: string | null = null;
-                if (preCart.status !== "restored" && complianceSvc.getInvoiceForCheckout) {
+                if (candidateCheckoutCart.status !== "restored" && complianceSvc.getInvoiceForCheckout) {
                   try {
-                    const lockedInvoice = await complianceSvc.getInvoiceForCheckout(preCart.checkoutInvoicePublicId, {
-                      principal,
-                      tx,
-                      forUpdate: true,
-                    });
+                    const lockedInvoice = await complianceSvc.getInvoiceForCheckout(
+                      candidateCheckoutCart.checkoutInvoicePublicId!,
+                      {
+                        principal,
+                        tx,
+                        forUpdate: true,
+                      },
+                    );
                     lockedInvoiceStatus = lockedInvoice.status;
                   } catch (err) {
                     if (err instanceof DomainError && err.code === "NOT_FOUND") {
@@ -3199,17 +3397,12 @@ export function createCartService(deps: ModuleDeps): CartModule {
                   }
                 }
 
-                const checkoutOrderLive = await isCheckoutOrderLive(tx, preCart, { forShare: true });
-                if (!checkoutOrderLive) {
-                  throw cartNotFound();
-                }
-
-                if (preCart.status !== "restored") {
+                if (candidateCheckoutCart.status !== "restored") {
                   if (
-                    preCart.status === "checked_out" &&
-                    (preCart.paymentMode !== "invoice" ||
-                      preCart.checkedOutTotalMinor === 0 ||
-                      (preCart.checkedOutWaivedMinor ?? 0) > 0)
+                    candidateCheckoutCart.status === "checked_out" &&
+                    (candidateCheckoutCart.paymentMode !== "invoice" ||
+                      candidateCheckoutCart.checkedOutTotalMinor === 0 ||
+                      (candidateCheckoutCart.checkedOutWaivedMinor ?? 0) > 0)
                   ) {
                     throw conflict("CHECKOUT_ALREADY_PAID", "Payment has already been confirmed for this order.");
                   }
@@ -3217,13 +3410,14 @@ export function createCartService(deps: ModuleDeps): CartModule {
                     throw conflict("CHECKOUT_ALREADY_PAID", "Payment has already been confirmed for this order.");
                   }
 
-                  const resolvedAttemptId = input.attemptPublicId ?? preCart.paymentAttemptPublicId ?? undefined;
+                  const resolvedAttemptId =
+                    input.attemptPublicId ?? candidateCheckoutCart.paymentAttemptPublicId ?? undefined;
                   let cancelResult: Awaited<ReturnType<typeof paymentsSvc.cancelAttemptIfUnpaid>>;
                   try {
                     cancelResult = await paymentsSvc.cancelAttemptIfUnpaid(
                       principal,
                       {
-                        invoicePublicId: preCart.checkoutInvoicePublicId,
+                        invoicePublicId: candidateCheckoutCart.checkoutInvoicePublicId!,
                         ...(resolvedAttemptId ? { attemptPublicId: resolvedAttemptId } : {}),
                       },
                       tx,
@@ -3237,16 +3431,22 @@ export function createCartService(deps: ModuleDeps): CartModule {
                   if (cancelResult.status === "paid") {
                     throw conflict("CHECKOUT_ALREADY_PAID", "Payment has already been confirmed for this order.");
                   }
-                  preVerifiedInvoiceId = preCart.checkoutInvoicePublicId;
+                  preVerifiedInvoiceId = candidateCheckoutCart.checkoutInvoicePublicId;
                 }
               }
 
-              // 3. Re-validate live actor (`users -> user_sessions`).
-              const liveActor = await actorCheck(principal, tx, "orders.create");
-              if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
-              await assertCartEnabled(tx);
+              // 5. Lock owned `carts` rows in `carts.id ASC` order when both `sourceCart` and `openCart` already exist.
+              if (preCart && preCart.ownerUserId === principal.userId && preOpenCart && preCart.id !== preOpenCart.id) {
+                const orderedCartIds = [preCart.id, preOpenCart.id].sort((a, b) => a - b);
+                await tx
+                  .select({ id: carts.id })
+                  .from(carts)
+                  .where(and(inArray(carts.id, orderedCartIds), eq(carts.ownerUserId, principal.userId)))
+                  .orderBy(asc(carts.id))
+                  .for("update");
+              }
 
-              // 4. Lock `sourceCart` (`carts FOR UPDATE`).
+              // 6. Lock `sourceCart` (`carts FOR UPDATE`).
               const [sourceCart] = input.cartPublicId
                 ? await tx.select().from(carts).where(eq(carts.publicId, input.cartPublicId)).for("update").limit(1)
                 : resolvedRetryInvoicePublicId
@@ -3289,6 +3489,15 @@ export function createCartService(deps: ModuleDeps): CartModule {
 
               // Idempotent repeat: already restored -> return current open cart without duplicating items
               if (sourceCart.status === "restored") {
+                if (
+                  (preCart?.checkoutOrderId ?? null) !== (sourceCart.checkoutOrderId ?? null) ||
+                  (preCart?.checkoutOrderPublicId ?? null) !== (sourceCart.checkoutOrderPublicId ?? null)
+                ) {
+                  throw RETRY_RESTORE_LOCK_SENTINEL;
+                }
+                if (!ordersFence.checkoutOrderLive) {
+                  throw cartNotFound();
+                }
                 alreadyRestoredFlag = true;
                 return;
               }
@@ -3313,6 +3522,8 @@ export function createCartService(deps: ModuleDeps): CartModule {
 
               if (
                 preVerifiedInvoiceId !== sourceCart.checkoutInvoicePublicId ||
+                (preCart?.checkoutOrderId ?? null) !== (sourceCart.checkoutOrderId ?? null) ||
+                (preCart?.checkoutOrderPublicId ?? null) !== (sourceCart.checkoutOrderPublicId ?? null) ||
                 (preCart?.addToOrderPublicId ?? null) !== (sourceCart.addToOrderPublicId ?? null)
               ) {
                 throw RETRY_RESTORE_LOCK_SENTINEL;
@@ -3326,6 +3537,11 @@ export function createCartService(deps: ModuleDeps): CartModule {
 
               const now = deps.clock.now();
               const openCart = await getOrCreateOpenCartInTx(tx, principal.userId, now);
+              const existingOpenAddTo = openCart.addToOrderPublicId ?? null;
+              if (candidateOpenAddTo !== existingOpenAddTo) {
+                throw RETRY_RESTORE_LOCK_SENTINEL;
+              }
+
               const existingOpenItems = await tx
                 .select()
                 .from(cartItems)
@@ -3369,7 +3585,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
               const sourceNote = decryptNote(sourceCart.noteEnc, sourceCart.publicId);
 
               const restoredAddToOrderPublicId: string | null =
-                openCart.addToOrderPublicId ?? preResolvedAddOnRootPublicId ?? null;
+                fencedOpenAddOnRootPublicId ?? fencedSourceAddOnRootPublicId ?? null;
 
               await bumpCartVersionInTx(tx, openCart, now, {
                 projectName: openCart.projectName ?? sourceCart.projectName,
@@ -3413,11 +3629,17 @@ export function createCartService(deps: ModuleDeps): CartModule {
             });
             break;
           } catch (err) {
-            if (err === RETRY_RESTORE_LOCK_SENTINEL && attempt === 0) {
+            if (err === RETRY_RESTORE_LOCK_SENTINEL) {
+              if (sentinelRetries >= 2) {
+                throw staleCartVersion();
+              }
+              sentinelRetries += 1;
               continue;
             }
-            if (err === RETRY_RESTORE_LOCK_SENTINEL) {
-              throw staleCartVersion();
+            if (isMysqlDeadlockError(err) && deadlockRetries < 3) {
+              deadlockRetries += 1;
+              await new Promise((resolve) => setTimeout(resolve, 10 * deadlockRetries));
+              continue;
             }
             throw err;
           }

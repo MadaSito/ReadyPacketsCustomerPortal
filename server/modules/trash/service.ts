@@ -576,6 +576,33 @@ export function createTrashCoordinator(
       .onDuplicateKeyUpdate({ set: { singletonKey: sql`${trashRetentionState.singletonKey}` } });
   }
 
+  function isMysqlDeadlockError(err: unknown): boolean {
+    let cur: unknown = err;
+    for (let depth = 0; depth < 5 && cur && typeof cur === "object"; depth += 1) {
+      const e = cur as { code?: unknown; errno?: unknown; sqlState?: unknown; cause?: unknown };
+      if (e.code === "ER_LOCK_DEADLOCK" || e.errno === 1213 || e.sqlState === "40001") {
+        return true;
+      }
+      cur = e.cause;
+    }
+    return false;
+  }
+
+  async function withMysqlDeadlockRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
+    let retries = 0;
+    for (;;) {
+      try {
+        return await fn();
+      } catch (err) {
+        if (!isMysqlDeadlockError(err) || retries >= maxRetries) {
+          throw err;
+        }
+        retries += 1;
+        await new Promise((resolve) => setTimeout(resolve, 10 * retries));
+      }
+    }
+  }
+
   async function shareLockRetentionCohortInTx(tx: Tx): Promise<number> {
     await ensureRetentionRowInTx(tx);
     const [row] = await tx
@@ -4380,9 +4407,10 @@ export function createTrashCoordinator(
       }
 
       try {
-        return await deps.db.transaction(async (tx) => {
-          await guardActorInTx(tx, principal, "trash.manage");
-          await shareLockRetentionCohortInTx(tx);
+        return await withMysqlDeadlockRetry(() =>
+          deps.db.transaction(async (tx) => {
+            await guardActorInTx(tx, principal, "trash.manage");
+            await shareLockRetentionCohortInTx(tx);
 
           const now = deps.clock.now();
           const batchId = ulid(now.getTime());
@@ -4534,7 +4562,8 @@ export function createTrashCoordinator(
             tx,
           );
           return { batchId, dueAt, cascadedOrders };
-        });
+          }),
+        );
       } catch (err) {
         await releaseUnmutatedIdempotency(reservation.rowId, reservation.attemptOwner);
         throw err;
@@ -4586,20 +4615,22 @@ export function createTrashCoordinator(
             continue;
           }
           try {
-            const one = await deps.db.transaction(async (tx) => {
-              await guardActorInTx(tx, principal, "trash.manage");
-              const res = await restoreSingleInTx(tx, item, actor, principal);
-              await recordRestoreProgressInTx({
-                tx,
-                rowId: reservation.rowId,
-                attemptOwner: reservation.attemptOwner,
-                itemKey,
-                batchId: res.batchId,
-                itemResult: { ...item, ok: true },
-                now: deps.clock.now(),
-              });
-              return res;
-            });
+            const one = await withMysqlDeadlockRetry(() =>
+              deps.db.transaction(async (tx) => {
+                await guardActorInTx(tx, principal, "trash.manage");
+                const res = await restoreSingleInTx(tx, item, actor, principal);
+                await recordRestoreProgressInTx({
+                  tx,
+                  rowId: reservation.rowId,
+                  attemptOwner: reservation.attemptOwner,
+                  itemKey,
+                  batchId: res.batchId,
+                  itemResult: { ...item, ok: true },
+                  now: deps.clock.now(),
+                });
+                return res;
+              }),
+            );
             restored += 1;
             batchBindings[itemKey] = one.batchId;
             results.push({ ...item, ok: true });

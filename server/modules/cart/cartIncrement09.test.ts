@@ -823,4 +823,367 @@ describe("Increment 09 — Cart TrashParticipant & trashed customer/order guards
       await singlePool.end();
     }
   });
+
+  it("reconciles lock ordering between concurrent `restoreCheckout` and suspend + `moveToTrash(customer)` and survives real InnoDB 1213 deadlocks", async () => {
+    const racePool = mysql.createPool({
+      uri: t.url,
+      connectionLimit: 5,
+      timezone: "Z",
+      supportBigNumbers: true,
+      charset: "utf8mb4",
+    });
+    try {
+      const raceDb = drizzle(racePool, { schema: testSchema, mode: "default" }) as unknown as Db;
+      const raceHarness = createTestDeps({ db: raceDb });
+      raceHarness.settings.flags.add(CART_FEATURE_FLAG.flag);
+
+      raceHarness.services.opsAlerts = h.services.opsAlerts;
+      raceHarness.services.assurance = h.services.assurance;
+      raceHarness.services.jobAdmin = h.services.jobAdmin;
+      const raceIdentity = createIdentityModule(raceHarness.deps);
+      const raceOrders = createOrdersModule(raceHarness.deps);
+      const raceCompliance = createComplianceModule(raceHarness.deps);
+      const raceBilling = createBillingProfileModule(raceHarness.deps);
+      const racePromos = createPromotionsModule(raceHarness.deps);
+      const racePayments = createPaymentsModule(raceHarness.deps);
+      const raceTrash = createTrashModule(raceHarness.deps, {
+        expectedParticipants: ["cart", "orders", "identity", "compliance", "billingProfile", "promotions"],
+      });
+      raceHarness.services.trash = raceTrash;
+      raceHarness.services.orders = raceOrders;
+      raceHarness.services.compliance = raceCompliance;
+      raceHarness.services.billingProfile = raceBilling;
+      raceHarness.services.promotions = racePromos;
+      raceHarness.services.payments = racePayments;
+      const raceFakeIdent = fakeIdentity(raceHarness, raceDb);
+      raceHarness.services.identity = {
+        ...raceFakeIdent,
+        users: raceIdentity.users,
+        trash: raceIdentity.trash,
+      } as unknown as Services["identity"];
+      raceHarness.services.files = h.services.files;
+      raceHarness.services.engagement = h.services.engagement;
+      const raceCart = createCartModule(raceHarness.deps);
+      raceHarness.services.cart = raceCart;
+
+      raceIdentity.init?.();
+      raceOrders.init?.();
+      raceCompliance.init?.();
+      raceBilling.init?.();
+      racePromos.init?.();
+      raceCart.init?.();
+      raceTrash.init?.();
+
+      const raceAdmin = await insertUser(raceHarness, raceDb, { role: "admin", stepUp: true });
+      const raceBuyer = await insertUser(raceHarness, raceDb, { role: "customer" });
+      await raceDb.update(users).set({ customerRef: "RPCUS-RACE10009" }).where(eq(users.id, raceBuyer.id));
+
+      // Part A: An already-admitted `restoreCheckout` holds `users(raceBuyer.id) FOR UPDATE` BEFORE `orders`,
+      // so concurrent suspend + `moveToTrash(customer)` queues behind `users` instead of deadlocking on `orders <-> users`.
+      const raceOpen = await raceCart.addItems(raceBuyer.principal, {
+        items: [{ productPublicId: packet1ProductId, quantity: 1 }],
+        projectName: "Ice Queen Restore vs Customer Move",
+      });
+      const raceCheckedOut = await raceCart.checkout(raceBuyer.principal, {
+        cartPublicId: raceOpen.cartPublicId!,
+        expectedVersion: raceOpen.version,
+        projectName: "Ice Queen Restore vs Customer Move",
+        billing: ZEUS_BILLING,
+        idempotencyKey: `inc09-race-co-${ulid()}`,
+      });
+
+      let releaseOrderBarrier!: () => void;
+      const orderBarrierHeld = new Promise<void>((resolve) => {
+        releaseOrderBarrier = resolve;
+      });
+      let markOrderLocked!: () => void;
+      const orderLockedReady = new Promise<void>((resolve) => {
+        markOrderLocked = resolve;
+      });
+
+      const orderBarrierTx = raceDb.transaction(async (tx) => {
+        await tx
+          .select({ id: orderTables.orders.id })
+          .from(orderTables.orders)
+          .where(eq(orderTables.orders.publicId, raceCheckedOut.orderPublicId))
+          .for("update");
+        markOrderLocked();
+        await orderBarrierHeld;
+      });
+
+      await orderLockedReady;
+
+      // Start `restoreCheckout`: acquires `users(raceBuyer.id) FOR UPDATE` (`actorCheck`), then blocks on `orders FOR UPDATE`.
+      const restorePromise = raceCart.restoreCheckout(raceBuyer.principal, {
+        cartPublicId: raceOpen.cartPublicId!,
+      });
+      await new Promise((r) => setTimeout(r, 80));
+
+      // Concurrently suspend + move customer to Trash: queues cleanly on `users(raceBuyer.id) FOR UPDATE` without inversion!
+      const suspendAndMovePromise = (async () => {
+        await raceDb.update(users).set({ status: "suspended" }).where(eq(users.id, raceBuyer.id));
+        return raceTrash.moveToTrash(raceAdmin.principal, {
+          kind: "customer",
+          publicId: raceBuyer.publicId,
+          idempotencyKey: `inc09-race-cust-move-${ulid()}`,
+        });
+      })();
+      await new Promise((r) => setTimeout(r, 80));
+
+      releaseOrderBarrier();
+      await orderBarrierTx;
+
+      const [restoredOutcome, movedOutcome] = await Promise.all([restorePromise, suspendAndMovePromise]);
+      expect(restoredOutcome.restored).toBe(true);
+      expect(movedOutcome.cascadedOrders).toBe(1);
+
+      // Once suspended + trashed, any subsequent `restoreCheckout` by `raceBuyer` fails closed at `actorCheck`.
+      await expect(
+        raceCart.restoreCheckout(raceBuyer.principal, {
+          cartPublicId: raceOpen.cartPublicId!,
+        }),
+      ).rejects.toMatchObject({
+        code: "UNAUTHENTICATED",
+        reasonCode: "SESSION_NOT_CURRENT",
+      } satisfies Partial<DomainError>);
+
+      // Part B: Force a genuine two-connection MySQL 1213 `ER_LOCK_DEADLOCK` (`orders -> users` with heavier undo weight
+      // vs `moveToTrash(customer)`'s `users -> orders`) and verify `moveToTrash` retries the whole transaction cleanly.
+      const dlBuyer = await insertUser(raceHarness, raceDb, { role: "customer" });
+      await raceDb.update(users).set({ customerRef: "RPCUS-DLRK20009" }).where(eq(users.id, dlBuyer.id));
+      const dlOpen = await raceCart.addItems(dlBuyer.principal, {
+        items: [{ productPublicId: packet1ProductId, quantity: 1 }],
+        projectName: "Ice Queen Deadlock Retry",
+      });
+      const dlCheckedOut = await raceCart.checkout(dlBuyer.principal, {
+        cartPublicId: dlOpen.cartPublicId!,
+        expectedVersion: dlOpen.version,
+        projectName: "Ice Queen Deadlock Retry",
+        billing: ZEUS_BILLING,
+        idempotencyKey: `inc09-dl-co-${ulid()}`,
+      });
+      await raceDb.update(users).set({ status: "suspended" }).where(eq(users.id, dlBuyer.id));
+
+      let markHeavyOrderHeld!: () => void;
+      const heavyOrderHeld = new Promise<void>((resolve) => {
+        markHeavyOrderHeld = resolve;
+      });
+      let triggerInversion!: () => void;
+      const inversionReady = new Promise<void>((resolve) => {
+        triggerInversion = resolve;
+      });
+
+      const heavyInverterTx = raceDb.transaction(async (tx) => {
+        const [ord] = await tx
+          .select()
+          .from(orderTables.orders)
+          .where(eq(orderTables.orders.publicId, dlCheckedOut.orderPublicId))
+          .for("update");
+        // Inflate undo weight on `orders` so InnoDB deterministically picks `moveToTrash` as the 1213 deadlock victim!
+        for (let i = 0; i < 20; i += 1) {
+          await tx
+            .update(orderTables.orders)
+            .set({ updatedAt: new Date(raceHarness.clock.now().getTime() + i * 1000) })
+            .where(eq(orderTables.orders.id, ord!.id));
+        }
+        await tx
+          .update(orderTables.orders)
+          .set({ updatedAt: ord!.updatedAt })
+          .where(eq(orderTables.orders.id, ord!.id));
+        markHeavyOrderHeld();
+        await inversionReady;
+        await tx.select({ id: users.id }).from(users).where(eq(users.id, dlBuyer.id)).for("update");
+      });
+
+      await heavyOrderHeld;
+      const dlMovePromise = raceTrash.moveToTrash(raceAdmin.principal, {
+        kind: "customer",
+        publicId: dlBuyer.publicId,
+        idempotencyKey: `inc09-dl-move-${ulid()}`,
+      });
+      // Allow `moveToTrash` to lock+update `users(dlBuyer.id)` and block on `orders(dlCheckedOut.orderPublicId) FOR UPDATE`.
+      await new Promise((r) => setTimeout(r, 100));
+      triggerInversion();
+
+      const [, dlMoveResult] = await Promise.all([heavyInverterTx, dlMovePromise]);
+      expect(dlMoveResult.cascadedOrders).toBe(1);
+    } finally {
+      await racePool.end();
+    }
+  });
+
+  it("fences add-on target liveness in `restoreCheckout` under `orders FOR SHARE` when `moveToTrash(order)` races `sourceCart` and `openCart`", async () => {
+    const fencePool = mysql.createPool({
+      uri: t.url,
+      connectionLimit: 4,
+      timezone: "Z",
+      supportBigNumbers: true,
+      charset: "utf8mb4",
+    });
+    try {
+      const fenceDb = drizzle(fencePool, { schema: testSchema, mode: "default" }) as unknown as Db;
+      const fenceHarness = createTestDeps({ db: fenceDb });
+      fenceHarness.settings.flags.add(CART_FEATURE_FLAG.flag);
+      fenceHarness.services.opsAlerts = h.services.opsAlerts;
+      fenceHarness.services.assurance = h.services.assurance;
+      fenceHarness.services.jobAdmin = h.services.jobAdmin;
+      const fenceIdentity = createIdentityModule(fenceHarness.deps);
+      const fenceOrders = createOrdersModule(fenceHarness.deps);
+      const fenceCompliance = createComplianceModule(fenceHarness.deps);
+      const fenceBilling = createBillingProfileModule(fenceHarness.deps);
+      const fencePromos = createPromotionsModule(fenceHarness.deps);
+      const fencePayments = createPaymentsModule(fenceHarness.deps);
+      const fenceTrash = createTrashModule(fenceHarness.deps, {
+        expectedParticipants: ["cart", "orders", "identity", "compliance", "billingProfile", "promotions"],
+      });
+      fenceHarness.services.trash = fenceTrash;
+      fenceHarness.services.orders = fenceOrders;
+      fenceHarness.services.compliance = fenceCompliance;
+      fenceHarness.services.billingProfile = fenceBilling;
+      fenceHarness.services.promotions = fencePromos;
+      fenceHarness.services.payments = fencePayments;
+      const fenceFakeIdent = fakeIdentity(fenceHarness, fenceDb);
+      fenceHarness.services.identity = {
+        ...fenceFakeIdent,
+        users: fenceIdentity.users,
+        trash: fenceIdentity.trash,
+      } as unknown as Services["identity"];
+      fenceHarness.services.files = h.services.files;
+      fenceHarness.services.engagement = h.services.engagement;
+      const fenceCart = createCartModule(fenceHarness.deps);
+      fenceHarness.services.cart = fenceCart;
+
+      fenceIdentity.init?.();
+      fenceOrders.init?.();
+      fenceCompliance.init?.();
+      fenceBilling.init?.();
+      fencePromos.init?.();
+      fenceCart.init?.();
+      fenceTrash.init?.();
+
+      const fenceAdmin = await insertUser(fenceHarness, fenceDb, { role: "admin", stepUp: true });
+      const fenceBuyer = await insertUser(fenceHarness, fenceDb, { role: "customer" });
+      await fenceDb.update(users).set({ customerRef: "RPCUS-FNCE30009" }).where(eq(users.id, fenceBuyer.id));
+
+      // Create live root order (`Packet 1`), then a second checked-out add-on cart (`Packet 2`) targeting `rootOrder`,
+      // PLUS an existing open cart ALSO targeting `rootOrder` (testing both `sourceCart.addToOrderPublicId` and `openCart.addToOrderPublicId`).
+      const rootCart = await fenceCart.addItems(fenceBuyer.principal, {
+        items: [{ productPublicId: packet1ProductId, quantity: 1 }],
+        projectName: "Ice Queen Fence Root",
+      });
+      const rootCheckout = await fenceCart.checkout(fenceBuyer.principal, {
+        cartPublicId: rootCart.cartPublicId!,
+        expectedVersion: rootCart.version,
+        projectName: "Ice Queen Fence Root",
+        billing: ZEUS_BILLING,
+        idempotencyKey: `inc09-fence-root-${ulid()}`,
+      });
+
+      const addOnCart = await fenceCart.addItems(fenceBuyer.principal, {
+        items: [{ productPublicId: packet2ProductId, quantity: 1 }],
+        addToOrderPublicId: rootCheckout.orderPublicId,
+      });
+      await fenceCart.checkout(fenceBuyer.principal, {
+        cartPublicId: addOnCart.cartPublicId!,
+        expectedVersion: addOnCart.version,
+        projectName: "Ice Queen Fence Root",
+        billing: ZEUS_BILLING,
+        idempotencyKey: `inc09-fence-addon-${ulid()}`,
+      });
+
+      // Open a new cart targeting `rootCheckout.orderPublicId` before `restoreCheckout` starts!
+      await fenceCart.setTarget(fenceBuyer.principal, {
+        addToOrderPublicId: rootCheckout.orderPublicId,
+      });
+
+      // Subcase A: Hold `orders(rootCheckout.orderPublicId) FOR UPDATE` while `restoreCheckout` enters `tx` (taking its RR snapshot
+      // while `rootOrder` is still live) and blocks on `lockRestoreOrdersFenceInTx` (`orders FOR SHARE`), then mark `rootOrder` trashed!
+      let markRootLocked!: () => void;
+      const rootLocked = new Promise<void>((resolve) => {
+        markRootLocked = resolve;
+      });
+      let finishTrashingRoot!: () => void;
+      const allowTrashCommit = new Promise<void>((resolve) => {
+        finishTrashingRoot = resolve;
+      });
+
+      const trashRootTx = fenceDb.transaction(async (tx) => {
+        await tx
+          .select({ id: orderTables.orders.id })
+          .from(orderTables.orders)
+          .where(eq(orderTables.orders.publicId, rootCheckout.orderPublicId))
+          .for("update");
+        markRootLocked();
+        await allowTrashCommit;
+        await tx
+          .update(orderTables.orders)
+          .set({
+            trashedAt: fenceHarness.clock.now(),
+            trashedByUserId: fenceAdmin.id,
+            trashBatchId: ulid(),
+          })
+          .where(eq(orderTables.orders.publicId, rootCheckout.orderPublicId));
+      });
+
+      await rootLocked;
+      const restoreBlockedOnFence = fenceCart.restoreCheckout(fenceBuyer.principal, {
+        cartPublicId: addOnCart.cartPublicId!,
+      });
+      await new Promise((r) => setTimeout(r, 80));
+      finishTrashingRoot();
+
+      const [, restoredAfterFence] = await Promise.all([trashRootTx, restoreBlockedOnFence]);
+      expect(restoredAfterFence.restored).toBe(true);
+      expect(restoredAfterFence.cart.addToOrder).toBeNull();
+
+      const [openAfterSubcaseA] = await fenceDb
+        .select()
+        .from(cartTables.carts)
+        .where(eq(cartTables.carts.publicId, restoredAfterFence.cart.cartPublicId!));
+      expect(openAfterSubcaseA?.addToOrderPublicId).toBeNull();
+
+      // Subcase B: Race real `restoreCheckout` (with an existing `openCart` targeting `rootCartB` AND an add-on cart)
+      // against real `trash.moveToTrash(kind: "order")` concurrently via `Promise.all` / `Promise.allSettled`.
+      const rootCartB = await fenceCart.checkout(fenceBuyer.principal, {
+        cartPublicId: restoredAfterFence.cart.cartPublicId!,
+        expectedVersion: restoredAfterFence.cart.version,
+        projectName: "Ice Queen Fence Root B",
+        billing: ZEUS_BILLING,
+        idempotencyKey: `inc09-fence-rootb-${ulid()}`,
+      });
+      const standaloneCartB = await fenceCart.addItems(fenceBuyer.principal, {
+        items: [{ productPublicId: packet1ProductId, quantity: 1 }],
+        projectName: "Ice Queen Standalone Restore B",
+      });
+      await fenceCart.checkout(fenceBuyer.principal, {
+        cartPublicId: standaloneCartB.cartPublicId!,
+        expectedVersion: standaloneCartB.version,
+        projectName: "Ice Queen Standalone Restore B",
+        billing: ZEUS_BILLING,
+        idempotencyKey: `inc09-fence-stdb-${ulid()}`,
+      });
+      await fenceCart.setTarget(fenceBuyer.principal, {
+        addToOrderPublicId: rootCartB.orderPublicId,
+      });
+
+      const [restoredB, movedRootB] = await Promise.all([
+        fenceCart.restoreCheckout(fenceBuyer.principal, { cartPublicId: standaloneCartB.cartPublicId! }),
+        fenceTrash.moveToTrash(fenceAdmin.principal, {
+          kind: "order",
+          publicId: rootCartB.orderPublicId,
+          idempotencyKey: `inc09-fence-moveb-${ulid()}`,
+        }),
+      ]);
+      expect(restoredB.restored).toBe(true);
+      expect(movedRootB.batchId).toBeTruthy();
+
+      const [openAfterSubcaseB] = await fenceDb
+        .select()
+        .from(cartTables.carts)
+        .where(eq(cartTables.carts.publicId, restoredB.cart.cartPublicId!));
+      expect(openAfterSubcaseB?.addToOrderPublicId).toBeNull();
+    } finally {
+      await fencePool.end();
+    }
+  });
 });
