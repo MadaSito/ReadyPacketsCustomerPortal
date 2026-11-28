@@ -25,7 +25,7 @@ import { createTokenService } from "./tokens.js";
 import { createTransitionService } from "./transitions.js";
 import { createUserRepo, namePartsOf, toView, type LoadOptions, type UserView } from "./users.js";
 import type { NameParts } from "./normalize.js";
-import { isTrashedUserInTx } from "./live.js";
+import { isTrashedUserInTx, lockGoneUsersInTx, type TrashedCheckOptions } from "./live.js";
 import { createIdentityTrash, type IdentityTrash } from "./trash.js";
 import type { TrashParticipant } from "../trash/ports.js";
 
@@ -138,8 +138,13 @@ export interface IdentityModule extends ModuleLifecycle {
   /** D1 port (orders). Name parts (derived when not stored) + customer reference. No lock, no audit. Unknown user → NOT_FOUND USER_NOT_FOUND. */
   users: {
     namePartsInTx(tx: DbOrTx, userId: number): Promise<{ firstName: string; lastName: string; preferredName: string | null; customerRef: string | null }>;
-    /** Increment 09 (D2.5): true when the account is in the trash or a tombstone; false for live or unknown ids. */
-    isTrashedInTx(tx: DbOrTx, userId: number): Promise<boolean>;
+    /**
+     * Increment 09 (D2.5): true when the account is in the trash or a tombstone. Plain read: false for live or unknown ids.
+     * `{ lock: "share" }` (mutation consumers, Tx only): locking current read held to commit; unknown → true (fail closed).
+     */
+    isTrashedInTx(tx: DbOrTx, userId: number, opts?: TrashedCheckOptions): Promise<boolean>;
+    /** D2.5 for mutation consumers: locks owners FOR SHARE in ascending id order; returns ids that are trashed, tombstoned or unknown. */
+    lockGoneInTx(tx: Tx, userIds: readonly number[]): Promise<number[]>;
   };
   searchCustomers(
     principal: SessionPrincipal,
@@ -247,7 +252,8 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
         const parts = namePartsOf(deps.crypto, row);
         return { firstName: parts.firstName, lastName: parts.lastName, preferredName: parts.preferredName, customerRef: row.customerRef ?? null };
       },
-      isTrashedInTx: (tx, userId) => isTrashedUserInTx(tx, userId),
+      isTrashedInTx: (tx, userId, opts) => isTrashedUserInTx(tx, userId, opts),
+      lockGoneInTx: (tx, userIds) => lockGoneUsersInTx(tx, userIds),
     },
     portableCustomerRefInTx: admin.portableCustomerRefInTx,
     trash,

@@ -6,7 +6,7 @@
  * re-registration of a purged address inheriting nothing, audit without personal data, portable hooks.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import type { Services } from "../../container.js";
 import { DomainError } from "../../core/errors.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
@@ -17,6 +17,7 @@ import { createIdentityModule, type IdentityModule } from "./index.js";
 import { emailIndexOf } from "./users.js";
 import { liveUserPredicate } from "./live.js";
 import { cleanTrashReason, DELETED_ACCOUNT_NAME, TOMBSTONE_EMAIL_DOMAIN } from "./trash.js";
+import { PASSWORD_RESET_JOB } from "./auth.js";
 import {
   customerRefHistory,
   customerRefReservations,
@@ -197,6 +198,46 @@ describe("identity trash (MySQL)", () => {
       expect(visible).toEqual([]);
     });
 
+    it("locking check for mutation consumers: unknown fails closed, ascending FOR SHARE blocks a concurrent trash until commit", async () => {
+      const s = await suspendedCustomer();
+      const other = await makeUser();
+      // Plain read keeps the read contract (unknown → false); the locking form fails closed.
+      expect(await tx((t) => identity.users.isTrashedInTx(t, 987654321))).toBe(false);
+      expect(await tx((t) => identity.users.isTrashedInTx(t, 987654321, { lock: "share" }))).toBe(true);
+      expect(await tx((t) => identity.users.isTrashedInTx(t, s.customer.id, { lock: "share" }))).toBe(false);
+      expect(await tx((t) => identity.users.lockGoneInTx(t, [other.id, 987654321, s.customer.id, other.id]))).toEqual([987654321]);
+
+      // While a consumer holds the share lock, the coordinator's trash (FOR UPDATE) must wait.
+      let release!: () => void;
+      const held = new Promise<void>((r) => (release = r));
+      let locked!: () => void;
+      const isLocked = new Promise<void>((r) => (locked = r));
+      const consumer = tx(async (t) => {
+        expect(await identity.users.lockGoneInTx(t, [s.customer.id])).toEqual([]);
+        locked();
+        await held;
+      });
+      await isLocked;
+      const blocked = tx(async (t) => {
+        await t.execute(sql`SET SESSION innodb_lock_wait_timeout = 1`);
+        try {
+          return await identity.trash.trashCustomerInTx(t, s.customer.id, { actor: actorFor(s.admin), batchId: ulid(), reason: null });
+        } finally {
+          await t.execute(sql`SET SESSION innodb_lock_wait_timeout = 50`);
+        }
+      });
+      const err = (await blocked.then(() => null, (e: unknown) => e)) as { message?: string; cause?: { message?: string; code?: string } } | null;
+      expect(err?.message).toMatch(/from `users` .* for update/);
+      expect(err?.cause?.code ?? err?.cause?.message).toMatch(/ER_LOCK_WAIT_TIMEOUT|Lock wait timeout/i);
+      release();
+      await consumer;
+      expect((await row(s.customer.id)).trashedAt).toBeNull();
+      // After the consumer commits the trash proceeds, and the locking check then reports gone.
+      await tx((t) => identity.trash.trashCustomerInTx(t, s.customer.id, { actor: actorFor(s.admin), batchId: ulid() }));
+      expect(await tx((t) => identity.users.isTrashedInTx(t, s.customer.id, { lock: "share" }))).toBe(true);
+      expect(await tx((t) => identity.users.lockGoneInTx(t, [s.customer.id, other.id]))).toEqual([s.customer.id]);
+    });
+
     it("admin detail, reactivation and invitation answer the same not-found as an unknown id", async () => {
       const s = await trashed();
       const unknown = ulid();
@@ -220,6 +261,7 @@ describe("identity trash (MySQL)", () => {
       expect([trashedSignIn.code, trashedSignIn.reasonCode, trashedSignIn.safeMessage]).toEqual([unknownSignIn.code, unknownSignIn.reasonCode, unknownSignIn.safeMessage]);
       expect(await identity.auth.requestPasswordReset({ email: s.customer.email })).toEqual({ accepted: true });
       expect(await identity.auth.dispatchPasswordReset({ emailIndex: emailIndexOf(h.deps.crypto, s.customer.email) })).toBe("ineligible");
+      expect(await identity.auth.dispatchPasswordReset({ emailIndex: emailIndexOf(h.deps.crypto, s.customer.email), userId: s.customer.id })).toBe("ineligible");
       // Registration: the address stays reserved, the response is the uniform one, and nothing is mailed.
       const result = await identity.auth.register({ email: s.customer.email, nameParts: { firstName: "Ice", lastName: "Queen", preferredName: null }, password: PW }, {});
       expect(result).toEqual({ accepted: true });
@@ -325,6 +367,59 @@ describe("identity trash (MySQL)", () => {
       expect((await row(s.customer.id)).purgedAt).not.toBeNull();
       // The old session token stays dead.
       expect(await identity.sessionResolver.resolve({ token: s.customerToken, transport: "cookie" })).toBeNull();
+    });
+  });
+
+  describe("queued work never reaches a re-registered address (D2.8)", () => {
+    it("a reset queued before the purge is bound to the old id: after re-registration it issues nothing to the new account", async () => {
+      const s = await suspendedCustomer();
+      h.jobs.enqueued = [];
+      // Queued while the old account still owned the address (a suspended account: the uniform intake still runs).
+      expect(await identity.auth.requestPasswordReset({ email: s.customer.email })).toEqual({ accepted: true });
+      const queued = h.jobs.enqueued.find((j) => j.type === PASSWORD_RESET_JOB)!.payload as { emailIndex: string; userId: number | null };
+      expect(queued.userId).toBe(s.customer.id);
+      const batchId = ulid();
+      await tx((t) => identity.trash.trashCustomerInTx(t, s.customer.id, { actor: actorFor(s.admin), batchId }));
+      const runId = ulid();
+      await tx((t) => identity.trash.markPurgeStartedInTx(t, s.customer.id, { batchId, runId }));
+      await identity.trash.participant().purge!({ kind: "customer", id: s.customer.id, publicId: s.customer.publicId, batchId }, { runId });
+      await tx((t) => identity.trash.tombstoneCustomerInTx(t, s.customer.id, { runId }));
+      await identity.auth.register({ email: s.customer.email, nameParts: { firstName: "Ice", lastName: "Queen", preferredName: null }, password: PW }, {});
+      const fresh = (await identity.findUserIdByEmail(s.customer.email))!;
+      await db.db.update(users).set({ emailVerifiedAt: h.clock.now() }).where(eq(users.id, fresh.userId));
+      h.mailer.sent = [];
+      expect(await identity.auth.dispatchPasswordReset(queued)).toBe("ineligible");
+      expect(await db.db.select().from(identityTokens).where(and(eq(identityTokens.userId, fresh.userId), eq(identityTokens.purpose, "password_reset")))).toEqual([]);
+      expect(h.mailer.sent.filter((m) => (m as { template?: string }).template === "auth.password_reset")).toEqual([]);
+      // A request made AFTER re-registration serves the new account normally.
+      h.jobs.enqueued = [];
+      await identity.auth.requestPasswordReset({ email: s.customer.email });
+      const next = h.jobs.enqueued.find((j) => j.type === PASSWORD_RESET_JOB)!.payload as { emailIndex: string; userId: number | null };
+      expect(next.userId).toBe(fresh.userId);
+      expect(await identity.auth.dispatchPasswordReset(next)).toBe("issued");
+    });
+
+    it("a reset job without a bound id (queued before this field) fails closed; unknown at intake stays unknown", async () => {
+      const live = await makeUser();
+      const emailIndex = emailIndexOf(h.deps.crypto, live.email);
+      expect(await identity.auth.dispatchPasswordReset({ emailIndex })).toBe("ineligible");
+      expect(await identity.auth.dispatchPasswordReset({ emailIndex, userId: null })).toBe("ineligible");
+      expect(await identity.auth.dispatchPasswordReset({ emailIndex, userId: live.id + 100000 })).toBe("ineligible");
+      expect(await identity.auth.dispatchPasswordReset({ emailIndex, userId: live.id })).toBe("issued");
+    });
+
+    it("security sign-in log hides a trashed account: no name, and filtering by its ID matches nothing (like an unknown ID)", async () => {
+      const s = await suspendedCustomer();
+      await tx((t) => identity.trash.trashCustomerInTx(t, s.customer.id, { actor: actorFor(s.admin), batchId: ulid() }));
+      const all = await identity.centre.listSignInLog(s.principal, { limit: 100 } as never);
+      const names = JSON.stringify(all.items);
+      expect(all.items.length).toBeGreaterThan(0);
+      expect(all.items.some((it) => it.user === null)).toBe(true); // the customer's kept events, account hidden
+      expect(names).not.toContain(s.customer.publicId);
+      const byId = await identity.centre.listSignInLog(s.principal, { userId: s.customer.publicId });
+      const unknown = await identity.centre.listSignInLog(s.principal, { userId: "01J0000000000000000000NONE" });
+      expect(byId.items).toEqual([]);
+      expect(unknown.items).toEqual([]);
     });
   });
 

@@ -33,6 +33,12 @@ export const PASSWORD_RESET_JOB = "identity.password_reset.dispatch";
 export interface PasswordResetJob {
   /** Blind index only — never the address, never auth material. */
   emailIndex: string;
+  /**
+   * D2.8: the immutable id the address belonged to AT INTAKE (null = no account then). Dispatch serves only that
+   * account, so a request queued before a purge never reaches an account registered later on the freed address
+   * (it inherits nothing). Missing on jobs queued before this field existed → refused (fail closed).
+   */
+  userId?: number | null;
 }
 
 export interface CallMeta {
@@ -551,7 +557,9 @@ export function createAuthService(i: AuthInternals) {
       const slot = Math.floor(deps.clock.now().getTime() / RESEND_MIN_INTERVAL_MS);
       // Durable intake and its audit row commit together (audit failure ⇒ no accepted work).
       await deps.db.transaction(async (tx) => {
-        await deps.jobs.enqueue<PasswordResetJob>(PASSWORD_RESET_JOB, { emailIndex }, { idempotencyKey: `${emailIndex}:${slot}`, maxAttempts: 3 }, tx);
+        // The same single indexed read for every address (gone accounts included: they are refused at dispatch).
+        const [owner] = await tx.select({ id: users.id }).from(users).where(eq(users.emailIndex, emailIndex)).limit(1);
+        await deps.jobs.enqueue<PasswordResetJob>(PASSWORD_RESET_JOB, { emailIndex, userId: owner?.id ?? null }, { idempotencyKey: `${emailIndex}:${slot}`, maxAttempts: 3 }, tx);
         await deps.audit.record(
           {
             category: "security",
@@ -573,9 +581,10 @@ export function createAuthService(i: AuthInternals) {
       // Resolve the id OUTSIDE the transaction, so the transaction's first statement is the locking read of
       // the users row: under REPEATABLE READ the read view (used by the cooldown query) is then created only
       // after the lock is held, and therefore sees any token committed by a concurrent dispatch (review ID-03).
-      const [peek] = await deps.db.select({ id: users.id }).from(users).where(eq(users.emailIndex, payload.emailIndex)).limit(1);
+      // D2.8: bound to the account that owned the address at intake (never re-resolved by address).
+      const boundId = typeof payload.userId === "number" && Number.isSafeInteger(payload.userId) && payload.userId > 0 ? payload.userId : null;
       return deps.db.transaction(async (tx) => {
-        const locked = peek ? await repo.byId(peek.id, { tx, forUpdate: true }) : null;
+        const locked = boundId !== null ? await repo.byId(boundId, { tx, forUpdate: true }) : null;
         const user = locked && locked.emailIndex === payload.emailIndex ? locked : null; // re-validated under lock
         if (!user || user.status !== "active" || user.authSource !== "local") {
           await deps.audit.record(

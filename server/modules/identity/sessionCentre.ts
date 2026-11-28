@@ -8,6 +8,7 @@
  * → `user_sessions` → `identity_sign_in_events` (insert only).
  */
 import { and, desc, eq, gt, gte, inArray, isNull, lt, lte, type SQL } from "drizzle-orm";
+import { liveUserPredicate } from "./live.js";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, forbidden, notFound, validation } from "../../core/errors.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
@@ -117,8 +118,8 @@ export function createSessionCentre(i: {
 
   async function userIdOf(publicId: string | undefined): Promise<number | null | undefined> {
     if (publicId === undefined) return undefined;
-    const [row] = await deps.db.select({ id: users.id }).from(users).where(eq(users.publicId, publicId)).limit(1);
-    return row?.id ?? null;
+    const [row] = await deps.db.select({ id: users.id }).from(users).where(and(eq(users.publicId, publicId), liveUserPredicate())).limit(1);
+    return row?.id ?? null; // D2: a trashed or tombstoned account filters exactly like an unknown one
   }
 
   function signInConditions(filter: SignInLogFilter, userId: number | null | undefined): (SQL | undefined)[] {
@@ -140,7 +141,7 @@ export function createSessionCentre(i: {
 
   async function signInItems(rows: SignInEventRow[]): Promise<SignInLogItem[]> {
     const ids = [...new Set(rows.flatMap((r) => [r.userId, r.actorUserId]).filter((v): v is number => v !== null))];
-    const people = ids.length ? await deps.db.select().from(users).where(inArray(users.id, ids)) : [];
+    const people = ids.length ? await deps.db.select().from(users).where(and(inArray(users.id, ids), liveUserPredicate())) : []; // D2: kept events, hidden account → user null
     const byId = new Map(people.map((row) => [row.id, viewOf(row)]));
     return rows.map((row) => {
       const user = row.userId !== null ? byId.get(row.userId) : undefined;

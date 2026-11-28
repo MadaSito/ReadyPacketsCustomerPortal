@@ -471,6 +471,11 @@ Identity owns the `users` trash columns (`trashed_at`, `trashed_by_user_id`, `tr
 - `liveUserPredicate(table = users): SQL` gives `trashed_at IS NULL AND purged_at IS NULL`. Reuse it in any query that joins `users`.
 - `isLiveUserRow(row)` is the same check for a row already loaded.
 - `services.identity.users.isTrashedInTx(tx, userId)` returns true when the account is trashed or tombstoned, and false for unknown ids.
+- Mutation consumers (the owner must stay live until their commit): `services.identity.users.isTrashedInTx(tx, userId, { lock: "share" })` or `services.identity.users.lockGoneInTx(tx, userIds)`. These require a Tx.
+  - They do a locking current read (`FOR SHARE`, in ascending id order) that is held until commit. A concurrent trash or purge (`FOR UPDATE`) waits.
+  - An unknown id counts as gone (fails closed).
+  - `lockGoneInTx` returns the ids that are trashed, tombstoned or unknown; an empty result means every owner is live.
+  - Lock order: users first, then the owned rows.
 - The repo's `one()` and `byIds()` filter to live accounts by default. Only identity-internal callers pass `includeGone`. `getUser` and `getUserByPublicId` strip that option, so they return null for a trashed or tombstoned account.
 - Gated paths:
   - sign-in and password reset (through the repo)
@@ -480,6 +485,8 @@ Identity owns the `users` trash columns (`trashed_at`, `trashed_by_user_id`, `tr
   - the customer picker and search
   - the public API customers provider
   - SSO sign-in
+- The sign-in log (security centre) hides gone accounts: their kept events show `user: null`, and filtering by their ID matches nothing, exactly as for an unknown ID.
+- Password-reset jobs are bound at intake to the immutable `userId` that owned the address (null if there was none). Dispatch serves only that id, so a job queued before a purge never reaches an account registered later on the freed address. A job with no bound id fails closed.
 - Each gated path answers exactly as it would for an unknown id or address, so there is no existence oracle. Registration and SSO provisioning check collisions against gone accounts too. Until the tombstone commits, a trashed address gets the same uniform response, no mail is sent, and the audit records reason `TRASHED_ACCOUNT`.
 
 ### Coordinator functions (`services.identity.trash`, created by trash.ts)
