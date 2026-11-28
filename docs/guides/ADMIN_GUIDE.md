@@ -608,7 +608,7 @@ On builds before 07.1, reloading or bookmarking a template editor whose key has 
 
 ## Increment 09: Trash centre (draft)
 
-<!-- DRAFT by platform_engineer from INCREMENT_09_CONTRACT.md D2. PENDING-OWNER recovery_ops_engineer, audit_engineer, orders_engineer, identity_engineer: screen labels and behaviour to be confirmed against commits. -->
+<!-- DRAFT by platform_engineer from INCREMENT_09_CONTRACT.md D2. Settings, states and job name confirmed by recovery_ops_engineer; storage copies by files_engineer. PENDING-OWNER audit_engineer, orders_engineer, identity_engineer: screen labels. -->
 
 The Trash centre is at **Administration → Trash** (`/admin/trash`). It has an **Orders** tab and a **Customers** tab. Only administrators can use it:
 
@@ -624,7 +624,7 @@ Every row shows:
 - who moved it and when;
 - the reason;
 - the date it will be deleted permanently;
-- its state: in trash, deleting, or failed.
+- its state: **In trash**, **Deleting**, or **Failed — retry available**.
 
 You can filter by text, date range, who moved it, and items due within a number of days. You can sort the rows, page through them, and restore or delete several at once. On a phone, rows become cards.
 
@@ -694,15 +694,15 @@ A tombstone never appears in lists, search or pickers, and it cannot be restored
 ### Retention clean-up
 
 The settings are in the Trash centre:
-- **Automatic clean-up:** on by default.
-- **Days to keep orders in the trash:** 30 by default.
-- **Days to keep customers in the trash:** 30 by default.
+- **Automatic trash clean-up** (`trash.autoPurge.enabled`): on by default.
+- **Order retention in trash (days)** (`trash.retention.orderDays`): 30 by default.
+- **Customer account retention in trash (days)** (`trash.retention.customerDays`): 30 by default.
 
 The day settings allow 1 to 3,650 days. Changing them needs `trash.retention.manage` and a fresh two-step check, and is audited.
 
 - **Due date.** An item is due on the day it was moved plus the setting **as it is now**. Changing the setting moves the due date of everything already in the trash. Orders moved together with a customer follow the customer's date.
 - **Shortening retention.** The panel shows how many items become due. It asks for the same confirmation as a permanent deletion.
-- **The hourly job** deletes what is due, as the system, through the same path as a manual deletion.
+- **The hourly job** `trash.retention_cleanup` deletes what is due, as the system, through the same path as a manual deletion. Only one run happens at a time, it works in bounded batches, and it continues after an interruption. Each run is audited as `trash.cleanup_completed`. Failures raise an operational alert with source `trash`.
   - It does not run during maintenance or an upgrade.
   - One failing item does not block the others. Failures raise an operational alert and are retried.
   - The Trash centre shows the last clean-up run and how many items are due next.
@@ -712,7 +712,13 @@ The day settings allow 1 to 3,650 days. Changing them needs `trash.retention.man
 Permanent deletion only reaches data that the portal itself controls.
 - **Backups** keep their copy until they expire under the backup retention, see [BACKUP_AND_RESTORE.md](../operations/BACKUP_AND_RESTORE.md). **Restoring an older backup brings deleted items back.** After a restore, delete them again from the Trash centre, using the `order.purged` and `customer.purged` audit events as the list.
 - **Stripe.** Customers, payments and checkout sessions at Stripe are not changed.
-- **SharePoint and other external stores.** Folders already written there are not deleted. Only the portal's mapping rows are erased. Delete the folders in SharePoint if needed.
+- **Storage copies the portal controls** are deleted and checked. If a write to the current destination is still uncertain, the deletion stops and is retried; it never reports success early.
+- **Copies the portal cannot prove it owns,** for example in an older or changed storage destination, are not touched. They are counted as `unverifiedExternalCopies`, with only the connection's public ID. The portal's pointer is removed. Remove them by hand after checking.
+- **Provider recycle bins.** Residual copies left in a provider's retention or recycle bin are counted as `providerRecycleBin`. The portal never empties a whole bin.
+  - **Microsoft Graph (OneDrive and SharePoint)** deletes the exact item permanently.
+  - **Dropbox** user apps only soft-delete, so a copy stays in Dropbox's own bin until Dropbox removes it.
+  - **Azure Blob** with soft delete enabled may keep a retained version, under the storage administrator's control.
+- **SharePoint folders and reused external items.** Folders already written to SharePoint, and external items that were reused, are not deleted. Only the portal's mapping rows are erased. Delete the folders in SharePoint if needed.
 - **E-mail.** Messages already delivered stay in the recipients' mailboxes.
 - **SIEM.** Copies already sent to the SIEM or syslog server stay there.
 

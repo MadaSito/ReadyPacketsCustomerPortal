@@ -84,21 +84,31 @@ Dark panels keep using `.rp-brand-on-dark`, and forced-colours mode must still s
 
 ### 2.4 Live files in the portal
 
-The files are self-hosted on the same origin from `client/public/brand/`. Each has an explicit `width` and `height` to avoid layout shift, and a versioned or hashed name so that neither the browser cache nor the service worker keeps serving the old logo. The registry is `BRAND_ASSETS` in `shared/brand.ts`.
+The files are self-hosted on the same origin from `client/public/brand/`. They were copied unchanged from `logo-assets/` and `platform-and-print-exports/` after the package's `SHA256SUMS` check passed. Every name ends in `-v2026101502`, the package version, so neither the browser cache nor the service worker keeps serving the old logo. The precache is now `precache-v4`. Each image has an explicit `width` and `height`, to avoid layout shift.
 
-<!-- PENDING-OWNER ui_foundation_engineer: final file names, sizes and component names -->
-
-| Use | File (light / dark) | Source in the package |
+| Use | Files (`{light,dark}` = one of each) | Size |
 | --- | --- | --- |
-| Square lockup (sign-in pages, public pages, sidebar tile, error and offline pages) | to be confirmed | `logo-assets/readypackets-document-stack-square-{light,dark}.svg`, PNG fallbacks from `full-square-app-and-launch/` |
-| Horizontal lockup (narrow bars) | to be confirmed | `logo-assets/readypackets-document-stack-{light,dark}.svg`, PNG from `website-header/` |
-| Favicon 16/32/48 and `favicon.ico` | to be confirmed | `utility-icons-only/readypackets-utility-favicon-multiresolution.ico`, `readypackets-utility-mark-*` |
-| Maskable PWA icon | to be confirmed | `utility-icons-only/readypackets-utility-app-icon-maskable-512x512.png` |
-| Apple touch icon | to be confirmed | `utility-icons-only/readypackets-utility-app-icon-navy-180x180.png` |
-| Open Graph, Twitter and JSON-LD logo | to be confirmed | square full lockup |
-| E-mail and PDF header | to be confirmed | `email-signature/readypackets-full-lockup-horizontal-light-300x90.png` |
+| Square full lockup | `readypackets-square-{light,dark}-v2026101502.svg` | 1024 × 1024, transparent |
+| Square PNG fallbacks | `readypackets-square-{light,dark}-{192,512}-v2026101502.png` | 192 and 512, opaque |
+| Horizontal full lockup | `readypackets-horizontal-{light,dark}-v2026101502.svg` | 2460 × 680 |
+| Horizontal PNG | `readypackets-horizontal-{light,dark}-{500x150,300x90}-v2026101502.png` | 500 × 150 and 300 × 90 |
+| Invoice and receipt PDFs | `readypackets-horizontal-light-600x180-v2026101502.png` | 600 × 180 |
+| Favicon | `readypackets-utility-favicon-v2026101502.ico` (16–256 px), also served as `/favicon.ico` | — |
+| Utility marks | `readypackets-utility-mark-{light,dark}-{16,32,48}-v2026101502.png` | 16, 32 and 48 |
+| Apple touch icon | `readypackets-utility-apple-touch-180-v2026101502.png` (navy) | 180 |
+| Maskable PWA icon | `readypackets-utility-maskable-512-v2026101502.png` | 512 |
+| Open Graph and Twitter image | `readypackets-og-square-light-800-v2026101502.png` | 800 × 800 |
 
-The superseded `readypackets-approved-*` files are removed from the live paths once nothing refers to them. They remain in the Git history.
+- **Web manifest:** the square light lockup at 192 and 512 (purpose `any`), plus the utility maskable icon at 512.
+- **Component:** `BrandLogo` in `client/src/ui`, the single logo component. It takes three props:
+  - `lockup`: `"square"` or `"horizontal"`;
+  - `appearance`: `auto`, `light` or `dark`;
+  - `label`: the alternative text; an empty string makes the logo decorative.
+
+  `ApprovedBrandLogo`, `ApprovedBrandIcon` and the icon-only variant have been removed.
+- **Forced colours:** `.rp-brand-plate-light` and `.rp-brand-plate-dark` give a lockup a white or navy backplate.
+- **Sign-in page slides:** the platform module's `BRAND_IMAGE_ALLOWLIST` keeps its stored IDs and now points at `readypackets-square-light-512-v2026101502.png` and `readypackets-utility-maskable-512-v2026101502.png`.
+- **Retired files:** the 13 superseded `readypackets-approved-*` files are removed from the live paths once nothing refers to them. They remain in the Git history.
 
 ### 2.5 Alternative text
 
@@ -194,7 +204,7 @@ Treat accessibility as a requirement to verify in each context, not something th
 
 Do not rely on color alone for status or instructions. Preserve keyboard-visible focus, meaningful labels, user zoom, and reduced-motion behavior. The stylesheet supplies a `3px` focus outline with `3px` offset, a focus-revealed skip-link style, reduced-motion rules, and forced-colors adjustments; these still require context testing.
 
-The logo is one image with the accessible name in section 2.5. When the surrounding link already has an adequate name, the image uses `alt=""` to avoid saying it twice. The contrast of the dark lockup on the navy surface and of the light lockup on white is checked as part of increment 09.
+The logo is one image (`BrandLogo`) with the accessible name in section 2.5. When the surrounding link already has an adequate name, the image uses `alt=""` to avoid saying it twice. The contrast of the dark lockup on the navy surface and of the light lockup on white is checked as part of increment 09.
 
 This guide does not claim blanket conformance with WCAG or the ADA. A complete accessibility review must consider content, behavior, forms, navigation, and assistive-technology use—not just branding.
 

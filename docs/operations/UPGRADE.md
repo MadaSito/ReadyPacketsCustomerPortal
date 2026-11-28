@@ -197,20 +197,27 @@ Existing orders keep their pinned workflow version. The start-up job `orders.inc
 
 ## Increment 09 and migration `0009`
 
-<!-- DRAFT by platform_engineer from INCREMENT_09_CONTRACT.md. PENDING-LEAD: exact statements once 0009 is generated. -->
-
 `0009_increment_09` is additive only: new tables, new nullable columns or columns with defaults, new indexes, and enum widening. It drops and renames nothing, and does no backfill in SQL.
 
-- **Expected schema, per the contract:**
-  - `orders` and `users`: `trashed_at`, `trashed_by_user_id`, `trash_batch_id`, `trash_reason`, `purge_started_at` and `purged_at`, all nullable, with an index on `(trashed_at, id)`;
-  - the trash module's tables, including `trash_purge_runs`, and its settings.
+- **Schema.** `migrations/0009_increment_09.sql` (commit 8b76e87) has 48 statements: 4 new tables, 1 enum widening, 23 new nullable columns and 20 new indexes.
+  - **New tables:** `trash_purge_runs` (one row per permanent deletion, with per-module counts and a safe error code), `trash_cleanup_sweeps` (retention job runs), `trash_idempotency_keys` and `trash_retention_state`.
+  - **`users` and `orders`:** `trashed_at`, `trashed_by_user_id`, `trash_batch_id`, `trash_reason`, `purge_started_at` and `purged_at`, with indexes `users_trashed_idx` and `orders_trashed_idx` on `(trashed_at, id)`, and `orders_trash_batch_idx`.
+  - **Other new columns:**
+    - `engagement_notifications.order_id` and `ticket_id`;
+    - `compliance_invoices`: `issuer_contact_snapshot`, `order_reference_snapshot`, `customer_ref_snapshot` and `buyer_snapshot_enc` (the frozen copies that are kept);
+    - `mail_outbox.order_id` and `recipient_account_id`;
+    - `automation_runs.subject_user_id`;
+    - `payment_attempts.trash_cancelled_at` and `provider_cancelled_at`.
+  - **Widened:** `operational_alerts.source` gains `trash`.
+  - **Indexes** for the new lookups on notifications, support tickets, the mail outbox, automation runs, API keys, community reports and topics, and payment attempts.
+  - Nothing is dropped or renamed. Existing rows keep `NULL` in the new columns, so nothing is in the trash.
 - **Native upgrade and Docker Compose.** These are the same as for increment 08: sections 2–5, with the backup, fence and `BACKUP-VERIFIED` gates. Release validation and the image build require the SQL file and the journal entry `0009_increment_09`. Never run the SQL by hand. If you mistype a confirmation, see the box at the top of [section 6](#6-recovery-if-an-upgrade-stops-mid-way).
 - **What stays the same:**
   - nothing is in the trash after the upgrade, and every order and customer stays visible as before;
   - order numbers and customer IDs are unchanged;
   - API v1 responses stay backward compatible.
 - **After the upgrade:**
-  - **Retention.** Open **Administration → Trash** and check the retention settings. Automatic clean-up is **on** with 30 days for orders and for customers. Change these before moving anything to the trash if your policy differs.
+  - **Retention.** Open **Administration → Trash** and check the retention settings. **Automatic trash clean-up** is **on**, with 30 days for both **Order retention in trash (days)** and **Customer account retention in trash (days)**. Change these before moving anything to the trash if your policy differs.
   - **E-mail links.** Send a test from the template editor and check that links are clickable. Stored templates are fixed when the message is produced; you do not need to edit them.
   - **Logo.** Reload the portal. The new square logo replaces the old one. If an installed app still shows the old icon, reopen it once, so that it picks up the updated service worker.
   - **Go-live checklist.** Run the increment 09 rows of [GO_LIVE_CHECKLIST.md](GO_LIVE_CHECKLIST.md).
