@@ -262,6 +262,22 @@ export interface TrashParticipant {
 - `docs/brand/BRAND_GUIDE.md` rewritten for the new package (platform_engineer), including the note that the
   package README calls itself a production candidate and that the owner supplied it for use on 2026-11-27.
 
+### D1/D3 security addendum (accepted from the design review; binding)
+
+- D1: autolinking runs on text nodes only, after the final variable substitution, with the existing URL check
+  applied once to the decoded text; reject control characters, bidirectional overrides, backslashes and
+  userinfo; the visible text of an autolink is the normalised URL itself (an internationalised host is shown in
+  its punycode form), so the text can never differ from the destination; bounded candidate length and body
+  size. Untrusted field values never become a button — only an inline link whose text is the URL. Links and
+  buttons of security templates (verification, reset, invitation, set password) stay built from the canonical
+  origin. Tests for malformed anchors/entities and for preview/send parity.
+- D3: served SVG files are checked for active content and external references (no script, event handlers,
+  `foreignObject`, external `href`/`url()`); the 4096 px originals and the archive stay outside the served
+  root (`docs/brand/master/`); no CSP relaxation; every changed runtime, manifest and Open Graph asset gets a
+  new versioned name; the service worker cache is rotated so the offline page never shows the old lockup and
+  never caches personalised responses; assurance MFA factors of a purged customer are erased by an assurance
+  trash participant (assurance_engineer).
+
 ### D4 Documents (platform_engineer; checklist assurance_engineer)
 
 Session log for prompts 35–37, `STATUS`, `CHANGELOG`, `APPLICATION_CONTEXT`, upgrade notes (this increment HAS a
