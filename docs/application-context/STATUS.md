@@ -1,6 +1,6 @@
 # ReadyPackets Portal — Status
 
-Last updated: 2026-11-28 (increment 07 merged to `main` as `c337492` through PR #16; fix pack 07.1 merged as `547a31d` through PR #19; fix pack 07.2 merged as `762ea41` through PR #21; increment 08 merged as `1587d11` through PR #23; increment 09 verified by the lead on `feat/increment-09` at `cf02944` and `6f54429`, PR and merge pending). Keep this file current; it is the honest state of the build,
+Last updated: 2026-11-28 (increment 07 merged to `main` as `c337492` through PR #16; fix pack 07.1 merged as `547a31d` through PR #19; fix pack 07.2 merged as `762ea41` through PR #21; increment 08 merged as `1587d11` through PR #23; increment 09 merged to `main` as `5e45745` through PR #25 on 2026-11-28; `main` is at `5e45745`). Keep this file current; it is the honest state of the build,
 not a certification. "Verified" below means the integrator ran the check and saw the result. Anything not
 listed under "Verified" has not been proven and must not be described as working in production.
 
@@ -388,14 +388,17 @@ Owner's prompt 37 of 2026-11-27 ([session log](../session-logs/2026-11-27-sessio
 
 | Decision | What | Owner | State |
 | --- | --- | --- | --- |
-| D1 | Clickable links in e-mail; e-mail addresses in the console as `mailto` links | jobs_engineer, ui_foundation_engineer, page owners | implemented; the UI `mailto` links were verified by the lead on QA. Mail anchors are checked by tests only (eeee72e, 69378d7, cd822d3, bfca43a, eb57918) |
+| D1 | Clickable links in e-mail; e-mail addresses in the console as `mailto` links | jobs_engineer, ui_foundation_engineer, page owners | implemented; the UI `mailto` links were verified by the lead on QA. Mail anchors are checked by tests only (eeee72e, 69378d7, cd822d3, bfca43a, eb57918; CodeQL test fix 9ecb572) |
 | D2 | Trash centre: move to trash, restore, permanent deletion, retention clean-up, legal hold | recovery_ops_engineer, audit_engineer, identity_engineer, orders_engineer, every data-owning module | implemented; verified by the lead on QA at `cf02944` and `6f54429` (3ed7b75, 1acae2c, a764b69, 851cf45, 9d9a0ba, fc4562b, 700ff9c, 0413d5a, 164b9c4, 33d8ac5, 6d93d94, e3b9e92, d7497b5, 8837890, 13f2a1d, 5c94588, 21b4149, 980f4ec, bcd27cc, cf02944, f57c510, 6f54429) |
 | D3 | New square logo and brand files, package 2026.10.15.2 | ui_foundation_engineer, compliance_engineer | implemented; verified by the lead on QA (da419de, 14dcade, 8bfdf73, aad7083, 6ed8d1c, 884213d, cf02944) |
 | D4 | Documents; go-live checklist; security review record | platform_engineer, assurance_engineer | documents a22e302, acd4ab4, 465427a, 980f4ec, 5aa212a, ee46c7c, c97c86f and this update; checklist 8f4155a (to be run on the owner's server); [security review record](../verification/INCREMENT_09_SECURITY_REVIEW.md) |
 
 ### Verification for increment 09
 
-Branch HEAD `6f54429` (the first checks below ran on `cf02944`); base `main` at `44d04bf`. PR and merge commit: (filled at merge).
+PR #25, "Increment 09: clickable mail links, trash with restore and permanent deletion, new square logo", was merged on 2026-11-28 with merge commit `5e45745` on `main`. `main` was at `44d04bf` before the merge, and the branch head at merge was `9ecb572`. The browser checks below ran on `cf02944` and `6f54429`.
+- **CI on `9ecb572`.** All four workflows succeeded: ci, security, container and native-install.
+- **Earlier CI failure.** On the previous head, `5deed1f`, the security workflow failed. CodeQL flagged `js/incomplete-sanitization` (7.8) in `server/modules/mailTemplates/mailTemplates.test.ts` line 141: a test built its expected link with a replace that changed only the first match. `9ecb572` fixed it by escaping every ampersand, with no baseline entry added. The file's 8 tests pass and the type check is clean.
+- **Lead re-run before the push.** The type check was clean and eslint exited 0. vitest: 254 files, 3,402 passed, 4 todo. gitleaks over `main..HEAD` (110 commits) found no leaks.
 
 **Verified by the lead** on a QA production build of `feat/increment-09` at `cf02944`, in Chromium only. The build ran on a copy of the QA database with synthetic data, in pay-by-invoice mode, with mail not configured and local storage only.
 - **Static checks.**
