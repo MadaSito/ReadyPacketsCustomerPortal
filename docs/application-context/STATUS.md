@@ -475,7 +475,7 @@ Branch HEAD `3eee534` (the first checks below ran on `cf02944`); base `main` at 
     - The new unit test fails without the fix.
     - Checked again live: two permanent deletions in a row, in one page session, both completed.
 
-<!-- RERUN-PENDING-LEAD -->
+**Re-run by the lead after both fixes** (source at `3eee534`): the type check was clean, eslint over the whole repository exited 0, and the full vitest suite passed with 254 files, 3,402 tests passed and 4 todo. The production build of `3eee534` exited 0 and is the build the 2026-11-28 checks ran on.
 
 **Reported by owners, not re-run individually by the lead.** These test files are part of the lead's full vitest run above, but the lead did not exercise them one by one.
 - **Cross-module journey.** `tests/integration/journey-trash.test.ts` (ede33a1, 14c63ab) covers Trash isolation, the lifecycle and scheduled retention across modules. Every Trash capability is probed against a customer and a staff member who completed the two-step check.
