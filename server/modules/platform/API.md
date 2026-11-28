@@ -292,3 +292,9 @@ time. No user agent and no IP in clear.
 - Job `platform.consent.purge` every 6 h, batches of 1000, audits `privacy.consent.purged` with counts only.
 - `ctx.services.platform` internals: `consent.forgetUser(userPublicId, tx?)` — account erasure unlinks the person (sets `userPublicId` null); the anonymous record stays until retention ends. Identity's erasure flow should call it.
 - `consentRevision()` / `commitConsentDecision(revision, choices, meta): boolean` — a server-confirmed decision is applied only if the persisted choice (read fresh from storage, plus this tab's write counter), policy version and privacy signal are unchanged since the request started; otherwise the newer state stands.
+
+## Increment 09
+
+- Trash participant `platform` (`trash.ts`, registered in `init()`): `purge` of a customer calls `consent.forgetUser(entity.publicId)` and returns `{ deleted: { consents: n } }`; orders hold no platform data; no `onTrashedInTx`/`onRestoredInTx` veto. Idempotent (a retry reports 0).
+- `BRAND_IMAGE_ALLOWLIST` keeps the ids `brand-icon-light-512` and `brand-icon-maskable-512` (stored slides refer to them) and now points them at `/brand/readypackets-square-light-512-v2026101502.png` and `/brand/readypackets-utility-maskable-512-v2026101502.png`.
+- Protection reads no orders or users (IP-keyed), so it needs no trash predicate.

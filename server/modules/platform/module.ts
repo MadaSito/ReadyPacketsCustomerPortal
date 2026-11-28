@@ -13,6 +13,7 @@ import { createConfigTransfer, type ConfigTransfer } from "./configTransfer.js";
 import type { HealthReport, PlatformModule, SchemaStatus, SetupChecklistItem } from "./index.js";
 import { createPresentationService, type PresentationService } from "./presentation.js";
 import { CONSENT_PURGE_JOB, createConsentService, type ConsentService } from "./consent.js";
+import { createPlatformTrashParticipant } from "./trash.js";
 import { computeSchemaStatus, schemaContractError } from "./schemaContract.js";
 import { PRESENTATION_SLIDES, slidesSchema } from "./settings.js";
 import { getSettingDefinition } from "./settingsRegistry.js";
@@ -388,6 +389,8 @@ export function createPlatformModule(deps: ModuleDeps): PlatformModuleImpl {
     init() {
       // Exactly one startup WARN per process (container calls init once after construction).
       if (preview) log.warn("preview profile active: relaxed framing/CORS, in-memory session transport, synthetic data only", { event: "platform.preview_profile.active" });
+      // Increment 09: a customer's permanent deletion unlinks their consent records.
+      deps.services.trash.register(createPlatformTrashParticipant(consent));
     },
     schemaStatus,
     healthReport,

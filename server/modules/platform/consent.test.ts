@@ -18,6 +18,7 @@ import {
   searchInputSchema,
 } from "./consent.js";
 import { listSettingDefinitions, writeSetting } from "./settingsRegistry.js";
+import { createPlatformTrashParticipant, PLATFORM_TRASH_MODULE } from "./trash.js";
 
 let t: TestDb;
 let h: TestHarness;
@@ -174,5 +175,22 @@ describe("consent: retention", () => {
     expect(await svc.forgetUser("usr_b")).toBe(1);
     expect(await svc.mine("usr_b")).toHaveLength(0);
     expect(await t.db.select().from(platformConsentRecords)).toHaveLength(1);
+  });
+
+  it("trash participant: a customer's permanent deletion unlinks only that customer's consent records, idempotently", async () => {
+    await enable();
+    await svc.record({ policyVersion: 1, choices: NONE, action: "reject_all", source: "banner", gpc: false }, { userPublicId: "usr_trash_a", ipAddress: null });
+    await svc.record({ policyVersion: 1, choices: ALL, action: "accept_all", source: "banner", gpc: false }, { userPublicId: "usr_trash_b", ipAddress: null });
+    const participant = createPlatformTrashParticipant(svc);
+    expect(participant.module).toBe(PLATFORM_TRASH_MODULE);
+    expect(participant.onTrashedInTx).toBeUndefined();
+    expect(participant.onRestoredInTx).toBeUndefined();
+    const order = { kind: "order" as const, id: 1, publicId: "ord_trash", batchId: "01J0000000000000000000BATCH" };
+    expect(await participant.purge!(order, { runId: "run_1" })).toEqual({ deleted: {} });
+    const customer = { kind: "customer" as const, id: 2, publicId: "usr_trash_a", batchId: "01J0000000000000000000BATCH" };
+    expect(await participant.purge!(customer, { runId: "run_1" })).toEqual({ deleted: { consents: 1 } });
+    expect(await participant.purge!(customer, { runId: "run_1" })).toEqual({ deleted: { consents: 0 } });
+    expect(await svc.mine("usr_trash_a")).toHaveLength(0);
+    expect(await svc.mine("usr_trash_b")).toHaveLength(1);
   });
 });
