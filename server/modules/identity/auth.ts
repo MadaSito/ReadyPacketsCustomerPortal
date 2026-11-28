@@ -2,6 +2,7 @@
  * Public account flows: registration, sign-in, e-mail verification, password reset, invitation activation,
  * change password, sign-out. Uniform responses + timing; no account enumeration.
  */
+import { isLiveUserRow } from "./live.js";
 import { and, eq, sql } from "drizzle-orm";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, validation } from "../../core/errors.js";
@@ -342,13 +343,16 @@ export function createAuthService(i: AuthInternals) {
       const greetingParts = input.nameParts ?? deriveNameParts(name);
       assertPasswordAcceptable(input.password, { email, name });
       const passwordHash = await hasher.hash(input.password); // always hash: uniform timing
-      const existing = await repo.byEmail(email);
+      // Increment 09 (D2.2): a trashed account keeps its address reserved, so the lookup includes it. It is
+      // answered exactly like an existing account, but it receives no mail (trashed accounts get none).
+      const existing = await repo.byEmail(email, { includeGone: true });
       if (existing) {
+        const gone = !isLiveUserRow(existing);
         // Same shape of work as the create branch (one transaction, one mail enqueue, one audit row) so the
         // response and its timing do not distinguish existing addresses (review ID-04). Residual timing
         // differences (row insert vs none) are documented in VERIFICATION.md as not benchmarked.
         await deps.db.transaction(async (tx) => {
-          await deps.mailer.enqueue(
+          if (!gone) await deps.mailer.enqueue(
             {
               template: "auth.account_exists",
               to: { userId: existing.id },
@@ -363,7 +367,7 @@ export function createAuthService(i: AuthInternals) {
               eventName: "auth.register.requested",
               action: "register",
               outcome: "refused",
-              reasonCode: "EXISTING_ACCOUNT",
+              reasonCode: gone ? "TRASHED_ACCOUNT" : "EXISTING_ACCOUNT",
               actor: { role: "anonymous" },
               resource: { type: "user", publicId: existing.publicId },
             },

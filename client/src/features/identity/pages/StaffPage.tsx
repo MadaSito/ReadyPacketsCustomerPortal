@@ -5,7 +5,7 @@ import { useState, type FormEvent } from "react";
 import { useSession } from "@/lib/session";
 import { errorMessage, safeError, useTRPC, type useTRPCClient } from "@/lib/trpc";
 import {
-  Badge, Button, Callout, DataTable, DateTime, Dialog, DropdownMenu, EmptyState, Field, FilterBar, IconButton, Input, LoadMore,
+  Badge, Button, Callout, DataTable, DateTime, Dialog, DropdownMenu, EmailLink, EmptyState, Field, FilterBar, IconButton, Input, LoadMore,
   PageHeader, RadioGroup, Select, StepUpCancelledError, useStepUp, useToast,
 } from "@/ui";
 import { MoreHorizontal } from "lucide-react";
@@ -75,7 +75,7 @@ export default function StaffPage() {
               key: "name", header: "Name", primary: true,
               cell: (row) => <span className="flex flex-wrap items-center gap-2"><span className="font-semibold text-ink">{row.name}</span>{row.publicId === self ? <Badge tone="brand">You</Badge> : null}</span>,
             },
-            { key: "email", header: "E-mail", cell: (row) => <span className="break-all">{row.email}</span> },
+            { key: "email", header: "E-mail", cell: (row) => <EmailLink email={row.email} /> },
             { key: "role", header: "Role", cell: (row) => <Badge tone={row.role === "admin" ? "info" : "neutral"}>{ROLE_LABELS[row.role]}</Badge> },
             { key: "status", header: "Status", cell: (row) => <UserStatusBadge status={row.status} /> },
             { key: "signIn", header: "Sign-in method", hideOnMobile: true, cell: (row) => <SignInMethodBadges methods={row.signInMethods} /> },

@@ -14,6 +14,8 @@ import { namePrefixes, normalizeEmail, normalizeName, type NameInput, type NameP
 import type { ApiCaller, ApiListQuery, ApiPage, CustomerDto } from "../publicApi/ports.js";
 import { customerRefHistory, USER_STATUSES, users, type UserRow, type UserStatus } from "./schema.js";
 import { RESEND_MIN_INTERVAL_MS } from "./settings.js";
+import { liveUserPredicate } from "./live.js";
+import { cleanTrashReason, DELETED_ACCOUNT_NAME, tombstoneColumns, tombstoneEmail } from "./trash.js";
 import { emailIndexOf, nameAad, nameColumns, namePartColumns, namePartsOf, namePrefixIndex, toView } from "./users.js";
 
 export interface CustomerListItem {
@@ -116,7 +118,7 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
   ): Promise<Page<CustomerListItem>> {
     const limit = Math.min(Math.max(input.limit ?? 25, 1), MAX_LIMIT);
     const after = decodeCursor(input.cursor);
-    const conditions: (SQL | undefined)[] = [inArray(users.role, [...roles])];
+    const conditions: (SQL | undefined)[] = [inArray(users.role, [...roles]), liveUserPredicate()];
     if (input.status) conditions.push(eq(users.status, input.status));
     if (after !== null) conditions.push(lt(users.id, after));
     let nameFilter: ((name: string) => boolean) | undefined;
@@ -149,7 +151,7 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
   async function authorizeInTx(tx: Tx, principal: SessionPrincipal, capability: Capability, targetPublicId?: string): Promise<UserRow | null> {
     let targetId: number | null = null;
     if (targetPublicId !== undefined) {
-      const [peek] = await tx.select({ id: users.id }).from(users).where(eq(users.publicId, targetPublicId)).limit(1);
+      const [peek] = await tx.select({ id: users.id }).from(users).where(and(eq(users.publicId, targetPublicId), liveUserPredicate())).limit(1);
       if (!peek) throw notFound("USER_NOT_FOUND");
       targetId = peek.id;
     }
@@ -263,7 +265,7 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
     async list(query: ApiListQuery, caller: ApiCaller): Promise<ApiPage<CustomerDto>> {
       const limit = Math.min(Math.max(query.limit, 1), MAX_LIMIT);
       const after = decodeCursor(query.cursor);
-      const conditions: (SQL | undefined)[] = [eq(users.role, "customer")];
+      const conditions: (SQL | undefined)[] = [eq(users.role, "customer"), liveUserPredicate()];
       const status = query.filter.status;
       if (status !== undefined) {
         if (!(USER_STATUSES as readonly string[]).includes(status)) throw validation("FILTER_INVALID", "Unknown status filter.", { field: "status" });
@@ -286,7 +288,7 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
       return { items, nextCursor: rows.length > limit ? encodeCursor(page[page.length - 1]!.id) : null };
     },
     async get(publicId: string, caller: ApiCaller): Promise<CustomerDto | null> {
-      const [row] = await deps.db.select().from(users).where(and(eq(users.publicId, publicId), eq(users.role, "customer"))).limit(1);
+      const [row] = await deps.db.select().from(users).where(and(eq(users.publicId, publicId), eq(users.role, "customer"), liveUserPredicate())).limit(1);
       await auditApiRead(caller, "api.customer.read", row ? 1 : 0);
       return row ? customerDto(row) : null;
     },
@@ -303,7 +305,7 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
       const limit = Math.min(Math.max(opts.limit ?? 500, 1), 500);
       if (!query.trim()) return [];
       const search = searchCondition(query.slice(0, 100));
-      const conditions: (SQL | undefined)[] = [eq(users.role, "customer"), search.where, opts.status ? eq(users.status, opts.status) : undefined];
+      const conditions: (SQL | undefined)[] = [eq(users.role, "customer"), liveUserPredicate(), search.where, opts.status ? eq(users.status, opts.status) : undefined];
       const rows = await (opts.tx ?? deps.db)
         .select({ id: users.id, publicId: users.publicId, nameEnc: users.nameEnc, customerRef: users.customerRef })
         .from(users)
@@ -560,14 +562,25 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
     /* ----------------------------------------------------------- portable import/export hooks */
 
     async createPendingCustomer(
-      input: { email: string; name: string; nameParts?: NameParts; customerRef?: string | null; publicId?: string; createdAt?: Date },
+      input: {
+        email: string; name: string; nameParts?: NameParts; customerRef?: string | null; publicId?: string; createdAt?: Date;
+        /**
+         * Increment 09 (portable import of trash state). purgedAt null → created already IN THE TRASH and suspended
+         * (never live, cannot sign in, address stays reserved). purgedAt set → created as a TOMBSTONE (own placeholder
+         * address; the given e-mail and names are ignored; customer ID kept as a reservation).
+         */
+        trash?: { trashedAt: Date; batchId: string | null; reason: string | null; purgedAt: Date | null } | null;
+      },
       opts: { tx: Tx },
     ): Promise<{ userId: number; publicId: string; customerRef: string }> {
       const tx = opts.tx;
+      const trash = input.trash ?? null;
+      const tombstone = trash !== null && trash.purgedAt !== null;
+      const now = deps.clock.now();
       const created = await auth.insertUser(tx, {
-        email: input.email,
-        name: input.name,
-        ...(input.nameParts ? { nameParts: input.nameParts } : {}),
+        email: tombstone ? tombstoneEmail(now) : input.email,
+        name: tombstone ? DELETED_ACCOUNT_NAME : input.name,
+        ...(input.nameParts && !tombstone ? { nameParts: input.nameParts } : {}),
         role: "customer", // never staff/admin from an archive
         status: "pending_activation", // never an automatically active account
         origin: "import",
@@ -577,21 +590,58 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
         passwordHash: null, // no authentication material is ever imported
       });
       await tx.insert(customerRefHistory).values({ userId: created.id, previousReference: null, newReference: created.customerRef!, changedByUserId: null, reasonCode: "IMPORTED", changedAt: deps.clock.now() });
+      if (trash) {
+        const batchId = trash.batchId && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(trash.batchId) ? trash.batchId : null;
+        await tx
+          .update(users)
+          .set(
+            tombstone
+              ? { ...tombstoneColumns(deps.crypto, created.publicId, trash.purgedAt!), trashedAt: trash.trashedAt, trashBatchId: batchId, purgeStartedAt: trash.purgedAt! }
+              : { status: "suspended", statusReasonCode: "IMPORTED_IN_TRASH", trashedAt: trash.trashedAt, trashedByUserId: null, trashBatchId: batchId, trashReason: cleanTrashReason(trash.reason) },
+          )
+          .where(eq(users.id, created.id));
+      }
       await deps.audit.record(
-        { category: "portable_transfer", eventName: "identity.customer.imported_pending", action: "import", outcome: "completed", resource: { type: "user", publicId: created.publicId } },
+        {
+          category: "portable_transfer", eventName: "identity.customer.imported_pending", action: "import", outcome: "completed", resource: { type: "user", publicId: created.publicId },
+          ...(trash ? { attributes: { trash_state: tombstone ? "tombstone" : "in_trash" } } : {}),
+        },
         tx,
       );
       return { userId: created.id, publicId: created.publicId, customerRef: created.customerRef! };
     },
 
-    async findUserIdByEmail(email: string, opts: { tx?: DbOrTx } = {}) {
-      const row = await repo.byEmail(email, opts.tx ? { tx: opts.tx } : {});
-      return row ? { userId: row.id, publicId: row.publicId, role: row.role, status: row.status } : null;
+    /**
+     * Live accounts only by default (a trashed account answers null like an unknown address). `includeTrashed`
+     * (portable import collision planning only) also sees an account in the trash, which keeps its address
+     * reserved, and reports `trashed: true`. Tombstones never match: their address is a placeholder.
+     */
+    async findUserIdByEmail(email: string, opts: { tx?: DbOrTx; includeTrashed?: boolean } = {}) {
+      const row = await repo.byEmail(email, { ...(opts.tx ? { tx: opts.tx } : {}), ...(opts.includeTrashed ? { includeGone: true } : {}) });
+      if (!row || row.purgedAt) return null;
+      return { userId: row.id, publicId: row.publicId, role: row.role, status: row.status, trashed: row.trashedAt !== null };
     },
 
-    async portableCustomers(tx: DbOrTx, after: string | null, limit: number, publicIds?: readonly string[]) {
+    /**
+     * Increment 09 (portable export/import reconciliation; trusted, never on tRPC). UNGATED: sees trashed and
+     * tombstoned rows. Lookup by internal id or public id. Never resolves by e-mail.
+     */
+    async portableCustomerRefInTx(tx: DbOrTx, key: { userId: number } | { publicId: string }) {
+      const [row] = await tx
+        .select({ id: users.id, publicId: users.publicId, role: users.role, trashedAt: users.trashedAt, purgeStartedAt: users.purgeStartedAt, purgedAt: users.purgedAt })
+        .from(users)
+        .where("userId" in key ? eq(users.id, key.userId) : eq(users.publicId, key.publicId))
+        .limit(1);
+      return row
+        ? { userId: row.id, publicId: row.publicId, role: row.role, trashed: row.trashedAt !== null, trashedAt: row.trashedAt, purgeStartedAt: row.purgeStartedAt, purged: row.purgedAt !== null, purgedAt: row.purgedAt }
+        : null;
+    },
+
+    async portableCustomers(tx: DbOrTx, after: string | null, limit: number, publicIds?: readonly string[], opts: { includeTrashed?: boolean } = {}) {
       const bounded = Math.min(Math.max(limit, 1), 500);
       const conditions: SQL[] = [eq(users.role, "customer")];
+      // Increment 09: live accounts only unless the export asks for trash state (then tombstones come too).
+      if (!opts.includeTrashed) conditions.push(liveUserPredicate());
       if (after) conditions.push(gt(users.publicId, after));
       if (publicIds) {
         if (publicIds.length === 0) return [];
@@ -603,8 +653,13 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
         // D1: stored parts only (null while not stored; derived parts are never exported).
         const stored = view.namePartsStored === true;
         return {
+          userId: row.id,
           publicId: view.publicId, email: view.email, name: view.name, customerRef: view.customerRef, createdAt: view.createdAt,
           firstName: stored ? (view.firstName ?? null) : null, lastName: stored ? (view.lastName ?? null) : null, preferredName: stored ? (view.preferredName ?? null) : null,
+          trash:
+            row.trashedAt || row.purgedAt
+              ? { trashedAt: (row.trashedAt ?? row.purgedAt)!, batchId: row.trashBatchId ?? null, reason: row.trashReason ?? null, purgeStartedAt: row.purgeStartedAt ?? null, purgedAt: row.purgedAt ?? null }
+              : null,
         };
       });
     },

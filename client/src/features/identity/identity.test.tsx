@@ -167,6 +167,43 @@ describe("Console customer pages", () => {
     }));
   });
 
+  it("D2: Move to trash is disabled with a visible reason unless the account is suspended", async () => {
+    renderPage(<Route path="/admin/customers/:customerId" component={CustomerDetailPage} />, {
+      "identity.admin.customers.get": () => ({
+        customer: { ...customerRow, mustChangePassword: false, hasPassword: true, statusReasonCode: null, statusChangedAt: null },
+        activeSessions: 0,
+        referenceHistory: [],
+      }),
+    }, { path: `/admin/customers/${customerId}`, role: "admin" });
+    await screen.findByRole("heading", { level: 1, name: "Cara Customer" });
+    const button = screen.getByRole("button", { name: "Move to trash" });
+    expect(button).toBeDisabled();
+    expect(screen.getByText("Suspend this account first")).toBeVisible();
+    expect(button).toHaveAccessibleDescription("Suspend this account first");
+    // D1: the e-mail address is a real mailto link.
+    expect(screen.getByRole("link", { name: "cara@example.test" })).toHaveAttribute("href", "mailto:cara@example.test");
+    await expectNoAxeViolations();
+  });
+
+  it("D2: a suspended account opens the shared trash dialog named by its customer ID (never the e-mail)", async () => {
+    const { calls } = renderPage(<Route path="/admin/customers/:customerId" component={CustomerDetailPage} />, {
+      "identity.admin.customers.get": () => ({
+        customer: { ...customerRow, status: "suspended", mustChangePassword: false, hasPassword: true, statusReasonCode: "POLICY_VIOLATION", statusChangedAt: date },
+        activeSessions: 0,
+        referenceHistory: [],
+      }),
+      "trash.summarize": () => ({ counts: {}, dueAt: null, cascadedOrders: 2, hasPayments: false, autoPurgeEnabled: true }),
+    }, { path: `/admin/customers/${customerId}`, role: "admin" });
+    await screen.findByRole("heading", { level: 1, name: "Cara Customer" });
+    const button = screen.getByRole("button", { name: "Move to trash" });
+    expect(button).toBeEnabled();
+    await userEvent.click(button);
+    const dialog = await screen.findByRole("alertdialog", { name: /Move RP-ABC1234 to the trash\?/ }).catch(() => screen.findByRole("dialog", { name: /Move RP-ABC1234 to the trash\?/ }));
+    expect(within(dialog).queryByText(/cara@example\.test/)).toBeNull();
+    await waitFor(() => expect(calls.find((c) => c.path === "trash.summarize")?.input).toEqual({ kind: "customer", publicId: customerId }));
+    await expectNoAxeViolations();
+  });
+
   it("staff viewers see no admin-only tabs and no management actions", async () => {
     renderPage(<Route path="/admin/customers/:customerId" component={CustomerDetailPage} />, {
       "identity.admin.customers.get": () => ({
