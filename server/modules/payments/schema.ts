@@ -119,6 +119,10 @@ export const paymentAttempts = mysqlTable(
     expiresAt: utcDateTime("expires_at"),
     paidAt: utcDateTime("paid_at"),
     cancelledAt: utcDateTime("cancelled_at"),
+    /** Increment 09 D2.5: set when an open attempt is cancelled because its order moved to trash. */
+    trashCancelledAt: utcDateTime("trash_cancelled_at"),
+    /** Increment 09 D2.5: set once the outbox job has expired/deleted the upstream provider checkout. */
+    providerCancelledAt: utcDateTime("provider_cancelled_at"),
     lastReconciledAt: utcDateTime("last_reconciled_at"),
     /** Increment 08 D5: per-attempt customer confirmation lookup cool-down timestamp. */
     lastCustomerLookupAt: utcDateTime("last_customer_lookup_at"),
@@ -137,6 +141,7 @@ export const paymentAttempts = mysqlTable(
     uniqueIndex("pmt_att_inv_idem_uq").on(t.invoiceId, t.idempotencyKey),
     uniqueIndex("pmt_att_prov_ref_uq").on(t.provider, t.providerRef),
     index("pmt_att_inv_pub_idx").on(t.invoicePublicId, t.id),
+    index("pmt_att_ord_pub_idx").on(t.orderPublicId, t.id),
     index("pmt_att_cust_idx").on(t.customerUserId, t.id),
     index("pmt_att_st_exp_idx").on(t.status, t.expiresAt),
     index("pmt_att_prov_ord_idx").on(t.provider, t.providerOrderRef),
