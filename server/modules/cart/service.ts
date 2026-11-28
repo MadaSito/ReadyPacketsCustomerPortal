@@ -13,10 +13,11 @@
  */
 import { and, asc, desc, eq, inArray, like, lt, lte, or } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
-import type { ModuleDeps } from "../../container.js";
+import type { ModuleDeps, Services } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
 import { ulid, ULID_PATTERN } from "../../core/ids.js";
 import type { ClaimedJob, DbOrTx, JobResult, ModuleHealth, SessionPrincipal, Tx } from "../../core/types.js";
+import { liveUserPredicate } from "../identity/live.js";
 import { users } from "../identity/schema.js";
 import type { CatalogGroupView, CatalogProductView } from "../orders/catalog.js";
 import { readSetting } from "../platform/index.js";
@@ -61,6 +62,7 @@ import {
   type PacketTierName,
   type RestoreCheckoutResult,
 } from "./types.js";
+import { createCartTrashParticipant, isCheckoutOrderLive } from "./trash.js";
 import { createCartUpsellService } from "./upsell.js";
 import type { z } from "zod";
 
@@ -835,12 +837,30 @@ export function createCartService(deps: ModuleDeps): CartModule {
       if (options.job) {
         await options.job.assertStillOwned(tx);
       }
+      const candidateRows = await tx
+        .select({ id: carts.id })
+        .from(carts)
+        .innerJoin(users, eq(users.id, carts.ownerUserId))
+        .where(and(eq(carts.status, "open"), lte(carts.lastActivityAt, cutoff), liveUserPredicate()))
+        .orderBy(asc(carts.lastActivityAt), asc(carts.id))
+        .limit(batchLimit);
+      if (candidateRows.length === 0) {
+        return { expiredCount: 0 };
+      }
       const staleRows = await tx
         .select()
         .from(carts)
-        .where(and(eq(carts.status, "open"), lte(carts.lastActivityAt, cutoff)))
+        .where(
+          and(
+            inArray(
+              carts.id,
+              candidateRows.map((c) => c.id),
+            ),
+            eq(carts.status, "open"),
+            lte(carts.lastActivityAt, cutoff),
+          ),
+        )
         .orderBy(asc(carts.lastActivityAt), asc(carts.id))
-        .limit(batchLimit)
         .for("update");
 
       let expiredCount = 0;
@@ -889,10 +909,19 @@ export function createCartService(deps: ModuleDeps): CartModule {
     computeLiveLines: computeLiveLinesForCart,
   });
 
+  const cartTrashParticipant = createCartTrashParticipant(deps);
   let initialized = false;
+  let trashRegistered = false;
 
   return {
     init() {
+      if (!trashRegistered) {
+        const trashRegistry = (deps.services as Partial<Services>).trash;
+        if (trashRegistry) {
+          trashRegistry.register(cartTrashParticipant);
+          trashRegistered = true;
+        }
+      }
       if (initialized) return;
       initialized = true;
       deps.jobs.register<Record<string, never>>(
@@ -2801,8 +2830,15 @@ export function createCartService(deps: ModuleDeps): CartModule {
           await denyCartAuthz(principal, "NOT_CART_OWNER", { type: "cart", publicId: cartRow.publicId });
           throw cartNotFound();
         }
-        if (!cartRow.checkoutInvoicePublicId || !cartRow.checkoutOrderPublicId || !cartRow.checkoutOrderReference) {
+        if (!cartRow.checkoutInvoicePublicId) {
           throw conflict("CART_NOT_CHECKED_OUT", "This cart has not completed checkout yet.");
+        }
+        if (
+          !cartRow.checkoutOrderPublicId ||
+          !cartRow.checkoutOrderReference ||
+          !(await isCheckoutOrderLive(deps.db, cartRow))
+        ) {
+          throw cartNotFound();
         }
         try {
           paymentStatus = await paymentsSvc.getCheckoutStatus(principal, {
@@ -2810,7 +2846,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
             ...(input.attemptPublicId ? { attemptPublicId: input.attemptPublicId } : {}),
           });
         } catch (err) {
-          if (input.attemptPublicId && err instanceof DomainError && err.code === "NOT_FOUND") {
+          if (err instanceof DomainError && err.code === "NOT_FOUND") {
             throw cartNotFound();
           }
           throw err;
@@ -2833,12 +2869,15 @@ export function createCartService(deps: ModuleDeps): CartModule {
             await denyCartAuthz(principal, "NOT_CART_OWNER", { type: "cart", publicId: foundByAttempt.publicId });
             throw cartNotFound();
           }
-          if (
-            !foundByAttempt.checkoutInvoicePublicId ||
-            !foundByAttempt.checkoutOrderPublicId ||
-            !foundByAttempt.checkoutOrderReference
-          ) {
+          if (!foundByAttempt.checkoutInvoicePublicId) {
             throw conflict("CART_NOT_CHECKED_OUT", "This cart has not completed checkout yet.");
+          }
+          if (
+            !foundByAttempt.checkoutOrderPublicId ||
+            !foundByAttempt.checkoutOrderReference ||
+            !(await isCheckoutOrderLive(deps.db, foundByAttempt))
+          ) {
+            throw cartNotFound();
           }
           try {
             paymentStatus = await paymentsSvc.getCheckoutStatus(principal, {
@@ -2875,12 +2914,15 @@ export function createCartService(deps: ModuleDeps): CartModule {
             await denyCartAuthz(principal, "NOT_CART_OWNER", { type: "cart", publicId: foundByInvoice.publicId });
             throw cartNotFound();
           }
-          if (
-            !foundByInvoice.checkoutInvoicePublicId ||
-            !foundByInvoice.checkoutOrderPublicId ||
-            !foundByInvoice.checkoutOrderReference
-          ) {
+          if (!foundByInvoice.checkoutInvoicePublicId) {
             throw conflict("CART_NOT_CHECKED_OUT", "This cart has not completed checkout yet.");
+          }
+          if (
+            !foundByInvoice.checkoutOrderPublicId ||
+            !foundByInvoice.checkoutOrderReference ||
+            !(await isCheckoutOrderLive(deps.db, foundByInvoice))
+          ) {
+            throw cartNotFound();
           }
           cartRow = foundByInvoice;
         }
@@ -2989,7 +3031,8 @@ export function createCartService(deps: ModuleDeps): CartModule {
       await assertCartEnabled();
 
       const paymentsSvc = cartPaymentsPort(deps.services);
-      const catalogGroups = await cartOrdersPort(deps.services).listActiveCatalog();
+      const ordersSvc = cartOrdersPort(deps.services);
+      const catalogGroups = await ordersSvc.listActiveCatalog();
       const catalogMap = indexCatalog(catalogGroups);
 
       // Pre-resolve retry `attemptPublicId` outside `tx` so single-connection pools never deadlock on `paymentsSvc.getCheckoutStatus`.
@@ -3061,6 +3104,35 @@ export function createCartService(deps: ModuleDeps): CartModule {
           if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
           await assertCartEnabled(tx);
 
+          // Pre-read candidate cart (unlocked) so we can `FOR SHARE` lock its checkout order BEFORE locking `carts`
+          // (`users -> user_sessions -> orders FOR SHARE -> carts FOR UPDATE`).
+          const [preCart] = input.cartPublicId
+            ? await tx.select().from(carts).where(eq(carts.publicId, input.cartPublicId)).limit(1)
+            : resolvedRetryInvoicePublicId
+              ? await tx
+                  .select()
+                  .from(carts)
+                  .where(eq(carts.checkoutInvoicePublicId, resolvedRetryInvoicePublicId))
+                  .orderBy(desc(carts.id))
+                  .limit(1)
+              : await tx
+                  .select()
+                  .from(carts)
+                  .where(eq(carts.paymentAttemptPublicId, input.attemptPublicId!))
+                  .limit(1);
+
+          if (
+            preCart &&
+            preCart.ownerUserId === principal.userId &&
+            preCart.status !== "open" &&
+            preCart.checkoutInvoicePublicId
+          ) {
+            const checkoutOrderLive = await isCheckoutOrderLive(tx, preCart, { forShare: true });
+            if (!checkoutOrderLive) {
+              throw cartNotFound();
+            }
+          }
+
           const [sourceCart] = input.cartPublicId
             ? await tx.select().from(carts).where(eq(carts.publicId, input.cartPublicId)).for("update").limit(1)
             : resolvedRetryInvoicePublicId
@@ -3089,6 +3161,14 @@ export function createCartService(deps: ModuleDeps): CartModule {
             sourceCart.paymentAttemptPublicId !== input.attemptPublicId &&
             !resolvedRetryInvoicePublicId &&
             !verifiedRetryAttemptForCart
+          ) {
+            throw cartNotFound();
+          }
+          if (
+            sourceCart.status !== "open" &&
+            sourceCart.checkoutInvoicePublicId &&
+            sourceCart.checkoutOrderId === null &&
+            !sourceCart.checkoutOrderPublicId
           ) {
             throw cartNotFound();
           }
@@ -3188,9 +3268,19 @@ export function createCartService(deps: ModuleDeps): CartModule {
           const sourceBilling = decryptBilling(sourceCart.billingEnc, sourceCart.publicId);
           const sourceNote = decryptNote(sourceCart.noteEnc, sourceCart.publicId);
 
+          let restoredAddToOrderPublicId: string | null = openCart.addToOrderPublicId ?? null;
+          if (!restoredAddToOrderPublicId && sourceCart.addToOrderPublicId) {
+            const liveTarget = await ordersSvc.addOnTargetInTx(
+              tx,
+              principal.userId,
+              sourceCart.addToOrderPublicId,
+            );
+            restoredAddToOrderPublicId = liveTarget ? liveTarget.rootPublicId : null;
+          }
+
           await bumpCartVersionInTx(tx, openCart, now, {
             projectName: openCart.projectName ?? sourceCart.projectName,
-            addToOrderPublicId: openCart.addToOrderPublicId ?? sourceCart.addToOrderPublicId,
+            addToOrderPublicId: restoredAddToOrderPublicId,
             noteEnc: openCart.noteEnc ?? encryptNote(sourceNote, openCart.publicId),
             billingEnc: openCart.billingEnc ?? encryptBilling(sourceBilling, openCart.publicId),
             billingCountry: openCart.billingCountry ?? sourceCart.billingCountry,
@@ -3260,7 +3350,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
 
       return deps.db.transaction(
         async (tx) => {
-          const predicates = [eq(carts.status, "open")];
+          const predicates = [eq(carts.status, "open"), liveUserPredicate()];
           if (cursorId !== null) {
             predicates.push(lt(carts.id, cursorId));
           }
@@ -3390,7 +3480,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
             })
             .from(carts)
             .innerJoin(users, eq(users.id, carts.ownerUserId))
-            .where(and(eq(carts.publicId, input.cartPublicId), eq(carts.status, "open")))
+            .where(and(eq(carts.publicId, input.cartPublicId), eq(carts.status, "open"), liveUserPredicate()))
             .limit(1);
 
           if (!row) throw cartNotFound();

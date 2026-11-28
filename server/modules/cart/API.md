@@ -1,4 +1,4 @@
-# Cart & Checkout Module API (Increments 04–08)
+# Cart & Checkout Module API (Increments 04–09)
 
 Owner: `recovery_ops_engineer` (`server/modules/cart/**`, `client/src/features/cart/**`).
 Import types from `server/modules/cart/index.ts`; reach the runtime instance at call time via `deps.services.cart`.
@@ -30,6 +30,12 @@ Import types from `server/modules/cart/index.ts`; reach the runtime instance at 
   - `server/modules/cart/types.ts` re-exports `shared/billingDetails.ts` directly.
   - `cart.checkout` enforces mandatory CAS generation tokens on the new D4 modes while keeping plain one-off custom checkouts (`billingSource: "custom"`, `saveAsBillingProfile: false`) backwards-compatible: `billingSource: "saved"` requires `savedBillingPublicId` + `savedBillingVersion >= 1`; `saveAsBillingProfile: true` requires `savedBillingVersion: 0` (when no profile existed) or `savedBillingPublicId` + `savedBillingVersion >= 1`.
   - Under the transaction's existing `users FOR UPDATE` lock, `cart.checkout` calls `billingProfile.getForUserInTx(tx, principal.userId, { forUpdate: true })` (current locking read so InnoDB `REPEATABLE READ` never reads a stale pre-lock snapshot) and rejects drift with `CONFLICT:SAVED_BILLING_CHANGED` (`CONFLICT:SAVED_BILLING_NOT_FOUND` when cleared).
+- **Trash & Permanent Deletion integration (Increment 09 Decisions D2.5, D2.6, D2.8):**
+  - `cart.init()` registers the `"cart"` `TrashParticipant` (`createCartTrashParticipant` in `server/modules/cart/trash.ts`) with `deps.services.trash`.
+  - `onTrashedInTx`: when an order moves to trash, any `open` cart targeting it (`add_to_order_public_id = order.publicId`) clears `add_to_order_public_id = null` and bumps `version`.
+  - `summarize`: returns `{ carts }` for a customer when non-zero (`{}` otherwise, and `{}` for orders).
+  - `purge`: calls `await run.assertCurrentInTx(tx)` as the first statement of its mutation transaction (`trash_purge_runs FOR SHARE -> users/orders FOR SHARE -> carts FOR UPDATE -> cart_items`), verifies `purge_started_at` + `trash_batch_id` on the target row, deletes all customer `carts` (cascading `cart_items`, `cart_upsell_cart_states`, and `cart_upsell_acceptances`) on customer deletion, and scrubs `checkout_order_id`, `checkout_order_public_id`, `checkout_order_reference`, and `add_to_order_public_id` on `carts` on order deletion (`{ deleted: { cartOrderLinks } }`).
+  - **Live-entity visibility & restore gates:** `cart.admin.listOpen`, `cart.admin.getOpen`, and `cart.abandoned.expire` filter non-live customers via `liveUserPredicate()`. `cart.checkoutStatus` and `cart.restoreCheckout` verify the checkout order is live (`isCheckoutOrderLive`, acquiring `orders FOR SHARE` before `carts FOR UPDATE` in `restoreCheckout`) and return indistinguishable `NOT_FOUND:CART_NOT_FOUND` when the checkout order is trashed or permanently deleted; `restoreCheckout` also scrubs any trashed/purged `addToOrderPublicId` before copying draft metadata onto the open cart.
 
 ---
 
