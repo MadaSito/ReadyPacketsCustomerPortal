@@ -4,6 +4,7 @@ import type { ModuleDeps } from "../../container.js";
 import { DomainError, forbidden } from "../../core/errors.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
+import { isLiveUserRow } from "../identity/live.js";
 import { userSessions, users } from "../identity/schema.js";
 
 export async function denyReferralsAuthz(
@@ -96,13 +97,19 @@ export async function assertLiveActorInTx(
   }
 
   const [liveUser] = await tx
-    .select({ id: users.id, role: users.role, status: users.status })
+    .select({
+      id: users.id,
+      role: users.role,
+      status: users.status,
+      trashedAt: users.trashedAt,
+      purgedAt: users.purgedAt,
+    })
     .from(users)
     .where(eq(users.id, principal.userId))
     .for("update")
     .limit(1);
 
-  if (!liveUser || liveUser.status !== "active") {
+  if (!liveUser || !isLiveUserRow(liveUser) || liveUser.status !== "active") {
     throw new DomainError(
       "UNAUTHENTICATED",
       "SESSION_NOT_CURRENT",

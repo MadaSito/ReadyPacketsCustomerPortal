@@ -614,7 +614,7 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
         contact: "billing@example.test",
         taxId: "EIN 12-3456789",
         logoMode: "brand",
-        logoBrandPath: "/brand/readypackets-approved-header-wordmark-light.png",
+        logoBrandPath: "/brand/readypackets-horizontal-light-500x150-v2026101502.png",
       },
       customer: {
         name: "María Elena García-López",
@@ -839,7 +839,7 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
       issuerTaxId: "TAX-99-887766",
       issuerLogo: {
         mode: "brand",
-        brandPath: "/brand/readypackets-approved-header-wordmark-light.png",
+        brandPath: "/brand/readypackets-horizontal-light-500x150-v2026101502.png",
       },
     });
 

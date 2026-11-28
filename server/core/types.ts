@@ -248,6 +248,12 @@ export interface OutboundMail {
    * sensitive payload at this time (bounded by its own maximum) and never delivers after it.
    */
   expiresAt?: Date;
+  /**
+   * Increment 09 (D2.8): trusted internal id of the order this message is about, when the producer knows it.
+   * The mail module re-checks the order's trash state immediately before transport and drops the message for
+   * a trashed or permanently deleted order. Never taken from request input.
+   */
+  orderId?: number;
 }
 
 export interface MailTemplate {

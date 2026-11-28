@@ -17,6 +17,7 @@ import { ORDER_NOT_FOUND, orderLocked, type OrderPolicy } from "./policy.js";
 import { compliancePort, engagementPort, filesPort, identityPort, namePartsInTx, paymentExposurePort, promoNotApplicable, promotionsPort, releaseIsSafe, requirePromotions, withPromoAttemptGuard, type PromotionContext, type PromotionOutcome } from "./ports.js";
 import { getRequestContext } from "../../core/requestContext.js";
 import { allocateStemReference, buildReferenceStem, normalizeReference, reserveReference } from "./references.js";
+import { isLiveOrderRow, liveOrderPredicate } from "./trashGate.js";
 import { addOnTarget, assertAddOnAllowed, groupMembers, isGroupOrderCancelled, lockGroupRoot, packetNumbersByOrder, prelockGroupRoot } from "./orderGroups.js";
 import { ORDER_NOTIFY_MAIL, ORDER_REFERENCE_PREFIX } from "./settings.js";
 import type { OrderAccessRole, OrderAccessView, OrderLockState, OrderProductionScope, OrderQuote, OrderSummary, NoteVisibility } from "./types.js";
@@ -267,7 +268,7 @@ export function createOrderService(deps: OrderServiceDeps) {
         if (engagement)
           await engagement.notify({ userId, kind, title, body, link: `/orders/${order.publicId}`, idempotencyKey: `${kind}:${order.publicId}:${idempotencySuffix}:${userId}`, skipEmail: true });
         if (mail && mailOn) {
-          await deps.mailer.enqueue({ template: mail.template, to: { userId }, vars: mail.vars, idempotencyKey: `${mail.idempotencyKey}:${userId}` });
+          await deps.mailer.enqueue({ template: mail.template, to: { userId }, vars: mail.vars, idempotencyKey: `${mail.idempotencyKey}:${userId}`, orderId: order.id });
         }
       }
     } catch (error) {
@@ -556,7 +557,7 @@ export function createOrderService(deps: OrderServiceDeps) {
     const rootIds = [...new Set(rows.map((row) => row.groupRootOrderId).filter((id): id is number => id !== null))];
     const roots = new Map(
       rootIds.length
-        ? (await deps.db.select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, ownerUserId: orders.ownerUserId }).from(orders).where(inArray(orders.id, rootIds))).map(
+        ? (await deps.db.select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, ownerUserId: orders.ownerUserId }).from(orders).where(and(inArray(orders.id, rootIds), liveOrderPredicate()))).map(
             (root) => [root.id, root] as const,
           )
         : [],
@@ -797,6 +798,7 @@ export function createOrderService(deps: OrderServiceDeps) {
         .where(
           and(
             or(eq(orders.ownerUserId, principal.userId), inArray(orders.id, sharedIds)),
+            liveOrderPredicate(),
             before !== null ? lt(orders.id, before) : undefined,
             input.status ? eq(orders.statusKey, input.status) : undefined,
           ),
@@ -841,6 +843,7 @@ export function createOrderService(deps: OrderServiceDeps) {
         .from(orders)
         .where(
           and(
+            liveOrderPredicate(),
             before !== null ? lt(orders.id, before) : undefined,
             input.status ? eq(orders.statusKey, input.status) : undefined,
             input.lockState ? eq(orders.lockState, input.lockState) : undefined,
@@ -1208,7 +1211,7 @@ export function createOrderService(deps: OrderServiceDeps) {
       },
     ): Promise<{ fromStatus: string; toStatus: string; version: number; notify: boolean; view: OrderAccessView; bound: BoundWorkflow }> {
       const [row] = await tx.select().from(orders).where(eq(orders.id, input.orderId)).limit(1).for("update");
-      if (!row) throw ORDER_NOT_FOUND();
+      if (!row || !isLiveOrderRow(row)) throw ORDER_NOT_FOUND();
       if (row.lockState !== "none") throw orderLocked(row.lockState);
       if (input.expectedVersion !== undefined && row.version !== input.expectedVersion) throw staleVersion();
       const bound = await workflows.byVersionId(tx, row.workflowVersionId);
@@ -1418,7 +1421,7 @@ export function createOrderService(deps: OrderServiceDeps) {
     async transitionAsSystem(input: { orderPublicId: string; expectedVersion: number; toStatus: string; note?: string; correlationId: string }) {
       const outcome = await deps.db.transaction(async (tx) => {
         const [row] = await tx.select().from(orders).where(eq(orders.publicId, input.orderPublicId)).limit(1).for("update");
-        if (!row) throw ORDER_NOT_FOUND();
+        if (!row || !isLiveOrderRow(row)) throw ORDER_NOT_FOUND();
         if (row.lockState !== "none") throw orderLocked(row.lockState);
         if (row.version !== input.expectedVersion) throw staleVersion();
         const bound = await workflows.byVersionId(tx, row.workflowVersionId);
@@ -1640,11 +1643,13 @@ export function createOrderService(deps: OrderServiceDeps) {
       if (principal.role !== "admin" || !roleHasCapability(principal.role, "orders.reassign")) throw forbidden("CAPABILITY_NOT_GRANTED");
       assertFreshStepUp(principal);
       const [prior] = await deps.db
-        .select({ r: orderReassignments, orderPublicId: orders.publicId, version: orders.version })
+        .select({ r: orderReassignments, orderPublicId: orders.publicId, version: orders.version, trashedAt: orders.trashedAt, purgedAt: orders.purgedAt })
         .from(orderReassignments)
         .innerJoin(orders, eq(orders.id, orderReassignments.orderId))
         .where(eq(orderReassignments.operationId, input.operationId))
         .limit(1);
+      // Increment 09: a replay never reveals an order that is now in the trash or a tombstone.
+      if (prior && !isLiveOrderRow(prior)) throw ORDER_NOT_FOUND();
       if (prior) {
         const target = await identityPort(deps.services).getUser(prior.r.toUserId);
         if (prior.orderPublicId === input.orderId && target?.publicId === input.targetCustomerPublicId) {
@@ -1774,6 +1779,7 @@ export function createOrderService(deps: OrderServiceDeps) {
         .where(
           and(
             staffSide ? undefined : or(eq(orders.ownerUserId, principal.userId), inArray(orders.id, sharedIds)),
+            liveOrderPredicate(),
             or(like(orders.reference, `${likeLiteral(q.toUpperCase())}%`), like(orders.projectName, pattern)),
           ),
         )
@@ -1829,7 +1835,7 @@ export function createOrderService(deps: OrderServiceDeps) {
           origin: orders.origin,
         })
         .from(orders)
-        .where(eq(orders.id, orderId))
+        .where(and(eq(orders.id, orderId), liveOrderPredicate()))
         .limit(1);
       if (!order) return null;
       const items = await db
@@ -1870,7 +1876,7 @@ export function createOrderService(deps: OrderServiceDeps) {
       const rows = await db
         .select({ publicId: orders.publicId })
         .from(orders)
-        .where(after === null ? undefined : sql`${orders.publicId} > ${after}`)
+        .where(and(liveOrderPredicate(), after === null ? undefined : sql`${orders.publicId} > ${after}`))
         .orderBy(asc(orders.publicId))
         .limit(limit + 1);
       const page = rows.slice(0, limit).map((row) => row.publicId);
@@ -1884,7 +1890,7 @@ export function createOrderService(deps: OrderServiceDeps) {
     async getOrderSyncView(orderPublicId: string, tx?: DbOrTx): Promise<OrderSyncView | null> {
       if (!ULID_LIKE.test(orderPublicId)) return null;
       const db = tx ?? deps.db;
-      const [order] = await db.select().from(orders).where(eq(orders.publicId, orderPublicId)).limit(1);
+      const [order] = await db.select().from(orders).where(and(eq(orders.publicId, orderPublicId), liveOrderPredicate())).limit(1);
       if (!order) return null;
       const items = await db
         .select({ packetNumber: orderLineItems.packetNumber, tier: orderLineItems.tier, name: orderLineItems.name })
@@ -1928,7 +1934,7 @@ export function createOrderService(deps: OrderServiceDeps) {
       const query = (tx ?? deps.db)
         .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, name: orders.projectName, ownerUserId: orders.ownerUserId, lockState: orders.lockState, statusKey: orders.statusKey, workflowVersionId: orders.workflowVersionId })
         .from(orders)
-        .where(eq(orders.publicId, orderPublicId))
+        .where(and(eq(orders.publicId, orderPublicId), liveOrderPredicate()))
         .limit(1);
       const [row] = options.forUpdate ? await query.for("update") : await query;
       return row ?? null;
@@ -1939,7 +1945,7 @@ export function createOrderService(deps: OrderServiceDeps) {
       const query = (tx ?? deps.db)
         .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, name: orders.projectName, ownerUserId: orders.ownerUserId, lockState: orders.lockState, statusKey: orders.statusKey, workflowVersionId: orders.workflowVersionId })
         .from(orders)
-        .where(eq(orders.id, orderId))
+        .where(and(eq(orders.id, orderId), liveOrderPredicate()))
         .limit(1);
       const [row] = options.forUpdate ? await query.for("update") : await query;
       return row ?? null;

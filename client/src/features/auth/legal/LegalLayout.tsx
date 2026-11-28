@@ -64,7 +64,7 @@ export function LegalLayout({ title, description, canonical, children }: LegalLa
       {signedIn ? null : (
         <div className="flex items-center justify-between gap-3 px-4 pt-4 sm:px-8 sm:pt-6">
           <Link href="/sign-in" aria-label="ReadyPackets sign in" className="inline-flex rounded">
-            <BrandLogo label="" className="w-44 sm:w-52" />
+            <BrandLogo lockup="square" label="" className="w-24 sm:w-28" />
           </Link>
           <ThemeToggle />
         </div>

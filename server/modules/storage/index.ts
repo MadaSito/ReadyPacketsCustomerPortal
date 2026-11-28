@@ -18,6 +18,7 @@ import { registerFileCopies } from "./fileCopies.js";
 import { createManagedFileSync } from "./managedFileSync.js";
 import { createOrderCopies } from "./orderCopies.js";
 import { storageAssignments, storageConnections } from "./schema.js";
+import { createTrashCopies } from "./trashCopies.js";
 import { copyMetadata, storageAssignment, storageCreate, storageGet, storageList, storagePublicId, storageTest, storageUpdate } from "./validation.js";
 
 export type { StorageModule } from "./contracts.js";
@@ -168,12 +169,14 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
     }, tx);
   }
 
-  const fileSync = createManagedFileSync(deps, (row) => {
+  const configuredAdapter = (row: Row) => {
     const credentials = secret(row);
     if (!credentials) throw notFound("STORAGE_FILE_SYNC_TARGET_INACTIVE");
     return provider(row.kind).instantiate(row, credentials);
-  });
+  };
+  const fileSync = createManagedFileSync(deps, configuredAdapter);
   const service: StorageModule = {
+    ...createTrashCopies(deps, configuredAdapter),
     copies: createCopyLogService(deps),
     orderCopies: createOrderCopies(deps, (publicId, tx, version) => assigned("order_files", publicId, tx, version)),
     fileSync,
@@ -341,7 +344,7 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
           await adapter.ensureFolder(input.path, input.signal, beforeWrite);
           await beforeWrite();
         }
-        result = await adapter.put({ ...input, beforeWrite });
+        result = await adapter.put({ ...input, beforeWrite, ...(input.purpose === "order_files" ? { protectExisting: true } : {}) });
       } catch (error) {
         if (!(error instanceof StorageAdapterError)) throw error;
         const reason = error.code === "OUTCOME_UNKNOWN" ? "STORAGE_COPY_UNCERTAIN" :

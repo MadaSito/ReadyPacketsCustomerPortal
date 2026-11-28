@@ -26,6 +26,8 @@ import type {
   PaymentProviderAdapter,
   PaymentProviderAdapterDeps,
   PaymentRefundAdapter,
+  ProviderCancelCheckoutInput,
+  ProviderCancelCheckoutResult,
   ProviderCreateCheckoutInput,
   ProviderCreateCheckoutOutput,
   ProviderCredentials,
@@ -81,6 +83,7 @@ import {
   type AdminPaymentAttemptDetail,
   type AdminPaymentAttemptSummary,
   type AdminPaymentWebhookSummary,
+  CANCEL_ATTEMPT_PROVIDER_JOB_TYPE,
   type CancelAttemptResult,
   type CheckoutAmountEvaluation,
   type CheckoutReturnPaths,
@@ -221,10 +224,57 @@ export function createPaymentsModule(
     everyMs: RECONCILE_PAYMENTS_EVERY_MS,
   });
 
+  deps.jobs.register<{ attemptPublicId: string }>(
+    CANCEL_ATTEMPT_PROVIDER_JOB_TYPE,
+    async (job) => {
+      await job.assertStillOwned();
+      const attemptPublicId =
+        typeof job.payload?.attemptPublicId === "string" ? job.payload.attemptPublicId : "";
+      if (!attemptPublicId) {
+        return { outcome: "completed" };
+      }
+      const res = await service.cancelProviderAttemptFromJob(attemptPublicId, {
+        signal: job.signal,
+        beforeSend: () => job.assertStillOwned(),
+        assertOwnedInTx: (tx) => job.assertStillOwned(tx),
+      });
+      return {
+        outcome: "completed",
+        safeCounts: {
+          cancelled: res.outcome === "cancelled" ? 1 : 0,
+          already_cancelled: res.outcome === "already_cancelled" ? 1 : 0,
+          booked_late_payment: res.outcome === "booked_late_payment" ? 1 : 0,
+        },
+      };
+    },
+    { retrySafe: true },
+  );
+
+  let trashRegistered = false;
+
   return {
     ...service,
 
-    init(): void {},
+    init(): void {
+      if (!trashRegistered && deps.services.trash?.register) {
+        deps.services.trash.register({
+          module: "payments",
+          async onTrashedInTx(tx, entity) {
+            await service.onOrderTrashedInTx(tx, entity);
+          },
+          async onRestoredInTx() {
+            // Trash-cancelled open attempts remain cancelled; restored orders start a fresh checkout attempt.
+          },
+          async summarize(entity) {
+            return service.summarizeOrderForTrash(entity);
+          },
+          async purge(entity, run) {
+            return service.purgeOrderForTrash(entity, run);
+          },
+        });
+        trashRegistered = true;
+      }
+    },
 
     async health(): Promise<ModuleHealth[]> {
       const checkedAt = deps.clock.now();
@@ -261,6 +311,7 @@ export function createPaymentsModule(
 export {
   ACTIVE_PAYMENT_PROVIDERS,
   buildSignedStripeSelfTestWebhook,
+  CANCEL_ATTEMPT_PROVIDER_JOB_TYPE,
   CHECKOUT_FAILURE_CLASSES,
   classifyCheckoutFailureReason,
   createOrderRefundInputSchema,
@@ -380,6 +431,8 @@ export type {
   PaymentWebhookRejectionSummary,
   PaymentWebhookResult,
   PaymentWebhookStatus,
+  ProviderCancelCheckoutInput,
+  ProviderCancelCheckoutResult,
   ProviderCreateCheckoutInput,
   ProviderCreateCheckoutOutput,
   ProviderCredentials,

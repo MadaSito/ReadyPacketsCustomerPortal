@@ -16,6 +16,8 @@ import { sendPrivateDownload } from "../../http/downloads.js";
 import { createIdentityModule, type IdentityModule } from "../identity/index.js";
 import { customerRefHistory, customerRefReservations, identityTokens, sessionRestrictions, signInEvents, users, userSessions } from "../identity/schema.js";
 import { orders } from "../orders/schema.js";
+import { auditExports } from "../audit/schema.js";
+import { portableExports } from "../portable/schema.js";
 import { archiveDownloadName, archiveEntryNames, isSafeEntryName, sanitiseSegment } from "./archiveNames.js";
 import { ARCHIVE_BUILD_JOB, ARCHIVE_LIMITS, createFileArchivesModule, type DeliverableFile, type FileArchivesModule } from "./archives.js";
 import { fileArchiveTickets, fileArchives } from "./archivesSchema.js";
@@ -59,7 +61,7 @@ function readZip(buffer: Buffer): Promise<Map<string, Buffer>> {
 const drain = async (s: Readable) => { const c: Buffer[] = []; for await (const x of s) c.push(x as Buffer); return Buffer.concat(c); };
 
 beforeAll(async () => {
-  db = await createTestDb({ schema: { users, orders, fileArchives, fileArchiveTickets } });
+  db = await createTestDb({ schema: { users, orders, auditExports, portableExports, fileArchives, fileArchiveTickets } });
 });
 afterAll(() => db?.cleanup());
 
@@ -160,6 +162,21 @@ describe("entry names", () => {
 });
 
 describe("request", () => {
+  it("refuses archive status, new tickets and existing ticket redemption for trash and tombstones", async () => {
+    const id = await buildReady(customer);
+    const first = await mod.issueDownloadTicket(customer, id);
+    const second = await mod.issueDownloadTicket(customer, id);
+    const now = h.clock.now();
+    await db.db.update(orders).set({ trashedAt: now, trashBatchId: ulid() }).where(eq(orders.publicId, orderId));
+    await expect(mod.status(customer, id)).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(mod.issueDownloadTicket(customer, id)).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(mod.redeemDownloadTicket(customer, first.ticket)).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(mod.latest(customer, { orderId, stageKey: "design" })).resolves.toBeNull();
+    await db.db.update(orders).set({ trashedAt: null, purgedAt: now }).where(eq(orders.publicId, orderId));
+    await expect(mod.cancel(customer, id)).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(mod.redeemDownloadTicket(customer, second.ticket)).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
   it("refuses more than 250 files and more than 500 MiB, and empty sets", async () => {
     files = Array.from({ length: ARCHIVE_LIMITS.maxFiles + 1 }, (_, i) => file(`f${i}.txt`, "x"));
     expect(await reason(mod.request(customer, { orderId, stageKey: "design" }))).toBe("ARCHIVE_TOO_LARGE");
@@ -393,7 +410,7 @@ describe("build with real Identity sessions", () => {
   }
 
   beforeAll(async () => {
-    rdb = await createTestDb({ schema: { users, userSessions, identityTokens, customerRefReservations, customerRefHistory, signInEvents, sessionRestrictions, orders, fileArchives, fileArchiveTickets } });
+    rdb = await createTestDb({ schema: { users, userSessions, identityTokens, customerRefReservations, customerRefHistory, signInEvents, sessionRestrictions, orders, auditExports, portableExports, fileArchives, fileArchiveTickets } });
   });
   afterAll(() => rdb?.cleanup());
 

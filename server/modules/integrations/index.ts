@@ -5,6 +5,7 @@
 import type { ModuleDeps } from "../../container.js";
 import type { HealthState, ModuleHealth, ModuleLifecycle } from "../../core/types.js";
 import type { SsoStatusSummary } from "../identity/sso/service.js";
+import type { TrashParticipant } from "../trash/ports.js";
 import {
   createAnalyticsService,
   type AdminAnalyticsConfig,
@@ -938,6 +939,34 @@ export function createIntegrationsModule(
       deps.services.jobAdmin?.registerMailTransport?.(graphRuntime.mailTransport);
       webhooks.init();
       workflowWebhooks.init();
+      const trashParticipant: TrashParticipant = {
+        module: "integrations",
+        async onTrashedInTx(tx, entity) {
+          await production.onOrderTrashedInTx(tx, entity);
+          await webhooks.onOrderTrashedInTx(tx, entity);
+        },
+        async onRestoredInTx() {
+          // Restoring an order re-enables future production and outbound webhook triggers automatically.
+        },
+        async summarize(entity) {
+          return production.summarizeOrderForTrash(entity);
+        },
+        async purge(entity, run) {
+          if (entity.kind !== "order") return { deleted: {} };
+          return deps.db.transaction(async (tx) => {
+            await run.assertCurrentInTx(tx);
+            const prod = await production.purgeOrderDispatchesInTx(tx, entity);
+            const wh = await webhooks.purgeOrderDeliveriesInTx(tx, entity);
+            return {
+              deleted: {
+                ...prod.deleted,
+                ...wh.deleted,
+              },
+            };
+          });
+        },
+      };
+      deps.services.trash?.register(trashParticipant);
     },
 
     stop(): void {

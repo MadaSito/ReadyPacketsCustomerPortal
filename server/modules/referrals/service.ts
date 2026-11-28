@@ -5,6 +5,7 @@ import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
 import { ulid, ULID_PATTERN } from "../../core/ids.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
+import { isLiveUserRow, liveUserPredicate } from "../identity/live.js";
 import { users } from "../identity/schema.js";
 import { isFlagEnabled, readSetting, writeSetting } from "../platform/index.js";
 import { assertLiveActorInTx, denyReferralsAuthz, runReferralsTx } from "./actorAuth.js";
@@ -258,6 +259,20 @@ export function createReferralsService(deps: ModuleDeps) {
   }
 
   async function loadUserSummary(dbOrTx: DbOrTx, userId: number): Promise<LoadedUserSummary | null> {
+    const [row] = await dbOrTx
+      .select({
+        id: users.id,
+        publicId: users.publicId,
+        customerRef: users.customerRef,
+        role: users.role,
+        status: users.status,
+        emailEnc: users.emailEnc,
+        nameEnc: users.nameEnc,
+      })
+      .from(users)
+      .where(and(eq(users.id, userId), liveUserPredicate(users)))
+      .limit(1);
+    if (!row) return null;
     const identitySvc = (deps.services as Partial<typeof deps.services>).identity;
     if (identitySvc?.getUser) {
       const view = await identitySvc.getUser(userId, { tx: dbOrTx });
@@ -272,20 +287,6 @@ export function createReferralsService(deps: ModuleDeps) {
         name: view.name,
       };
     }
-    const [row] = await dbOrTx
-      .select({
-        id: users.id,
-        publicId: users.publicId,
-        customerRef: users.customerRef,
-        role: users.role,
-        status: users.status,
-        emailEnc: users.emailEnc,
-        nameEnc: users.nameEnc,
-      })
-      .from(users)
-      .where(eq(users.id, userId))
-      .limit(1);
-    if (!row) return null;
     return {
       userId: row.id,
       publicId: row.publicId,
@@ -311,12 +312,26 @@ export function createReferralsService(deps: ModuleDeps) {
         customerRef: users.customerRef,
         role: users.role,
         status: users.status,
+        trashedAt: users.trashedAt,
+        purgedAt: users.purgedAt,
         emailEnc: users.emailEnc,
         nameEnc: users.nameEnc,
       })
       .from(users)
       .where(inArray(users.id, uniqueIds));
     for (const row of rows) {
+      if (!isLiveUserRow(row)) {
+        out.set(row.id, {
+          userId: row.id,
+          publicId: row.publicId,
+          customerRef: null,
+          role: row.role,
+          status: row.status,
+          email: "",
+          name: "Deleted account",
+        });
+        continue;
+      }
       out.set(row.id, {
         userId: row.id,
         publicId: row.publicId,
@@ -341,7 +356,7 @@ export function createReferralsService(deps: ModuleDeps) {
     const [row] = await dbOrTx
       .select({ id: users.id })
       .from(users)
-      .where(eq(users.emailIndex, emailIndex))
+      .where(and(eq(users.emailIndex, emailIndex), liveUserPredicate(users)))
       .limit(1);
     return Boolean(row);
   }
@@ -558,6 +573,16 @@ export function createReferralsService(deps: ModuleDeps) {
         reasonCode: "CODE_NOT_FOUND",
       };
     }
+
+    const referrer = await loadUserSummary(dbOrTx, codeRow.userId);
+    if (!referrer) {
+      return {
+        valid: false,
+        programEnabled: true,
+        normalizedCode,
+        reasonCode: "CODE_NOT_FOUND",
+      };
+    }
     if (!codeRow.active) {
       return {
         valid: false,
@@ -566,9 +591,7 @@ export function createReferralsService(deps: ModuleDeps) {
         reasonCode: "CODE_DISABLED",
       };
     }
-
-    const referrer = await loadUserSummary(dbOrTx, codeRow.userId);
-    if (!referrer || referrer.role !== "customer" || referrer.status !== "active") {
+    if (referrer.role !== "customer" || referrer.status !== "active") {
       return {
         valid: false,
         programEnabled: true,
@@ -629,6 +652,11 @@ export function createReferralsService(deps: ModuleDeps) {
     if (!codeRow) {
       return { attributed: false, reasonCode: "CODE_NOT_FOUND" };
     }
+
+    const referrer = await loadUserSummary(tx, codeRow.userId);
+    if (!referrer) {
+      return { attributed: false, reasonCode: "CODE_NOT_FOUND" };
+    }
     if (!codeRow.active) {
       return { attributed: false, reasonCode: "CODE_DISABLED" };
     }
@@ -655,8 +683,7 @@ export function createReferralsService(deps: ModuleDeps) {
       return { attributed: false, reasonCode: "SELF_REFERRAL" };
     }
 
-    const referrer = await loadUserSummary(tx, codeRow.userId);
-    if (!referrer || referrer.role !== "customer" || referrer.status !== "active") {
+    if (referrer.role !== "customer" || referrer.status !== "active") {
       await deps.audit.record(
         {
           category: "security",
@@ -780,6 +807,11 @@ export function createReferralsService(deps: ModuleDeps) {
     const enabled = await isFlagEnabled(deps.settings, REFERRALS_ENABLED_FLAG, tx);
     if (!enabled) {
       return { outcome: "program_disabled" };
+    }
+
+    const referredCustomer = await loadUserSummary(tx, event.customerUserId);
+    if (!referredCustomer) {
+      return { outcome: "not_referred" };
     }
 
     const [row] = await tx
@@ -1220,7 +1252,10 @@ export function createReferralsService(deps: ModuleDeps) {
     const limit = Math.min(Math.max(input.limit ?? 25, 1), 100);
     const cursorId = input.cursor ? decodeIdCursor(input.cursor) : null;
 
-    const conditions = [eq(referrals.referrerUserId, principal.userId)];
+    const conditions = [
+      eq(referrals.referrerUserId, principal.userId),
+      sql`EXISTS (SELECT 1 FROM ${users} WHERE ${users.id} = ${referrals.referredUserId} AND ${liveUserPredicate(users)})`,
+    ];
     if (cursorId !== null) {
       conditions.push(lt(referrals.id, cursorId));
     }
@@ -1600,7 +1635,10 @@ export function createReferralsService(deps: ModuleDeps) {
     to?: Date;
     cursorId?: number | null;
   }) {
-    const conditions = [];
+    const conditions = [
+      sql`EXISTS (SELECT 1 FROM ${users} WHERE ${users.id} = ${referrals.referrerUserId} AND ${liveUserPredicate(users)})`,
+      sql`EXISTS (SELECT 1 FROM ${users} WHERE ${users.id} = ${referrals.referredUserId} AND ${liveUserPredicate(users)})`,
+    ];
     if (input.status) {
       conditions.push(eq(referrals.status, input.status));
     }
@@ -1804,6 +1842,13 @@ export function createReferralsService(deps: ModuleDeps) {
         if (!row) {
           throw notFound("REFERRAL_NOT_FOUND");
         }
+        const [liveReferrer, liveReferred] = await Promise.all([
+          loadUserSummary(tx, row.referrerUserId),
+          loadUserSummary(tx, row.referredUserId),
+        ]);
+        if (!liveReferrer || !liveReferred) {
+          throw notFound("REFERRAL_NOT_FOUND");
+        }
         if (row.version !== input.expectedVersion) {
           throw conflict(
             "VERSION_CONFLICT",
@@ -1979,6 +2024,13 @@ export function createReferralsService(deps: ModuleDeps) {
         if (!row) {
           throw notFound("REFERRAL_NOT_FOUND");
         }
+        const [liveReferrer, liveReferred] = await Promise.all([
+          loadUserSummary(tx, row.referrerUserId),
+          loadUserSummary(tx, row.referredUserId),
+        ]);
+        if (!liveReferrer || !liveReferred) {
+          throw notFound("REFERRAL_NOT_FOUND");
+        }
         if (row.version !== input.expectedVersion) {
           throw conflict(
             "VERSION_CONFLICT",
@@ -2075,6 +2127,13 @@ export function createReferralsService(deps: ModuleDeps) {
           .limit(1);
 
         if (!row) {
+          throw notFound("REFERRAL_NOT_FOUND");
+        }
+        const [liveReferrer, liveReferred] = await Promise.all([
+          loadUserSummary(tx, row.referrerUserId),
+          loadUserSummary(tx, row.referredUserId),
+        ]);
+        if (!liveReferrer || !liveReferred) {
           throw notFound("REFERRAL_NOT_FOUND");
         }
         if (row.version !== input.expectedVersion) {

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { validation } from "../../../core/errors.js";
-import type { StorageAdapterDefinition, StoragePutInput } from "../contracts.js";
+import { verifyRemoval, type StorageAdapterDefinition, type StoragePutInput } from "../contracts.js";
 import {
   accessFor, dataError, dataRequest, integrityError, oauthConfigSchema, oauthCredentialsSchema, parseResponse, pathParts,
   safeObjectName, testResult, verifiedChunks, type OAuthStorageConfig, type OAuthStorageCredentials,
@@ -70,7 +70,7 @@ export function dropboxAdapter(request: StorageRequest): StorageAdapterDefinitio
         },
         async put(input: StoragePutInput) {
           const path = dropboxPath([...pathParts(config, input.path), safeObjectName(input.name)]);
-          const commit = { path, mode: "overwrite", autorename: false, mute: true };
+          const commit = { path, mode: input.protectExisting ? "add" : "overwrite", autorename: false, mute: true };
           const hash = createHash("sha256");
           const bytes = verifiedChunks(input, CHUNK);
           let metadata: z.infer<typeof file>;
@@ -102,7 +102,30 @@ export function dropboxAdapter(request: StorageRequest): StorageAdapterDefinitio
         },
         async remove(remoteId, signal) {
           if (!id.safeParse(remoteId).success) throw validation("STORAGE_REMOTE_ID_INVALID", "The storage object reference is invalid.");
-          parseResponse(await rpc("files/delete_v2", { path: remoteId }, signal), z.object({ metadata: z.object({ id }) }));
+          function absent(rsp: Awaited<ReturnType<typeof rpc>>) {
+            if (rsp.status !== 409) return false;
+            const missing = z.object({ error: z.object({ ".tag": z.literal("path_lookup"),
+              path_lookup: z.object({ ".tag": z.literal("not_found") }) }) });
+            const alternate = z.object({ error: z.object({ ".tag": z.literal("path"),
+              path: z.object({ ".tag": z.literal("not_found") }) }) });
+            const result = JSON.parse(rsp.body.toString("utf8")) as unknown;
+            return missing.safeParse(result).success || alternate.safeParse(result).success;
+          }
+          const path = { path: remoteId };
+          const before = await rpc("files/get_metadata", path, signal);
+          if (!absent(before)) {
+            const { id: foundId } = before.status === 200 ?
+              await verifyRemoval(async () => parseResponse(before, file)) : parseResponse(before, file);
+            if (foundId !== remoteId) throw integrityError();
+            const result = await verifyRemoval(() => rpc("files/delete_v2", path, signal));
+            if (result.status === 401 || result.status === 403) parseResponse(result, file);
+            await verifyRemoval(async () => {
+              if (!absent(result)) parseResponse(result, z.object({ metadata: z.object({ id: z.literal(remoteId) }) }));
+              if (!absent(await rpc("files/get_metadata", path, signal))) throw integrityError();
+            });
+          }
+          // This connector is a user app; Dropbox Business-only permanent-delete is not within its scope.
+          return { providerRecycleBin: true as const };
         },
       };
     },

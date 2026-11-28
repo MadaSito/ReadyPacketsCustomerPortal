@@ -11,6 +11,7 @@ import type { ModuleDeps } from "../../container.js";
 import { conflict, notFound, validation } from "../../core/errors.js";
 import { ULID_PATTERN, ulid } from "../../core/ids.js";
 import type { Tx } from "../../core/types.js";
+import { isLiveUserRow } from "../identity/live.js";
 import { users } from "../identity/schema.js";
 import type {
   ApiCaller,
@@ -33,6 +34,7 @@ import {
   normalizePlainText,
 } from "./textAndSearch.js";
 import { generateTicketNumber } from "./ticketsService.js";
+import { liveTicketPredicate } from "./trashGate.js";
 import { TICKET_STATUSES, type TicketStatus } from "./types.js";
 
 function isDuplicateKeyError(err: unknown): boolean {
@@ -109,6 +111,7 @@ export function createTicketsApiProvider(deps: ModuleDeps): PublicApiProviders["
         .from(engagementSupportTickets)
         .where(
           and(
+            liveTicketPredicate(),
             customerId ? eq(engagementSupportTickets.requesterUserPublicId, customerId) : undefined,
             statusFilter ? eq(engagementSupportTickets.status, statusFilter) : undefined,
             query.updatedSince ? gte(engagementSupportTickets.updatedAt, query.updatedSince) : undefined,
@@ -133,7 +136,7 @@ export function createTicketsApiProvider(deps: ModuleDeps): PublicApiProviders["
       const [row] = await db
         .select()
         .from(engagementSupportTickets)
-        .where(eq(engagementSupportTickets.publicId, publicId))
+        .where(and(eq(engagementSupportTickets.publicId, publicId), liveTicketPredicate()))
         .limit(1);
       if (!row) return null;
       return toTicketDto(row);
@@ -170,13 +173,15 @@ export function createTicketsApiProvider(deps: ModuleDeps): PublicApiProviders["
             publicId: users.publicId,
             role: users.role,
             status: users.status,
+            trashedAt: users.trashedAt,
+            purgedAt: users.purgedAt,
           })
           .from(users)
           .where(eq(users.publicId, input.customerId))
           .limit(1)
           .for("share");
 
-        if (!customer || customer.role !== "customer") {
+        if (!customer || customer.role !== "customer" || !isLiveUserRow(customer)) {
           throw notFound("CUSTOMER_NOT_FOUND");
         }
         if (customer.status !== "active") {

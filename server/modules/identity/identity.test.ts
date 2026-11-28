@@ -497,7 +497,8 @@ describe("identity module (MySQL)", () => {
         for (const r of responses) expect(r).toEqual({ accepted: true });
         expect(h.mailer.sent).toEqual([]); // no synchronous mail on the request path
         expect(h.jobs.enqueued.map((j) => j.type)).toEqual([PASSWORD_RESET_JOB, PASSWORD_RESET_JOB, PASSWORD_RESET_JOB]);
-        for (const job of h.jobs.enqueued) expect(Object.keys(job.payload as object)).toEqual(["emailIndex"]);
+        for (const job of h.jobs.enqueued) expect(Object.keys(job.payload as object)).toEqual(["emailIndex", "userId"]); // blind index + internal id bound at intake (D2.8), never the address
+        expect(h.jobs.enqueued.map((j) => typeof (j.payload as { userId: unknown }).userId === "number")).toEqual([true, false, true]);
         expect(h.audit.named("auth.password.reset_requested").map((e) => e.outcome)).toEqual(["attempted", "attempted", "attempted"]);
         const results = await h.jobs.runAll(PASSWORD_RESET_JOB);
         expect(results.map((r) => r.outcome)).toEqual(["completed", "completed", "completed"]);
@@ -540,12 +541,12 @@ describe("identity module (MySQL)", () => {
     it("cooldown inside the job: two dispatches in one minute issue one token", async () => {
       const user = await makeUser();
       const emailIndex = h.deps.crypto.blindIndex(user.email, "users.email");
-      expect(await identity.auth.dispatchPasswordReset({ emailIndex })).toBe("issued");
-      expect(await identity.auth.dispatchPasswordReset({ emailIndex })).toBe("cooldown");
+      expect(await identity.auth.dispatchPasswordReset({ emailIndex, userId: user.id })).toBe("issued");
+      expect(await identity.auth.dispatchPasswordReset({ emailIndex, userId: user.id })).toBe("cooldown");
       expect(await identity.auth.dispatchPasswordReset({ emailIndex: "zz" })).toBe("ineligible");
       // Concurrent dispatches (adjoining enqueue slots) after the cooldown: exactly one issues.
       h.clock.advance(61_000);
-      const outcomes = await Promise.all([identity.auth.dispatchPasswordReset({ emailIndex }), identity.auth.dispatchPasswordReset({ emailIndex })]);
+      const outcomes = await Promise.all([identity.auth.dispatchPasswordReset({ emailIndex, userId: user.id }), identity.auth.dispatchPasswordReset({ emailIndex, userId: user.id })]);
       expect([...outcomes].sort()).toEqual(["cooldown", "issued"]);
     });
   });

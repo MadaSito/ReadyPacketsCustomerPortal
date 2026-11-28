@@ -52,6 +52,8 @@ export interface SettingView {
   managedBy?: SettingManagedBy;
   /** Extra capability required (in addition to platform.settings.manage) for generic writes. */
   writeCapability?: Capability;
+  /** Only the owning module may write this setting; generic editors must show it read-only (see `managedBy`). */
+  ownerWriteOnly?: true;
 }
 
 export interface WriteOptions {
@@ -222,6 +224,7 @@ export function createSettingsStore(deps: SettingsStoreDeps): PlatformSettingsSt
       version: row?.version ?? 0,
       updatedAt: row?.updatedAt ?? null,
       ...(def.kind !== "flag" && def.managedBy ? { managedBy: def.managedBy } : {}),
+      ...(def.kind !== "flag" && def.ownerWriteOnly ? { ownerWriteOnly: true as const } : {}),
       ...(def.kind !== "flag" && def.writeCapability ? { writeCapability: def.writeCapability } : {}),
     };
     if (def.kind === "secret") return { ...base, configured: Boolean(row?.secretEnc) };

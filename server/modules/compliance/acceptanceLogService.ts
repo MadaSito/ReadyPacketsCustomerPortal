@@ -38,6 +38,7 @@ import { DomainError, forbidden, notFound, validation } from "../../core/errors.
 import { ULID_PATTERN } from "../../core/ids.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { hasFreshStepUp, STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
+import { liveUserPredicate } from "../identity/live.js";
 import { users, type UserStatus } from "../identity/schema.js";
 import type { UserView } from "../identity/index.js";
 import { orders } from "../orders/schema.js";
@@ -511,6 +512,8 @@ export function createAcceptanceLogService(
           publicId: users.publicId,
           role: users.role,
           status: users.status,
+          trashedAt: users.trashedAt,
+          purgedAt: users.purgedAt,
         })
         .from(users)
         .where(eq(users.id, principal.userId))
@@ -520,6 +523,8 @@ export function createAcceptanceLogService(
     if (
       !liveUser ||
       liveUser.status !== "active" ||
+      liveUser.trashedAt !== null ||
+      liveUser.purgedAt !== null ||
       liveUser.publicId !== principal.userPublicId ||
       !sessionState ||
       !sessionState.live ||
@@ -691,7 +696,9 @@ export function createAcceptanceLogService(
             createdAt: u.createdAt,
           });
         }
-      } else {
+      }
+      const missingIds = chunk.filter((id) => !out.has(id));
+      if (missingIds.length > 0) {
         const rows = await dbOrTx
           .select({
             id: users.id,
@@ -702,9 +709,11 @@ export function createAcceptanceLogService(
             role: users.role,
             status: users.status,
             createdAt: users.createdAt,
+            trashedAt: users.trashedAt,
+            purgedAt: users.purgedAt,
           })
           .from(users)
-          .where(inArray(users.id, chunk));
+          .where(inArray(users.id, missingIds));
         for (const r of rows) {
           const decodeFallback = (enc: string, aad: string): string => {
             if (enc.startsWith("enc:")) return enc.slice(4);
@@ -714,11 +723,12 @@ export function createAcceptanceLogService(
               return "[Unavailable]";
             }
           };
+          const purged = r.purgedAt !== null;
           out.set(r.id, {
             id: r.id,
             publicId: r.publicId,
-            name: decodeFallback(r.nameEnc, `users.name:${r.publicId}`),
-            email: decodeFallback(r.emailEnc, `users.email:${r.publicId}`),
+            name: purged ? "Deleted account" : decodeFallback(r.nameEnc, `users.name:${r.publicId}`),
+            email: purged ? "" : decodeFallback(r.emailEnc, `users.email:${r.publicId}`),
             customerRef: r.customerRef,
             role: r.role,
             status: r.status,
@@ -773,7 +783,7 @@ export function createAcceptanceLogService(
     const rows = await dbOrTx
       .select({ id: users.id })
       .from(users)
-      .where(eq(users.role, "customer"))
+      .where(and(eq(users.role, "customer"), liveUserPredicate()))
       .limit(EVIDENCE_MAX_IDS);
     const loaded = await loadUsersByIds(
       dbOrTx,
@@ -1860,7 +1870,7 @@ export function createAcceptanceLogService(
     const activeCustomerRows = await deps.db
       .select({ id: users.id })
       .from(users)
-      .where(and(eq(users.role, "customer"), eq(users.status, "active")))
+      .where(and(eq(users.role, "customer"), eq(users.status, "active"), liveUserPredicate()))
       .orderBy(asc(users.id));
     const activeCustomerIds = activeCustomerRows.map((r) => r.id);
     const activeCustomerIdSet = new Set(activeCustomerIds);

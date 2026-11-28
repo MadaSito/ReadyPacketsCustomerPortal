@@ -9,6 +9,7 @@ import type { ModuleDeps } from "../../container.js";
 import { DomainError, forbidden } from "../../core/errors.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import type { FilesModule } from "../files/index.js";
+import { isLiveUserRow } from "../identity/live.js";
 import { users, type UserStatus } from "../identity/schema.js";
 import type { OrdersModule } from "../orders/index.js";
 
@@ -61,6 +62,8 @@ export interface LockedUserSummary {
   publicId: string;
   role: UserRole;
   status: UserStatus;
+  trashedAt: Date | null;
+  purgedAt: Date | null;
 }
 
 /**
@@ -90,6 +93,8 @@ export async function assertCurrentActorInTx(
       publicId: users.publicId,
       role: users.role,
       status: users.status,
+      trashedAt: users.trashedAt,
+      purgedAt: users.purgedAt,
     })
     .from(users)
     .where(inArray(users.id, idsToLock))
@@ -98,7 +103,12 @@ export async function assertCurrentActorInTx(
 
   const lockedMap = new Map<number, LockedUserSummary>(lockedRows.map((row) => [row.id, row]));
   const actorRow = lockedMap.get(principal.userId);
-  if (!actorRow || actorRow.status !== "active" || actorRow.role !== principal.role) {
+  if (
+    !actorRow ||
+    actorRow.status !== "active" ||
+    !isLiveUserRow(actorRow) ||
+    actorRow.role !== principal.role
+  ) {
     throw new DomainError(
       "UNAUTHENTICATED",
       "SESSION_NOT_CURRENT",

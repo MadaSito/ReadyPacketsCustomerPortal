@@ -12,9 +12,11 @@ import { conflict, forbidden, notFound } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { ClaimedJob, Db, FieldCrypto, JobResult, SessionPrincipal, Tx } from "../../core/types.js";
 import { automationCorrelationId } from "../audit/tap.js";
+import { isLiveUserRow } from "../identity/live.js";
 import { users } from "../identity/schema.js";
 import { lockBlocks, orderLocked } from "../orders/policy.js";
 import { orders } from "../orders/schema.js";
+import { isLiveOrderRow, liveOrderPredicate } from "../orders/trashGate.js";
 import {
   assertAutomationsActorInTx,
   assertAutomationsCapabilityPreflight,
@@ -59,15 +61,21 @@ export async function loadActorViewsById(
       publicId: users.publicId,
       nameEnc: users.nameEnc,
       role: users.role,
+      trashedAt: users.trashedAt,
+      purgedAt: users.purgedAt,
     })
     .from(users)
     .where(inArray(users.id, uniqueIds));
   for (const r of rows) {
     let displayName: string;
-    try {
-      displayName = crypto.decrypt(r.nameEnc, `users.name:${r.publicId}`);
-    } catch {
-      displayName = r.publicId;
+    if (!isLiveUserRow(r)) {
+      displayName = "Deleted account";
+    } else {
+      try {
+        displayName = crypto.decrypt(r.nameEnc, `users.name:${r.publicId}`);
+      } catch {
+        displayName = r.publicId;
+      }
     }
     map.set(r.id, {
       publicId: r.publicId,
@@ -264,11 +272,15 @@ export async function admitOrderCompletionInTx(
   }
 
   const [orderLockRow] = await tx
-    .select({ lockState: orders.lockState })
+    .select({
+      lockState: orders.lockState,
+      trashedAt: orders.trashedAt,
+      purgedAt: orders.purgedAt,
+    })
     .from(orders)
     .where(eq(orders.id, input.orderId))
     .for("update");
-  if (!orderLockRow) {
+  if (!orderLockRow || !isLiveOrderRow(orderLockRow)) {
     throw notFound("Order not found.");
   }
   if (lockBlocks(orderLockRow.lockState, true, "order")) {
@@ -581,6 +593,8 @@ export async function handleApplyCompletionJob(
         .select({
           id: orders.id,
           lockState: orders.lockState,
+          trashedAt: orders.trashedAt,
+          purgedAt: orders.purgedAt,
         })
         .from(orders)
         .where(eq(orders.id, locked.orderId))
@@ -624,8 +638,8 @@ export async function handleApplyCompletionJob(
         outcomeKind = "superseded";
       };
 
-      if (!orderRow) {
-        await markSuperseded("ORDER_DELETED");
+      if (!orderRow || !isLiveOrderRow(orderRow)) {
+        await markSuperseded(!orderRow ? "ORDER_DELETED" : "ORDER_TRASHED");
         return;
       }
       if (lockBlocks(orderRow.lockState, true, "order")) {
@@ -832,7 +846,7 @@ export async function listOrderCompletionJobsForOrder(
   const [activeOrderRow] = await deps.db
     .select({ id: orders.id })
     .from(orders)
-    .where(eq(orders.publicId, input.orderPublicId))
+    .where(and(eq(orders.publicId, input.orderPublicId), liveOrderPredicate()))
     .limit(1);
 
   if (!activeOrderRow) {

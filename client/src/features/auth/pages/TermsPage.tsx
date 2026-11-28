@@ -5,6 +5,7 @@
  */
 import { Link } from "wouter";
 import { BRAND } from "@shared/brand";
+import { EmailLink } from "@/ui";
 import { ExternalPolicyLink, LegalLayout, LegalSection, MARKETING_POLICY_URLS, PRIVACY_CONTACT_EMAIL } from "../legal/LegalLayout";
 
 export default function TermsPage() {
@@ -30,9 +31,7 @@ export default function TermsPage() {
           </li>
           <li>
             Tell us straight away at{" "}
-            <a href={`mailto:${PRIVACY_CONTACT_EMAIL}`} className="text-action underline underline-offset-2">
-              {PRIVACY_CONTACT_EMAIL}
-            </a>{" "}
+            <EmailLink email={PRIVACY_CONTACT_EMAIL} />{" "}
             if you think someone else has used your account.
           </li>
           <li>We may suspend or close accounts that break these terms or put other customers or the portal at risk.</li>
@@ -70,9 +69,7 @@ export default function TermsPage() {
       <LegalSection id="changes" title="Changes and contact">
         <p>
           We may update these terms. When we do, we will change the date at the top of this page. Questions:{" "}
-          <a href={`mailto:${PRIVACY_CONTACT_EMAIL}`} className="text-action underline underline-offset-2">
-            {PRIVACY_CONTACT_EMAIL}
-          </a>
+          <EmailLink email={PRIVACY_CONTACT_EMAIL} />
           .
         </p>
       </LegalSection>

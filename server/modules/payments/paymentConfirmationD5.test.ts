@@ -42,10 +42,18 @@ import { createCartModule } from "../cart/index.js";
 import { cartRouter } from "../cart/router.js";
 import * as opsAlertTables from "../opsAlerts/schema.js";
 import { createOpsAlertsModule } from "../opsAlerts/index.js";
+import { conflict } from "../../core/errors.js";
 import type { EgressFetchOptions, EgressFetchResponse, EgressPurpose } from "../integrations/egress.js";
 import {
+  unfencedPurgeRunForTests,
+  type TrashEntityRef,
+  type TrashParticipant,
+} from "../trash/ports.js";
+import {
+  CANCEL_ATTEMPT_PROVIDER_JOB_TYPE,
   createPaymentsModule,
   paymentAttempts,
+  paymentRefunds,
   paymentsRouter,
   paymentWebhookEvents,
 } from "./index.js";
@@ -254,6 +262,18 @@ function createD5FakeStripe(opts: { nowSec: () => number }) {
             body: Buffer.from(JSON.stringify({ error: { code: "resource_missing" } }), "utf8"),
           };
         }
+        if (session.status !== "open") {
+          return {
+            status: 400,
+            headers: { "content-type": "application/json" },
+            body: Buffer.from(
+              JSON.stringify({
+                error: { type: "invalid_request_error", message: "Only open sessions can be expired." },
+              }),
+              "utf8",
+            ),
+          };
+        }
         const expired: FakeStripeSession = { ...session, status: "expired" };
         sessions.set(sessionId, expired);
         return {
@@ -360,6 +380,13 @@ describe("Increment 08 — Package D5 Payment confirmation (authoritative bookin
     h.services.integrations = {
       egress: fakeStripe.egress,
     } as unknown as Services["integrations"];
+
+    const trashParticipants = new Map<string, TrashParticipant>();
+    h.services.trash = {
+      register(participant: TrashParticipant) {
+        trashParticipants.set(participant.module, participant);
+      },
+    } as unknown as Services["trash"];
 
     const ordersMod = createOrdersModule(h.deps);
     h.services.orders = ordersMod;
@@ -581,6 +608,7 @@ describe("Increment 08 — Package D5 Payment confirmation (authoritative bookin
       callerFor,
       createCustomerCheckout,
       deliverSignedCompletedWebhook,
+      trashParticipants,
     };
   }
 
@@ -1752,5 +1780,421 @@ describe("Increment 08 — Package D5 Payment confirmation (authoritative bookin
       .from(complianceTables.complianceInvoices)
       .where(eq(complianceTables.complianceInvoices.publicId, activeCheckout.invoicePublicId));
     expect(voidedAfter?.status).toBe("void");
+  });
+
+  it("Increment 09 D2 & D2.8: cancels open attempts + enqueues outbox provider expire on trash, refuses new checkouts while trashed, books late payments via both webhook and reconcile with PAID_ON_CANCELLED_ATTEMPT without restoring, and keeps payment/refund records on purge", async () => {
+    const stack = await buildActivatedStack();
+    const {
+      h,
+      fakeStripe,
+      ordersMod,
+      complianceMod,
+      paymentsMod,
+      admin,
+      buyer,
+      callerFor,
+      createCustomerCheckout,
+      deliverSignedCompletedWebhook,
+      trashParticipants,
+    } = stack;
+    const buyerCaller = callerFor(buyer.principal);
+
+    const paymentsParticipant = trashParticipants.get("payments");
+    expect(paymentsParticipant).toBeDefined();
+
+    async function markOrderTrashedInTx(orderPublicId: string, batchId: string): Promise<TrashEntityRef> {
+      const [ord] = await tdb.db
+        .select()
+        .from(orderTables.orders)
+        .where(eq(orderTables.orders.publicId, orderPublicId));
+      if (!ord) throw new Error(`missing order ${orderPublicId}`);
+      const entity: TrashEntityRef = {
+        kind: "order",
+        id: ord.id,
+        publicId: ord.publicId,
+        batchId,
+      };
+      await tdb.db.transaction(async (tx) => {
+        await tx
+          .update(orderTables.orders)
+          .set({
+            trashedAt: h.clock.now(),
+            trashedByUserId: admin.id,
+            trashBatchId: batchId,
+            trashReason: "Test order trash",
+          })
+          .where(eq(orderTables.orders.id, ord.id));
+        await paymentsParticipant!.onTrashedInTx!(tx, entity, {
+          kind: "user",
+          userId: admin.id,
+          publicId: admin.publicId,
+        });
+      });
+      return entity;
+    }
+
+    // 1. Open checkout -> summarize -> onTrashedInTx marks cancelled + enqueues outbox job (zero HTTP calls in tx)
+    const c1 = await createCustomerCheckout();
+    const [ord1Row] = await tdb.db
+      .select()
+      .from(orderTables.orders)
+      .where(eq(orderTables.orders.publicId, c1.orderPublicId));
+    const entity1Pre: TrashEntityRef = {
+      kind: "order",
+      id: ord1Row!.id,
+      publicId: c1.orderPublicId,
+      batchId: "01JBATCHPMT000000000000001",
+    };
+    expect(await paymentsParticipant!.summarize!(entity1Pre)).toEqual({ paymentAttempts: 1 });
+
+    const requestsBeforeTrash = fakeStripe.requests.length;
+    const entity1 = await markOrderTrashedInTx(c1.orderPublicId, "01JBATCHPMT000000000000001");
+    expect(fakeStripe.requests.length).toBe(requestsBeforeTrash);
+
+    const [att1AfterTrash] = await tdb.db
+      .select()
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, c1.attemptPublicId));
+    expect(att1AfterTrash).toMatchObject({
+      status: "cancelled",
+      failureReasonCode: "ORDER_TRASHED",
+      redirectUrlEnc: null,
+      providerCancelledAt: null,
+    });
+    expect(att1AfterTrash?.trashCancelledAt).toBeInstanceOf(Date);
+
+    const queuedCancelJob = h.jobs.enqueued.find(
+      (j) =>
+        j.type === CANCEL_ATTEMPT_PROVIDER_JOB_TYPE &&
+        j.options?.idempotencyKey === `pmt-trash-cancel:${c1.attemptPublicId}`,
+    );
+    expect(queuedCancelJob).toBeDefined();
+
+    // Refuse starting or checking checkout while order is in trash, matching missing-invoice INVOICE_NOT_FOUND (no existence oracle):
+    let missingInvoiceErr: unknown;
+    try {
+      await buyerCaller.payments.startInvoiceCheckout({ invoicePublicId: ulid() });
+    } catch (err) {
+      missingInvoiceErr = err;
+    }
+    expect(missingInvoiceErr).toMatchObject({
+      code: "NOT_FOUND",
+      cause: expect.objectContaining({ reasonCode: "INVOICE_NOT_FOUND" }),
+    });
+    const expectedMissingMsg = (missingInvoiceErr as Error).message;
+
+    await expect(paymentsMod.startCheckout(c1.invoicePublicId)).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      reasonCode: "INVOICE_NOT_FOUND",
+    });
+    await expect(
+      buyerCaller.payments.startInvoiceCheckout({ invoicePublicId: c1.invoicePublicId }),
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      message: expectedMissingMsg,
+      cause: expect.objectContaining({ reasonCode: "INVOICE_NOT_FOUND" }),
+    });
+    await expect(
+      buyerCaller.payments.checkoutStatus({ invoicePublicId: c1.invoicePublicId }),
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      message: expectedMissingMsg,
+      cause: expect.objectContaining({ reasonCode: "INVOICE_NOT_FOUND" }),
+    });
+    await expect(
+      buyerCaller.payments.cancelAttempt({ invoicePublicId: c1.invoicePublicId }),
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      message: expectedMissingMsg,
+      cause: expect.objectContaining({ reasonCode: "INVOICE_NOT_FOUND" }),
+    });
+    await expect(
+      buyerCaller.payments.confirmCheckoutPayment({ attemptPublicId: c1.attemptPublicId }),
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      cause: expect.objectContaining({ reasonCode: "PAYMENT_ATTEMPT_NOT_FOUND" }),
+    });
+
+    // Run registered outbox provider cancel job -> expires session on Stripe and stamps providerCancelledAt:
+    await h.jobs.runAll(CANCEL_ATTEMPT_PROVIDER_JOB_TYPE);
+    expect(fakeStripe.sessions.get(c1.sessionId)?.status).toBe("expired");
+    const [att1AfterProviderCancel] = await tdb.db
+      .select()
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, c1.attemptPublicId));
+    expect(att1AfterProviderCancel?.providerCancelledAt).toBeInstanceOf(Date);
+
+    // Restore re-enables fresh checkout on the order:
+    await tdb.db.transaction(async (tx) => {
+      await tx
+        .update(orderTables.orders)
+        .set({
+          trashedAt: null,
+          trashedByUserId: null,
+          trashBatchId: null,
+          trashReason: null,
+        })
+        .where(eq(orderTables.orders.id, entity1.id));
+      await paymentsParticipant!.onRestoredInTx!(tx, entity1, {
+        kind: "user",
+        userId: admin.id,
+        publicId: admin.publicId,
+      });
+    });
+    const freshAfterRestore = await buyerCaller.payments.startInvoiceCheckout({
+      invoicePublicId: c1.invoicePublicId,
+    });
+    expect(freshAfterRestore.mode).toBe("redirect");
+
+    // 2. D2.8 Interleaving A: checkout opened BEFORE trashing -> trashed -> paid later via SIGNED WEBHOOK
+    //    Books money received as kept record + emits PAID_ON_CANCELLED_ATTEMPT + NEVER restores order!
+    const c2 = await createCustomerCheckout();
+    const entity2 = await markOrderTrashedInTx(c2.orderPublicId, "01JBATCHPMT000000000000002");
+    fakeStripe.markSessionPaid(c2.sessionId);
+
+    const whLate = await deliverSignedCompletedWebhook(
+      c2.sessionId,
+      `evt_trash_late_wh_${ulid().toLowerCase()}`,
+    );
+    expect(whLate.booked).toBe(true);
+
+    const [att2Paid] = await tdb.db
+      .select()
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, c2.attemptPublicId));
+    expect(att2Paid?.status).toBe("paid");
+    expect(att2Paid?.bookingSource).toBe("webhook");
+    expect(att2Paid?.compliancePaymentPublicId).toBeTruthy();
+
+    const [inv2Paid] = await tdb.db
+      .select()
+      .from(complianceTables.complianceInvoices)
+      .where(eq(complianceTables.complianceInvoices.publicId, c2.invoicePublicId));
+    expect(inv2Paid?.status).toBe("paid");
+
+    const [alert2] = await tdb.db
+      .select()
+      .from(opsAlertTables.operationalAlerts)
+      .where(
+        and(
+          eq(opsAlertTables.operationalAlerts.code, "PAID_ON_CANCELLED_ATTEMPT"),
+          eq(opsAlertTables.operationalAlerts.orderPublicId, c2.orderPublicId),
+        ),
+      );
+    expect(alert2?.state).toBe("open");
+    expect(await ordersMod.isTrashedInTx(tdb.db, entity2.id)).toBe(true);
+
+    // 3. D2.8 Interleaving B: checkout opened BEFORE trashing -> trashed -> paid later via RECONCILE JOB
+    //    Books money received as kept record + emits PAID_ON_CANCELLED_ATTEMPT + NEVER restores order!
+    const c3 = await createCustomerCheckout();
+    const entity3 = await markOrderTrashedInTx(c3.orderPublicId, "01JBATCHPMT000000000000003");
+    fakeStripe.markSessionPaid(c3.sessionId);
+
+    const recLate = await paymentsMod.reconcilePendingAttempts();
+    expect(recLate.booked).toBeGreaterThanOrEqual(1);
+
+    const [att3Paid] = await tdb.db
+      .select()
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, c3.attemptPublicId));
+    expect(att3Paid?.status).toBe("paid");
+    expect(att3Paid?.bookingSource).toBe("provider_lookup");
+    expect(att3Paid?.compliancePaymentPublicId).toBeTruthy();
+
+    const [alert3] = await tdb.db
+      .select()
+      .from(opsAlertTables.operationalAlerts)
+      .where(
+        and(
+          eq(opsAlertTables.operationalAlerts.code, "PAID_ON_CANCELLED_ATTEMPT"),
+          eq(opsAlertTables.operationalAlerts.orderPublicId, c3.orderPublicId),
+        ),
+      );
+    expect(alert3?.state).toBe("open");
+    expect(await ordersMod.isTrashedInTx(tdb.db, entity3.id)).toBe(true);
+
+    // Running the queued provider-cancel job AFTER late payment was booked is an idempotent no-op:
+    const postPaidCancel = await paymentsMod.cancelProviderAttemptFromJob(c3.attemptPublicId);
+    expect(postPaidCancel.outcome).toBe("noop");
+
+    // 4. summarize reports payments & refunds; purge KEEPS payment and refund records (deleted: {}, kept: { payments, refunds })
+    const [ledgerPmt2] = await tdb.db
+      .select()
+      .from(complianceTables.complianceInvoicePayments)
+      .where(eq(complianceTables.complianceInvoicePayments.publicId, att2Paid!.compliancePaymentPublicId!));
+    await tdb.db.insert(paymentRefunds).values({
+      publicId: ulid(),
+      invoiceId: inv2Paid!.id,
+      invoicePublicId: c2.invoicePublicId,
+      orderId: entity2.id,
+      orderPublicId: c2.orderPublicId,
+      compliancePaymentId: ledgerPmt2!.id,
+      compliancePaymentPublicId: ledgerPmt2!.publicId,
+      attemptId: att2Paid!.id,
+      provider: "stripe",
+      environment: "test",
+      status: "succeeded",
+      amountMinor: 500,
+      currency: "USD",
+      reasonCode: "CUSTOMER_REQUEST",
+      reasonEnc: h.deps.crypto.encrypt("Partial refund", "test"),
+      idempotencyKey: `idem-ref-${ulid()}`,
+      providerIdempotencyKey: `rp-refund-${ulid()}`,
+      providerPaymentRef: att2Paid!.providerPaymentRef ?? "pi_test_1",
+      providerRefundRef: "re_test_kept_001",
+      requestedByUserId: admin.id,
+    });
+
+    expect(await paymentsParticipant!.summarize!(entity2)).toEqual({
+      payments: 1,
+      refunds: 1,
+    });
+
+    const purgeOut = await paymentsParticipant!.purge!(
+      entity2,
+      unfencedPurgeRunForTests("01JRUNPMT00000000000000002"),
+    );
+    expect(purgeOut).toEqual({
+      deleted: {},
+      kept: {
+        payments: 1,
+        refunds: 1,
+      },
+    });
+    // Idempotent second call:
+    expect(
+      await paymentsParticipant!.purge!(
+        entity2,
+        unfencedPurgeRunForTests("01JRUNPMT00000000000000002"),
+      ),
+    ).toEqual({
+      deleted: {},
+      kept: {
+        payments: 1,
+        refunds: 1,
+      },
+    });
+
+    const [keptAttAfterPurge] = await tdb.db
+      .select()
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, c2.attemptPublicId));
+    expect(keptAttAfterPurge?.status).toBe("paid");
+    const [keptRefAfterPurge] = await tdb.db
+      .select()
+      .from(paymentRefunds)
+      .where(eq(paymentRefunds.orderPublicId, c2.orderPublicId));
+    expect(keptRefAfterPurge?.providerRefundRef).toBe("re_test_kept_001");
+
+    // 5. Tombstoned order (purgedAt set): both unpaid/voided AND paid invoices normalize checkout endpoints
+    //    to exact INVOICE_NOT_FOUND (matching missing invoice), while kept paid invoice reads stay available!
+    const c4UnpaidTombstoned = await createCustomerCheckout();
+    const entity4 = await markOrderTrashedInTx(
+      c4UnpaidTombstoned.orderPublicId,
+      "01JBATCHPMT000000000000004",
+    );
+    await tdb.db
+      .update(orderTables.orders)
+      .set({ purgedAt: h.clock.now(), projectName: "Deleted order" })
+      .where(eq(orderTables.orders.id, entity4.id));
+    await tdb.db
+      .update(complianceTables.complianceInvoices)
+      .set({ status: "void", voidedAt: h.clock.now() })
+      .where(eq(complianceTables.complianceInvoices.publicId, c4UnpaidTombstoned.invoicePublicId));
+
+    await tdb.db
+      .update(orderTables.orders)
+      .set({ purgedAt: h.clock.now(), projectName: "Deleted order" })
+      .where(eq(orderTables.orders.id, entity2.id));
+
+    for (const invPubId of [c4UnpaidTombstoned.invoicePublicId, c2.invoicePublicId]) {
+      await expect(paymentsMod.startCheckout(invPubId)).rejects.toMatchObject({
+        code: "NOT_FOUND",
+        reasonCode: "INVOICE_NOT_FOUND",
+      });
+      await expect(
+        buyerCaller.payments.startInvoiceCheckout({ invoicePublicId: invPubId }),
+      ).rejects.toMatchObject({
+        code: "NOT_FOUND",
+        message: expectedMissingMsg,
+        cause: expect.objectContaining({ reasonCode: "INVOICE_NOT_FOUND" }),
+      });
+      await expect(
+        buyerCaller.payments.checkoutStatus({ invoicePublicId: invPubId }),
+      ).rejects.toMatchObject({
+        code: "NOT_FOUND",
+        message: expectedMissingMsg,
+        cause: expect.objectContaining({ reasonCode: "INVOICE_NOT_FOUND" }),
+      });
+      await expect(
+        buyerCaller.payments.cancelAttempt({ invoicePublicId: invPubId }),
+      ).rejects.toMatchObject({
+        code: "NOT_FOUND",
+        message: expectedMissingMsg,
+        cause: expect.objectContaining({ reasonCode: "INVOICE_NOT_FOUND" }),
+      });
+    }
+
+    // Kept paid invoice remains readable by customer on tombstoned order:
+    const keptPaidInvoiceView = await complianceMod.invoices.get(
+      buyer.principal,
+      c2.invoicePublicId,
+    );
+    expect(keptPaidInvoiceView.status).toBe("paid");
+  });
+
+  it("Increment 09 D2.8: payments purge aborts and leaves attempt data unchanged when TrashPurgeRun.assertCurrentInTx throws PURGE_FENCE_LOST", async () => {
+    const stack = await buildActivatedStack();
+    const { h, createCustomerCheckout, trashParticipants } = stack;
+    const paymentsParticipant = trashParticipants.get("payments")!;
+
+    const c = await createCustomerCheckout();
+    const [ord] = await tdb.db
+      .select()
+      .from(orderTables.orders)
+      .where(eq(orderTables.orders.publicId, c.orderPublicId));
+    const [attBefore] = await tdb.db
+      .select({ redirectUrlEnc: paymentAttempts.redirectUrlEnc })
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, c.attemptPublicId));
+    expect(attBefore?.redirectUrlEnc).toBeTruthy();
+
+    const entity: TrashEntityRef = {
+      kind: "order",
+      id: ord!.id,
+      publicId: c.orderPublicId,
+      batchId: "01JBATCHPMTFENCE0000000001",
+    };
+    const lostFenceRun = unfencedPurgeRunForTests("01JRUNPMTFENCE000000000001", {
+      async assertCurrentInTx() {
+        throw conflict("PURGE_FENCE_LOST", "Worker replaced.");
+      },
+    });
+
+    await expect(paymentsParticipant.purge!(entity, lostFenceRun)).rejects.toMatchObject({
+      code: "CONFLICT",
+      reasonCode: "PURGE_FENCE_LOST",
+    });
+
+    const [attAfterFailedFence] = await tdb.db
+      .select({ redirectUrlEnc: paymentAttempts.redirectUrlEnc })
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, c.attemptPublicId));
+    expect(attAfterFailedFence?.redirectUrlEnc).toBe(attBefore?.redirectUrlEnc);
+
+    // Once fenced properly, residual redirectUrlEnc is scrubbed while attempt row is kept:
+    await tdb.db
+      .update(orderTables.orders)
+      .set({ trashedAt: h.clock.now(), trashBatchId: entity.batchId })
+      .where(eq(orderTables.orders.id, entity.id));
+    await paymentsParticipant.purge!(
+      entity,
+      unfencedPurgeRunForTests("01JRUNPMTFENCE000000000002"),
+    );
+    const [attAfterValidPurge] = await tdb.db
+      .select({ redirectUrlEnc: paymentAttempts.redirectUrlEnc })
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, c.attemptPublicId));
+    expect(attAfterValidPurge?.redirectUrlEnc).toBeNull();
   });
 });

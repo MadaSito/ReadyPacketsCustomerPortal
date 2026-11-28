@@ -27,6 +27,8 @@ import {
 import { ORDER_REFERENCE_PREFIX } from "./settings.js";
 import type { ImportOrderInput, PortableOrder, PortableSelection } from "./types.js";
 import type { WorkflowService } from "./workflows.js";
+import { TOMBSTONE_PROJECT_NAME } from "./trash.js";
+import { isLiveOrderRow, liveOrderPredicate } from "./trashGate.js";
 import { DEFAULT_WORKFLOW, findState } from "./workflowTypes.js";
 
 export interface PortableDeps {
@@ -108,6 +110,19 @@ export const importOrderInputSchema = z.strictObject({
     .max(200)
     .optional(),
   editable: z.boolean().optional(),
+  /**
+   * Increment 09 (D2): trash state of the source order. purgedAt null = imported into the trash (hidden by the gate);
+   * purgedAt set = imported as a tombstone (reference, totals, currency, createdAt and owner only; no lines or notes).
+   */
+  trash: z
+    .strictObject({
+      trashedAt: z.date(),
+      batchId: z.string().regex(/^[0-9A-HJKMNP-TV-Z]{26}$/).nullable(),
+      reason: text(200).nullable(),
+      purgedAt: z.date().nullable(),
+    })
+    .nullable()
+    .optional(),
 });
 
 export interface ImportReceipt {
@@ -158,6 +173,7 @@ export function preflightImportOrder(raw: unknown): { ok: true; input: ImportOrd
   if (discount < 0 || discount > subtotal || subtotal - discount !== input.totalMinor)
     return { ok: false, reasonCode: "IMPORT_TOTAL_MISMATCH", paths: ["totalMinor"] };
   if ((input.promoDiscountMinor ?? 0) > discount) return { ok: false, reasonCode: "IMPORT_TOTAL_MISMATCH", paths: ["promoDiscountMinor"] };
+  if (input.trash?.purgedAt && input.trash.purgedAt < input.trash.trashedAt) return { ok: false, reasonCode: "IMPORT_ORDER_INVALID", paths: ["trash.purgedAt"] };
   if (input.lineItems.length > 0 && sum !== subtotal) return { ok: false, reasonCode: "IMPORT_TOTAL_MISMATCH", paths: ["totalMinor"] };
   for (const [index, item] of input.lineItems.entries())
     if ((item.packetNumber ?? null) === null !== ((item.tier ?? null) === null))
@@ -193,6 +209,9 @@ export function createPortableHooks(deps: PortableDeps) {
         totalMinor: orders.totalMinor,
         currency: orders.currency,
         groupRootOrderId: orders.groupRootOrderId,
+        trashedAt: orders.trashedAt,
+        purgeStartedAt: orders.purgeStartedAt,
+        purgedAt: orders.purgedAt,
         importId: orderImportProvenance.importId,
       })
       .from(orderImportProvenance)
@@ -207,6 +226,28 @@ export function createPortableHooks(deps: PortableDeps) {
     return row ?? null;
   }
 
+  /**
+   * Increment 09: the owner of an order imported into the trash or as a tombstone may itself be in the trash or a
+   * tombstone, so it is read UNGATED by internal id, after a locking current read (FOR SHARE) of the users row.
+   * A trashed owner takes a trashed order or a tombstone; a tombstoned owner only a tombstone; never an owner whose
+   * permanent deletion is still running. A tombstone owner is deactivated, so that check is skipped for tombstones.
+   */
+  async function trashedImportOwner(tx: Tx, userId: number, tombstone: boolean): Promise<{ id: number; publicId: string; role: string; status: string } | null> {
+    const identity = (deps.services as Partial<Services>).identity;
+    if (typeof identity?.users?.isTrashedInTx !== "function" || typeof identity.portableCustomerRefInTx !== "function") return null;
+    await identity.users.isTrashedInTx(tx, userId, { lock: "share" });
+    const ref = await identity.portableCustomerRefInTx(tx, { userId });
+    if (!ref || ref.role !== "customer") return null;
+    if (ref.purgeStartedAt && !ref.purged) return null;
+    if (ref.purged && !tombstone) return null;
+    if (!ref.trashed && !ref.purged) {
+      const live = await identityPort(deps.services).getUser(userId, { tx });
+      if (!live) return null;
+      return { id: live.id, publicId: live.publicId, role: live.role, status: tombstone ? "active" : live.status };
+    }
+    return { id: ref.userId, publicId: ref.publicId, role: ref.role, status: "active" };
+  }
+
   return {
     findImportedOrder,
 
@@ -218,6 +259,33 @@ export function createPortableHooks(deps: PortableDeps) {
     },
 
     preflightImportOrder,
+
+    /**
+     * Increment 09 (D2, trusted custody read — NOT gated): the order row in any trash state, for portable custody
+     * checks and kept-record owners (late payments on a trashed order). Callers must never expose a trashed order
+     * through a customer-facing path. `forUpdate` locks the order row (requires a tx).
+     */
+    async orderCustodyInTx(tx: DbOrTx, orderId: number, options?: { forUpdate?: boolean }): Promise<OrderCustody | null> {
+      const q = tx
+        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, ownerUserId: orders.ownerUserId, trashedAt: orders.trashedAt, purgeStartedAt: orders.purgeStartedAt, purgedAt: orders.purgedAt })
+        .from(orders)
+        .where(eq(orders.id, orderId))
+        .limit(1);
+      const [row] = options?.forUpdate ? await q.for("update") : await q;
+      if (!row) return null;
+      // Ungated by internal id: the owner of a trashed order may itself be in the trash or a tombstone.
+      const owner = await (deps.services as Partial<Services>).identity?.portableCustomerRefInTx?.(tx, { userId: row.ownerUserId });
+      return {
+        id: row.id,
+        publicId: row.publicId,
+        reference: row.reference,
+        ownerUserId: row.ownerUserId,
+        ownerPublicId: owner?.publicId ?? "",
+        trashed: row.trashedAt !== null,
+        purgeStarted: row.purgeStartedAt !== null,
+        purged: row.purgedAt !== null,
+      };
+    },
 
     /** Bounded export projection (internal notes and grants are excluded — grants are authority, not data). */
     async portableOrders(tx: DbOrTx, selection: PortableSelection): Promise<{ items: PortableOrder[]; nextAfter: number | null }> {
@@ -231,6 +299,8 @@ export function createPortableHooks(deps: PortableDeps) {
         .where(
           and(
             selection.after !== undefined ? gt(orders.id, selection.after) : undefined,
+            // Increment 09 (D2): trashed orders and tombstones travel only in a whole-installation export.
+            selection.includeTrashed ? undefined : liveOrderPredicate(),
             selection.customerIds ? inArray(orders.ownerUserId, selection.customerIds.slice(0, 1000)) : undefined,
             selection.orderIds ? inArray(orders.id, selection.orderIds.slice(0, 1000)) : undefined,
             // Increment 08 (D3): whole groups — the roots themselves and every addition pointing at them.
@@ -285,6 +355,9 @@ export function createPortableHooks(deps: PortableDeps) {
           createdAt: order.createdAt,
           updatedAt: order.updatedAt,
           submittedAt: order.submittedAt,
+          trash: order.trashedAt
+            ? { trashedAt: order.trashedAt, batchId: order.trashBatchId, reason: order.trashReason, purgeStartedAt: order.purgeStartedAt, purgedAt: order.purgedAt }
+            : null,
           lineItems: items
             .filter((i) => i.orderId === order.id)
             .map((i) => ({
@@ -326,12 +399,14 @@ export function createPortableHooks(deps: PortableDeps) {
     async importOrder(raw: ImportOrderInput, tx: Tx): Promise<ImportReceipt> {
       const input = assertImportOrderPreflight(raw);
       const existing = await findImportedOrder(input.sourceInstallationId, input.sourceOrderPublicId, tx);
+      const tombstone = Boolean(input.trash?.purgedAt);
       if (existing) {
+        if (existing.purgeStartedAt && !(tombstone && existing.purgedAt)) throw conflict("IMPORT_ORDER_PURGED", "This order was deleted permanently on this installation.");
         if (existing.ownerUserId !== input.targetOwnerUserId) throw conflict("IMPORT_LINK_CONFLICT", "This source order was already imported for a different customer.");
         return { id: existing.id, publicId: existing.publicId, reference: existing.reference, created: false, receipts: { lineItems: [], statusHistory: [], customerNotes: [] } };
       }
 
-      const owner = await identityPort(deps.services).getUser(input.targetOwnerUserId, { tx, forUpdate: true });
+      const owner = input.trash ? await trashedImportOwner(tx, input.targetOwnerUserId, tombstone) : await identityPort(deps.services).getUser(input.targetOwnerUserId, { tx, forUpdate: true });
       if (!owner || owner.role !== "customer" || owner.status === "deactivated")
         throw validation("IMPORT_OWNER_NOT_ELIGIBLE", "The mapped owner is not an eligible customer account.");
 
@@ -355,7 +430,9 @@ export function createPortableHooks(deps: PortableDeps) {
       let groupRoot: typeof orders.$inferSelect | null = null;
       if (input.groupRootOrderId !== undefined && input.groupRootOrderId !== null) {
         const [root] = await tx.select().from(orders).where(eq(orders.id, input.groupRootOrderId)).for("update").limit(1);
-        if (!root || root.groupRootOrderId !== null || root.ownerUserId !== owner.id || root.currency !== input.currency || root.origin !== "import")
+        // Increment 09: a live addition needs a live root; a tombstone root takes only tombstone additions.
+        const rootStateOk = !root ? false : root.purgedAt ? tombstone : isLiveOrderRow(root) || Boolean(input.trash);
+        if (!root || !rootStateOk || root.groupRootOrderId !== null || root.ownerUserId !== owner.id || root.currency !== input.currency || root.origin !== "import")
           throw validation("IMPORT_GROUP_ROOT_INVALID", "The imported order's project root is not available.");
         groupRoot = root;
       }
@@ -387,7 +464,7 @@ export function createPortableHooks(deps: PortableDeps) {
         referenceStem,
         groupRootOrderId: groupRoot?.id ?? null,
         ownerUserId: owner.id,
-        projectName: input.projectName,
+        projectName: tombstone ? TOMBSTONE_PROJECT_NAME : input.projectName,
         workflowVersionId: workflow.versionId,
         statusKey,
         lockState,
@@ -395,9 +472,9 @@ export function createPortableHooks(deps: PortableDeps) {
         lockedAt: input.editable ? null : now,
         subtotalMinor: input.subtotalMinor ?? input.totalMinor + (input.discountMinor ?? 0),
         discountMinor: input.discountMinor ?? 0,
-        discountLabel: input.discountLabel ?? null,
+        discountLabel: tombstone ? null : (input.discountLabel ?? null),
         promoDiscountMinor: input.promoDiscountMinor ?? 0,
-        promoLabel: input.promoLabel ?? null,
+        promoLabel: tombstone ? null : (input.promoLabel ?? null),
         totalMinor: input.totalMinor,
         currency: input.currency,
         origin: "import",
@@ -405,14 +482,26 @@ export function createPortableHooks(deps: PortableDeps) {
         submittedAt: input.submittedAt ?? null,
         createdAt: input.createdAt,
         updatedAt: now,
+        ...(input.trash
+          ? {
+              trashedAt: input.trash.trashedAt,
+              trashedByUserId: null,
+              trashBatchId: input.trash.batchId,
+              trashReason: tombstone ? null : input.trash.reason,
+              purgeStartedAt: input.trash.purgedAt,
+              purgedAt: input.trash.purgedAt,
+            }
+          : {}),
       });
       const [order] = await tx.select({ id: orders.id }).from(orders).where(eq(orders.publicId, publicId));
       const orderId = order!.id;
       await reserveReference(tx, { reference, orderId, reasonCode: referenceReason, actorUserId: null, now });
 
       const receipts: ImportReceipt["receipts"] = { lineItems: [], statusHistory: [], customerNotes: [] };
-      if (input.lineItems.length) {
-        const values = input.lineItems.map((item, index) => {
+      // A tombstone carries no lines, history or notes (D2.6); the line items of a trashed order travel.
+      const lineInputs = tombstone ? [] : input.lineItems;
+      if (lineInputs.length) {
+        const values = lineInputs.map((item, index) => {
           const id = ulid(now.getTime());
           receipts.lineItems.push({ sourcePublicId: item.sourcePublicId ?? null, publicId: id });
           return {
@@ -441,7 +530,7 @@ export function createPortableHooks(deps: PortableDeps) {
         await tx.insert(orderLineItems).values(values);
       }
       // Historical evidence only — never replayed through the workflow engine.
-      const history = input.statusHistory ?? [];
+      const history = tombstone ? [] : (input.statusHistory ?? []);
       if (history.length) {
         await tx.insert(orderStatusHistory).values(
           history.map((h) => {
@@ -472,7 +561,7 @@ export function createPortableHooks(deps: PortableDeps) {
         noteId: null,
         occurredAt: now,
       });
-      for (const note of input.customerNotes ?? []) {
+      for (const note of tombstone ? [] : (input.customerNotes ?? [])) {
         const id = ulid(now.getTime());
         receipts.customerNotes.push({ sourcePublicId: note.sourcePublicId ?? null, publicId: id });
         await tx.insert(orderNotes).values({
@@ -503,14 +592,25 @@ export function createPortableHooks(deps: PortableDeps) {
           importId: input.importId,
           resource: { type: "order", publicId },
           reasonCode: knownStatus ? undefined : "STATUS_UNMAPPED",
-          attributes: { lock_state: lockState, reference_source: referenceReason, owner_public_id: owner.publicId },
-          safeCounts: { line_items: input.lineItems.length, history: history.length, notes: input.customerNotes?.length ?? 0 },
+          attributes: { lock_state: lockState, reference_source: referenceReason, owner_public_id: owner.publicId, trash_state: tombstone ? "tombstone" : input.trash ? "trashed" : "live" },
+          safeCounts: { line_items: lineInputs.length, history: history.length, notes: tombstone ? 0 : (input.customerNotes?.length ?? 0) },
         },
         tx,
       );
       return { id: orderId, publicId, reference, created: true, receipts };
     },
   };
+}
+
+export interface OrderCustody {
+  id: number;
+  publicId: string;
+  reference: string;
+  ownerUserId: number;
+  ownerPublicId: string;
+  trashed: boolean;
+  purgeStarted: boolean;
+  purged: boolean;
 }
 
 export type PortableHooks = ReturnType<typeof createPortableHooks>;

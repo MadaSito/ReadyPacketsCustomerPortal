@@ -7,6 +7,7 @@
  * The helpers below work against the core `SettingsStore` contract, so they also work with test fakes.
  */
 import { z } from "zod";
+import { DomainError } from "../../core/errors.js";
 import type { SettingsStore, Tx } from "../../core/types.js";
 import { CAPABILITIES, type Capability } from "../../../shared/capabilities.js";
 
@@ -59,6 +60,12 @@ export interface ValueSettingDefinition<T> extends CommonDefinition {
   writeCapability?: Capability;
   /** A dedicated admin page owns this setting; the generic settings page links there instead. */
   managedBy?: SettingManagedBy;
+  /**
+   * Owner-managed: only the owning module may write this setting (through its own guarded flow, e.g. preview,
+   * typed confirmation, step-up and CAS). The generic settings write and configuration import refuse it.
+   * Requires `managedBy`; implies `exportable: false`.
+   */
+  ownerWriteOnly?: true;
 }
 
 export interface SettingFieldText {
@@ -74,7 +81,15 @@ export interface SettingManagedBy {
 
 const FIELD_PATH_PATTERN = /^$|^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$/;
 
-function assertExtras(key: string, input: { fields?: Record<string, SettingFieldText>; writeCapability?: Capability; managedBy?: SettingManagedBy }): void {
+function assertExtras(
+  key: string,
+  input: { fields?: Record<string, SettingFieldText>; writeCapability?: Capability; managedBy?: SettingManagedBy; ownerWriteOnly?: true; exportable?: boolean },
+): void {
+  if (input.ownerWriteOnly !== undefined) {
+    if (input.ownerWriteOnly !== true) throw new Error(`invalid ownerWriteOnly for ${key}`);
+    if (!input.managedBy) throw new Error(`ownerWriteOnly requires managedBy for ${key}`);
+    if (input.exportable === true) throw new Error(`ownerWriteOnly settings cannot be exportable (${key})`);
+  }
   for (const [path, text] of Object.entries(input.fields ?? {})) {
     if (!FIELD_PATH_PATTERN.test(path) || path.length > 200) throw new Error(`invalid field path ${path} for ${key}`);
     if (text.label !== undefined && (text.label.length === 0 || text.label.length > 80)) throw new Error(`invalid field label ${path} for ${key}`);
@@ -97,6 +112,8 @@ export interface SecretSettingDefinition extends CommonDefinition {
   exportable: boolean;
   writeCapability?: Capability;
   managedBy?: SettingManagedBy;
+  /** See `ValueSettingDefinition.ownerWriteOnly`. */
+  ownerWriteOnly?: true;
 }
 
 export interface FeatureFlagDefinition extends CommonDefinition {
@@ -144,6 +161,7 @@ export function defineSetting<T>(input: {
   fields?: Record<string, SettingFieldText>;
   writeCapability?: Capability;
   managedBy?: SettingManagedBy;
+  ownerWriteOnly?: true;
 }): ValueSettingDefinition<T> {
   assertCommon(input);
   assertExtras(input.key, input);
@@ -160,10 +178,11 @@ export function defineSetting<T>(input: {
     schema: input.schema,
     default: input.default,
     sensitivity: input.sensitivity ?? "internal",
-    exportable: input.exportable ?? true,
+    exportable: input.ownerWriteOnly ? false : (input.exportable ?? true),
     ...(input.fields ? { fields: Object.freeze({ ...input.fields }) } : {}),
     ...(input.writeCapability ? { writeCapability: input.writeCapability } : {}),
     ...(input.managedBy ? { managedBy: Object.freeze({ ...input.managedBy }) } : {}),
+    ...(input.ownerWriteOnly ? { ownerWriteOnly: true as const } : {}),
   });
 }
 
@@ -179,6 +198,7 @@ export function defineSecret(input: {
   exportable?: boolean;
   writeCapability?: Capability;
   managedBy?: SettingManagedBy;
+  ownerWriteOnly?: true;
 }): SecretSettingDefinition {
   assertCommon(input);
   assertExtras(input.key, input);
@@ -194,9 +214,10 @@ export function defineSecret(input: {
     sensitivity: "secret",
     // Secrets are NOT exportable unless the owning module opts in explicitly (and even then only into a
     // passphrase-encrypted export block).
-    exportable: input.exportable ?? false,
+    exportable: input.ownerWriteOnly ? false : (input.exportable ?? false),
     ...(input.writeCapability ? { writeCapability: input.writeCapability } : {}),
     ...(input.managedBy ? { managedBy: Object.freeze({ ...input.managedBy }) } : {}),
+    ...(input.ownerWriteOnly ? { ownerWriteOnly: true as const } : {}),
   });
 }
 
@@ -231,6 +252,23 @@ export function defineFeatureFlag(input: {
 
 export function getSettingDefinition(key: string): AnySettingDefinition | undefined {
   return registry.get(key);
+}
+
+/**
+ * Server-side boundary for generic writes (settings page, mail page, consent page, configuration import):
+ * refuses settings that only their owning module may write. Owning modules write through
+ * `SettingsStore.set` / `writeSetting` inside their own guarded flow and are not affected.
+ */
+export function assertGenericWriteAllowed(key: string): void {
+  const def = registry.get(key);
+  if (def && def.kind !== "flag" && def.ownerWriteOnly) {
+    const label = def.managedBy?.label ?? "the page that owns it";
+    throw new DomainError("FORBIDDEN", "SETTING_OWNER_MANAGED", `Change this in the ${label}.`, def.managedBy ? { href: def.managedBy.href } : undefined);
+  }
+}
+
+export function isOwnerWriteOnly(def: AnySettingDefinition | undefined): boolean {
+  return !!def && def.kind !== "flag" && def.ownerWriteOnly === true;
 }
 
 export function listSettingDefinitions(): AnySettingDefinition[] {

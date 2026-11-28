@@ -698,7 +698,7 @@ describe("invoices", () => {
       issuerTaxId: "EIN-12-3456789",
       issuerLogo: {
         mode: "brand" as const,
-        brandPath: "/brand/readypackets-approved-header-wordmark-light.png" as const,
+        brandPath: "/brand/readypackets-horizontal-light-500x150-v2026101502.png" as const,
       },
       paymentInstructions: "Pay by wire within 30 days.",
     }));
@@ -717,7 +717,7 @@ describe("invoices", () => {
         issuerTaxId: "EIN-12-3456789",
         issuerLogo: {
           mode: "brand",
-          brandPath: "/brand/readypackets-approved-header-wordmark-light.png",
+          brandPath: "/brand/readypackets-horizontal-light-500x150-v2026101502.png",
         },
       }),
     );
@@ -738,7 +738,7 @@ describe("invoices", () => {
       issuerTaxId: "EIN 98-7654321",
       issuerLogo: {
         mode: "brand" as const,
-        brandPath: "/brand/readypackets-approved-header-icon-light.png" as const,
+        brandPath: "/brand/readypackets-horizontal-light-600x180-v2026101502.png" as const,
       },
       paymentInstructions: "Pay by wire within 30 days.",
     }));
@@ -798,7 +798,7 @@ describe("invoices", () => {
           contact: "billing@example.test",
           taxId: "EIN 98-7654321",
           logoMode: "brand",
-          logoBrandPath: "/brand/readypackets-approved-header-icon-light.png",
+          logoBrandPath: "/brand/readypackets-horizontal-light-600x180-v2026101502.png",
         },
         customer: {
           name: "Synthetic Buyer",
@@ -836,7 +836,7 @@ describe("invoices", () => {
     const logoSelect = await within(profileDialog).findByLabelText(/^PDF header logo/);
     expect(logoSelect).toHaveValue("brand");
     const assetSelect = await within(profileDialog).findByLabelText(/^Brand logo asset/);
-    expect(assetSelect).toHaveValue("/brand/readypackets-approved-header-icon-light.png");
+    expect(assetSelect).toHaveValue("/brand/readypackets-horizontal-light-600x180-v2026101502.png");
     await expectNoAxeViolations(profileDialog);
     adminListView.unmount();
 
@@ -968,5 +968,171 @@ describe("invoices", () => {
       expect(screen.getByRole("group", { name: "Invoice actions" })).toHaveFocus(),
     );
     await expectNoAxeViolations(view.container);
+  });
+
+  it("labels In trash and Deleted order rows on InvoicesAdminPage and renders EmailLink + frozen snapshots on kept views", async () => {
+    const trashedInvId = "01J00000000000000000000081";
+    const deletedInvId = "01J00000000000000000000082";
+    const RECEIPT = "01J00000000000000000000083";
+
+    handlers.set("compliance.invoices.admin.list", () => ({
+      items: [
+        {
+          ...summary,
+          invoicePublicId: trashedInvId,
+          invoiceNumber: "INV-2026-0081",
+          orderReference: "RP-2026-ICEQ81",
+          projectName: "Ice Queen",
+          orderLifecycleState: "trashed" as const,
+        },
+        {
+          ...summary,
+          invoicePublicId: deletedInvId,
+          invoiceNumber: "INV-2026-0082",
+          orderReference: "RP-2026-ICEQ82",
+          projectName: "Deleted order",
+          status: "paid" as const,
+          balanceDueMinor: 0,
+          orderLifecycleState: "deleted" as const,
+        },
+      ],
+      nextCursor: null,
+    }));
+
+    const listView = renderUi(<InvoicesAdminPage />, { path: "/admin/invoices" });
+    expect((await screen.findAllByText("In trash")).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("Deleted order").length).toBeGreaterThanOrEqual(2);
+    await expectNoAxeViolations(listView.container);
+    listView.unmount();
+
+    handlers.set("compliance.invoices.get", () => ({
+      ...detail,
+      invoicePublicId: deletedInvId,
+      invoiceNumber: "INV-2026-0082",
+      orderReference: "RP-2026-ICEQ82",
+      projectName: "Deleted order",
+      status: "paid" as const,
+      balanceDueMinor: 0,
+      grossPaidMinor: 10825,
+      netPaidMinor: 10825,
+      canManage: false,
+      canRecordPayment: false,
+      orderLifecycleState: "deleted" as const,
+      issuerContact: "billing@example.test",
+      buyer: {
+        name: "Zeus Greene",
+        email: "zeus.greene@example.test",
+        customerRef: "RPCUS-A1B2CJJG5",
+      },
+    }));
+
+    const invView = pageByPath(`/admin/invoices/${deletedInvId}`, <InvoiceDetailPage />, "/admin/invoices/:invoiceId");
+    expect((await screen.findAllByText("Deleted order")).length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByRole("link", { name: "RP-2026-ICEQ82" })).not.toBeInTheDocument();
+    expect(screen.getByText("Zeus Greene")).toBeVisible();
+    expect(screen.getByText("RPCUS-A1B2CJJG5")).toBeVisible();
+    const buyerEmailLink = screen.getByRole("link", { name: "zeus.greene@example.test" });
+    expect(buyerEmailLink).toHaveAttribute("href", "mailto:zeus.greene@example.test");
+    expect(buyerEmailLink).toHaveAttribute("data-rp-email-link", "");
+    const issuerEmailLink = screen.getByRole("link", { name: "billing@example.test" });
+    expect(issuerEmailLink).toHaveAttribute("href", "mailto:billing@example.test");
+    await expectNoAxeViolations(invView.container);
+    invView.unmount();
+
+    handlers.set("compliance.receipts.get", () => ({
+      receiptPublicId: RECEIPT,
+      receiptNumber: "RPR-2026-000083",
+      settlementKind: "provider_online",
+      invoicePublicId: deletedInvId,
+      paymentPublicId: PAY,
+      orderPublicId: ORDER,
+      orderReference: "RP-2026-ICEQ82",
+      projectName: "Deleted order",
+      orderLifecycleState: "deleted" as const,
+      customerRef: "RPCUS-A1B2CJJG5",
+      currency: "USD",
+      subtotalMinor: 5000,
+      discountMinor: 0,
+      bundleDiscountMinor: 0,
+      promoDiscountMinor: 0,
+      promoLabel: null,
+      taxMinor: 0,
+      amountWaivedMinor: 0,
+      amountPaidMinor: 5000,
+      refundedMinor: 0,
+      refundState: "none",
+      paymentMethod: "provider_online",
+      paymentMethodBrand: "visa",
+      paymentMethodLast4: "4242",
+      paymentMethodSummary: "Visa ending in 4242",
+      provider: "stripe",
+      issuedAt: now,
+      emailedAt: now,
+      lastResentAt: null,
+      resendCount: 0,
+      canResend: false,
+      origin: "portal",
+      refundNotes: [],
+      snapshot: {
+        schemaVersion: 1,
+        receiptPublicId: RECEIPT,
+        receiptNumber: "RPR-2026-000083",
+        settlementKind: "provider_online",
+        issuedAt: now.toISOString(),
+        orderPublicId: ORDER,
+        orderReference: "RP-2026-ICEQ82",
+        projectName: "Deleted order",
+        invoicePublicId: deletedInvId,
+        invoiceNumber: "INV-2026-0082",
+        paymentPublicId: PAY,
+        company: {
+          legalName: "Ready Packets Synthetic LLC",
+          address: "100 Harbor Way",
+          contact: "billing@example.test",
+          taxId: "SYN-99-1234567",
+          logoMode: "brand",
+          logoBrandPath: "/brand/readypackets-horizontal-light-600x180-v2026101502.png",
+        },
+        customer: {
+          name: "Zeus Greene",
+          email: "zeus.greene@example.test",
+          customerRef: "RPCUS-A1B2CJJG5",
+        },
+        currency: "USD",
+        lines: [
+          { position: 1, description: "Packet review", quantity: 1, unitAmountMinor: 5000, lineTotalMinor: 5000 },
+        ],
+        subtotalMinor: 5000,
+        discountMinor: 0,
+        bundleDiscountMinor: 0,
+        discountLabel: null,
+        promoDiscountMinor: 0,
+        promoLabel: null,
+        taxMinor: 0,
+        invoiceTotalMinor: 5000,
+        amountWaivedMinor: 0,
+        amountPaidMinor: 5000,
+        paymentMethod: "provider_online",
+        paymentMethodBrand: "visa",
+        paymentMethodLast4: "4242",
+        provider: "stripe",
+        paymentReference: "pi_synthetic_83",
+        footerText: "",
+      },
+    }));
+
+    const rcptView = pageByPath(`/admin/receipts/${RECEIPT}`, <AdminReceiptDetailPage />, "/admin/receipts/:receiptId");
+    expect((await screen.findAllByText("Deleted order")).length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByRole("link", { name: "RP-2026-ICEQ82" })).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "zeus.greene@example.test" })).toHaveAttribute(
+      "href",
+      "mailto:zeus.greene@example.test",
+    );
+    expect(screen.getByRole("link", { name: "billing@example.test" })).toHaveAttribute(
+      "href",
+      "mailto:billing@example.test",
+    );
+    await expectNoAxeViolations(rcptView.container);
+    rcptView.unmount();
   });
 });

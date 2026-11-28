@@ -25,14 +25,22 @@ import { createTokenService } from "./tokens.js";
 import { createTransitionService } from "./transitions.js";
 import { createUserRepo, namePartsOf, toView, type LoadOptions, type UserView } from "./users.js";
 import type { NameParts } from "./normalize.js";
+import { isTrashedUserInTx, lockGoneUsersInTx, type TrashedCheckOptions } from "./live.js";
+import { createIdentityTrash, type IdentityTrash } from "./trash.js";
+import type { TrashParticipant } from "../trash/ports.js";
+
+/** Other modules may pass a transaction / lock, never `includeGone` (trash paths use `identity.trash`). */
+export type PublicLoadOptions = Omit<LoadOptions, "includeGone">;
+const publicLoad = (opts?: PublicLoadOptions): LoadOptions | undefined => (opts ? { ...(opts.tx ? { tx: opts.tx } : {}), ...(opts.forUpdate ? { forUpdate: true } : {}) } : undefined);
 
 export type { CustomerListItem, IssuedSession, Page, SessionListItem, SessionState, UserStatus, UserView };
 
 export interface IdentityModule extends ModuleLifecycle {
   /** Authoritative session validation; consumed by the HTTP pipeline through `services.sessionResolver`. */
   sessionResolver: SessionResolver;
-  getUser(userId: number, opts?: LoadOptions): Promise<UserView | null>;
-  getUserByPublicId(publicId: string, opts?: LoadOptions): Promise<UserView | null>;
+  /** Increment 09: a trashed or tombstoned account answers null (exactly like an unknown id). */
+  getUser(userId: number, opts?: PublicLoadOptions): Promise<UserView | null>;
+  getUserByPublicId(publicId: string, opts?: PublicLoadOptions): Promise<UserView | null>;
   /**
    * Batch lookup by internal id for read views (e.g. the acceptance log): one query, at most 500 distinct ids,
    * missing ids are simply absent. Returns decrypted name/e-mail — callers must hold the capability for the
@@ -93,25 +101,50 @@ export interface IdentityModule extends ModuleLifecycle {
     derive(userId: number, session?: { mfaVerifiedAt: Date | null; authMethod?: AuthMethod; tx?: DbOrTx }): Promise<TransitionStep[]>;
   };
   createPendingCustomer(
-    input: { email: string; name: string; nameParts?: NameParts; customerRef?: string | null; publicId?: string; createdAt?: Date },
+    input: {
+      email: string; name: string; nameParts?: NameParts; customerRef?: string | null; publicId?: string; createdAt?: Date;
+      trash?: { trashedAt: Date; batchId: string | null; reason: string | null; purgedAt: Date | null } | null;
+    },
     opts: { tx: Tx },
   ): Promise<{ userId: number; publicId: string; customerRef: string }>;
-  findUserIdByEmail(email: string, opts?: { tx?: DbOrTx }): Promise<{ userId: number; publicId: string; role: UserRole; status: UserStatus } | null>;
+  /** Live accounts only unless `includeTrashed` (portable import planning: an account in the trash keeps its address). */
+  findUserIdByEmail(
+    email: string,
+    opts?: { tx?: DbOrTx; includeTrashed?: boolean },
+  ): Promise<{ userId: number; publicId: string; role: UserRole; status: UserStatus; trashed: boolean } | null>;
+  /** Increment 09: live customers only unless `includeTrashed` (then trashed AND tombstoned rows, with `trash`). */
   portableCustomers(
     tx: DbOrTx,
     after: string | null,
     limit: number,
     publicIds?: readonly string[],
+    opts?: { includeTrashed?: boolean },
   ): Promise<
     {
+      userId: number;
       publicId: string; email: string; name: string; customerRef: string | null; createdAt: Date;
       /** D1: stored parts only; null while the account has not stored them. */
       firstName: string | null; lastName: string | null; preferredName: string | null;
+      trash: { trashedAt: Date; batchId: string | null; reason: string | null; purgeStartedAt: Date | null; purgedAt: Date | null } | null;
     }[]
   >;
+  /** Increment 09 (portable only): UNGATED reference read by internal id or public id. Never by e-mail. */
+  portableCustomerRefInTx(
+    tx: DbOrTx,
+    key: { userId: number } | { publicId: string },
+  ): Promise<{ userId: number; publicId: string; role: UserRole; trashed: boolean; trashedAt: Date | null; purgeStartedAt: Date | null; purged: boolean; purgedAt: Date | null } | null>;
+  /** Increment 09 (D2): trusted customer trash functions for the trash coordinator only. See API.md "Trash". */
+  trash: IdentityTrash;
   /** D1 port (orders). Name parts (derived when not stored) + customer reference. No lock, no audit. Unknown user → NOT_FOUND USER_NOT_FOUND. */
   users: {
     namePartsInTx(tx: DbOrTx, userId: number): Promise<{ firstName: string; lastName: string; preferredName: string | null; customerRef: string | null }>;
+    /**
+     * Increment 09 (D2.5): true when the account is in the trash or a tombstone. Plain read: false for live or unknown ids.
+     * `{ lock: "share" }` (mutation consumers, Tx only): locking current read held to commit; unknown → true (fail closed).
+     */
+    isTrashedInTx(tx: DbOrTx, userId: number, opts?: TrashedCheckOptions): Promise<boolean>;
+    /** D2.5 for mutation consumers: locks owners FOR SHARE in ascending id order; returns ids that are trashed, tombstoned or unknown. */
+    lockGoneInTx(tx: Tx, userIds: readonly number[]): Promise<number[]>;
   };
   searchCustomers(
     principal: SessionPrincipal,
@@ -171,12 +204,13 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
   );
 
   const signInSignals = createSignInSignals(deps);
+  const trash = createIdentityTrash({ deps, sessions, tokens });
   const view = (row: Awaited<ReturnType<typeof repo.byId>>) => (row ? toView(deps.crypto, row) : null);
 
   return {
     sessionResolver: sessions.resolver,
-    getUser: async (userId, opts) => view(await repo.byId(userId, opts)),
-    getUserByPublicId: async (publicId, opts) => view(await repo.byPublicId(publicId, opts)),
+    getUser: async (userId, opts) => view(await repo.byId(userId, publicLoad(opts))),
+    getUserByPublicId: async (publicId, opts) => view(await repo.byPublicId(publicId, publicLoad(opts))),
     async getUsersByIds(userIds, opts) {
       const rows = await repo.byIds(userIds, opts);
       return new Map(rows.map((row) => [row.id, toView(deps.crypto, row)]));
@@ -218,7 +252,11 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
         const parts = namePartsOf(deps.crypto, row);
         return { firstName: parts.firstName, lastName: parts.lastName, preferredName: parts.preferredName, customerRef: row.customerRef ?? null };
       },
+      isTrashedInTx: (tx, userId, opts) => isTrashedUserInTx(tx, userId, opts),
+      lockGoneInTx: (tx, userIds) => lockGoneUsersInTx(tx, userIds),
     },
+    portableCustomerRefInTx: admin.portableCustomerRefInTx,
+    trash,
     findUserIdByEmail: admin.findUserIdByEmail,
     portableCustomers: admin.portableCustomers,
     searchCustomers: admin.searchCustomers,
@@ -250,6 +288,9 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
     init() {
       const publicApi = (deps.services as { publicApi?: { registerProvider?: (key: "customers", provider: typeof admin.apiCustomers) => void } }).publicApi;
       publicApi?.registerProvider?.("customers", admin.apiCustomers);
+      // Increment 09 (D2.5): identity's part of a customer purge (tokens, sessions, SSO links).
+      const trashRegistry = (deps.services as { trash?: { register?: (participant: TrashParticipant) => void } }).trash;
+      trashRegistry?.register?.(trash.participant());
     },
     listSessions: (principal) => sessions.listForUser(principal.userId, principal.sessionId, principal.role),
     async health(): Promise<ModuleHealth[]> {

@@ -60,6 +60,12 @@ TLS, upgrades, and go-live checks are in the [deployment profiles](../../deploy/
   - [Company branding on invoices and receipts](#company-branding-on-invoices-and-receipts)
   - [Setting the default workflow](#setting-the-default-workflow)
   - [The "ReadyPackets was updated on the server" prompt](#the-readypackets-was-updated-on-the-server-prompt)
+- [Increment 09: Trash centre (draft)](#increment-09-trash-centre-draft)
+  - [Moving to trash and restoring](#moving-to-trash-and-restoring)
+  - [Deleting permanently](#deleting-permanently)
+  - [What is erased and what is kept](#what-is-erased-and-what-is-kept)
+  - [Retention clean-up](#retention-clean-up)
+  - [Backups, Stripe, SharePoint and other copies](#backups-stripe-sharepoint-and-other-copies)
 - [Increment 08](#increment-08)
   - [Names](#names-increment-08)
   - [Order numbers](#order-numbers-increment-08)
@@ -600,6 +606,150 @@ On builds before 07.1, reloading or bookmarking a template editor whose key has 
   - the feature in use is on at `/admin/settings/features`.
   Then look up the request's correlation ID in the audit centre.
 
+## Increment 09: Trash centre (draft)
+
+<!-- DRAFT by platform_engineer from INCREMENT_09_CONTRACT.md D2. Settings, states and job name confirmed by recovery_ops_engineer; storage copies by files_engineer. PENDING-OWNER audit_engineer, orders_engineer, identity_engineer: screen labels. -->
+
+The Trash centre is at **Administration → Trash** (`/admin/trash`). It has an **Orders** tab and a **Customers** tab. Only administrators can use it:
+
+| Permission | Allows |
+| --- | --- |
+| `trash.read` | Seeing the Trash centre |
+| `trash.manage` | **Move to trash**, **Restore** and **Undo** |
+| `trash.purge` | **Delete permanently**, with a fresh two-step check |
+| `trash.retention.manage` | Changing the retention settings, with a fresh two-step check |
+
+Every row shows:
+- the item, and the owner's customer ID;
+- who moved it and when;
+- the reason;
+- the date it will be deleted permanently;
+- its state: **In trash**, **Deleting**, or **Failed — retry available**.
+
+You can filter by text, date range, who moved it, and items due within a number of days. You can sort the rows, page through them, and restore or delete several at once. On a phone, rows become cards.
+
+### Moving to trash and restoring
+
+- **Orders.** Use **Move to trash** on the order page or the order list row.
+  - Moving the first order of a project also moves the packets added to it later (increment 08), in the same batch.
+  - An addition can be moved and restored on its own, but it cannot be restored while the first order is in the trash.
+- **Customers.** Use **Move to trash** on the customer's page. Only customer accounts can be moved; staff and administrator accounts cannot. The button is disabled, with the visible reason "Suspend this account first", until the account is **suspended**.
+  - Moving a customer revokes all of their sessions and pending links, and moves **all of their orders** in the same batch.
+  - Their e-mail address stays reserved while the account is in the trash.
+- **The dialog** names the item and says what moves with it. It shows the date the item will be deleted permanently under the current retention setting, or "kept until an administrator deletes it". You can add an optional reason of up to 200 characters.
+- **Payments.** Moving to trash never refunds anything and never changes anything at Stripe, apart from cancelling the order's open checkout attempts. The dialog says so when the order has payments.
+- **Undo.** After moving an item, a message with **Undo** appears and you return to the list.
+- **While an item is in the trash,** it disappears from every list, search, picker, count, report, dashboard, customer export, notification, reminder, automation and e-mail, and from the public API (404).
+  - A direct link shows the ordinary "not found" page, exactly as if the item never existed.
+  - The order's unpaid invoices are hidden from the customer and cannot be paid. Paid invoices and receipts stay available.
+- **Restore** brings back the item and everything moved with it in the same batch.
+  - A customer comes back **suspended**. Reactivate the account separately.
+  - An order whose customer is in the trash cannot be restored alone: "Restore the customer account first".
+  - If something has changed in the meantime, the restore is refused with a plain explanation and nothing is half-restored. For example, the project may now have the same packet in another live order.
+- **Numbers are never reused.** Order numbers and customer IDs are never reused, even after a permanent deletion.
+
+### Legal hold
+
+An order on **legal hold** is protected from the trash:
+- it cannot be moved to the trash or deleted permanently, by an administrator, by a customer cascade or by the clean-up job. The answer is "Release the legal hold first." (`ORDER_ON_LEGAL_HOLD`);
+- a customer who owns an order on legal hold cannot be moved to the trash or deleted permanently either;
+- an order placed on hold while it is already in the trash stays there. The clean-up job skips it and raises an operational alert.
+
+Release the hold first, then repeat the action.
+
+The Trash centre cannot place a legal hold. To put an order that is in the trash on legal hold, **Restore** it (one click, no two-step check), then place the hold on the order; from then on the hold blocks moving it to the trash and deleting it permanently.
+
+### Deleting permanently
+
+**Delete permanently** needs `trash.purge` and a fresh two-step check.
+- **Typed confirmation.** To enable the button, type the order number or the customer ID. For several items at once, type `DELETE <count>`.
+- **What the dialog lists.** What is erased and what is kept. It also says that this cannot be undone, and that copies remain in backups until those backups expire.
+- **Restore stops working** as soon as the deletion starts.
+- **A customer's orders first.** For a customer, each of their orders is deleted first, then the account.
+- **If a step fails,** the item shows **failed** and the clean-up job or an administrator retries it. Each run is recorded with its counts and a safe error code.
+- **Complete lists only.** If the list of a customer's orders reaches a query limit, the deletion fails and nothing is deleted. It never works on a cut-off list.
+
+### What is erased and what is kept
+
+**Erased for an order:**
+- project details, line working state, and phase and stage progress;
+- notes, messages, and tickets tied to the order;
+- files and recordings, including the stored objects and every storage copy the portal controls;
+- intake answers, questionnaires and acknowledgements tied to the order;
+- grants, production payload copies and SharePoint mapping rows;
+- cart references and automation run payloads.
+
+**Erased for a customer, in addition:**
+- name, e-mail address and password;
+- two-step factors, sessions, tokens and SSO links;
+- saved billing information and consent choices;
+- referral links, API keys and notification preferences.
+
+Community posts are removed or shown as "Deleted account".
+
+**Kept, with no way back to a live record:**
+- issued invoices and receipts, with their own frozen copies;
+- payment and refund records;
+- policy acceptance entries required as evidence;
+- audit and security log entries;
+- the reservations of the order number and customer ID.
+
+Unpaid, unissued or draft invoices of a deleted order are voided. Their numbers are never reused or deleted.
+
+**What stays behind (a tombstone).** The order or account row stays so that the kept records still point at something:
+- an order shows "Deleted order";
+- an account shows "Deleted account", with a placeholder in place of the e-mail address, so that the real address can register again;
+- a deleted account cannot sign in.
+
+A tombstone never appears in lists, search or pickers, and it cannot be restored.
+
+### Retention clean-up
+
+The settings are in the Trash centre:
+- **Automatic trash clean-up** (`trash.auto_purge.enabled`): on by default.
+- **Order retention in trash (days)** (`trash.retention.order_days`): 30 by default.
+- **Customer account retention in trash (days)** (`trash.retention.customer_days`): 30 by default.
+
+The day settings allow 1 to 3,650 days. Changing them needs `trash.retention.manage` and a fresh two-step check, and is audited.
+
+**Only in the Trash centre.** These three settings can be changed only in the Trash centre:
+- **Settings** (`/admin/settings`) shows them read-only, with a link to the Trash centre. A direct change through the generic settings interface is refused on the server: "Change this in the Trash centre." (`SETTING_OWNER_MANAGED`).
+- **Configuration export** leaves them out, and an import file that contains them is refused. The target installation keeps its own values.
+
+- **Due date.** An item is due on the day it was moved plus the setting **as it is now**. Changing the setting moves the due date of everything already in the trash. Orders moved together with a customer follow the customer's date.
+- **Shortening retention.** The panel shows how many items become due. It asks for the same confirmation as a permanent deletion.
+- **The hourly job** `trash.retention_cleanup` deletes what is due, as the system, through the same path as a manual deletion. Only one run happens at a time, it works in bounded batches, and it continues after an interruption. Each run is audited as `trash.cleanup_completed`. Failures raise an operational alert with source `trash`.
+  - It does not run during maintenance or an upgrade.
+  - One failing item does not block the others. Failures raise an operational alert and are retried.
+  - The Trash centre shows the last clean-up run and how many items are due next.
+  - A manual retry of the job is refused. Retry a failed item from the Trash centre instead.
+
+### Backups, Stripe, SharePoint and other copies
+
+Permanent deletion only reaches data that the portal itself controls.
+- **Backups** keep their copy until they expire under the backup retention, or longer if a legal hold applies to the backup; see [BACKUP_AND_RESTORE.md](../operations/BACKUP_AND_RESTORE.md). A permanent deletion never rewrites existing backups.
+  - **Restoring an older backup brings deleted items back,** and the restored deletion records and audit tables are just as old.
+  - After a restore, use the audit copy kept outside the database (SIEM or syslog) to find the `order.purged` and `customer.purged` events recorded after the backup was taken. Delete those items again from the Trash centre **before reopening the portal**.
+- **Portable transfer.** Only an **all records** export carries items in the trash and deleted-item placeholders, so a migration keeps the trash. Exports of selected customers or orders include live items only. An export is refused while a permanent deletion is half-finished (`PORTABLE_PURGE_IN_PROGRESS`); export again when it has finished.
+- **Stripe.** Customers, payments and checkout sessions at Stripe are not changed.
+- **Storage copies.** There are four cases:
+  - **A. A copy the portal recorded as its own, on a destination it can reach,** is deleted and checked. If a write to the current destination is still uncertain, the deletion stops and is retried; it never reports success early.
+  - **B. A copy the portal recorded as its own, on a destination that was changed or cannot be reached,** makes the deletion fail with `EXTERNAL_COPIES_UNREACHABLE`. It can be resumed, and the portal keeps the copy's location. You can then choose **Finish and leave N external copies in place**. This needs `trash.purge`, a fresh two-step check and the typed order number, and it is audited. The clean-up job never makes this choice.
+  - **C. Older copies whose ownership the portal never recorded** are left in place and reported as kept (`unverifiedExternalCopies`, with only the connection's public ID). The portal's pointer is removed. Remove them by hand after checking.
+  - **D. Provider recycle bins.** Residual copies in a provider's retention or recycle bin are reported as kept (`providerRecycleBin`). The portal never empties a whole bin.
+  - **Microsoft Graph (OneDrive and SharePoint)** deletes the exact item permanently.
+  - **Dropbox** user apps only soft-delete, so a copy stays in Dropbox's own bin until Dropbox removes it.
+  - **Azure Blob** with soft delete enabled may keep a retained version, under the storage administrator's control.
+- **SharePoint folders and reused external items.** Folders already written to SharePoint, and external items that were reused, are not deleted. Only the portal's mapping rows are erased. Delete the folders in SharePoint if needed.
+- **E-mail.** Messages already delivered stay in the recipients' mailboxes.
+- **Queued e-mail.** Messages still waiting to be sent for a deleted customer are not sent. Older queued messages that are not tied to an order or account may also be held back, because the portal does not send what it cannot check.
+- **SIEM.** Copies already sent to the SIEM or syslog server stay there.
+
+**Audit.** Every action is audited with the actor, public IDs, batch ID, reason and counts, never with names, e-mail addresses or content. The events are:
+- `order.trashed`, `order.restored`, `order.purge_started`, `order.purged`;
+- `customer.trashed`, `customer.restored`, `customer.purge_started`, `customer.purged`;
+- `trash.retention_changed`, `trash.cleanup_completed`.
+
 ## Increment 08
 
 ### Names (increment 08)
@@ -1003,6 +1153,8 @@ All of these are audited. You never see a user's existing password or codes.
 - **Settings** (`/admin/settings`, `platform.settings.manage`) — **Available**. Settings are grouped by module. Every
   change requires step-up, uses optimistic concurrency (a conflict if someone changed it first) and is audited. Secrets
   are write-only: the page shows only whether a secret is set and when. **Remove secret** stops dependent features.
+  Settings that belong to a dedicated page show a link to it. Some can be changed only on that page, for example the
+  trash retention settings (increment 09): the generic change and configuration import refuse them.
 - **Features** (`/admin/settings/features`) — **Available**. Installation-wide switches. All default to **off**.
 
 | Feature switch | Owner |
@@ -1125,6 +1277,10 @@ This is a business-data transfer between ReadyPackets installations, **not a bac
 - **Not transferred (increment 06)**: the business export leaves out payment receipts and receipt refund notes, policy notices and enforcement records, security incidents, order task notes and waivers, and saved reports. The package manifest lists each exclusion. Backups include all of them.
 - **Workflows** are moved separately with workflow export/import (drafts only). Portable transfer carries the
   workflow key only as inert history.
+- **Trash (increment 09)**: only an **all records** export carries items in the trash and deleted-item placeholders
+  (tombstones); exports of selected customers or orders read live items only. An export refuses while a permanent
+  deletion is half-finished (`PORTABLE_PURGE_IN_PROGRESS`). An import never brings back an item that the target has
+  already started deleting or has deleted (`IMPORT_ORDER_PURGED`).
 - **Backups** cover every table, but encrypted promo codes and keyed hashes restore correctly only with the same
   encryption and blind-index keys.
 

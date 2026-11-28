@@ -7,7 +7,7 @@ import { PRESENTATION_QUERY_KEY } from "@/app/shell/common";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronLeft, ChevronRight, Pause, Play } from "lucide-react";
 import { useEffect, useState } from "react";
-import { BRAND_PILLARS } from "@shared/brand";
+import { BRAND, BRAND_PILLARS } from "@shared/brand";
 import { useAuthApi, type PublicSlide } from "@/lib/authApi";
 import { apiUrl, assetUrl } from "@/lib/runtime";
 import { BrandLogo } from "@/ui";
@@ -49,7 +49,7 @@ export function BrandSlideshow() {
     <section aria-roledescription="carousel" aria-label="About ReadyPackets" className="relative flex w-full flex-col justify-between overflow-hidden bg-navy p-10 text-on-navy xl:p-14">
       <div aria-hidden="true" className="pointer-events-none absolute -top-32 -right-32 size-96 rounded-full bg-teal/10 blur-3xl" />
       <div aria-hidden="true" className="pointer-events-none absolute -bottom-40 -left-24 size-[28rem] rounded-full bg-gold/10 blur-3xl" />
-      <BrandLogo appearance="dark" className="relative w-60" />
+      <BrandLogo appearance="dark" lockup="square" className="relative w-56" />
       <div className="relative max-w-lg">
         <div aria-live={autoAllowed && playing ? "off" : "polite"} aria-atomic="true">
           <div role="group" aria-roledescription="slide" aria-label={`${(index % slides.length) + 1} of ${slides.length}`}>
@@ -80,7 +80,7 @@ export function BrandSlideshow() {
           </div>
         ) : null}
       </div>
-      <p className="relative text-sm text-on-navy-muted">{presentation.data?.supportText || "Your Business, Professionally Packeted\u2122"}</p>
+      <p className="relative text-sm text-on-navy-muted">{presentation.data?.supportText || BRAND.tagline}</p>
     </section>
   );
 }

@@ -15,6 +15,7 @@ import {
   OrderProgress, RouteTabPanel, RouteTabs, Skeleton, Spinner, Textarea, formatDateTime, useToast, type Tone,
 } from "@/ui";
 import { ConsoleActions, ReferenceHistory } from "../ConsoleActions";
+import { MoveOrderToTrashButton } from "../MoveOrderToTrash";
 import { SharingPanel } from "../SharingPanel";
 import { WorkflowRulesPanel } from "../WorkflowRulesPanel";
 import { CustomerOrderLayout } from "../stages/CustomerOrderLayout";
@@ -99,6 +100,10 @@ export function OrderDetailView({ area }: { area: Area }) {
           <ConsoleOrderProgress orderId={order.publicId} />
           <ConsoleActions orderId={order.publicId} version={order.version} lockState={lockState} reference={order.reference} name={order.projectName} />
           <TransitionControl order={order} />
+          {/* Increment 09 (D2.7): administrators only (trash.manage); the dialog belongs to the trash feature. */}
+          <div className="flex flex-wrap justify-end">
+            <MoveOrderToTrashButton orderPublicId={order.publicId} reference={order.reference} projectName={order.projectName} placement="detail" />
+          </div>
         </div>
       ) : null}
       {/* ── increment 08 order group (orders_engineer) ── */}

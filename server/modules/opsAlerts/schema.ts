@@ -4,7 +4,7 @@ import { createdAtColumn, idColumn, publicIdColumn, refColumn, updatedAtColumn, 
 export const OPS_ALERT_SEVERITIES = ["warning", "error", "critical"] as const;
 export const OPS_ALERT_STATES = ["open", "acknowledged", "resolved"] as const;
 export const OPS_ALERT_SOURCES = [
-  "stage_bundle", "completion_job", "automation", "webhook", "graph", "file_sync", "payment", "certificate", "attention",
+  "stage_bundle", "completion_job", "automation", "webhook", "graph", "file_sync", "payment", "certificate", "attention", "trash",
 ] as const;
 export type OpsAlertSeverity = typeof OPS_ALERT_SEVERITIES[number];
 export type OpsAlertState = typeof OPS_ALERT_STATES[number];

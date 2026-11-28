@@ -8,8 +8,10 @@ import { and, count, countDistinct, eq, gte, inArray, isNotNull, isNull, lt, ne,
 import { cartUpsellCartStates, carts } from "../cart/schema.js";
 import { policyAcceptances, policyDocuments } from "../compliance/schema.js";
 import { engagementSupportTicketMessages, engagementSupportTickets } from "../engagement/schema.js";
+import { liveUserPredicate } from "../identity/live.js";
 import { signInEvents, users } from "../identity/schema.js";
 import { orders, orderStatusHistory, orderWorkflowVersions } from "../orders/schema.js";
+import { liveOrderIdPredicate, liveOrderPredicate } from "../orders/trashGate.js";
 import { isCancelState, type WorkflowDefinition } from "../orders/workflowTypes.js";
 import { protectionSignInBans } from "../protection/schema.js";
 import { referralEmailInvites } from "../referrals/schema.js";
@@ -49,6 +51,20 @@ export interface BuiltInOutput { metrics: MetricView[]; panels: PanelView[]; not
 const PANEL_ROWS = 500;
 const ABANDON_HOURS = 24;
 const OPEN_TICKET_STATUSES = ["open", "pending_customer", "pending_staff"] as const;
+
+/**
+ * Increment 09 (D2.2): operational panels exclude trashed and tombstoned orders and customers. Money panels
+ * (payments, refunds, receipts, code redemptions) keep the kept records of D2.6 and are not filtered.
+ */
+const liveUserIdPredicate = (column: SQL | Parameters<typeof eq>[0]): SQL =>
+  sql`exists (select 1 from ${users} where ${users.id} = ${column} and ${users.trashedAt} is null and ${users.purgedAt} is null)`;
+/** `orders` is in the FROM clause: the order and its owner are live. */
+const liveOrderAndOwner = (): SQL => and(liveOrderPredicate(), liveUserIdPredicate(orders.ownerUserId)) as SQL;
+/** Support ticket requester live and, when tied to an order, that order live. */
+const liveTicket = (): SQL => and(
+  liveUserIdPredicate(engagementSupportTickets.requesterUserId),
+  or(isNull(engagementSupportTickets.relatedOrderId), liveOrderIdPredicate(engagementSupportTickets.relatedOrderId)),
+) as SQL;
 
 const num = (value: unknown): number | null => {
   if (value === null || value === undefined) return null;
@@ -199,7 +215,8 @@ async function ordersReport(b: Builder) {
   const { tx, now, overdueDays } = b.ctx;
   const facts = await workflowFacts(tx);
   const completedIn = (range: Range) => tx.select({ value: countDistinct(orderStatusHistory.orderId) }).from(orderStatusHistory)
-    .where(and(inArray(orderStatusHistory.toStatus, facts.completedKeys), inRange(orderStatusHistory.occurredAt, range)));
+    .innerJoin(orders, eq(orders.id, orderStatusHistory.orderId))
+    .where(and(inArray(orderStatusHistory.toStatus, facts.completedKeys), inRange(orderStatusHistory.occurredAt, range), liveOrderAndOwner()));
   await b.metric("created", "Orders created", "number", b.countSpec("orders", "createdAt"));
   await b.metric("submitted", "Orders submitted", "number", b.countSpec("orders", "submittedAt"));
   await b.metric("completed", "Orders completed", "number", async (range) => num((await completedIn(range))[0]?.value) ?? 0);
@@ -209,11 +226,11 @@ async function ordersReport(b: Builder) {
       .groupBy(orderStatusHistory.orderId).as("done");
     const [row] = await tx.select({
       value: sql<number>`AVG(GREATEST(0, TIMESTAMPDIFF(SECOND, COALESCE(${orders.submittedAt}, ${orders.createdAt}), ${done.doneAt})))`,
-    }).from(done).innerJoin(orders, eq(orders.id, done.orderId)).where(inRange(done.doneAt, range));
+    }).from(done).innerJoin(orders, eq(orders.id, done.orderId)).where(and(inRange(done.doneAt, range), liveOrderAndOwner()));
     return num(row?.value);
   });
   const overdueBefore = new Date(now.getTime() - overdueDays * 86_400_000);
-  const overdueWhere = and(notInArray(orders.statusKey, facts.terminalKeys), lt(sql`COALESCE(${orders.submittedAt}, ${orders.createdAt})`, overdueBefore));
+  const overdueWhere = and(notInArray(orders.statusKey, facts.terminalKeys), lt(sql`COALESCE(${orders.submittedAt}, ${orders.createdAt})`, overdueBefore), liveOrderAndOwner());
   await b.metric("overdue", `Open longer than ${overdueDays} days`, "number", async () => {
     const [row] = await tx.select({ value: count() }).from(orders).where(overdueWhere);
     return num(row?.value) ?? 0;
@@ -224,7 +241,7 @@ async function ordersReport(b: Builder) {
   await b.breakdown("by_status", "Orders by status", "orders", "createdAt", ["status"]);
   await b.breakdown("by_workflow", "Orders by workflow", "orders", "createdAt", ["workflow"]);
   const phaseRows = await tx.select({ versionId: orders.workflowVersionId, statusKey: orders.statusKey, value: count() }).from(orders)
-    .where(inRange(orders.createdAt, b.ctx.range)).groupBy(orders.workflowVersionId, orders.statusKey).limit(5_000);
+    .where(and(inRange(orders.createdAt, b.ctx.range), liveOrderAndOwner())).groupBy(orders.workflowVersionId, orders.statusKey).limit(5_000);
   const byPhase = new Map<string, number>();
   for (const row of phaseRows) {
     const phase = facts.phaseOf(row.versionId, row.statusKey);
@@ -252,7 +269,8 @@ async function customersReport(b: Builder) {
   await b.metric("new", "New customers", "number", b.countSpec("customers", "createdAt"));
   await b.metric("active", "Active customers (signed in)", "number", async (range) => {
     const [row] = await tx.select({ value: countDistinct(signInEvents.userId) }).from(signInEvents)
-      .where(and(eq(signInEvents.kind, "success"), eq(signInEvents.role, "customer"), inRange(signInEvents.occurredAt, range)));
+      .innerJoin(users, eq(users.id, signInEvents.userId))
+      .where(and(eq(signInEvents.kind, "success"), eq(signInEvents.role, "customer"), inRange(signInEvents.occurredAt, range), liveUserPredicate()));
     return num(row?.value) ?? 0;
   });
   await b.series("new_over_time", "New customers", "customers", "createdAt");
@@ -260,7 +278,7 @@ async function customersReport(b: Builder) {
   if (b.ctx.includePersonal) {
     const top = await tx.select({ customerNumber: users.customerRef, currency: orders.currency, orders: count(), revenue: sql<number>`SUM(${orders.totalMinor})` })
       .from(orders).innerJoin(users, eq(users.id, orders.ownerUserId))
-      .where(and(eq(users.role, "customer"), inRange(orders.createdAt, b.ctx.range)))
+      .where(and(eq(users.role, "customer"), inRange(orders.createdAt, b.ctx.range), liveOrderPredicate(), liveUserPredicate()))
       .groupBy(users.id, users.customerRef, orders.currency).orderBy(sql`COUNT(*) DESC`, sql`SUM(${orders.totalMinor}) DESC`).limit(10);
     b.panels.push(makePanel("top_customers", "Top customers by orders and revenue", "table", [
       { key: "customerNumber", label: "Customer number", type: "string" }, { key: "currency", label: "Currency", type: "string" },
@@ -273,13 +291,13 @@ async function customersReport(b: Builder) {
     .from(policyDocuments)
     .where(and(eq(policyDocuments.active, true), eq(policyDocuments.requiresAcceptance, true), isNotNull(policyDocuments.currentPublishedVersionId), ne(policyDocuments.audience, "staff")))
     .limit(50);
-  const [active] = await tx.select({ value: count() }).from(users).where(and(eq(users.role, "customer"), eq(users.status, "active")));
+  const [active] = await tx.select({ value: count() }).from(users).where(and(eq(users.role, "customer"), eq(users.status, "active"), liveUserPredicate()));
   const activeCustomers = num(active?.value) ?? 0;
   const rows: Cell[][] = [];
   for (const doc of docs) {
     const [accepted] = await tx.select({ value: countDistinct(policyAcceptances.userId) }).from(policyAcceptances)
       .innerJoin(users, eq(users.id, policyAcceptances.userId))
-      .where(and(eq(policyAcceptances.policyVersionId, doc.versionId!), eq(users.role, "customer"), eq(users.status, "active")));
+      .where(and(eq(policyAcceptances.policyVersionId, doc.versionId!), eq(users.role, "customer"), eq(users.status, "active"), liveUserPredicate()));
     const value = num(accepted?.value) ?? 0;
     rows.push([doc.title, value, Math.max(0, activeCustomers - value)]);
   }
@@ -293,7 +311,8 @@ async function referralsReport(b: Builder) {
   const { tx } = b.ctx;
   await b.metric("invitations", "Invitations sent", "number", async (range) => {
     const [row] = await tx.select({ value: count() }).from(referralEmailInvites)
-      .where(and(eq(referralEmailInvites.outcome, "enqueued"), inRange(referralEmailInvites.createdAt, range)));
+      .innerJoin(users, eq(users.id, referralEmailInvites.senderUserId))
+      .where(and(eq(referralEmailInvites.outcome, "enqueued"), inRange(referralEmailInvites.createdAt, range), liveUserPredicate()));
     return num(row?.value) ?? 0;
   });
   await b.metric("signups", "Referred sign-ups", "number", b.countSpec("referrals", "attributedAt"));
@@ -314,7 +333,7 @@ async function supportReport(b: Builder) {
   const resolvedAt = sql`COALESCE(${t.resolvedAt}, ${t.closedAt})`;
   await b.metric("opened", "Tickets opened", "number", b.countSpec("support_tickets", "createdAt"));
   await b.metric("closed", "Tickets resolved or closed", "number", async (range) => {
-    const [row] = await tx.select({ value: count() }).from(t).where(inRange(closedAt, range));
+    const [row] = await tx.select({ value: count() }).from(t).where(and(inRange(closedAt, range), liveTicket()));
     return num(row?.value) ?? 0;
   });
   await b.metric("first_response", "Average time to first response", "duration", async (range) => {
@@ -322,16 +341,16 @@ async function supportReport(b: Builder) {
       .where(and(inArray(m.authorRole, ["staff", "admin"]), eq(m.internalOnly, false), gte(m.createdAt, t.createdAt)))
       .groupBy(m.ticketId).as("first_reply");
     const [row] = await tx.select({ value: sql<number>`AVG(GREATEST(0, TIMESTAMPDIFF(SECOND, ${t.createdAt}, ${first.at})))` })
-      .from(t).innerJoin(first, eq(first.ticketId, t.id)).where(inRange(t.createdAt, range));
+      .from(t).innerJoin(first, eq(first.ticketId, t.id)).where(and(inRange(t.createdAt, range), liveTicket()));
     return num(row?.value);
   });
   await b.metric("resolution", "Average time to resolution", "duration", async (range) => {
     const [row] = await tx.select({ value: sql<number>`AVG(GREATEST(0, TIMESTAMPDIFF(SECOND, ${t.createdAt}, ${resolvedAt})))` })
-      .from(t).where(inRange(resolvedAt, range));
+      .from(t).where(and(inRange(resolvedAt, range), liveTicket()));
     return num(row?.value);
   });
   await b.metric("backlog", "Open backlog", "number", async () => {
-    const [row] = await tx.select({ value: count() }).from(t).where(inArray(t.status, OPEN_TICKET_STATUSES));
+    const [row] = await tx.select({ value: count() }).from(t).where(and(inArray(t.status, OPEN_TICKET_STATUSES), liveTicket()));
     return num(row?.value) ?? 0;
   }, { snapshot: true });
   await b.series("opened_over_time", "Tickets opened", "support_tickets", "createdAt");
@@ -341,7 +360,7 @@ async function supportReport(b: Builder) {
   const age = sql`TIMESTAMPDIFF(HOUR, ${t.createdAt}, ${now})`;
   const bucket = sql<string>`CASE WHEN ${age} < 24 THEN 'Under 24 hours' WHEN ${age} < 72 THEN '1–3 days' WHEN ${age} < 168 THEN '3–7 days' ELSE 'Over 7 days' END`;
   const backlog = await tx.select({ bucket, value: count(), order: sql<number>`MIN(${age})` }).from(t)
-    .where(inArray(t.status, OPEN_TICKET_STATUSES)).groupBy(bucket).orderBy(sql`MIN(${age})`);
+    .where(and(inArray(t.status, OPEN_TICKET_STATUSES), liveTicket())).groupBy(bucket).orderBy(sql`MIN(${age})`);
   b.panels.push(makePanel("backlog_age", "Open backlog by age", "bar",
     [{ key: "age", label: "Age", type: "string" }, { key: "count", label: "Tickets", type: "number" }],
     backlog.map((row) => [row.bucket, num(row.value)])));
@@ -383,8 +402,15 @@ async function cartsReport(b: Builder) {
     return num(row?.[0]) ?? 0;
   });
   await b.metric("converted", "Converted (checked out)", "number", b.countSpec("carts", "checkedOutAt"));
+  const liveCartWhere = and(
+    liveUserPredicate(),
+    or(isNull(carts.checkoutOrderId), liveOrderIdPredicate(carts.checkoutOrderId)),
+  );
   const upsell = (column: typeof cartUpsellCartStates.firstShownAt) => async (range: Range) => {
-    const [row] = await tx.select({ value: count() }).from(cartUpsellCartStates).where(inRange(column, range));
+    const [row] = await tx.select({ value: count() }).from(cartUpsellCartStates)
+      .innerJoin(carts, eq(carts.id, cartUpsellCartStates.cartId))
+      .innerJoin(users, eq(users.id, carts.ownerUserId))
+      .where(and(inRange(column, range), liveCartWhere));
     return num(row?.value) ?? 0;
   };
   await b.metric("upsell_shown", "Upsell offers shown", "number", upsell(cartUpsellCartStates.firstShownAt));
@@ -396,7 +422,10 @@ async function cartsReport(b: Builder) {
     shown: sql<number>`SUM(${cartUpsellCartStates.firstShownAt} IS NOT NULL)`,
     accepted: sql<number>`SUM(${cartUpsellCartStates.acceptedAt} IS NOT NULL)`,
     dismissed: sql<number>`SUM(${cartUpsellCartStates.dismissedAt} IS NOT NULL)`,
-  }).from(cartUpsellCartStates).where(inRange(sql`COALESCE(${cartUpsellCartStates.firstShownAt}, ${cartUpsellCartStates.createdAt})`, b.ctx.range))
+  }).from(cartUpsellCartStates)
+    .innerJoin(carts, eq(carts.id, cartUpsellCartStates.cartId))
+    .innerJoin(users, eq(users.id, carts.ownerUserId))
+    .where(and(inRange(sql`COALESCE(${cartUpsellCartStates.firstShownAt}, ${cartUpsellCartStates.createdAt})`, b.ctx.range), liveCartWhere))
     .groupBy(cartUpsellCartStates.offerKey).orderBy(sql`SUM(${cartUpsellCartStates.firstShownAt} IS NOT NULL) DESC`).limit(100);
   b.panels.push(makePanel("upsell_offers", "Upsell offers", "bar", [
     { key: "offer", label: "Offer", type: "string" }, { key: "shown", label: "Shown", type: "number" },

@@ -180,9 +180,17 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
   }
 
   /** Live = not revoked, not idle-expired, not absolute-expired (stored OR current policy), user active. */
-  function isLive(session: UserSessionRow, user: Pick<UserRow, "status">, now: Date, p: { idleMs: number; absoluteMs: number }): boolean {
+  function isLive(
+    session: UserSessionRow,
+    user: Pick<UserRow, "status"> & Partial<Pick<UserRow, "trashedAt" | "purgedAt">>,
+    now: Date,
+    p: { idleMs: number; absoluteMs: number },
+  ): boolean {
     if (session.revokedAt !== null) return false;
     if (user.status !== "active") return false;
+    // Increment 09 (D2): a trashed or tombstoned account never has a live session (defence in depth: trash also
+    // suspends and revokes; this holds even if a row was edited out of band).
+    if ((user.trashedAt ?? null) !== null || (user.purgedAt ?? null) !== null) return false;
     const t = now.getTime();
     if (t >= session.absoluteExpiresAt.getTime()) return false;
     if (t >= session.authenticatedAt.getTime() + p.absoluteMs) return false;

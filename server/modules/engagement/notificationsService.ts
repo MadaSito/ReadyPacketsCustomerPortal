@@ -1,14 +1,21 @@
-import { and, count, desc, eq, exists, inArray, isNull, lt, lte, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, exists, gt, inArray, isNotNull, isNull, lt, lte, or } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, notFound, validation } from "../../core/errors.js";
 import { ULID_PATTERN, ulid } from "../../core/ids.js";
 import type { DbOrTx, JobResult, SessionPrincipal, Tx } from "../../core/types.js";
-import { readSetting } from "../platform/index.js";
+import { complianceInvoices } from "../compliance/schema.js";
+import { isLiveUserRow, isTrashedUserInTx } from "../identity/live.js";
 import { users } from "../identity/schema.js";
+import { orders } from "../orders/schema.js";
+import { readSetting } from "../platform/index.js";
 import { buildCanonicalPortalUrl, MAIL_GENERIC_NOTIFICATION } from "./mail.js";
 import { assertCurrentActorInTx } from "./peers.js";
-import { engagementNotificationPreferences, engagementNotifications } from "./schema.js";
+import {
+  engagementNotificationPreferences,
+  engagementNotifications,
+  engagementSupportTickets,
+} from "./schema.js";
 import { ENGAGEMENT_NOTIFICATIONS_EMAIL_ENABLED, ENGAGEMENT_NOTIFICATIONS_RETENTION_DAYS } from "./settings.js";
 import {
   classifyNotificationCategory,
@@ -18,6 +25,11 @@ import {
   normalizeInternalLink,
   normalizePlainText,
 } from "./textAndSearch.js";
+import {
+  liveNotificationPredicate,
+  parseNotificationLinkRef,
+  resolveNotificationTargetsInTx,
+} from "./trashGate.js";
 import {
   NOTIFICATION_PREFERENCE_CATEGORIES,
   type NotificationPreferenceCategory,
@@ -65,6 +77,116 @@ function assertFullSession(principal: SessionPrincipal): void {
 
 export function createNotificationsService(deps: ModuleDeps) {
   const { db, clock, audit, mailer, settings, config } = deps;
+  let lastScannedLegacyId = 0;
+  let legacyScanInFlight: Promise<void> | null = null;
+
+  /**
+   * Bounded idempotent backfill for pre-0009 notification rows whose `orderId` and `ticketId`
+   * columns are NULL so `liveNotificationPredicate()` and `purge()` cover upgraded databases.
+   */
+  async function backfillLegacyTargets(handle: DbOrTx = db): Promise<void> {
+    for (let batch = 0; batch < 10; batch += 1) {
+      const candidates = await handle
+        .select({
+          id: engagementNotifications.id,
+          link: engagementNotifications.link,
+        })
+        .from(engagementNotifications)
+        .where(
+          and(
+            gt(engagementNotifications.id, lastScannedLegacyId),
+            isNull(engagementNotifications.orderId),
+            isNull(engagementNotifications.ticketId),
+            isNotNull(engagementNotifications.link),
+          ),
+        )
+        .orderBy(asc(engagementNotifications.id))
+        .limit(250);
+
+      if (candidates.length === 0) break;
+
+      const orderPubs = new Set<string>();
+      const invoicePubs = new Set<string>();
+      const ticketPubs = new Set<string>();
+      const parsedById = new Map<number, ReturnType<typeof parseNotificationLinkRef>>();
+
+      for (const row of candidates) {
+        const parsed = parseNotificationLinkRef(row.link);
+        parsedById.set(row.id, parsed);
+        if (parsed?.kind === "order") orderPubs.add(parsed.publicId);
+        else if (parsed?.kind === "invoice") invoicePubs.add(parsed.publicId);
+        else if (parsed?.kind === "ticket") ticketPubs.add(parsed.publicId);
+      }
+
+      const orderByPub = new Map<string, number>();
+      if (orderPubs.size > 0) {
+        const ordRows = await handle
+          .select({ id: orders.id, publicId: orders.publicId })
+          .from(orders)
+          .where(inArray(orders.publicId, [...orderPubs]));
+        for (const ord of ordRows) orderByPub.set(ord.publicId, ord.id);
+      }
+
+      const invoiceOrderByPub = new Map<string, number>();
+      if (invoicePubs.size > 0) {
+        const invRows = await handle
+          .select({ publicId: complianceInvoices.publicId, orderId: complianceInvoices.orderId })
+          .from(complianceInvoices)
+          .where(inArray(complianceInvoices.publicId, [...invoicePubs]));
+        for (const inv of invRows) invoiceOrderByPub.set(inv.publicId, inv.orderId);
+      }
+
+      const ticketByPub = new Map<string, { id: number; relatedOrderId: number | null }>();
+      if (ticketPubs.size > 0) {
+        const tktRows = await handle
+          .select({
+            id: engagementSupportTickets.id,
+            publicId: engagementSupportTickets.publicId,
+            relatedOrderId: engagementSupportTickets.relatedOrderId,
+          })
+          .from(engagementSupportTickets)
+          .where(inArray(engagementSupportTickets.publicId, [...ticketPubs]));
+        for (const tkt of tktRows) {
+          ticketByPub.set(tkt.publicId, { id: tkt.id, relatedOrderId: tkt.relatedOrderId });
+        }
+      }
+
+      for (const row of candidates) {
+        const parsed = parsedById.get(row.id);
+        let orderId: number | null = null;
+        let ticketId: number | null = null;
+        if (parsed?.kind === "order") {
+          orderId = orderByPub.get(parsed.publicId) ?? null;
+        } else if (parsed?.kind === "invoice") {
+          orderId = invoiceOrderByPub.get(parsed.publicId) ?? null;
+        } else if (parsed?.kind === "ticket") {
+          const tkt = ticketByPub.get(parsed.publicId);
+          if (tkt) {
+            ticketId = tkt.id;
+            orderId = tkt.relatedOrderId;
+          }
+        }
+        if (orderId !== null || ticketId !== null) {
+          await handle
+            .update(engagementNotifications)
+            .set({ orderId, ticketId })
+            .where(eq(engagementNotifications.id, row.id));
+        }
+      }
+
+      lastScannedLegacyId = candidates[candidates.length - 1]!.id;
+      if (candidates.length < 250) break;
+    }
+  }
+
+  async function ensureLegacyBackfilled(): Promise<void> {
+    if (!legacyScanInFlight) {
+      legacyScanInFlight = backfillLegacyTargets(db).finally(() => {
+        legacyScanInFlight = null;
+      });
+    }
+    await legacyScanInFlight;
+  }
 
   async function resolvePreference(
     handle: DbOrTx,
@@ -126,16 +248,37 @@ export function createNotificationsService(deps: ModuleDeps) {
 
     if (staffOnly) {
       const [liveRecipient] = await handle
-        .select({ role: users.role, status: users.status })
+        .select({
+          role: users.role,
+          status: users.status,
+          trashedAt: users.trashedAt,
+          purgedAt: users.purgedAt,
+        })
         .from(users)
         .where(eq(users.id, input.userId))
         .limit(1);
-      if (!liveRecipient || liveRecipient.status !== "active" || liveRecipient.role === "customer") {
+      if (
+        !liveRecipient ||
+        liveRecipient.status !== "active" ||
+        !isLiveUserRow(liveRecipient) ||
+        liveRecipient.role === "customer"
+      ) {
         throw validation(
           "STAFF_ONLY_RECIPIENT_FORBIDDEN",
           "Staff-only notifications may only be delivered to active staff or administrator accounts.",
         );
       }
+    } else if (await isTrashedUserInTx(handle, input.userId)) {
+      return { publicId: "", deliveredInApp: false, enqueuedEmail: false };
+    }
+
+    const resolvedTargets = await resolveNotificationTargetsInTx(handle, {
+      orderId: input.orderId,
+      ticketId: input.ticketId,
+      link,
+    });
+    if (resolvedTargets.suppressed) {
+      return { publicId: "", deliveredInApp: false, enqueuedEmail: false };
     }
 
     if (idempotencyKey !== null) {
@@ -146,6 +289,7 @@ export function createNotificationsService(deps: ModuleDeps) {
           and(
             eq(engagementNotifications.userId, input.userId),
             eq(engagementNotifications.idempotencyKey, idempotencyKey),
+            liveNotificationPredicate(),
           ),
         )
         .limit(1);
@@ -163,6 +307,8 @@ export function createNotificationsService(deps: ModuleDeps) {
       await handle.insert(engagementNotifications).values({
         publicId,
         userId: input.userId,
+        orderId: resolvedTargets.orderId,
+        ticketId: resolvedTargets.ticketId,
         kind,
         category,
         title,
@@ -187,6 +333,7 @@ export function createNotificationsService(deps: ModuleDeps) {
             to: { userId: input.userId },
             vars: { title, link: portalUrl },
             idempotencyKey: `eng-notif-mail:${idempotencyKey ?? publicId}:${input.userId}`,
+            ...(resolvedTargets.orderId !== null ? { orderId: resolvedTargets.orderId } : {}),
           },
           tx,
         );
@@ -228,6 +375,7 @@ export function createNotificationsService(deps: ModuleDeps) {
     options: { unreadOnly?: boolean; cursor?: string; limit?: number } = {},
   ): Promise<{ items: NotificationView[]; nextCursor: string | null }> {
     assertFullSession(principal);
+    await ensureLegacyBackfilled();
     const limit = Math.min(Math.max(options.limit ?? 25, 1), 100);
     const beforeId = decodeIdCursor(options.cursor);
 
@@ -238,6 +386,7 @@ export function createNotificationsService(deps: ModuleDeps) {
         and(
           eq(engagementNotifications.userId, principal.userId),
           staffOnlyVisibilityPredicate(principal),
+          liveNotificationPredicate(),
           options.unreadOnly ? isNull(engagementNotifications.readAt) : undefined,
           beforeId !== undefined ? lt(engagementNotifications.id, beforeId) : undefined,
         ),
@@ -265,6 +414,7 @@ export function createNotificationsService(deps: ModuleDeps) {
 
   async function unreadCount(principal: SessionPrincipal): Promise<{ unreadCount: number }> {
     assertFullSession(principal);
+    await ensureLegacyBackfilled();
     const [row] = await db
       .select({ total: count(engagementNotifications.id) })
       .from(engagementNotifications)
@@ -272,6 +422,7 @@ export function createNotificationsService(deps: ModuleDeps) {
         and(
           eq(engagementNotifications.userId, principal.userId),
           staffOnlyVisibilityPredicate(principal),
+          liveNotificationPredicate(),
           isNull(engagementNotifications.readAt),
         ),
       );
@@ -280,6 +431,7 @@ export function createNotificationsService(deps: ModuleDeps) {
 
   async function markRead(principal: SessionPrincipal, notificationPublicId: string): Promise<{ ok: true }> {
     assertFullSession(principal);
+    await ensureLegacyBackfilled();
     if (!ULID_PATTERN.test(notificationPublicId)) {
       throw notFound("NOTIFICATION_NOT_FOUND");
     }
@@ -312,15 +464,14 @@ export function createNotificationsService(deps: ModuleDeps) {
     }
 
     const visibility = staffOnlyVisibilityPredicate(principal);
-    if (existing.staffOnly) {
-      const [visible] = await db
-        .select({ id: engagementNotifications.id })
-        .from(engagementNotifications)
-        .where(and(eq(engagementNotifications.id, existing.id), visibility))
-        .limit(1);
-      if (!visible) {
-        throw notFound("NOTIFICATION_NOT_FOUND");
-      }
+    const liveGate = liveNotificationPredicate();
+    const [visible] = await db
+      .select({ id: engagementNotifications.id })
+      .from(engagementNotifications)
+      .where(and(eq(engagementNotifications.id, existing.id), visibility, liveGate))
+      .limit(1);
+    if (!visible) {
+      throw notFound("NOTIFICATION_NOT_FOUND");
     }
 
     if (existing.readAt === null) {
@@ -332,6 +483,7 @@ export function createNotificationsService(deps: ModuleDeps) {
             eq(engagementNotifications.id, existing.id),
             eq(engagementNotifications.userId, principal.userId),
             visibility,
+            liveGate,
           ),
         );
     }
@@ -340,7 +492,9 @@ export function createNotificationsService(deps: ModuleDeps) {
 
   async function markAllRead(principal: SessionPrincipal): Promise<{ markedCount: number }> {
     assertFullSession(principal);
+    await ensureLegacyBackfilled();
     const visibility = staffOnlyVisibilityPredicate(principal);
+    const liveGate = liveNotificationPredicate();
     const unreadRows = await db
       .select({ id: engagementNotifications.id })
       .from(engagementNotifications)
@@ -348,6 +502,7 @@ export function createNotificationsService(deps: ModuleDeps) {
         and(
           eq(engagementNotifications.userId, principal.userId),
           visibility,
+          liveGate,
           isNull(engagementNotifications.readAt),
         ),
       )
@@ -361,6 +516,7 @@ export function createNotificationsService(deps: ModuleDeps) {
         and(
           eq(engagementNotifications.userId, principal.userId),
           visibility,
+          liveGate,
           isNull(engagementNotifications.readAt),
           inArray(
             engagementNotifications.id,
@@ -516,15 +672,17 @@ export function createNotificationsService(deps: ModuleDeps) {
   }
 
   async function totalUnreadMetric(): Promise<number> {
+    await ensureLegacyBackfilled();
     const [row] = await db
       .select({ total: count(engagementNotifications.id) })
       .from(engagementNotifications)
-      .where(isNull(engagementNotifications.readAt));
+      .where(and(isNull(engagementNotifications.readAt), liveNotificationPredicate()));
     return Number(row?.total ?? 0);
   }
 
   return {
     notify,
+    backfillLegacyTargets,
     isCategoryEmailEnabled,
     list,
     unreadCount,

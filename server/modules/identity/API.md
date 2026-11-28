@@ -462,3 +462,67 @@ refresh succeeds.
 - Backward compatible: `register`, `profile.update`, `admin.customers.create` and `admin.staff.create` still accept the
   pre-08 single `name` (1–120) instead of `firstName` + `lastName` (never both). The display name is then stored as
   given and the parts are derived lazily; a legacy `profile.update` clears any stored parts.
+
+## Increment 09 — D2 Trash (customers side)
+
+Identity owns the `users` trash columns (`trashed_at`, `trashed_by_user_id`, `trash_batch_id`, `trash_reason`, `purge_started_at`, `purged_at`; index `users_trashed_idx`). The trash coordinator (`server/modules/trash`) is the only caller of the write functions and emits every `customer.trashed | restored | purge_started | purged` audit event inside its transaction. Identity emits none of them.
+
+### Gate (live.ts)
+- `liveUserPredicate(table = users): SQL` gives `trashed_at IS NULL AND purged_at IS NULL`. Reuse it in any query that joins `users`.
+- `isLiveUserRow(row)` is the same check for a row already loaded.
+- `services.identity.users.isTrashedInTx(tx, userId)` returns true when the account is trashed or tombstoned, and false for unknown ids.
+- Mutation consumers (the owner must stay live until their commit): `services.identity.users.isTrashedInTx(tx, userId, { lock: "share" })` or `services.identity.users.lockGoneInTx(tx, userIds)`. These require a Tx.
+  - They do a locking current read (`FOR SHARE`, in ascending id order) that is held until commit. A concurrent trash or purge (`FOR UPDATE`) waits.
+  - An unknown id counts as gone (fails closed).
+  - `lockGoneInTx` returns the ids that are trashed, tombstoned or unknown; an empty result means every owner is live.
+  - Lock order: users first, then the owned rows.
+- The repo's `one()` and `byIds()` filter to live accounts by default. Only identity-internal callers pass `includeGone`. `getUser` and `getUserByPublicId` strip that option, so they return null for a trashed or tombstoned account.
+- Gated paths:
+  - sign-in and password reset (through the repo)
+  - session resolution (`sessions.isLive`)
+  - token consume (invitation, verification and reset)
+  - admin list, detail, status change and resend invitation
+  - the customer picker and search
+  - the public API customers provider
+  - SSO sign-in
+- The sign-in log (security centre) hides gone accounts: their kept events show `user: null`, and filtering by their ID matches nothing, exactly as for an unknown ID.
+- Password-reset jobs are bound at intake to the immutable `userId` that owned the address (null if there was none). Dispatch serves only that id, so a job queued before a purge never reaches an account registered later on the freed address. A job with no bound id fails closed.
+- Each gated path answers exactly as it would for an unknown id or address, so there is no existence oracle. Registration and SSO provisioning check collisions against gone accounts too. Until the tombstone commits, a trashed address gets the same uniform response, no mail is sent, and the audit records reason `TRASHED_ACCOUNT`.
+
+### Coordinator functions (`services.identity.trash`, created by trash.ts)
+- `resolveCustomerInTx(tx, publicId)` and `resolveCustomerByIdInTx(tx, id)` are ungated and match customers only.
+- `trashCustomerInTx(tx, userId, { actor, batchId, reason? })` returns `{ publicId, customerRef, changed, sessionsRevoked }`.
+  - It accepts role customer only. Any other role gets `CUSTOMER_NOT_FOUND`.
+  - The account must be suspended. Otherwise it fails with 409 `CUSTOMER_NOT_SUSPENDED` ("Suspend this account first.").
+  - It can also fail with `ALREADY_IN_TRASH` (another batch) or `TRASH_STATE_CHANGED` (the CAS lost).
+  - On success it revokes all sessions (reason `account_trashed`) and retires all tokens. It is idempotent per batch.
+- `restoreCustomerInTx(tx, userId, { actor, batchId })` brings the account back still suspended.
+  - It can fail with `PURGE_IN_PROGRESS` or `TRASH_BATCH_MISMATCH`.
+  - It is a no-op when the account is not in the trash.
+- `markPurgeStartedInTx(tx, userId, { batchId, runId?, actor? })` can fail with `NOT_IN_TRASH`. It is idempotent.
+- `tombstoneCustomerInTx(tx, userId, { runId, actor? })` returns `{ publicId, changed, erased }`. It fails with `PURGE_NOT_STARTED` if the purge was not claimed first.
+  - Personal fields are overwritten ("Deleted account", `deleted-<ulid>@tombstone.invalid`, a new blind index), which frees the address.
+  - It deletes tokens, sessions, SSO identities and SSO auth requests.
+  - It keeps `id`, `public_id` and `customer_ref`.
+- `listTrashedCustomers(query, db)` is capped at 1000 rows. Each item is `{ id, publicId, customerRef, trashedAt, trashedByUserId, trashedByPublicId, batchId, reason, purgeStartedAt }`, with no names or e-mail.
+- `getCustomerTrashMetaByIds(ids, db)`.
+- `TrashActor` is `{ kind: "user"; userId; publicId; sessionId? } | { kind: "system"; job }`.
+- Concurrency: every write uses `SELECT … FOR UPDATE` plus a CAS on the version and trash columns, and checks affectedRows. Restore and purge have exactly one winner.
+
+### Participant
+`init()` calls `deps.services.trash?.register?.(trash.participant())` with module `identity`.
+- `summarize` returns `{ sessions, ssoLinks }`.
+- `purge(entity, run)` erases sessions, tokens and SSO data in a single transaction. Its first statement is `run.assertCurrentInTx(tx)`, the D2.8 fence: a lost fence throws `PURGE_FENCE_LOST` and changes nothing. It makes no external provider calls and is idempotent.
+- MFA, recovery codes and passkeys are erased by the assurance participant, never here.
+
+### Portable ports
+- `findUserIdByEmail(email, { includeTrashed? })` returns `trashed`.
+- `portableCustomers(…, { includeTrashed? })` returns live accounts by default. With `includeTrashed`, items gain `userId` and `trash`.
+- `portableCustomerRefInTx` is ungated.
+- `createPendingCustomer(…, { trash })` imports either an in-trash account (suspended and gated) or a tombstone (address free).
+
+### Client
+`CustomerDetailPage` has an admin-only Card titled "Trash".
+- The button reads "Move to trash" (`MOVE_TO_TRASH_LABEL`). It is disabled unless the account is suspended, and then shows the visible reason "Suspend this account first" (`TRASH_BLOCKED_REASON`) through `aria-describedby="customer-trash-help"`.
+- The button opens `MoveToTrashDialog` from `@/features/trash/TrashDialogs` (cross-feature import allowed by D2.7). It passes `itemLabel = customerRef ?? publicId` and never the e-mail.
+- D1: e-mail addresses use `EmailLink` from `@/ui` in CustomerDetail, Customers, Staff and AdminSessions.

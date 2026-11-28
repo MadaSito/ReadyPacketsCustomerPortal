@@ -6,8 +6,8 @@ import { Link, useParams } from "wouter";
 import { AdminCheckStripePaymentButton } from "@/features/payments/AdminCheckStripePaymentButton";
 import { useSession } from "@/lib/session";
 import { errorMessage, useTRPC } from "@/lib/trpc";
-import { Badge, Breadcrumbs, Button, Callout, Card, ConfirmDialog, DataTable, DateTime, Field, Input, KeyValueList, Money, PageHeader, Select, Textarea, useToast } from "@/ui";
-import { InvoiceStatusBadge, downloadInvoicePdf, newIdempotencyKey, parseDecimalToMinor } from "../shared";
+import { Badge, Breadcrumbs, Button, Callout, Card, ConfirmDialog, DataTable, DateTime, EmailLink, Field, Input, KeyValueList, Money, PageHeader, Select, Textarea, useToast } from "@/ui";
+import { InvoiceStatusBadge, OrderLifecycleBadge, downloadInvoicePdf, newIdempotencyKey, parseDecimalToMinor } from "../shared";
 import { QueryState, useGuardedAction } from "./common";
 import { INVOICE_REASON, InvoiceEditor } from "./InvoiceEditor";
 import { MANUAL_PAYMENT_METHODS, PAYMENT_METHOD_LABELS, REFUND_REASONS, ULID, fromLocalInput, money, type InvoiceDetail, type InvoicePayment, type ManualPaymentMethod } from "./model";
@@ -70,7 +70,14 @@ export default function InvoiceDetailPage() {
           : undefined
       }
       breadcrumbs={<Breadcrumbs items={[{ label: "Invoices", href: "/admin/invoices" }, { label: title }]} />}
-      meta={inv ? <InvoiceStatusBadge status={inv.status} /> : undefined}
+      meta={
+        inv ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <OrderLifecycleBadge state={inv.orderLifecycleState} />
+            <InvoiceStatusBadge status={inv.status} />
+          </div>
+        ) : undefined
+      }
       actions={
         inv ? (
           <div
@@ -133,16 +140,25 @@ export default function InvoiceDetailPage() {
     <QueryState header={header} query={detail}>
       {() => {
         const invoice = detail.data as InvoiceDetail;
+        const isOrderLive = !invoice.orderLifecycleState || invoice.orderLifecycleState === "live";
         const m = (minor: number) => <Money value={money(minor, invoice.currency)} />;
         return (
           <div className="flex flex-col gap-6">
-            <Callout tone="info" title="Payments and refunds">
-              Record offline payments received by bank transfer, wire, ACH, check, or other manual methods here. For refunds of online payments, open the{" "}
-              <Link href={`/admin/orders/${encodeURIComponent(invoice.orderPublicId)}/refund`} className="font-semibold text-action underline underline-offset-2">
-                order&apos;s Refund tab
-              </Link>
-              .
-            </Callout>
+            {isOrderLive ? (
+              <Callout tone="info" title="Payments and refunds">
+                Record offline payments received by bank transfer, wire, ACH, check, or other manual methods here. For refunds of online payments, open the{" "}
+                <Link href={`/admin/orders/${encodeURIComponent(invoice.orderPublicId)}/refund`} className="font-semibold text-action underline underline-offset-2">
+                  order&apos;s Refund tab
+                </Link>
+                .
+              </Callout>
+            ) : (
+              <Callout tone="info" title="Retained finance record">
+                {invoice.orderLifecycleState === "deleted"
+                  ? "This order was permanently deleted. This retained invoice record uses the frozen buyer and order snapshot."
+                  : "This order is currently in trash. Restore the order before issuing drafts, recording manual payments, or voiding invoices."}
+              </Callout>
+            )}
             {invoice.status === "void" ? (
               <Callout tone="info" title="This invoice is void">
                 {invoice.voidReason ?? "No reason recorded."} {invoice.voidedAt ? <DateTime value={invoice.voidedAt} /> : null}
@@ -154,10 +170,12 @@ export default function InvoiceDetailPage() {
                 items={[
                   {
                     label: "Order",
-                    value: (
+                    value: isOrderLive ? (
                       <Link href={`/admin/orders/${invoice.orderPublicId}`} className="font-mono font-semibold break-all text-action underline-offset-2 hover:underline">
                         {invoice.orderReference}
                       </Link>
+                    ) : (
+                      <span className="font-mono font-semibold break-all">{invoice.orderReference}</span>
                     ),
                   },
                   {
@@ -168,6 +186,22 @@ export default function InvoiceDetailPage() {
                       <span className="text-muted">Not specified</span>
                     ),
                   },
+                  ...(invoice.buyer
+                    ? [
+                        { label: "Customer", value: invoice.buyer.name },
+                        {
+                          label: "Customer email",
+                          value: invoice.buyer.email ? (
+                            <EmailLink email={invoice.buyer.email} />
+                          ) : (
+                            <span className="text-muted">Not available</span>
+                          ),
+                        },
+                        ...(invoice.buyer.customerRef
+                          ? [{ label: "Customer reference", value: <span className="font-mono">{invoice.buyer.customerRef}</span> }]
+                          : []),
+                      ]
+                    : []),
                 ]}
               />
             </Card>
@@ -176,6 +210,8 @@ export default function InvoiceDetailPage() {
                 <KeyValueList
                   items={[
                     { label: "Issued by", value: invoice.issuerName },
+                    ...(invoice.issuerAddress ? [{ label: "Issuer address", value: <span className="whitespace-pre-line">{invoice.issuerAddress}</span> }] : []),
+                    ...(invoice.issuerContact ? [{ label: "Contact", value: <EmailLink email={invoice.issuerContact} /> }] : []),
                     { label: "Issued", value: <DateTime value={invoice.issuedAt} format="date" /> },
                     { label: "Due", value: <DateTime value={invoice.dueAt} format="date" /> },
                     { label: "Created", value: <DateTime value={invoice.createdAt} /> },

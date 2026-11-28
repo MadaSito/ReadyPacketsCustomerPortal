@@ -6,10 +6,11 @@
  * Status labels are taken from the workflow VERSION the order is bound to, and for `order.status_changed` from the
  * event's `to_status` (not the order's current status, which may have moved on before the worker ran).
  */
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { ULID_PATTERN } from "../../core/ids.js";
 import { registerAutomationTrigger, type AutomationTriggerResolveInput } from "../automations/contracts.js";
 import { orders } from "./schema.js";
+import { liveOrderPredicate } from "./trashGate.js";
 import { findState } from "./workflowTypes.js";
 
 const STATUS_KEY = /^[a-z][a-z0-9_]{1,47}$/;
@@ -21,7 +22,7 @@ async function resolveOrderContext({ event, db, services, signal }: AutomationTr
   const [order] = await db
     .select({ publicId: orders.publicId, reference: orders.reference, ownerUserId: orders.ownerUserId, statusKey: orders.statusKey, workflowVersionId: orders.workflowVersionId })
     .from(orders)
-    .where(eq(orders.publicId, orderPublicId))
+    .where(and(eq(orders.publicId, orderPublicId), liveOrderPredicate()))
     .limit(1);
   if (!order) return {};
   const attributes = event.attributes;

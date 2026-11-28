@@ -1,0 +1,35 @@
+{
+  "sessions": {
+    "customer": "customer.state.json",
+    "admin": "admin.state.json"
+  },
+  "increment09": {
+    "trash-orders": {},
+    "trash-customers": {},
+    "trash-empty": {},
+    "trash-date-filters": {},
+    "trash-restore-dialog": {},
+    "trash-purge-dialog": {},
+    "trash-retention": {},
+    "order-row-move-to-trash": {},
+    "order-detail-move-to-trash": { "path": "/admin/orders/REPLACE_WITH_ACTIVE_ORDER_PUBLIC_ID" },
+    "customer-move-to-trash-blocked": { "path": "/admin/customers/REPLACE_WITH_ACTIVE_CUSTOMER_PUBLIC_ID" },
+    "customer-move-to-trash-dialog": { "path": "/admin/customers/REPLACE_WITH_SUSPENDED_CUSTOMER_PUBLIC_ID" },
+    "customer-email-link": { "path": "/admin/customers/REPLACE_WITH_ACTIVE_CUSTOMER_PUBLIC_ID" },
+    "staff-email-link": {},
+    "privacy-email-link": {},
+    "terms-email-link": {},
+    "mail-template-preview": { "path": "/admin/email-templates/orders.confirmed" },
+    "invoice-email-link": { "path": "/invoices/REPLACE_WITH_CUSTOMER_INVOICE_PUBLIC_ID" },
+    "admin-invoice-email-link": { "path": "/admin/invoices/REPLACE_WITH_ADMIN_INVOICE_PUBLIC_ID" },
+    "receipt-email-link": { "path": "/receipts/REPLACE_WITH_CUSTOMER_RECEIPT_PUBLIC_ID" },
+    "admin-receipt-email-link": { "path": "/admin/receipts/REPLACE_WITH_ADMIN_RECEIPT_PUBLIC_ID" },
+    "brand-sign-in": {},
+    "brand-registration": {},
+    "brand-privacy": {},
+    "brand-terms": {},
+    "brand-customer-shell": {},
+    "brand-console-shell": {},
+    "brand-not-found": {}
+  }
+}

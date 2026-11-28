@@ -15,6 +15,7 @@ import {
 } from "./schema.js";
 import { computeSearchTokenHashes, normalizePlainText } from "./textAndSearch.js";
 import { generateTicketNumber } from "./ticketsService.js";
+import { liveOrderMessagePredicate, liveTicketPredicate } from "./trashGate.js";
 import type {
   ImportOrderMessageInput,
   ImportTicketInput,
@@ -58,7 +59,7 @@ export function createPortableEngagementService(deps: ModuleDeps) {
       }
     }
 
-    // Security invariant: ONLY customer-visible messages (`visibility = "customer"`) are exported.
+    // Security invariant: ONLY customer-visible messages (`visibility = "customer"`) on live orders/authors are exported.
     const rows = await tx
       .select()
       .from(engagementOrderMessages)
@@ -66,6 +67,7 @@ export function createPortableEngagementService(deps: ModuleDeps) {
         and(
           inArray(engagementOrderMessages.orderPublicId, [...input.orderPublicIds]),
           eq(engagementOrderMessages.visibility, "customer"),
+          liveOrderMessagePredicate(),
           after !== undefined ? gt(engagementOrderMessages.publicId, after) : undefined,
         ),
       )
@@ -139,6 +141,7 @@ export function createPortableEngagementService(deps: ModuleDeps) {
       .from(engagementSupportTickets)
       .where(
         and(
+          liveTicketPredicate(),
           input.customerUserIds
             ? inArray(engagementSupportTickets.requesterUserId, [...input.customerUserIds])
             : undefined,

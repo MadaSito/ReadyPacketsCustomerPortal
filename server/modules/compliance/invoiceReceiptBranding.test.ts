@@ -18,6 +18,7 @@ import { orders as ordersTable } from "../orders/schema.js";
 import { createComplianceModule } from "./index.js";
 import {
   decodePdfLiteralText,
+  escapePdfText,
   PDF_BRAND_LEGAL_NAME,
   PDF_BRAND_PORTAL_HOST,
   PDF_BRAND_SHORT_NAME,
@@ -32,7 +33,12 @@ import {
 } from "./invoicePdf.js";
 import { complianceRouter } from "./router.js";
 import * as complianceSchema from "./schema.js";
-import { DEFAULT_ISSUER_LOGO_SETTING, INVOICE_ISSUER_NAME } from "./settings.js";
+import {
+  DEFAULT_ISSUER_LOGO_SETTING,
+  DOCUMENT_LOGO_ALLOWLIST,
+  INVOICE_ISSUER_NAME,
+  parseIssuerLogoSetting,
+} from "./settings.js";
 
 function extractDecodedPdfText(pdf: Buffer): string {
   return decodePdfLiteralText(pdf);
@@ -195,8 +201,17 @@ describe("Fix Pack 07.2 — branded invoice, receipt & refund-note PDFs, Order/P
     expect(INVOICE_ISSUER_NAME.default).toBe(PDF_BRAND_LEGAL_NAME);
     expect(DEFAULT_ISSUER_LOGO_SETTING).toEqual({
       mode: "brand",
-      brandPath: "/brand/readypackets-approved-header-icon-light.png",
+      brandPath: "/brand/readypackets-horizontal-light-600x180-v2026101502.png",
     });
+    expect(DOCUMENT_LOGO_ALLOWLIST).toEqual([
+      "/brand/readypackets-horizontal-light-600x180-v2026101502.png",
+      "/brand/readypackets-horizontal-light-500x150-v2026101502.png",
+      "/brand/readypackets-horizontal-light-300x90-v2026101502.png",
+    ]);
+    // Unrecognized or legacy stored paths fall back cleanly to the default horizontal full lockup:
+    expect(parseIssuerLogoSetting({ mode: "brand", brandPath: "/brand/legacy-nonexistent.png" })).toEqual(
+      DEFAULT_ISSUER_LOGO_SETTING,
+    );
 
     const issuedAt = new Date("2026-11-25T15:00:00.000Z");
     const dueAt = new Date("2026-12-09T15:00:00.000Z");
@@ -344,21 +359,21 @@ describe("Fix Pack 07.2 — branded invoice, receipt & refund-note PDFs, Order/P
       const decoded = extractDecodedPdfText(pdf);
 
       expect(raw.startsWith("%PDF-1.4\n"), `${label} header`).toBe(true);
-      expect(raw, `${label} image XObject`).toContain("/Subtype /Image");
+      expect(raw, `${label} image XObject`).toContain("/Subtype /Image /Width 600 /Height 180");
       expect(raw, `${label} ImLogo resource`).toContain("/XObject << /ImLogo");
-      expect(raw, `${label} ImLogo draw`).toContain("/ImLogo Do");
+      expect(raw, `${label} ImLogo draw`).toContain("160 0 0 48 48");
+      expect(raw, `${label} ImLogo op`).toContain("/ImLogo Do");
 
       // Accessibility & metadata checks (honest tagged figure + language + DisplayDocTitle + tab order)
       expect(raw, `${label} /Lang (en)`).toContain("/Lang (en)");
       expect(raw, `${label} DisplayDocTitle`).toContain("/ViewerPreferences << /DisplayDocTitle true >>");
       expect(raw, `${label} StructTreeRoot`).toContain("/StructTreeRoot");
-      expect(raw, `${label} Figure Alt`).toContain(`/Alt (${PDF_LOGO_ALT_TEXT})`);
+      expect(raw, `${label} Figure Alt`).toContain(`/Alt (${escapePdfText(PDF_LOGO_ALT_TEXT)})`);
       expect(raw, `${label} page tab order`).toContain("/Tabs /S");
 
-      // Brand identity + Order & Project prominence + portal footer
+      // Brand identity (D3 full lockup without re-typesetting wordmark/tagline) + Order & Project prominence + portal footer
       expect(decoded, `${label} heading`).toContain(expectedHeading);
-      expect(decoded, `${label} short brand`).toContain(PDF_BRAND_SHORT_NAME);
-      expect(decoded, `${label} tagline`).toContain(PDF_BRAND_TAGLINE);
+      expect(decoded, `${label} no re-typeset tagline when full lockup embedded`).not.toContain(PDF_BRAND_TAGLINE);
       expect(decoded, `${label} legal name`).toContain(PDF_BRAND_LEGAL_NAME);
       expect(decoded, `${label} Order label`).toContain("Order");
       expect(decoded, `${label} order ref`).toContain("RP-2026-000412");
@@ -369,13 +384,49 @@ describe("Fix Pack 07.2 — branded invoice, receipt & refund-note PDFs, Order/P
       expect(decoded, `${label} zero question marks`).not.toContain("?");
     }
 
+    // Explicit logoMode: "none" renders the text-only wordmark + tagline fallback cleanly:
+    const textOnlyPdf = renderInvoicePdf({
+      invoicePublicId: "01JBRANDTESTINVOICETEXT001",
+      invoiceNumber: "RP-INV-2026-000109",
+      status: "issued",
+      orderReference: "RP-2026-000419",
+      projectName: "Text Mode Fallback Check",
+      issuerName: PDF_BRAND_LEGAL_NAME,
+      issuerAddress: "1200 Market Street",
+      issuerLogo: { mode: "none", brandPath: DEFAULT_ISSUER_LOGO_SETTING.brandPath },
+      customerName: "Synthetic Buyer Co.",
+      customerEmail: "buyer@example.test",
+      currency: "USD",
+      issuedAt,
+      dueAt,
+      voidedAt: null,
+      voidReason: null,
+      memo: null,
+      paymentInstructions: "",
+      lines: [{ position: 1, description: "Packet", quantity: 1, unitAmountMinor: 1000, lineTotalMinor: 1000 }],
+      subtotalMinor: 1000,
+      discountMinor: 0,
+      taxMinor: 0,
+      totalMinor: 1000,
+      grossPaidMinor: 0,
+      refundedMinor: 0,
+      netPaidMinor: 0,
+      balanceDueMinor: 1000,
+      payments: [],
+      refunds: [],
+    });
+    const textOnlyDecoded = extractDecodedPdfText(textOnlyPdf);
+    expect(textOnlyDecoded).toContain(PDF_BRAND_SHORT_NAME);
+    expect(textOnlyDecoded).toContain(PDF_BRAND_TAGLINE);
+    expect(textOnlyDecoded).not.toContain("?");
+
     // Verify production container fallback (`dist/public/brand/...` when `client/public` is absent)
     const tmpStaticDir = mkdtempSync(path.join(os.tmpdir(), "rp-static-brand-"));
     try {
       mkdirSync(path.join(tmpStaticDir, "brand"), { recursive: true });
       copyFileSync(
-        path.resolve(process.cwd(), "client/public/brand/readypackets-approved-header-icon-light.png"),
-        path.join(tmpStaticDir, "brand/readypackets-approved-header-icon-light.png"),
+        path.resolve(process.cwd(), "client/public/brand/readypackets-horizontal-light-600x180-v2026101502.png"),
+        path.join(tmpStaticDir, "brand/readypackets-horizontal-light-600x180-v2026101502.png"),
       );
       const prodContainerPdf = renderInvoicePdf(
         {

@@ -23,10 +23,12 @@ import { fakeIdentity, insertUser, ordersTestSchema } from "../orders/testSuppor
 import { workflowDefinitionSchema } from "../orders/workflowTypes.js";
 import * as ordersSchema from "../orders/schema.js";
 import { copyExact, inPrivateWorkspace } from "./custody.js";
-import { buildPlan, type PortableInputRecord } from "./importPlanning.js";
-import { customerBillingProfile, customerIdentity, groupLinkProblem, projectedOrder } from "./importShapes.js";
+import { buildPlan, type JsonRecord, type PortableInputRecord } from "./importPlanning.js";
+import { customerBillingProfile, customerIdentity, groupLinkProblem, orderTrashProblem, projectedOrder, trashOf } from "./importShapes.js";
 import { createPortableModule } from "./index.js";
 import * as portableSchema from "./schema.js";
+import { REDACTED_PAYLOAD, createPortableTrashParticipant, sealedClosure } from "./trash.js";
+import { unfencedPurgeRunForTests } from "../trash/ports.js";
 import { PORTABLE_EXPORT_JOB, PORTABLE_IMPORT_JOB, PORTABLE_RETENTION_JOB } from "./transferPolicy.js";
 
 const testSchema = { ...identitySchema, ...ordersSchema, ...filesSchema, ...portableSchema, ...billingProfileSchema };
@@ -164,7 +166,7 @@ describe("portable transfer across isolated MySQL installations", () => {
           promoDiscount: { amountMinor: OFFERING_PRICE.promoDiscountMinor, currency: "USD" }, promoLabel: OFFERING_PRICE.promoLabel,
         });
         expect(pkg.manifest.exclusions.map((entry) => entry.category)).toEqual(expect.arrayContaining(["promotions", "cart-upsell-offers", "security-operations", "policy-notices", "report-definitions",
-          "ephemeral-access", "phase-workspace", "operational-diagnostics", "installation-configuration"]));
+          "ephemeral-access", "phase-workspace", "operational-diagnostics", "installation-configuration", "trash-operations"]));
         expect(records.find((entry) => entry.type === "order-items")?.record).toMatchObject({
           ...OFFERING_SNAPSHOT, tier: "standard", lineTotal: { amountMinor: OFFERING_PRICE.subtotalMinor, currency: "USD" },
         });
@@ -607,5 +609,185 @@ describe("increment 08: name parts, saved billing profile and order groups", () 
     expect(groupLinkProblem(addition, byId({ ...root, currency: "EUR" }, addition))).toBe("PORTABLE_ORDER_GROUP_INVALID");
     expect(groupLinkProblem(addition, byId({ ...root, customerPublicId: ulid() }, addition))).toBe("PORTABLE_ORDER_GROUP_INVALID");
     expect(groupLinkProblem(addition, byId({ ...root, groupRootOrderPublicId: ulid() }, addition))).toBe("PORTABLE_ORDER_GROUP_INVALID");
+  });
+});
+
+describe("increment 09: trash state, tombstones and erasure of portable copies", () => {
+  const TRASHED = new Date("2026-11-20T10:00:00.000Z");
+  const PURGED = new Date("2026-11-25T10:00:00.000Z");
+  const BATCH = "01JDTRASHBATCH0000000000AA";
+  const line = () => ({
+    sourcePublicId: ulid(), productPublicId: null, productVersion: null, name: "Packet 1", description: "",
+    features: [], packetNumber: 1, tier: "Standard" as const, outcome: "Outcome", timeline: "Five business days",
+    deliverables: [{ title: "Summary", detail: "Findings" }], unitPriceMinor: 1000, currency: "USD", quantity: 1, lineTotalMinor: 1000,
+  });
+
+  it("carries trash and tombstones through an all-records migration, then erases this module's copies on purge", async () => {
+    const sourceDb = await createTestDb({ schema: testSchema });
+    const targetDb = await createTestDb({ schema: testSchema });
+    try {
+      const source = await environment(sourceDb, "inc09-source");
+      const target = await environment(targetDb, "inc09-target");
+      const customer = (email: string, name: string) => sourceDb.db.transaction((tx) =>
+        source.services.identity.createPendingCustomer({ email, name, createdAt: CREATED }, { tx }));
+      const order = (ownerUserId: number) => sourceDb.db.transaction((tx) => source.services.orders.importOrder({
+        importId: ulid(), sourceInstallationId: "inc09-fixture", sourceOrderPublicId: ulid(), targetOwnerUserId: ownerUserId,
+        projectName: "Ice Queen", statusKey: "submitted", subtotalMinor: 1000, discountMinor: 0, discountLabel: null, totalMinor: 1000,
+        promoDiscountMinor: 0, promoLabel: null, currency: "USD", createdAt: CREATED, submittedAt: CREATED, editable: false,
+        lineItems: [line()], statusHistory: [{ sourcePublicId: ulid(), fromStatus: null, toStatus: "submitted", actorRole: "system",
+          reasonCode: "SOURCE_FIXTURE", occurredAt: CREATED }],
+      }, tx));
+      const attach = async (target: { id: number; publicId: string }, ownerUserId: number) => {
+        const stage = await source.storage.put(source.storage.newKey("staging"), PDF);
+        await sourceDb.db.transaction((tx) => source.services.files.adoptVerifiedObject({
+          principal: source.admins[0]!, orderId: target.id, orderPublicId: target.publicId, ownerUserId,
+          displayName: "fixture.pdf", category: "deliverable", visibility: "customer_visible", stagedObject: stage,
+          destinationKey: source.storage.newKey("files"), contentType: "application/pdf", createdAt: CREATED,
+        }, tx));
+      };
+      const live = await customer("zeus.greene@example.test", "Zeus Greene");
+      const liveOrder = await order(live.userId);
+      const trashed = await customer("trashed.owner@example.test", "Trashed Owner");
+      const trashedOrder = await order(trashed.userId);
+      await attach(trashedOrder, trashed.userId);
+      const gone = await customer("gone.owner@example.test", "Gone Owner");
+      const goneOrder = await order(gone.userId);
+      const { users } = identitySchema;
+      const { orders } = ordersSchema;
+      await sourceDb.db.update(users).set({ trashedAt: TRASHED, trashBatchId: BATCH }).where(eq(users.id, trashed.userId));
+      await sourceDb.db.update(orders).set({ trashedAt: TRASHED, trashBatchId: BATCH }).where(eq(orders.id, trashedOrder.id));
+      await sourceDb.db.update(users).set({ trashedAt: TRASHED, purgedAt: PURGED }).where(eq(users.id, gone.userId));
+      await sourceDb.db.update(orders).set({ trashedAt: TRASHED, purgedAt: PURGED, projectName: "Deleted order" }).where(eq(orders.id, goneOrder.id));
+
+      const admin = source.admins[0]!;
+      const started = await source.services.portable.startExport(admin, { selection: { kind: "all" }, passphrase: PASSPHRASE });
+      expect(await source.jobs.runAll(PORTABLE_EXPORT_JOB)).toEqual([expect.objectContaining({ outcome: "completed" })]);
+      const opened = await source.services.portable.openExport(admin, started.exportId);
+      const payload = Buffer.concat(await collect(opened.stream as AsyncIterable<Buffer>));
+      await opened.finish("completed");
+
+      await inPrivateWorkspace(async (dir) => {
+        const [row] = await sourceDb.db.select().from(portableSchema.portableExports);
+        if (!row?.sha256 || !row.size) throw new Error("no export receipt");
+        await copyExact(source.storage, row.storageKey, `${dir}/inc09.rpkg`, { size: row.size, sha256: row.sha256 });
+        const pkg = await openPackage({ input: `${dir}/inc09.rpkg`, passphrase: PASSPHRASE });
+        try {
+          expect((await pkg.verify()).ok).toBe(true);
+          const records = await collect(pkg.allRecords());
+          const of = (type: string, publicId: string) => records.find((entry) => entry.type === type &&
+            (entry.record as { publicId: string }).publicId === publicId)?.record as Record<string, unknown> | undefined;
+          expect(of("customers", live.publicId)).not.toHaveProperty("trash");
+          expect(of("orders", liveOrder.publicId)).not.toHaveProperty("trash");
+          expect(of("orders", trashedOrder.publicId)?.trash).toMatchObject({ trashedAt: TRASHED.toISOString(), batchId: BATCH, purgedAt: null });
+          expect(of("customers", gone.publicId)).toMatchObject({
+            email: `deleted-${gone.publicId.toLowerCase()}@tombstone.invalid`, preferredName: "Deleted account", firstName: null,
+            trash: { purgedAt: PURGED.toISOString() },
+          });
+          expect(JSON.stringify(records)).not.toContain("gone.owner@example.test");
+          expect(of("orders", goneOrder.publicId)).toMatchObject({ projectName: "Deleted order", trash: { purgedAt: PURGED.toISOString() } });
+          const children = records.filter((entry) => (entry.record as { orderPublicId?: string }).orderPublicId === goneOrder.publicId);
+          expect(children).toEqual([]);
+          expect(records.filter((entry) => entry.type === "files")).toHaveLength(1);
+        } finally { await pkg.close(); }
+      });
+
+      const data = target.services.portable;
+      const targetAdmin = target.admins[0]!;
+      const uploaded = await data.upload(targetAdmin, Readable.from(payload));
+      const planned = await data.verifyAndPlan(targetAdmin, { importId: uploaded.importId, passphrase: PASSPHRASE });
+      expect(planned.plan?.counts).toMatchObject({ conflicts: 0 });
+      await data.approve(targetAdmin, { importId: uploaded.importId, planDigest: planned.planDigest! });
+      expect(await target.jobs.runAll(PORTABLE_IMPORT_JOB)).toEqual([expect.objectContaining({ outcome: "completed" })]);
+      expect((await data.getImport(targetAdmin, uploaded.importId)).reconciliation).toMatchObject({ discrepancies: 0 });
+
+      const targetUsers = await targetDb.db.select().from(users);
+      const byPublic = (publicId: string) => targetUsers.find((entry) => entry.publicId === publicId);
+      expect(byPublic(live.publicId)).toMatchObject({ trashedAt: null, purgedAt: null });
+      expect(byPublic(trashed.publicId)?.trashedAt?.toISOString()).toBe(TRASHED.toISOString());
+      expect(byPublic(trashed.publicId)?.purgedAt).toBeNull();
+      expect(byPublic(gone.publicId)?.purgedAt).not.toBeNull();
+      const targetOrders = await targetDb.db.select().from(orders);
+      const byReference = (reference: string) => targetOrders.find((entry) => entry.reference === reference);
+      expect(byReference(liveOrder.reference)).toMatchObject({ trashedAt: null, purgedAt: null });
+      const movedTrash = byReference(trashedOrder.reference);
+      expect(movedTrash?.trashedAt?.toISOString()).toBe(TRASHED.toISOString());
+      expect(movedTrash?.purgedAt).toBeNull();
+      expect(byReference(goneOrder.reference)).toMatchObject({ projectName: "Deleted order", totalMinor: 1000 });
+      expect(byReference(goneOrder.reference)?.purgedAt).not.toBeNull();
+      const targetFiles = await targetDb.db.select().from(filesSchema.orderFiles);
+      expect(targetFiles.filter((entry) => entry.orderId === movedTrash?.id)).toHaveLength(1);
+
+      // Purge the trashed order on the target: its sealed copies and staged bytes go, other records stay.
+      const objectsBefore = await targetDb.db.select().from(portableSchema.portableImportObjects);
+      expect(objectsBefore).toHaveLength(1);
+      const participant = createPortableTrashParticipant(target.deps);
+      if (!movedTrash) throw new Error("trashed order not imported");
+      // A replaced purge worker (lost fence) changes nothing: objects stay and no record is redacted.
+      const lost = unfencedPurgeRunForTests(ulid(), { assertCurrentInTx: async () => { throw new Error("PURGE_FENCE_LOST"); } });
+      await expect(participant.purge!({ kind: "order", id: movedTrash.id, publicId: movedTrash.publicId, batchId: BATCH }, lost))
+        .rejects.toThrow("PURGE_FENCE_LOST");
+      expect(await targetDb.db.select().from(portableSchema.portableImportObjects)).toHaveLength(1);
+      for (const key of [objectsBefore[0]!.escrowKey, objectsBefore[0]!.preparedKey]) expect(await target.storage.stat(key)).not.toBeNull();
+      expect((await targetDb.db.select().from(portableSchema.portableImportRecords))
+        .some((entry) => entry.encryptedPayload === REDACTED_PAYLOAD)).toBe(false);
+      const first = await participant.purge!({ kind: "order", id: movedTrash.id, publicId: movedTrash.publicId, batchId: BATCH }, unfencedPurgeRunForTests(ulid()));
+      for (const key of [objectsBefore[0]!.escrowKey, objectsBefore[0]!.preparedKey]) expect(await target.storage.stat(key)).toBeNull();
+      const sealed = await targetDb.db.select().from(portableSchema.portableImportRecords);
+      const redacted = sealed.filter((entry) => entry.encryptedPayload === REDACTED_PAYLOAD);
+      expect(redacted.map((entry) => entry.recordType).sort()).toEqual(["file-versions", "files", "order-items", "order-status-history", "order-status-history", "orders"]);
+      expect(first.deleted).toEqual({ portableSealedRecords: redacted.length, portableStagedObjects: 1 });
+      expect(redacted.some((entry) => entry.portableId === trashedOrder.publicId)).toBe(true);
+      const again = await participant.purge!({ kind: "order", id: movedTrash.id, publicId: movedTrash.publicId, batchId: BATCH }, unfencedPurgeRunForTests(ulid()));
+      expect(again.deleted).toEqual({ portableSealedRecords: 0, portableStagedObjects: 0 });
+      const owner = byPublic(trashed.publicId)!;
+      const customerPurge = await participant.purge!({ kind: "customer", id: owner.id, publicId: owner.publicId, batchId: BATCH }, unfencedPurgeRunForTests(ulid()));
+      expect(customerPurge.deleted).toEqual({ portableSealedRecords: 1, portableStagedObjects: 0 });
+      const remaining = await targetDb.db.select().from(portableSchema.portableImportRecords);
+      expect(remaining.find((entry) => entry.portableId === live.publicId)?.encryptedPayload).not.toBe(REDACTED_PAYLOAD);
+      expect(remaining.find((entry) => entry.portableId === liveOrder.publicId)?.encryptedPayload).not.toBe(REDACTED_PAYLOAD);
+
+      // A half-finished permanent deletion never travels.
+      await sourceDb.db.update(orders).set({ purgeStartedAt: PURGED }).where(eq(orders.id, trashedOrder.id));
+      await expect(source.services.portable.startExport(admin, { selection: { kind: "all" }, passphrase: PASSPHRASE }))
+        .rejects.toMatchObject({ reasonCode: "PORTABLE_PURGE_IN_PROGRESS" });
+    } finally {
+      await Promise.all([sourceDb.cleanup(), targetDb.cleanup()]);
+    }
+  }, 60_000);
+
+  it("refuses half-purged rows and inconsistent trash state, and keeps ownership closure to owned records", () => {
+    const customerId = ulid();
+    const trash = { trashedAt: TRASHED.toISOString(), batchId: null, reason: null, purgeStartedAt: null, purgedAt: null };
+    const tombstone = { ...trash, purgeStartedAt: PURGED.toISOString(), purgedAt: PURGED.toISOString() };
+    expect(trashOf({ publicId: customerId })).toBeNull();
+    expect(trashOf({ publicId: customerId, trash })).toMatchObject({ purgedAt: null });
+    expect(() => trashOf({ publicId: customerId, trash: { ...trash, purgeStartedAt: PURGED.toISOString() } }))
+      .toThrow(expect.objectContaining({ reasonCode: "PORTABLE_PURGE_IN_PROGRESS" }));
+    expect(() => trashOf({ publicId: customerId, trash: { ...trash, purgedAt: "2020-01-01T00:00:00.000Z" } })).toThrow();
+    const owner = { publicId: customerId };
+    const order = { publicId: ulid(), customerPublicId: customerId };
+    expect(orderTrashProblem(order, owner, 2)).toBeNull();
+    expect(orderTrashProblem({ ...order, trash }, owner, 2)).toBeNull();
+    expect(orderTrashProblem(order, { ...owner, trash }, 2)).toBe("PORTABLE_TRASH_STATE_INVALID");
+    expect(orderTrashProblem({ ...order, trash }, { ...owner, trash: tombstone }, 0)).toBe("PORTABLE_TRASH_STATE_INVALID");
+    expect(orderTrashProblem({ ...order, trash: tombstone }, { ...owner, trash: tombstone }, 0)).toBeNull();
+    expect(orderTrashProblem({ ...order, trash: tombstone }, owner, 1)).toBe("PORTABLE_TRASH_STATE_INVALID");
+    const rootId = ulid();
+    const root = { publicId: rootId, customerPublicId: customerId, currency: "USD", trash };
+    const addition = { publicId: ulid(), customerPublicId: customerId, currency: "USD", groupRootOrderPublicId: rootId };
+    const byId = new Map<string, JsonRecord>([[rootId, root], [addition.publicId, addition]]);
+    expect(groupLinkProblem(addition, byId)).not.toBeNull();
+
+    const fileId = ulid();
+    const rows = [
+      { recordType: "customers", portableId: customerId, record: owner },
+      { recordType: "orders", portableId: order.publicId, record: order },
+      { recordType: "orders", portableId: addition.publicId, record: { ...addition, groupRootOrderPublicId: order.publicId, customerPublicId: ulid() } },
+      { recordType: "files", portableId: fileId, record: { publicId: fileId, orderPublicId: order.publicId } },
+      { recordType: "file-versions", portableId: "v1", record: { publicId: "v1", filePublicId: fileId } },
+    ];
+    expect([...sealedClosure(rows, [`orders:${order.publicId}`])].sort())
+      .toEqual([`file-versions:v1`, `files:${fileId}`, `orders:${order.publicId}`].sort());
+    expect(sealedClosure(rows, [`customers:${customerId}`]).has(`orders:${addition.publicId}`)).toBe(false);
   });
 });

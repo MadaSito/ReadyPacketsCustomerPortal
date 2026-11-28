@@ -6,7 +6,7 @@ import { Link, useSearch } from "wouter";
 import { useSession } from "@/lib/session";
 import { errorMessage, useTRPC, type useTRPCClient } from "@/lib/trpc";
 import {
-  Badge, Button, ConfirmDialog, DataTable, DateTime, DropdownMenu, EmptyState, Field, FilterBar, IconButton, Input, LoadMore, PageHeader, Select,
+  Badge, Button, ConfirmDialog, DataTable, DateTime, DropdownMenu, EmailLink, EmptyState, Field, FilterBar, IconButton, Input, LoadMore, PageHeader, Select,
   StepUpCancelledError, useStepUp, useToast,
 } from "@/ui";
 import { ROLE_LABELS } from "../shared";
@@ -115,7 +115,7 @@ export default function AdminSessionsPage() {
                   <Badge tone={row.user.role === "customer" ? "neutral" : "info"}>{ROLE_LABELS[row.user.role]}</Badge>
                   {row.current ? <Badge tone="brand">You, this device</Badge> : null}
                 </span>
-                <span className="text-sm break-all text-muted">{row.user.email}</span>
+                <EmailLink email={row.user.email} className="text-sm" />
               </span>
             ),
           },

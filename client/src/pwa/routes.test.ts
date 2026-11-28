@@ -43,4 +43,14 @@ describe("static-only service worker rules", () => {
       expect(precacheableResponse({ ...safe, headers } as Response, origin)).toBe(false);
     }
   });
+  it("increment 09 D3: precaches the versioned brand SVG/PNG/ICO files only with their exact image type", () => {
+    for (const path of ["/brand/readypackets-square-light-v2026101502.svg", "/brand/readypackets-utility-favicon-v2026101502.ico",
+      "/brand/readypackets-square-light-512-v2026101502.png"]) expect(publicPrecacheUrl(at(path), origin)).toBe(true);
+    for (const path of ["/brand/Logo.svg", "/brand/a.svg.html", "/brand/a.svgz", "/brand/sub/a.svg", "/brand/a.svg?x=1"])
+      expect(publicPrecacheUrl(at(path), origin)).toBe(false);
+    const svg = { status: 200, redirected: false, url: at("/brand/readypackets-square-light-v2026101502.svg").href,
+      headers: new Headers({ "content-type": "image/svg+xml", "cache-control": "no-cache" }) };
+    expect(precacheableResponse(svg as Response, origin)).toBe(true);
+    expect(precacheableResponse({ ...svg, headers: new Headers({ "content-type": "text/html" }) } as Response, origin)).toBe(false);
+  });
 });

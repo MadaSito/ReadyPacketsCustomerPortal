@@ -53,6 +53,54 @@ profile cases use production parameters). Fakes: audit, mailer, jobs, rate limit
 - Client: `auth.test.tsx` (labels and autocomplete tokens, collapsed billing disclosure, partial billing refused, focus back to the error summary on every failed submit, success heading focused, pageA11y light and dark); `identity.test.tsx` (profile, admin create, admin name edit, pageA11y light and dark); `app/review.test.tsx` (uniform register).
 - Residual, not benchmarked: a new account does one more encrypted write and audit than an existing address when billing is given, so response timing may differ slightly (the existing-address path already differs in mail and audit work; the password hash dominates both paths). Failure mode: if the billing module throws (for example, the store is unavailable), the registration is rolled back and the caller gets an error. That error is only possible for a new address, so in that failure mode an outside observer could tell new from existing. Requested billing is never silently dropped while the module is present. When the module is absent, billing is skipped and the account is still created.
 
+## Increment 09 — D2 Trash, customers side (local fakes only)
+
+All of the following were run on 27 Nov 2026, one file per run.
+
+### Server: `trash.test.ts` (20 tests, MySQL, synthetic data)
+- Refusals: an account that is not suspended gets a 409 with a plain message; an account that is not a customer gets not-found.
+- Trash: the columns are set, sessions and tokens are revoked, and the call is idempotent per batch.
+- `cleanTrashReason` bounds.
+- Gates:
+  - Lookups, lists, search, the public API and the identity port hide trashed accounts.
+  - Admin detail, reactivation and invitation answer the same not-found as an unknown id.
+  - Sign-in, an old session, password reset and registration give the same answers as an unknown address, and no mail is sent.
+- Restore:
+  - The account comes back suspended.
+  - Another batch gets a 409.
+  - Restore after the purge claim is refused.
+  - A concurrent restore and purge claim have exactly one winner.
+- Tombstone:
+  - It is refused before the purge claim.
+  - It overwrites personal data, erases credentials, frees the address and keeps the customer ID. It is idempotent.
+  - A tombstone never appears anywhere. A purged address registers again as a new account that inherits nothing.
+- Locking check (follow-up): with a lock, an unknown id counts as trashed while the plain read still returns false; `lockGoneInTx` dedupes and sorts; a held `FOR SHARE` makes the coordinator's `FOR UPDATE` trash time out (lock wait) until commit.
+- Reset jobs: a job queued before the purge does nothing after re-registration (no token, no mail); a new request serves the new account; a job without a bound id or with a wrong id is refused.
+- Purge fence: when the fence throws, sessions, tokens and the user row are unchanged; it is called once, first; the current worker then succeeds.
+- Sign-in log: a trashed account's events show `user: null`, and its ID filter returns `[]`, like an unknown ID.
+- Lists and portable ports:
+  - `listTrashedCustomers` returns no names or e-mail.
+  - `portableCustomers` with `includeTrashed`.
+  - `portableCustomerRefInTx`.
+  - `createPendingCustomer` with trash state.
+
+### Server regression
+- `identity.test.ts`: 74 tests.
+- `sessionCentre.test.ts`: 23 tests.
+- `sso/sso.test.ts`: 53 tests.
+- `pure.test.ts`: 17 tests.
+
+### Client: `identity.test.tsx` (13 tests)
+- An active account shows a disabled "Move to trash" button with the visible, described reason "Suspend this account first".
+- A suspended account opens the shared dialog, named by customer ID with no e-mail, which calls `trash.summarize`.
+- `EmailLink` renders a mailto link.
+- axe checks were run.
+
+### Not verified
+- The end-to-end flow with the coordinator's router (that is owned and tested by `server/modules/trash`).
+- The trash dialog internals and the Undo toast (owned by audit_engineer).
+- A real database under load.
+
 ## Increment 04 package D — session centre, sign-in log, restrictions (local fakes only)
 - `server/modules/identity/sessionCentre.test.ts` (23 tests, MySQL, synthetic data; fakes for protection country, jobAdmin maintenance, referrals, publicApi registry): centre admin-only (customer/staff refused), step-up on forced ends; end one / user / all customers (>1 000 rows, no cap, concurrent calls idempotent, actor recorded); concurrency cutoff with stale rows after enabling (also >1 000 historical rows); per-role `idleTimeoutSeconds` from `sessions.timing()` (identity.me); role-specific idle; IP allow-list and country rules at sign-in and per request; disabling while enabled from a non-allowed address; `WOULD_LOCK_OUT`; customer maintenance at sign-in/registration; referral attribution; sign-in log rows, exact-IP filter by blind index, CSV formula guard, export requires fresh step-up; public API customers provider (customers only, filters, cursor, audit correlation, no e-mail in audit).
 - `client/src/features/identity/security/security.test.tsx` (22 tests): Security cards, admin sessions / sign-in log / restrictions pages, axe light + dark (designed and tested against WCAG 2.2 AA).

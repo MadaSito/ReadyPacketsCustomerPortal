@@ -5,10 +5,11 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
-import { DomainError } from "../../core/errors.js";
+import { DomainError, conflict } from "../../core/errors.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
 import { FakeGraph } from "../storage/adapters/graphDriveFake.js";
 import { storageCopyAttempts } from "../storage/schema.js";
+import { createTrashRegistry, unfencedPurgeRunForTests, type TrashRegistry } from "../trash/ports.js";
 import { LIST_COLUMNS, ORDER_ID_COLUMN, buildOrderFields, fieldsHash, isCompatible, packetsSummary, safeText, toMajor, validListName } from "./fields.js";
 import { createSharepointModule, type SharepointModule } from "./index.js";
 import { sharepointOrderSync, sharepointSyncConfig } from "./schema.js";
@@ -30,6 +31,8 @@ let orderStatus: string;
 let duringView: (() => Promise<void>) | null;
 let enabledListId: string | null;
 let renamedAt: Date | null;
+let orderTrashed: boolean;
+let trash: TrashRegistry;
 let listeners: ((e: { orderId: number; orderPublicId: string; kind: string }, tx: Tx) => Promise<void>)[];
 
 const orderView = () => ({
@@ -65,6 +68,9 @@ beforeEach(async () => {
   renamedAt = null;
   duringView = null;
   enabledListId = null;
+  orderTrashed = false;
+  trash = createTrashRegistry();
+  h.services.trash = trash as never;
   const config = { tenantId: TENANT, clientId: CLIENT, siteUrl: "https://contoso.sharepoint.com/sites/Orders", siteId: graph.site.id, driveId: "", driveName: "", rootFolderPath: "" };
   h.services.identity = {
     sessions: { assertCurrent: async (p: SessionPrincipal) => ({ role: p.role, stepUpAt: p.stepUpAt, pendingSteps: [] }) },
@@ -72,8 +78,9 @@ beforeEach(async () => {
   } as never;
   h.services.orders = {
     registerChangeListener: (l: (typeof listeners)[number]) => void listeners.push(l),
+    isTrashedInTx: async () => orderTrashed,
     getOrderSyncView: async (id: string) => {
-      const rendered = id === ORDER ? orderView() : null; // rendered before concurrent changes land
+      const rendered = id === ORDER && !orderTrashed ? orderView() : null; // rendered before concurrent changes land
       await duringView?.();
       return rendered;
     },
@@ -478,5 +485,103 @@ describe("sharepoint order sync (local fakes only)", () => {
     expect(await mod.enqueueOrder(ORDER, { correlationId: "automation:r1", idempotencyKey: "auto:r1:step:step_1" })).toBe("queued");
     expect(h.jobs.enqueued[0]?.options).toMatchObject({ idempotencyKey: "auto:r1:step:step_1", correlationId: "automation:r1" });
     expect(await mod.enqueueOrder("01JORDER000000000000000009", { correlationId: "c", idempotencyKey: "k" })).toBe("order_not_found");
+  });
+
+  it("D2.8: drops an in-flight sync job claimed before trashing right before the Graph write", async () => {
+    await enable();
+    await changeOrder();
+    const participant = trash.participants().find((p) => p.module === "sharepoint")!;
+    expect(participant).toBeDefined();
+
+    // Order is live when runSync claims and renders the fields, then moves to trash right before beforeWrite -> Graph POST.
+    duringView = async () => {
+      duringView = null;
+      orderTrashed = true;
+      await db.db.transaction((tx) =>
+        participant.onTrashedInTx!(tx, { kind: "order", id: 1, publicId: ORDER, batchId: "01JBATCH000000000000000001" }, { kind: "user", userId: 1, publicId: "01JADMIN000000000000000001" }),
+      );
+    };
+
+    const [res] = await h.jobs.runAll(SYNC_JOB);
+    expect(res).toEqual({ outcome: "canceled", reasonCode: "ORDER_TRASHED" });
+    expect(items().size).toBe(0);
+    expect((await mod.orderSync.get(admin)).lastError).toBeNull();
+    expect((await mod.orderSync.get(admin)).counts).toEqual({ pending: 0, synced: 0, failed: 0 });
+    expect((await mod.orderSync.status(admin, {})).items).toEqual([]);
+    const log = await copyRows();
+    expect(log[0]).toMatchObject({ state: "not_written", errorCode: "ORDER_TRASHED" });
+  });
+
+  it("D2: skips trashed orders, restores sync on restore, and erases only portal mappings on purge while keeping remote items", async () => {
+    await enable();
+    await changeOrder();
+    expect(await h.jobs.runAll(SYNC_JOB)).toEqual([{ outcome: "completed", safeCounts: { created: 1 } }]);
+    expect(items().size).toBe(1);
+
+    const participant = trash.participants().find((p) => p.module === "sharepoint")!;
+    const entity = { kind: "order" as const, id: 1, publicId: ORDER, batchId: "01JBATCH000000000000000002" };
+    const actor = { kind: "user" as const, userId: 1, publicId: "01JADMIN000000000000000001" };
+
+    expect(await participant.summarize!(entity)).toEqual({ sharepointMappings: 1 });
+
+    // Trash order: subsequent change events, manual enqueue, and resyncAll skip it.
+    orderTrashed = true;
+    await db.db.transaction((tx) => participant.onTrashedInTx!(tx, entity, actor));
+    h.jobs.enqueued = [];
+
+    await changeOrder();
+    expect(h.jobs.enqueued).toHaveLength(0);
+    expect(await mod.enqueueOrder(ORDER, { correlationId: "c", idempotencyKey: "k-trash" })).toBe("order_not_found");
+    expect(await mod.orderSync.resyncAll(admin)).toEqual({ enqueued: 0 });
+
+    // Restore re-enables sync and re-stages the order.
+    orderTrashed = false;
+    orderStatus = "Restored active";
+    await db.db.transaction((tx) => participant.onRestoredInTx!(tx, entity, actor));
+    expect(h.jobs.enqueued).toHaveLength(1);
+    expect(await h.jobs.runAll(SYNC_JOB)).toEqual([{ outcome: "completed", safeCounts: { updated: 1 } }]);
+    expect([...items().values()][0]!.fields.RpStatus).toBe("Restored active");
+
+    // Trash again and permanently purge: portal mapping row is erased, remote SharePoint item stays untouched.
+    orderTrashed = true;
+    await db.db.transaction((tx) => participant.onTrashedInTx!(tx, entity, actor));
+    expect(
+      await participant.purge!(entity, unfencedPurgeRunForTests("01JRUN00000000000000000001")),
+    ).toEqual({
+      deleted: { sharepointMappings: 1 },
+    });
+    // Idempotent second call on crash-retry:
+    expect(
+      await participant.purge!(entity, unfencedPurgeRunForTests("01JRUN00000000000000000001")),
+    ).toEqual({
+      deleted: {},
+    });
+    expect(await db.db.select().from(sharepointOrderSync)).toHaveLength(0);
+    expect(items().size).toBe(1);
+  });
+
+  it("purge aborts and leaves SharePoint mapping rows unchanged when TrashPurgeRun.assertCurrentInTx throws PURGE_FENCE_LOST", async () => {
+    await enable();
+    await changeOrder();
+    await h.jobs.runAll(SYNC_JOB);
+    expect(await db.db.select().from(sharepointOrderSync)).toHaveLength(1);
+
+    const participant = trash.participants().find((p) => p.module === "sharepoint")!;
+    const entity = { kind: "order" as const, id: 7, publicId: ORDER, batchId: "01JBATCH000000000000000002" };
+    orderTrashed = true;
+    await db.db.transaction((tx) =>
+      participant.onTrashedInTx!(tx, entity, { kind: "user", userId: admin.userId, publicId: admin.userPublicId }),
+    );
+
+    const lostFenceRun = unfencedPurgeRunForTests("01JRUN00000000000000000002", {
+      async assertCurrentInTx() {
+        throw conflict("PURGE_FENCE_LOST", "Worker replaced.");
+      },
+    });
+    await expect(participant.purge!(entity, lostFenceRun)).rejects.toMatchObject({
+      code: "CONFLICT",
+      reasonCode: "PURGE_FENCE_LOST",
+    });
+    expect(await db.db.select().from(sharepointOrderSync)).toHaveLength(1);
   });
 });

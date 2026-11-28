@@ -2,9 +2,10 @@ import { and, asc, desc, eq, lt, lte, or, sql } from "drizzle-orm";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
 import { ULID_PATTERN } from "../../core/ids.js";
-import type { ModuleHealth, SessionPrincipal, Tx } from "../../core/types.js";
+import type { DbOrTx, ModuleHealth, SessionPrincipal, Tx } from "../../core/types.js";
 import { roleHasCapability, STEP_UP_CAPABILITIES, type Capability } from "../../../shared/capabilities.js";
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
+import { TRASH_JOB_RETENTION_CLEANUP } from "../trash/jobNames.js";
 import { createCustomerMaintenance } from "./customerMaintenance.js";
 import { allowsMailCapture, mailAudit, mailEngineFor } from "./mail.js";
 import { readPolicyNoticeMailStates } from "./policyNoticeJobs.js";
@@ -28,7 +29,8 @@ const activeMessage = "Maintenance is in progress. Some operations are temporari
 const jobView = {
   publicId: jobRuns.publicId, type: jobRuns.type, state: jobRuns.state, correlationId: jobRuns.correlationId,
   attempt: jobRuns.attempt, maxAttempts: jobRuns.maxAttempts, reasonCode: jobRuns.reasonCode,
-  allowRetry: jobRuns.allowRetry, reconciledAt: jobRuns.reconciledAt, runAt: jobRuns.runAt, leaseUntil: jobRuns.leaseUntil,
+  allowRetry: sql<boolean>`(${jobRuns.type} <> ${TRASH_JOB_RETENTION_CLEANUP} and ${jobRuns.allowRetry})`.mapWith(Boolean),
+  reconciledAt: jobRuns.reconciledAt, runAt: jobRuns.runAt, leaseUntil: jobRuns.leaseUntil,
   interruptionPending: jobRuns.interruptionPending,
   scheduleName: jobRuns.scheduleName, createdAt: jobRuns.createdAt, updatedAt: jobRuns.updatedAt,
 };
@@ -82,7 +84,8 @@ export function createJobsAdmin(deps: ModuleDeps) {
     throw new DomainError("STEP_UP_REQUIRED", "STEP_UP_REQUIRED", "Confirm your password and authentication code to continue.", { capability });
   }
 
-  async function isDraining(): Promise<boolean> {
+  async function isDraining(tx?: DbOrTx): Promise<boolean> {
+    if (tx) return gateDraining(tx);
     const [gate] = await db.select({ active: jobMaintenance.active }).from(jobMaintenance)
       .where(eq(jobMaintenance.id, MAINTENANCE_ID)).limit(1);
     return gate?.active ?? false;
@@ -279,7 +282,7 @@ export function createJobsAdmin(deps: ModuleDeps) {
         if (await gateDraining(tx)) throw new DomainError("MAINTENANCE", "PORTAL_DRAINING", activeMessage);
         const [row] = await tx.select().from(jobRuns).where(eq(jobRuns.publicId, publicId)).limit(1).for("update");
         if (!row) throw notFound();
-        if (row.state !== "failed" || !row.allowRetry || row.payloadEnc === null || row.attempt >= 50) {
+        if (row.type === TRASH_JOB_RETENTION_CLEANUP || row.state !== "failed" || !row.allowRetry || row.payloadEnc === null || row.attempt >= 50) {
           throw conflict("JOB_RETRY_UNSAFE", "This job cannot be safely retried.");
         }
         const now = clock.now();

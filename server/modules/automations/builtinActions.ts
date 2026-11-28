@@ -24,10 +24,12 @@ import type { ModuleDeps } from "../../container.js";
 import { DomainError, validation } from "../../core/errors.js";
 import { ULID_PATTERN } from "../../core/ids.js";
 import type { Mailer, Tx } from "../../core/types.js";
+import { liveUserPredicate } from "../identity/live.js";
 import { users } from "../identity/schema.js";
 import type { EgressFetchResponse } from "../integrations/egress.js";
 import { lockBlocks } from "../orders/policy.js";
 import { orders } from "../orders/schema.js";
+import { isLiveOrderRow, liveOrderPredicate } from "../orders/trashGate.js";
 import { findState } from "../orders/workflowTypes.js";
 import { admitOrderCompletionInTx, sanitizeOpsAlertCopy } from "./completionJobs.js";
 import {
@@ -94,6 +96,7 @@ interface ResolvedUserRecipient {
   publicId: string;
   role: "admin" | "staff" | "customer";
   displayName: string;
+  greetingName: string;
 }
 
 async function resolveLiveUserRecipients(
@@ -119,7 +122,7 @@ async function resolveLiveUserRecipients(
     const rows = await ctx.deps.db
       .select({ id: users.id })
       .from(users)
-      .where(and(eq(users.status, "active"), eq(users.role, "admin")))
+      .where(and(eq(users.status, "active"), eq(users.role, "admin"), liveUserPredicate(users)))
       .orderBy(asc(users.id))
       .limit(50);
     candidateIds = rows.map((r) => r.id);
@@ -127,7 +130,13 @@ async function resolveLiveUserRecipients(
     const rows = await ctx.deps.db
       .select({ id: users.id })
       .from(users)
-      .where(and(eq(users.status, "active"), inArray(users.role, ["admin", "staff"])))
+      .where(
+        and(
+          eq(users.status, "active"),
+          inArray(users.role, ["admin", "staff"]),
+          liveUserPredicate(users),
+        ),
+      )
       .orderBy(asc(users.id))
       .limit(100);
     candidateIds = rows.map((r) => r.id);
@@ -148,9 +157,13 @@ async function resolveLiveUserRecipients(
       role: users.role,
       status: users.status,
       nameEnc: users.nameEnc,
+      firstNameEnc: users.firstNameEnc,
+      preferredNameEnc: users.preferredNameEnc,
     })
     .from(users)
-    .where(and(inArray(users.id, candidateIds), eq(users.status, "active")))
+    .where(
+      and(inArray(users.id, candidateIds), eq(users.status, "active"), liveUserPredicate(users)),
+    )
     .orderBy(asc(users.id));
 
   const resolved: ResolvedUserRecipient[] = [];
@@ -166,11 +179,33 @@ async function resolveLiveUserRecipients(
     } catch {
       displayName = "";
     }
+    let preferredName = "";
+    if (row.preferredNameEnc) {
+      try {
+        preferredName = ctx.deps.crypto
+          .decrypt(row.preferredNameEnc, `users.preferred_name:${row.publicId}`)
+          .trim();
+      } catch {
+        preferredName = "";
+      }
+    }
+    let firstName = "";
+    if (row.firstNameEnc) {
+      try {
+        firstName = ctx.deps.crypto
+          .decrypt(row.firstNameEnc, `users.first_name:${row.publicId}`)
+          .trim();
+      } catch {
+        firstName = "";
+      }
+    }
+    const greetingName = preferredName || firstName || displayName;
     resolved.push({
       id: row.id,
       publicId: row.publicId,
       role: row.role,
       displayName,
+      greetingName,
     });
   }
 
@@ -312,6 +347,7 @@ const emailSendTemplateAction: AutomationActionRegistration<
       await ctx.deps.mailer.enqueue({
         template: GENERIC_AUTOMATION_MAIL_TEMPLATE,
         to: { address },
+        ...(typeof ctx.orderId === "number" ? { orderId: ctx.orderId } : {}),
         vars: { subject, body, recipient_name: "" },
         idempotencyKey: `${ctx.idempotencyKey}:fixed`,
       });
@@ -337,17 +373,18 @@ const emailSendTemplateAction: AutomationActionRegistration<
       ctx.signal.throwIfAborted();
       const perRecipientFields = {
         ...ctx.fields,
-        recipient_name: recipient.displayName,
+        recipient_name: recipient.greetingName,
       };
       const subject = renderPlainTemplate(config.subject, perRecipientFields, { singleLine: true });
       const body = renderPlainTemplate(config.body, perRecipientFields);
       await ctx.deps.mailer.enqueue({
         template: GENERIC_AUTOMATION_MAIL_TEMPLATE,
         to: { userId: recipient.id },
+        ...(typeof ctx.orderId === "number" ? { orderId: ctx.orderId } : {}),
         vars: {
           subject,
           body,
-          recipient_name: recipient.displayName,
+          recipient_name: recipient.greetingName,
         },
         idempotencyKey: `${ctx.idempotencyKey}:u:${recipient.id}`,
       });
@@ -960,16 +997,20 @@ const orderSetCompletionAction: AutomationActionRegistration<OrderSetCompletionC
           lockState: orders.lockState,
           workflowVersionId: orders.workflowVersionId,
           completionRevision: orders.completionRevision,
+          trashedAt: orders.trashedAt,
+          purgedAt: orders.purgedAt,
         })
         .from(orders)
         .where(eq(orders.publicId, orderPublicId))
         .for("update");
 
-      if (!lockedOrder) {
+      if (!lockedOrder || !isLiveOrderRow(lockedOrder)) {
         return {
           outcome: "skipped",
-          reasonCode: "ORDER_NOT_FOUND",
-          safeSummary: "Target order no longer exists.",
+          reasonCode: !lockedOrder ? "ORDER_NOT_FOUND" : "ORDER_TRASHED",
+          safeSummary: !lockedOrder
+            ? "Target order no longer exists."
+            : "Target order is in trash or permanently deleted.",
         };
       }
       if (lockBlocks(lockedOrder.lockState, true, "order")) {
@@ -1315,7 +1356,7 @@ async function resolveStageSubmittedTriggerContext({
       workflowVersionId: orders.workflowVersionId,
     })
     .from(orders)
-    .where(eq(orders.publicId, rawOrderPublicId))
+    .where(and(eq(orders.publicId, rawOrderPublicId), liveOrderPredicate()))
     .limit(1);
   if (!orderRow) return {};
 

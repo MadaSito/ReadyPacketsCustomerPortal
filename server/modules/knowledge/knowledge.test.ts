@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import type { UserRole } from "../../../shared/domain.js";
+import { conflict } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import { newRequestContext } from "../../core/requestContext.js";
 import type { Db, SessionPrincipal } from "../../core/types.js";
@@ -11,9 +12,11 @@ import { createEngagementModule, type EngagementModule } from "../engagement/ind
 import * as engagementTables from "../engagement/schema.js";
 import type { StagedUpload } from "../files/index.js";
 import { users, type UserStatus } from "../identity/schema.js";
+import * as orderTables from "../orders/schema.js";
 import { platformSettings } from "../platform/schema.js";
 import { createSettingsStore } from "../platform/settingsStore.js";
 import type { ApiCaller, PublicApiProviders } from "../publicApi/ports.js";
+import { createTrashRegistry, unfencedPurgeRunForTests, type TrashRegistry } from "../trash/ports.js";
 import {
   createKnowledgeModule,
   KNOWLEDGE_RETENTION_JOB,
@@ -25,6 +28,7 @@ import * as knowledgeTables from "./schema.js";
 const testSchema = {
   users,
   platformSettings,
+  ...orderTables,
   ...engagementTables,
   ...knowledgeTables,
 };
@@ -96,6 +100,7 @@ describe("knowledge module (Package F) + Public API v1 providers (knowledge & ti
   let knowledge: KnowledgeModule;
   let engagement: EngagementModule;
   let registeredProviders: Partial<PublicApiProviders>;
+  let trashRegistry: TrashRegistry;
 
   let adminStepUp: SyntheticUser;
   let adminNoStepUp: SyntheticUser;
@@ -122,6 +127,8 @@ describe("knowledge module (Package F) + Public API v1 providers (knowledge & ti
       audit: h.deps.audit,
     });
     registeredProviders = {};
+    trashRegistry = createTrashRegistry();
+    (h.services as unknown as { trash: TrashRegistry }).trash = trashRegistry;
 
     (
       h.services as unknown as {
@@ -621,5 +628,111 @@ describe("knowledge module (Package F) + Public API v1 providers (knowledge & ti
         e.actor?.role === "system",
     );
     expect(matchingAudit).toBeDefined();
+  });
+
+  it("hides trashed customers from knowledge feedback/insights and Public API v1 tickets, and purges fail-closed + idempotently", async () => {
+    const kbParticipant = trashRegistry.participants().find((p) => p.module === "knowledge");
+    expect(kbParticipant).toBeDefined();
+
+    const articleDetail = await callerFor(aliceCustomer.principal).knowledge.help.article({
+      slug: "preparing-exhibits",
+    });
+    const trashedCustomer = await insertSyntheticUser(h, tdb.db, { role: "customer" });
+    await callerFor(trashedCustomer.principal).knowledge.help.submitFeedback({
+      articlePublicId: articleDetail.publicId,
+      helpful: false,
+      comment: "Trashed feedback note from synthetic customer.",
+    });
+
+    const beforeTrashInsights = await callerFor(staff.principal).knowledge.admin.insights();
+    expect(
+      beforeTrashInsights.recentFeedback.some(
+        (f) => f.comment === "Trashed feedback note from synthetic customer.",
+      ),
+    ).toBe(true);
+
+    // Move customer to Trash (not yet purgeStartedAt)
+    const now = h.clock.now();
+    await tdb.db
+      .update(users)
+      .set({ trashedAt: now })
+      .where(eq(users.id, trashedCustomer.id));
+
+    // Trashed customer actor is refused in-tx
+    await expect(
+      callerFor(trashedCustomer.principal).knowledge.help.home(),
+    ).rejects.toThrow();
+
+    // Insights exclude trashed customer's feedback comment
+    const afterTrashInsights = await callerFor(staff.principal).knowledge.admin.insights();
+    expect(
+      afterTrashInsights.recentFeedback.some(
+        (f) => f.comment === "Trashed feedback note from synthetic customer.",
+      ),
+    ).toBe(false);
+
+    // Public API v1 tickets refuses creating for a trashed customer and hides existing tickets if customer is trashed
+    const apiCaller: ApiCaller = {
+      kind: "api_key",
+      keyPublicId: ulid(),
+      scopes: ["tickets:read", "tickets:write"],
+      requestId: ulid(),
+      replay: false,
+    };
+    await expect(
+      registeredProviders.tickets!.create(
+        {
+          customerId: trashedCustomer.publicId,
+          subject: "Should fail for trashed customer",
+          body: "Blocked.",
+        },
+        apiCaller,
+      ),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", reasonCode: "CUSTOMER_NOT_FOUND" });
+
+    // Purge fails closed before purgeStartedAt is set
+    const batchId = ulid();
+    const runMeta = unfencedPurgeRunForTests(ulid());
+    const lostFenceRun = unfencedPurgeRunForTests(ulid(), {
+      assertCurrentInTx: async () => {
+        throw conflict("PURGE_FENCE_LOST", "Worker no longer owns purge run.");
+      },
+    });
+    await expect(
+      kbParticipant!.purge!(
+        { kind: "customer", id: trashedCustomer.id, publicId: trashedCustomer.publicId, batchId },
+        runMeta,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "PURGE_NOT_STARTED" });
+
+    // Authorize purgeStartedAt; verify throwing fence leaves feedback unchanged, then execute purge twice (idempotent)
+    await tdb.db
+      .update(users)
+      .set({ purgeStartedAt: now })
+      .where(eq(users.id, trashedCustomer.id));
+
+    await expect(
+      kbParticipant!.purge!(
+        { kind: "customer", id: trashedCustomer.id, publicId: trashedCustomer.publicId, batchId },
+        lostFenceRun,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "PURGE_FENCE_LOST" });
+    const fbStillPresent = await tdb.db
+      .select()
+      .from(knowledgeTables.knowledgeArticleFeedback)
+      .where(eq(knowledgeTables.knowledgeArticleFeedback.userId, trashedCustomer.id));
+    expect(fbStillPresent).toHaveLength(1);
+
+    const firstPurge = await kbParticipant!.purge!(
+      { kind: "customer", id: trashedCustomer.id, publicId: trashedCustomer.publicId, batchId },
+      runMeta,
+    );
+    expect(firstPurge.deleted.articleFeedback).toBe(1);
+
+    const secondPurge = await kbParticipant!.purge!(
+      { kind: "customer", id: trashedCustomer.id, publicId: trashedCustomer.publicId, batchId },
+      runMeta,
+    );
+    expect(secondPurge.deleted).toEqual({});
   });
 });

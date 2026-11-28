@@ -22,6 +22,8 @@ import type {
   LookupProviderRefundInput,
   PaymentProviderAdapter,
   PaymentRefundAdapter,
+  ProviderCancelCheckoutInput,
+  ProviderCancelCheckoutResult,
   ProviderCreateCheckoutInput,
   ProviderCreateCheckoutOutput,
   ProviderFetchedPayment,
@@ -763,6 +765,58 @@ export function createStripeProvider(
         paymentMethodBrand,
         paymentMethodLast4,
       };
+    },
+
+    async cancelCheckout(input: ProviderCancelCheckoutInput): Promise<ProviderCancelCheckoutResult> {
+      assertStripeKeyMatchesMode(input.credentials.secretKey, input.credentials.mode);
+      if (!/^cs_[A-Za-z0-9_]{8,120}$/u.test(input.providerRef)) {
+        throw validation("INVALID_STRIPE_SESSION_ID", "Invalid Stripe Checkout Session reference.");
+      }
+
+      const egress = getEgress();
+      const expireResp = await egress.fetchPinned(
+        new URL(`/v1/checkout/sessions/${encodeURIComponent(input.providerRef)}/expire`, STRIPE_API_ORIGIN),
+        "stripe",
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${input.credentials.secretKey}`,
+            "content-type": "application/x-www-form-urlencoded",
+            "stripe-version": STRIPE_API_VERSION,
+            "idempotency-key": `rp-expire:${input.providerRef}`,
+          },
+          body: "",
+          timeoutMs: STRIPE_TIMEOUT_MS,
+          maxRequestBytes: 1024,
+          maxResponseBytes: MAX_STRIPE_RESPONSE_BYTES,
+          requireAllowlistRule: true,
+          publicAddressesOnly: true,
+          expectedHostSuffixes: [STRIPE_API_HOST],
+          ...(input.signal ? { signal: input.signal } : {}),
+          ...(input.beforeSend ? { beforeSend: input.beforeSend } : {}),
+        },
+      );
+
+      if (expireResp.status >= 200 && expireResp.status < 300) {
+        return { status: "cancelled" };
+      }
+
+      if (expireResp.status === 400 || expireResp.status === 404) {
+        const fetched = await this.fetchPayment(input);
+        if (fetched.status === "paid") {
+          return { status: "already_paid" };
+        }
+        if (fetched.status === "expired" || fetched.status === "failed") {
+          return { status: "already_cancelled" };
+        }
+      }
+
+      throw new DomainError(
+        "UNAVAILABLE",
+        "STRIPE_CANCEL_SESSION_FAILED",
+        "Failed to expire Stripe Checkout session.",
+        { upstreamStatus: expireResp.status },
+      );
     },
 
     async testConnection(input: ProviderTestConnectionInput): Promise<ProviderTestConnectionResult> {

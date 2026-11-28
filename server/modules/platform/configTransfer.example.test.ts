@@ -27,6 +27,17 @@ const LOCAL = defineSetting({
   default: 1,
   exportable: false,
 });
+const OWNED = defineSetting({
+  key: "general.test_transfer_owned",
+  owner: "platform",
+  group: "general",
+  label: "Owner-managed",
+  description: "Synthetic, written only by its owning module.",
+  schema: z.number().int(),
+  default: 30,
+  managedBy: { href: "/admin/trash", label: "Trash centre" },
+  ownerWriteOnly: true,
+});
 const API_KEY = defineSecret({ key: "integrations.test_transfer_key", owner: "platform", group: "integrations", label: "Key", description: "Synthetic.", exportable: true });
 const DEFAULT_SECRET = defineSecret({ key: "integrations.test_transfer_default", owner: "platform", group: "integrations", label: "Default", description: "Not opted in." });
 
@@ -49,6 +60,7 @@ beforeEach(async () => {
   transfer = createConfigTransfer({ db: t.db, clock: h.clock, audit: h.audit, settings: store, installationId: "test-install", releaseRef: "test" });
   await store.update(COLOR.key, "green");
   await store.update(LOCAL.key, 5);
+  await store.update(OWNED.key, 45);
   await store.updateSecret(API_KEY.key, "sk-synthetic-123");
   await store.updateSecret(DEFAULT_SECRET.key, "default-synthetic-456");
   h.audit.clear();
@@ -61,6 +73,13 @@ async function reasonOf(promise: Promise<unknown>): Promise<string> {
 }
 
 describe("config export/import", () => {
+  it("never exports owner-managed settings", async () => {
+    expect(OWNED.exportable).toBe(false);
+    const { document } = await transfer.exportDocument({ includeSecrets: false }, allow);
+    expect(document).not.toContain(OWNED.key);
+    expect(document).toContain(COLOR.key);
+  });
+
   it("defineSecret is not exportable unless explicitly opted in", () => {
     expect(DEFAULT_SECRET.exportable).toBe(false);
     expect(API_KEY.exportable).toBe(true);

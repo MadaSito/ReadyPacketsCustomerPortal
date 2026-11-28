@@ -2,10 +2,10 @@ import { createHash, createHmac } from "node:crypto";
 import { z } from "zod";
 import type { Clock } from "../../../core/types.js";
 import type { EgressPolicy } from "../../integrations/egress.js";
-import { StorageAdapterError, type StorageAdapterDefinition } from "../contracts.js";
+import { StorageAdapterError, verifyRemoval, type StorageAdapterDefinition } from "../contracts.js";
 import {
   encodeSegment, fromStatus, MAX_OBJECT_BYTES, measuredBody, objectKey, objectRequest, observedEtag, observedSize, pathFor,
-  prefixParts, prefixSchema, removeKey, statusError, testError, WRITE_TIMEOUT_MS,
+  prefixParts, prefixSchema, readObjectRef, removeKey, statusError, testError, versionedObjectRef, WRITE_TIMEOUT_MS,
 } from "./objectProtocol.js";
 
 const endpointSchema = z.string().max(300).transform((value, ctx) => {
@@ -120,7 +120,7 @@ export function s3Adapter(egress: () => Pick<EgressPolicy, "fetchPinned">, clock
           const existing = await head();
           if (existing.status === 200) {
             if (observedSize(existing.headers) === input.size && checksum(existing.headers) === input.sha256) {
-              return { remoteId: key, size: input.size, sha256: input.sha256 };
+              return { remoteId: key, size: input.size, sha256: input.sha256, reusedExisting: true as const };
             }
             throw new StorageAdapterError("DESTINATION_CONFLICT");
           }
@@ -144,11 +144,27 @@ export function s3Adapter(egress: () => Pick<EgressPolicy, "fetchPinned">, clock
           const size = observedSize(uploaded.headers);
           const sha256 = checksum(uploaded.headers) ?? checksum(put.headers);
           if (nativeChecksum && !sha256) throw new StorageAdapterError("INTEGRITY_MISMATCH");
-          return { remoteId: key, size, ...(sha256 === undefined ? {} : { sha256 }) };
+          const version = put.headers["x-amz-version-id"];
+          if (input.protectExisting && uploaded.headers["x-amz-version-id"] !== version) throw new StorageAdapterError("OUTCOME_UNKNOWN");
+          return { remoteId: input.protectExisting ? versionedObjectRef(key, etag, version) : key,
+            size, ...(sha256 === undefined ? {} : { sha256 }) };
         },
         async remove(remoteId, signal) {
-          const result = await request("DELETE", urlFor(removeKey(prefix, remoteId)), { signal });
+          const { key, etag, version } = readObjectRef(remoteId);
+          const target = urlFor(removeKey(prefix, key));
+          if (version !== undefined) target.searchParams.set("versionId", version);
+          if (etag) {
+            const before = await request("HEAD", target, { signal });
+            if (before.status === 404) return;
+            if (before.status !== 200) throw statusError(before.status);
+            if (observedEtag(before.headers) !== etag ||
+              before.headers["x-amz-version-id"] !== version) throw new StorageAdapterError("OUTCOME_UNKNOWN");
+          }
+          const result = await request("DELETE", target, { signal, ...(etag ? { headers: { "if-match": etag } } : {}) });
           if (result.status !== 204 && result.status !== 404) throw statusError(result.status, true);
+          if (etag) await verifyRemoval(async () => {
+            if ((await request("HEAD", target, { signal })).status !== 404) throw new StorageAdapterError("OUTCOME_UNKNOWN");
+          });
         },
       };
     },

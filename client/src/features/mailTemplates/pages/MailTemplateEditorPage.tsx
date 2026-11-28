@@ -140,6 +140,7 @@ export default function MailTemplateEditorPage() {
 
     if (triggerPreview && src.subject.trim()) {
       previewMut.mutate({
+        templateKey: data.templateKey,
         format: src.format,
         subject: src.subject,
         bodyHtml: src.format === "html" ? src.bodyHtml : undefined,
@@ -197,6 +198,7 @@ export default function MailTemplateEditorPage() {
       return;
     }
     previewMut.mutate({
+      templateKey,
       format,
       subject,
       bodyHtml: format === "html" ? bodyHtml : undefined,

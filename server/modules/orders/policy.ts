@@ -9,6 +9,7 @@ import { ULID_PATTERN } from "../../core/ids.js";
 import type { AuditEmitter, Clock, DbOrTx, SessionPrincipal } from "../../core/types.js";
 import { users } from "../identity/schema.js";
 import { orderGrants, orders } from "./schema.js";
+import { liveOrderIdPredicate, liveOrderPredicate } from "./trashGate.js";
 import type {
   AccessibleOrderIds,
   AccessOptions,
@@ -52,7 +53,10 @@ async function loadOrder(db: DbOrTx, key: OrderKey, forUpdate: boolean) {
       promoLabel: orders.promoLabel,
     })
     .from(orders)
-    .where("publicId" in key ? eq(orders.publicId, key.publicId) : eq(orders.id, key.id))
+    // Increment 09 (D2.5): the central trash gate. A trashed or tombstoned order does not exist for any principal or
+    // the system actor here (same answer as a row that never existed); only the Trash centre ports see it. With
+    // FOR UPDATE the predicate is evaluated on the current row, so a concurrent trash wins cleanly.
+    .where(and("publicId" in key ? eq(orders.publicId, key.publicId) : eq(orders.id, key.id), liveOrderPredicate()))
     .limit(1);
   const [row] = forUpdate ? await query.for("update") : await query;
   if (!row) return null;
@@ -258,7 +262,7 @@ export function createOrderPolicy(deps: PolicyDeps) {
       const owned = await db
         .select({ id: orders.id })
         .from(orders)
-        .where(eq(orders.ownerUserId, principal.userId))
+        .where(and(eq(orders.ownerUserId, principal.userId), liveOrderPredicate()))
         .orderBy(orders.id)
         .limit(limit + 1);
       const now = deps.clock.now();
@@ -270,6 +274,7 @@ export function createOrderPolicy(deps: PolicyDeps) {
             eq(orderGrants.granteeUserId, principal.userId),
             eq(orderGrants.status, "active"),
             or(isNull(orderGrants.expiresAt), gt(orderGrants.expiresAt, now)),
+            liveOrderIdPredicate(orderGrants.orderId),
           ),
         )
         .orderBy(orderGrants.orderId)

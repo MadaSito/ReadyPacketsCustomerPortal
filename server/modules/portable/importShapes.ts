@@ -1,6 +1,6 @@
 import { OrderItemRecord, OrderRecord } from "../../../portable/src/index.js";
 import type { FileCategory } from "../files/index.js";
-import { validation } from "../../core/errors.js";
+import { DomainError, validation } from "../../core/errors.js";
 import { ULID_PATTERN } from "../../core/ids.js";
 import { billingDetailsSchema, type BillingDetails } from "../../../shared/billingDetails.js";
 import { firstNameSchema, fullNameOf, lastNameSchema, nameSchema, preferredNameSchema, type NameParts } from "../identity/normalize.js";
@@ -47,6 +47,37 @@ export function customerBillingProfile(record: JsonRecord): BillingDetails | nul
   return parsed.data;
 }
 
+export interface ImportTrash { trashedAt: Date; batchId: string | null; reason: string | null; purgedAt: Date | null }
+
+/**
+ * Trash state of a customer or order record (increment 09). Absent / null = live. A half-finished permanent deletion
+ * (purgeStartedAt without purgedAt) is refused: import never makes such a row live and never guesses its content.
+ */
+export function trashOf(record: JsonRecord): ImportTrash | null {
+  const value = record.trash;
+  if (value === undefined || value === null) return null;
+  const trash = fieldObject(value);
+  if (trash.purgeStartedAt !== null && trash.purgeStartedAt !== undefined && (trash.purgedAt === null || trash.purgedAt === undefined)) {
+    throw validation("PORTABLE_PURGE_IN_PROGRESS", "A source record is in the middle of a permanent deletion.");
+  }
+  const batchId = trash.batchId ?? null;
+  const reason = trash.reason ?? null;
+  if ((batchId !== null && (typeof batchId !== "string" || !ULID_PATTERN.test(batchId))) ||
+    (reason !== null && (typeof reason !== "string" || reason.length > 200))) throw invalidTarget();
+  const trashedAt = targetDate(trash.trashedAt);
+  const purgedAt = trash.purgedAt === null || trash.purgedAt === undefined ? null : targetDate(trash.purgedAt);
+  if (purgedAt && purgedAt < trashedAt) throw invalidTarget();
+  return { trashedAt, batchId, reason, purgedAt };
+}
+
+/** Reason code for a record's trash state, or null when it is acceptable. */
+export function trashProblem(record: JsonRecord): string | null {
+  try { trashOf(record); return null; } catch (error) {
+    return error instanceof DomainError && error.reasonCode === "PORTABLE_PURGE_IN_PROGRESS"
+      ? "PORTABLE_PURGE_IN_PROGRESS" : "PORTABLE_TARGET_POLICY";
+  }
+}
+
 /** Portable id of the order group root (increment 08). Absent / null = the order is its own root. */
 export function groupRootOf(record: JsonRecord): string | null {
   const value = record.groupRootOrderPublicId;
@@ -67,6 +98,24 @@ export function groupLinkProblem(record: JsonRecord, ordersById: ReadonlyMap<str
   if (!root) return "PORTABLE_ORDER_GROUP_ROOT_MISSING";
   if ((root.groupRootOrderPublicId ?? null) !== null || root.customerPublicId !== record.customerPublicId ||
     root.currency !== record.currency) return "PORTABLE_ORDER_GROUP_INVALID";
+  // A live addition under a root in the trash cannot occur at the source (increment 09 group rules).
+  if ((record.trash ?? null) === null && (root.trash ?? null) !== null) return "PORTABLE_ORDER_GROUP_INVALID";
+  return null;
+}
+
+/**
+ * Trash consistency of an order with its owner and its children (increment 09): an order of a customer in the trash is
+ * itself in the trash, an order of a tombstoned customer is a tombstone, and a tombstone has no items, history or files.
+ */
+export function orderTrashProblem(record: JsonRecord, owner: JsonRecord | undefined, children: number): string | null {
+  const own = trashProblem(record);
+  if (own) return own;
+  const trash = trashOf(record);
+  let ownerTrash: ImportTrash | null;
+  try { ownerTrash = owner ? trashOf(owner) : null; } catch { return "PORTABLE_OWNER_NOT_PLANNED"; }
+  if (ownerTrash && !trash) return "PORTABLE_TRASH_STATE_INVALID";
+  if (ownerTrash?.purgedAt && !trash?.purgedAt) return "PORTABLE_TRASH_STATE_INVALID";
+  if (trash?.purgedAt && children > 0) return "PORTABLE_TRASH_STATE_INVALID";
   return null;
 }
 

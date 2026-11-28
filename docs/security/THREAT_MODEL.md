@@ -69,6 +69,20 @@ of scope (ADR 0010).
 | Provider credentials (SMTP, SIEM client keys, Stripe secrets) | Settings store | Encrypted, never returned to the client (`server/modules/platform/settingsStore.ts`) |
 | Availability of the portal and audit forwarding | All | Rate limits, bounded queries, fenced jobs |
 
+**Increment 09: trash and permanent deletion (privacy and retention).**
+- **While in the trash.** A trashed order or customer keeps all its data, but every read path outside the Trash centre treats it as not found. The order access resolver (orders) and session, sign-in and customer lists (identity) are the central gates.
+- **Retention.** Items in the trash are deleted permanently after 30 days by default, configurable from 1 to 3,650 days, with automatic clean-up on by default. See the [Admin guide](../guides/ADMIN_GUIDE.md#retention-clean-up).
+- **What permanent deletion does.** It erases personal and working data the portal controls, including stored objects. It keeps:
+  - issued invoices and receipts, and payment and refund records;
+  - policy-acceptance evidence;
+  - audit and security logs, which record public IDs and counts, never names or content;
+  - number reservations.
+
+  A tombstone row remains, with personal fields overwritten.
+- **Copies the portal does not control.** These are not erased: backups (until they expire), Stripe, SharePoint folders already written, delivered e-mail and SIEM copies. Restoring an older backup reintroduces deleted data, which must then be deleted again.
+- **Consent records.** On a customer's deletion, the platform unlinks the account from its consent records (`consent.forgetUser`), and the anonymous record stays until consent retention ends. This is wired as the `platform` trash participant (acd4ab4).
+
+
 ## 3. Actors
 
 | Actor | Trust | Typical capabilities |

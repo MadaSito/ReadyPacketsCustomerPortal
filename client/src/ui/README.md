@@ -59,7 +59,8 @@ Built on Radix primitives + Tailwind 4 semantic tokens. Target: WCAG 2.2 AA, 320
 | `Money` | `value: {amountMinor, currency} \| null` | Integer minor units only. |
 | `FileDropzone` | `onFiles(files)`, `accept?`, `multiple?`, `maxSize?`, `label?`, `hint?`, `disabled?` | Button-first, drag-and-drop as enhancement; server re-validates. |
 | `useStepUp()` | `.run(() => mutation.mutateAsync(input), { reason? })`, `.request({ reason? })` | On `STEP_UP_REQUIRED` opens the password + factor dialog, calls `assurance.stepUp`, retries once. Cancel → rejects with `StepUpCancelledError` (ignore it). |
-| `BrandLogo` | `appearance: auto\|light\|dark`, `variant: full\|icon`, `label` | Approved 4-part PNG lockup. Only the shells/auth screens normally need it. |
+| `BrandLogo` | `lockup: square\|horizontal`, `appearance: auto\|light\|dark`, `label` | Document-Stack full lockup (package 2026.10.15.2), one versioned SVG with explicit size. Square for tiles/auth/public/error; horizontal for narrow bars. `label=""` when a parent link names it. |
+| `EmailLink` | `email`, `children?`, `subject?` | Safe `mailto:` link for contact addresses; wraps, underlined, visible text is the name. Non-plain values render as text. |
 | `useTheme()` | `{ preference, resolved, setPreference }` | In-memory System/Light/Dark. |
 
 ### Examples

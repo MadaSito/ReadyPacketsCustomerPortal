@@ -55,6 +55,7 @@ import { createKnowledgeModule, type KnowledgeModule } from "./modules/knowledge
 import { createPaymentsModule, type PaymentsModule } from "./modules/payments/index.js";
 import { createOpsAlertsModule, type OpsAlertsModule } from "./modules/opsAlerts/index.js";
 import { createFileArchivesModule, type FileArchivesModule } from "./modules/files/archives.js";
+import { createTrashModule, type TrashModule } from "./modules/trash/index.js";
 
 export interface ModuleRegistry {
   identity: IdentityModule;
@@ -88,6 +89,8 @@ export interface ModuleRegistry {
   payments: PaymentsModule;
   opsAlerts: OpsAlertsModule;
   fileArchives: FileArchivesModule;
+  /** Increment 09: trash registry and coordinator. Participants register from their own init(). */
+  trash: TrashModule;
 }
 
 /** Everything a request handler can reach: infrastructure + every module. */
@@ -169,6 +172,7 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
   services.payments = createPaymentsModule(deps);
   services.opsAlerts = createOpsAlertsModule(deps);
   services.fileArchives = createFileArchivesModule(deps);
+  services.trash = createTrashModule(deps);
   services.sessionResolver = {
     // Late-bound so the identity module owns session truth without the container knowing its shape.
     resolve: (credentials) => services.identity.sessionResolver.resolve(credentials),
@@ -205,6 +209,8 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
     services.payments,
     services.opsAlerts,
     services.fileArchives,
+    // Last: every participant has registered by the time the trash coordinator initialises.
+    services.trash,
   ];
   services.allModules = modules;
   for (const module of modules) module.init?.();

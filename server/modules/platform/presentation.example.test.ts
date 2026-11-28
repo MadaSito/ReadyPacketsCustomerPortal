@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { deflateSync } from "node:zlib";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
@@ -6,7 +7,7 @@ import { DomainError } from "../../core/errors.js";
 import { validateImage } from "./imageValidation.js";
 import { createPlatformModule, type PlatformModuleImpl } from "./module.js";
 import { platformPresentationImages, platformSettings } from "./schema.js";
-import { announcementSchema, plainText, PRESENTATION_ANNOUNCEMENT, PRESENTATION_SLIDES, slidesSchema } from "./settings.js";
+import { announcementSchema, BRAND_IMAGE_ALLOWLIST, plainText, PRESENTATION_ANNOUNCEMENT, PRESENTATION_SLIDES, slidesSchema } from "./settings.js";
 import { createSettingsStore } from "./settingsStore.js";
 
 /* ------------------------------------------------------------- synthetic images */
@@ -180,6 +181,15 @@ describe("presentation settings validation", () => {
       expect(text.safeParse(bad).success).toBe(false);
     }
     expect(plainText(50, { multiline: true }).parse("a\r\nb")).toBe("a\nb");
+  });
+
+  it("brand allowlist keeps its stored ids and points at shipped files of the 2026.10.15.2 package (increment 09)", () => {
+    expect(Object.keys(BRAND_IMAGE_ALLOWLIST).sort()).toEqual(["brand-icon-light-512", "brand-icon-maskable-512"]);
+    for (const entry of Object.values(BRAND_IMAGE_ALLOWLIST)) {
+      expect(entry.path).toMatch(/^\/brand\/readypackets-[a-z0-9-]+-v2026101502\.png$/);
+      expect(entry.path).not.toContain("readypackets-approved");
+      expect(existsSync(new URL(`../../../client/public${entry.path}`, import.meta.url))).toBe(true);
+    }
   });
 
   it("bounds slides and only allows allowlisted or uploaded images", () => {

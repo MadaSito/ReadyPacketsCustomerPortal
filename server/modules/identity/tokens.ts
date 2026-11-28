@@ -2,6 +2,7 @@
  * Single-use e-mail link tokens. 256-bit random, stored only as FieldCrypto.hashToken, newest-only per
  * (user, purpose), bounded TTL. Lock order: users row → token row (see API.md).
  */
+import { isLiveUserRow } from "./live.js";
 import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 import type { ModuleDeps } from "../../container.js";
 import { randomToken } from "../../core/ids.js";
@@ -77,7 +78,7 @@ export function createTokenService(deps: ModuleDeps) {
       const [user] = await tx.select().from(users).where(eq(users.id, peek.userId)).limit(1).for("update");
       const [row] = await tx.select().from(identityTokens).where(eq(identityTokens.tokenHash, tokenHash)).limit(1).for("update");
       const now = deps.clock.now();
-      if (!user || !row || row.consumedAt !== null || row.expiresAt.getTime() <= now.getTime() || !purposes.includes(row.purpose)) {
+      if (!user || !isLiveUserRow(user) || !row || row.consumedAt !== null || row.expiresAt.getTime() <= now.getTime() || !purposes.includes(row.purpose)) {
         return null;
       }
       await tx.update(identityTokens).set({ consumedAt: now, retiredReason: "consumed" }).where(eq(identityTokens.id, row.id));

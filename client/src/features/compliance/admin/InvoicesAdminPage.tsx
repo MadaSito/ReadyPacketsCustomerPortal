@@ -6,7 +6,7 @@ import { Link, useSearch } from "wouter";
 import { useTRPC } from "@/lib/trpc";
 import { Button, Callout, DataTable, DateTime, EmptyState, Field, FilterBar, LoadMore, Money, PageHeader, Select } from "@/ui";
 import { CompanyProfileDialog } from "../receipts/ReceiptViews";
-import { InvoiceStatusBadge, type InvoiceStatus } from "../shared";
+import { InvoiceStatusBadge, OrderLifecycleBadge, type InvoiceStatus } from "../shared";
 import { useCan } from "./common";
 import { InvoiceEditor } from "./InvoiceEditor";
 import { ULID, money, type InvoiceSummary } from "./model";
@@ -95,7 +95,16 @@ export default function InvoicesAdminPage() {
                 </Link>
               ),
             },
-            { key: "order", header: "Order", cell: (row) => <span className="font-mono break-all">{row.orderReference}</span> },
+            {
+              key: "order",
+              header: "Order",
+              cell: (row) => (
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-mono break-all">{row.orderReference}</span>
+                  <OrderLifecycleBadge state={row.orderLifecycleState} />
+                </div>
+              ),
+            },
             {
               key: "project",
               header: "Project",

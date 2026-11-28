@@ -112,6 +112,34 @@ describe("mailTemplates module (Package D)", () => {
     }).where(eq(mailTemplates.templateKey, template.templateKey));
     expect((await mod.get(adminPrincipal, { templateKey: template.templateKey })).declaredVars).toContainEqual(expected);
   });
+
+  it("uses the same relative bare-link render in preview, published delivery, and test-send", async () => {
+    const templateKey = "custom.legacy_order_link";
+    const declaredVars = [{ name: "portalPath", label: "Portal path", required: true, sampleValue: "/orders/demo?x=1&y=2" }];
+    const content = {
+      format: "html" as const,
+      subject: "Your order is ready",
+      bodyHtml: "<p>Review your order: {{portalPath}}.</p>",
+      bodyText: "Review your order: {{portalPath}}.",
+      declaredVars,
+    };
+    const draft = await mod.createCustom(adminPrincipal, {
+      templateKey, name: "Legacy order link", description: "Sample published template", category: "orders", ...content,
+    });
+    await mod.publish(adminPrincipal, { templateKey, expectedVersion: draft.version });
+    const preview = await mod.preview(adminPrincipal, { templateKey, ...content });
+    await mod.sendTestToMe(adminPrincipal, { templateKey, source: "published" });
+    const queued = enqueuedMails.at(-1)!.mail;
+    const live = (await registeredStore!.resolve(templateKey))!.render(queued.vars);
+    const test = (await registeredStore!.resolve(queued.template))!.render(queued.vars);
+    const url = "https://portal.readypackets.test/orders/demo?x=1&y=2";
+    expect(test.html).toBe(live.html);
+    expect(test.text).toBe(live.text);
+    expect(preview.text).toBe(test.text);
+    expect(preview.text.split("\n")).toContain(url);
+    expect(preview.previewHtml).not.toContain("href=");
+    expect(test.html).toContain(`href="${url.replaceAll("&", "&amp;")}"`);
+  });
   it("limits phase actions to the approved contracts and compatible published custom mail", async () => {
     async function create(templateKey: string, name: string, variable: string, sensitive = false) {
       return mod.createCustom(adminPrincipal, {

@@ -496,3 +496,14 @@ All `admin.*` queries require `adminProcedure`. Step-up mutations re-validate se
 - **`integration_webhook_deliveries`**: `order_public_id` (`varchar(26)`), `stage_key` (`varchar(64)`), `manual_retry_count` (`int unsigned not null default 0`), `stopped_at` (`datetime(3)`), `stopped_by_user_id` (`bigint unsigned`), `stopped_by_public_id` (`varchar(26)`), `stop_reason` (`varchar(280)`), index `idx_webhook_delivery_order_created (order_public_id, created_at, id)`.
 - **New audit events**: `integration.production.signing_updated`, `integration.production.signing_secret_rotated`, `integration.production.workflow_auto_queue_updated`, `integration.production.dispatch.stopped`, `integration.production.dispatch.refused`, `integration.webhook.delivery_stopped`, `integration.webhook.delivery_retried`, `integration.graph.sites_selected_checked`.
 
+## Increment 09 D2 — Trash, Restore & Permanent Purge (`TrashParticipant` `integrations`)
+
+- `init()` registers `integrations` as a `TrashParticipant` with `services.trash.register`.
+- **On trash (`onTrashedInTx`) & while trashed**:
+  - Queued `integration_production_dispatches` (`P101`/`P201`/`P301`/`P401`) and queued/retrying order-bound `integration_webhook_deliveries` are stopped (`ORDER_TRASHED`) and their encrypted payload copies cleared.
+  - No new production webhook dispatch or order-bound outbound webhook delivery is queued for a trashed or tombstoned order; `listDispatches` excludes trashed orders.
+  - **D2.8 in-flight fence**: any delivery already claimed before trashing re-checks live order state inside `egress.fetchPinned({ beforeSend })` immediately before opening the network socket and cancels itself (`outcome: "canceled"`, `reasonCode: "ORDER_TRASHED"`) without sending bytes or penalizing provider health.
+- **On restore (`onRestoredInTx`)**: unsent dispatches stopped solely due to `ORDER_TRASHED` do not block fresh phase triggers once the order is live again.
+- **On permanent purge (`purge`)**: erases all `integration_production_dispatches` rows and order-bound `integration_webhook_deliveries` / `integration_webhook_delivery_attempts` payload copies (`productionPayloadCopies`, `webhookPayloadCopies`).
+
+

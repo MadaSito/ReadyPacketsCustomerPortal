@@ -18,7 +18,7 @@
  *  - Every privileged write runs `actorCheck(principal, tx, "orders.statuses.manage")` as the first statement
  *    inside the transaction (enforcing live session currency, admin role and fresh MFA step-up).
  */
-import { asc, count, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, count, eq, inArray, sql } from "drizzle-orm";
 import {
   BUILT_IN_STATUS_CATALOG,
   fallbackStatusCatalogLookup,
@@ -35,6 +35,7 @@ import { ulid } from "../../core/ids.js";
 import type { AuditEmitter, Clock, Db, DbOrTx, SessionPrincipal } from "../../core/types.js";
 import type { ActorCheck } from "./actor.js";
 import { orders, orderWorkflowDrafts, orderWorkflows, orderWorkflowVersions } from "./schema.js";
+import { liveOrderPredicate } from "./trashGate.js";
 import { orderStatusCatalog, type OrderStatusCatalogRow } from "./statusCatalogSchema.js";
 import type { WorkflowDraftDefinition } from "./workflowDesign.js";
 import type { WorkflowDefinition, WorkflowState } from "./workflowTypes.js";
@@ -429,7 +430,7 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
           total: count(),
         })
         .from(orders)
-        .where(inArray(orders.attention, ["staff_review", "customer_response"]))
+        .where(and(inArray(orders.attention, ["staff_review", "customer_response"]), liveOrderPredicate()))
         .groupBy(orders.attention);
 
       let staffReview = 0;

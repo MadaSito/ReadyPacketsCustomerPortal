@@ -26,9 +26,10 @@ import type { ModuleDeps } from "../../../container.js";
 import { DomainError, conflict, forbidden, notFound, validation } from "../../../core/errors.js";
 import { ulid } from "../../../core/ids.js";
 import { getRequestContext } from "../../../core/requestContext.js";
-import type { ClaimedJob, JobResult, SafeAttributeValue, SessionPrincipal, Tx } from "../../../core/types.js";
+import type { ClaimedJob, DbOrTx, JobResult, SafeAttributeValue, SessionPrincipal, Tx } from "../../../core/types.js";
 import { jobRuns } from "../../jobs/schema.js";
 import type { OrderLockState } from "../../orders/types.js";
+import type { TrashEntityRef, TrashPurgeRun } from "../../trash/ports.js";
 import { isSecretConfigured, readSecret, readSetting, writeSetting } from "../../platform/index.js";
 import { flagKey } from "../../platform/settingsRegistry.js";
 import {
@@ -403,6 +404,17 @@ export interface ProductionWebhookService {
     principal: SessionPrincipal,
     input?: ListProductionDispatchesInput,
   ): Promise<{ items: ProductionDispatchItem[] }>;
+  onOrderTrashedInTx(tx: Tx, entity: TrashEntityRef): Promise<void>;
+  summarizeOrderForTrash(entity: TrashEntityRef): Promise<Record<string, number>>;
+  purgeOrderDispatchesInTx(tx: Tx, entity: TrashEntityRef): Promise<{ deleted: Record<string, number> }>;
+  purgeOrderDispatches(entity: TrashEntityRef, run: TrashPurgeRun): Promise<{ deleted: Record<string, number> }>;
+}
+
+class OrderTrashedDeliveryAbortError extends Error {
+  constructor() {
+    super("ORDER_TRASHED");
+    this.name = "OrderTrashedDeliveryAbortError";
+  }
 }
 
 function dispatchPayloadAad(dispatchPublicId: string): string {
@@ -481,7 +493,10 @@ export function fixedDispatchSummary(
     case "PHASE1_INTAKE_NOT_LOCKED":
       return "Canceled before delivery because the intake phase is not submitted and locked.";
     case "STOPPED_BY_OPERATOR":
+    case "OPERATOR_STOPPED":
       return "Stopped before delivery by an operator; payload cleared.";
+    case "ORDER_TRASHED":
+      return "Canceled before delivery because the order was moved to the trash; payload cleared.";
     case "PRODUCTION_NOT_CONFIGURED":
       return "Canceled before delivery because production webhooks are disabled or incomplete.";
     case "PRODUCTION_PAYLOAD_MISSING":
@@ -1381,6 +1396,18 @@ export function createProductionWebhookService(
     };
   }
 
+  function isUnsentTrashStoppedRow(
+    row: Pick<DispatchRow, "state" | "lastReasonCode" | "attemptCount">,
+  ): boolean {
+    return row.state === "stopped" && row.lastReasonCode === "ORDER_TRASHED" && row.attemptCount === 0;
+  }
+
+  async function isOrderTrashedInTx(tx: DbOrTx, orderId: number): Promise<boolean> {
+    const orders = deps.services.orders;
+    if (!orders || typeof orders.isTrashedInTx !== "function") return false;
+    return orders.isTrashedInTx(tx, orderId);
+  }
+
   async function evaluateP101CandidateInTx(
     tx: Tx,
     orderId: number,
@@ -1397,6 +1424,9 @@ export function createProductionWebhookService(
     const orders = requireOrders();
     const identity = requireIdentity();
 
+    if (await isOrderTrashedInTx(tx, orderId)) {
+      throw notFound("ORDER_NOT_FOUND");
+    }
     const scope = await orders.getProductionScope(orderId, { tx });
     if (!scope) {
       throw notFound("ORDER_NOT_FOUND");
@@ -1538,6 +1568,9 @@ export function createProductionWebhookService(
       correlationIdOverride?: string;
     },
   ): Promise<ProductionDispatchItem> {
+    if (await isOrderTrashedInTx(tx, params.orderId)) {
+      throw notFound("ORDER_NOT_FOUND");
+    }
     const now = deps.clock.now();
     const publicId = ulid();
     // Retry rows carry the root delivery's wire `Idempotency-Key` upstream (so receiver dedupe protects
@@ -1822,7 +1855,10 @@ export function createProductionWebhookService(
         return { kind: "canceled", reasonCode: "PRODUCTION_JOB_SUPERSEDED" };
       }
       if (row.state === "stopped") {
-        return { kind: "canceled", reasonCode: "STOPPED_BY_OPERATOR" };
+        return {
+          kind: "canceled",
+          reasonCode: row.lastReasonCode === "ORDER_TRASHED" ? "ORDER_TRASHED" : "STOPPED_BY_OPERATOR",
+        };
       }
       if (row.state === "delivered") {
         return { kind: "already_completed" };
@@ -1856,6 +1892,30 @@ export function createProductionWebhookService(
       }
       if (row.state !== "queued") {
         return { kind: "canceled", reasonCode: "PRODUCTION_UNEXPECTED_STATE" };
+      }
+      if (await isOrderTrashedInTx(tx, row.orderId)) {
+        const summary = fixedDispatchSummary("ORDER_TRASHED", null, "stopped");
+        await tx
+          .update(integrationProductionDispatches)
+          .set({
+            state: "stopped",
+            payloadEnc: null,
+            activeFencingToken: 0,
+            lastReasonCode: "ORDER_TRASHED",
+            responseSummary: summary,
+            stoppedAt: now,
+            stopReason: "ORDER_TRASHED",
+            finalizedAt: now,
+            updatedAt: now,
+            version: row.version + 1,
+          })
+          .where(
+            and(
+              eq(integrationProductionDispatches.id, row.id),
+              eq(integrationProductionDispatches.version, row.version),
+            ),
+          );
+        return { kind: "canceled", reasonCode: "ORDER_TRASHED" };
       }
       if (row.expiresAt.getTime() <= now.getTime()) {
         const expiryReason =
@@ -2151,6 +2211,7 @@ export function createProductionWebhookService(
 
     type AttemptOutcome =
       | { kind: "delivered"; httpStatus: number }
+      | { kind: "aborted_order_trashed" }
       | {
           kind: "failed";
           retryable: boolean;
@@ -2169,6 +2230,21 @@ export function createProductionWebhookService(
         signal: job.signal,
         requireAllowlistRule: true,
         publicAddressesOnly: true,
+        // Increment 09 D2.8: re-check live order state immediately before opening the network socket.
+        beforeSend: async () => {
+          await job.assertStillOwned();
+          if (await isOrderTrashedInTx(deps.db, decision.row.orderId)) {
+            throw new OrderTrashedDeliveryAbortError();
+          }
+          const [fresh] = await deps.db
+            .select({ state: integrationProductionDispatches.state })
+            .from(integrationProductionDispatches)
+            .where(eq(integrationProductionDispatches.id, decision.row.id))
+            .limit(1);
+          if (!fresh || fresh.state === "stopped") {
+            throw new OrderTrashedDeliveryAbortError();
+          }
+        },
       });
 
       // PW-01: Discard `resp.body` completely — record only `resp.status` and fixed server reason code.
@@ -2204,7 +2280,9 @@ export function createProductionWebhookService(
         };
       }
     } catch (err) {
-      if (err instanceof DomainError) {
+      if (err instanceof OrderTrashedDeliveryAbortError) {
+        attemptOutcome = { kind: "aborted_order_trashed" };
+      } else if (err instanceof DomainError) {
         const retryable = err.code === "UNAVAILABLE";
         attemptOutcome = {
           kind: "failed",
@@ -2258,6 +2336,26 @@ export function createProductionWebhookService(
       );
 
       const now = deps.clock.now();
+      if (attemptOutcome.kind === "aborted_order_trashed") {
+        const summary = fixedDispatchSummary("ORDER_TRASHED", null, "stopped");
+        await tx
+          .update(integrationProductionDispatches)
+          .set({
+            state: "stopped",
+            payloadEnc: null,
+            activeFencingToken: 0,
+            attemptCount: Math.max(0, locked.attemptCount - 1),
+            responseSummary: summary,
+            lastReasonCode: "ORDER_TRASHED",
+            stoppedAt: now,
+            stopReason: "ORDER_TRASHED",
+            finalizedAt: now,
+            updatedAt: now,
+            version: locked.version + 1,
+          })
+          .where(claimFenceWhere);
+        return { outcome: "canceled", reasonCode: "ORDER_TRASHED" };
+      }
       if (attemptOutcome.kind === "delivered") {
         const summary = fixedDispatchSummary("PRODUCTION_DELIVERED", attemptOutcome.httpStatus, "delivered");
         await tx
@@ -2482,6 +2580,8 @@ export function createProductionWebhookService(
     const phase = decision.row.phase as ProductionPhase;
     if (result.outcome === "completed") {
       await checks.recordOutcome("production", "succeeded", "PRODUCTION_DELIVERED");
+      await resolveProdOpsAlert(decision.row.orderPublicId, phase, job.correlationId);
+    } else if (result.outcome === "canceled") {
       await resolveProdOpsAlert(decision.row.orderPublicId, phase, job.correlationId);
     } else if (result.outcome === "unknown") {
       await checks.recordOutcome("production", "failed", result.reasonCode);
@@ -3481,7 +3581,7 @@ export function createProductionWebhookService(
           return prep;
         }
 
-        const existingPhase = existingRows.filter((r) => r.phase === phase);
+        const existingPhase = existingRows.filter((r) => r.phase === phase && !isUnsentTrashStoppedRow(r));
         if (existingPhase.some((r) => r.state === "queued" || r.state === "sending")) {
           throw conflict(
             "PRODUCTION_DISPATCH_IN_PROGRESS",
@@ -3991,7 +4091,7 @@ export function createProductionWebhookService(
     async enqueueWorkflowDispatch(input, tx): Promise<EnqueueWorkflowProductionDispatchResult> {
       const orders = requireOrders();
       const orderRef = await orders.getOrderRefByPublicId(input.orderPublicId, tx, { forUpdate: true });
-      if (!orderRef) {
+      if (!orderRef || (await isOrderTrashedInTx(tx, orderRef.id))) {
         return {
           outcome: "refused_precondition",
           dispatchPublicId: null,
@@ -4027,7 +4127,7 @@ export function createProductionWebhookService(
         .for("update")
         .orderBy(desc(integrationProductionDispatches.id));
 
-      const phaseRows = existingRows.filter((r) => r.phase === input.phase);
+      const phaseRows = existingRows.filter((r) => r.phase === input.phase && !isUnsentTrashStoppedRow(r));
       const existingActiveOrDelivered = phaseRows.find(
         (r) => r.state === "queued" || r.state === "sending" || r.state === "delivered",
       );
@@ -4525,19 +4625,20 @@ export function createProductionWebhookService(
             .for("update")
             .orderBy(desc(integrationProductionDispatches.id));
 
-          if (existingP101.some((r) => r.state === "queued" || r.state === "sending")) {
+          const effectiveP101 = existingP101.filter((r) => !isUnsentTrashStoppedRow(r));
+          if (effectiveP101.some((r) => r.state === "queued" || r.state === "sending")) {
             throw conflict(
               "PRODUCTION_DISPATCH_IN_PROGRESS",
               "A Phase I (P101) dispatch is already queued or sending for this order.",
             );
           }
-          if (existingP101.some((r) => r.state === "delivered")) {
+          if (effectiveP101.some((r) => r.state === "delivered")) {
             throw conflict(
               "PRODUCTION_P101_ALREADY_DELIVERED",
               "Phase I (P101) has already been delivered for this order. Re-sending requires an administrator with step-up authentication and a reason.",
             );
           }
-          if (existingP101.length > 0) {
+          if (effectiveP101.length > 0) {
             throw conflict(
               "PRODUCTION_RESEND_REQUIRED",
               "A prior Phase I (P101) attempt already ran for this order. Re-sending requires an administrator with step-up authentication and a reason.",
@@ -4725,7 +4826,7 @@ export function createProductionWebhookService(
             };
           }
 
-          const existingP201 = existingRows.filter((r) => r.phase === "P201");
+          const existingP201 = existingRows.filter((r) => r.phase === "P201" && !isUnsentTrashStoppedRow(r));
           if (existingP201.some((r) => r.state === "queued" || r.state === "sending")) {
             throw conflict(
               "PRODUCTION_DISPATCH_IN_PROGRESS",
@@ -5555,7 +5656,104 @@ export function createProductionWebhookService(
           .orderBy(desc(integrationProductionDispatches.id))
           .limit(limit);
 
-        return { items: await mapDispatchItemsWithScheduledRetries(tx, rows) };
+        let visibleRows = rows;
+        if (typeof deps.services.orders?.isTrashedInTx === "function" && rows.length > 0) {
+          const uniqueOrderIds = [...new Set(rows.map((r) => r.orderId))];
+          const trashedIds = new Set<number>();
+          for (const oid of uniqueOrderIds) {
+            if (await deps.services.orders.isTrashedInTx(tx, oid)) {
+              trashedIds.add(oid);
+            }
+          }
+          if (trashedIds.size > 0) {
+            visibleRows = rows.filter((r) => !trashedIds.has(r.orderId));
+          }
+        }
+
+        return { items: await mapDispatchItemsWithScheduledRetries(tx, visibleRows) };
+      });
+    },
+
+    async onOrderTrashedInTx(tx, entity) {
+      if (entity.kind !== "order") return;
+      const now = deps.clock.now();
+      const summary = fixedDispatchSummary("ORDER_TRASHED", null, "stopped");
+      const queuedRows = await tx
+        .select({ id: integrationProductionDispatches.id, version: integrationProductionDispatches.version })
+        .from(integrationProductionDispatches)
+        .where(
+          and(
+            eq(integrationProductionDispatches.orderId, entity.id),
+            eq(integrationProductionDispatches.state, "queued"),
+          ),
+        )
+        .for("update");
+
+      for (const row of queuedRows) {
+        await tx
+          .update(integrationProductionDispatches)
+          .set({
+            state: "stopped",
+            payloadEnc: null,
+            activeFencingToken: 0,
+            lastReasonCode: "ORDER_TRASHED",
+            responseSummary: summary,
+            stoppedAt: now,
+            stopReason: "ORDER_TRASHED",
+            finalizedAt: now,
+            updatedAt: now,
+            version: row.version + 1,
+          })
+          .where(
+            and(
+              eq(integrationProductionDispatches.id, row.id),
+              eq(integrationProductionDispatches.version, row.version),
+            ),
+          );
+      }
+    },
+
+    async summarizeOrderForTrash(entity) {
+      if (entity.kind !== "order") return {};
+      const rows = await deps.db
+        .select({ id: integrationProductionDispatches.id })
+        .from(integrationProductionDispatches)
+        .where(eq(integrationProductionDispatches.orderId, entity.id));
+      const out: Record<string, number> = {};
+      if (rows.length > 0) out.productionDispatches = rows.length;
+      return out;
+    },
+
+    async purgeOrderDispatchesInTx(tx, entity) {
+      if (entity.kind !== "order") return { deleted: {} };
+      const [res] = await tx
+        .delete(integrationProductionDispatches)
+        .where(
+          or(
+            eq(integrationProductionDispatches.orderId, entity.id),
+            eq(integrationProductionDispatches.orderPublicId, entity.publicId),
+          ),
+        );
+      const deleted: Record<string, number> = {};
+      if (res.affectedRows > 0) deleted.productionPayloadCopies = res.affectedRows;
+      return { deleted };
+    },
+
+    async purgeOrderDispatches(entity, run) {
+      if (entity.kind !== "order") return { deleted: {} };
+      return deps.db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
+        const [res] = await tx
+          .delete(integrationProductionDispatches)
+          .where(
+            or(
+              eq(integrationProductionDispatches.orderId, entity.id),
+              eq(integrationProductionDispatches.orderPublicId, entity.publicId),
+            ),
+          );
+        const deleted: Record<string, number> = {};
+        if (res.affectedRows > 0) deleted.productionPayloadCopies = res.affectedRows;
+        return { deleted };
       });
     },
   };

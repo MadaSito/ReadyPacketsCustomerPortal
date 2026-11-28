@@ -17,6 +17,7 @@ import type { Db, FieldCrypto, SessionPrincipal, Tx } from "../../core/types.js"
 import { automationCorrelationId } from "../audit/tap.js";
 import { lockBlocks, orderLocked } from "../orders/policy.js";
 import { orders } from "../orders/schema.js";
+import { isLiveOrderRow, liveOrderPredicate } from "../orders/trashGate.js";
 import type { BoundWorkflow } from "../orders/workflows.js";
 import { readSetting } from "../platform/index.js";
 import {
@@ -413,7 +414,7 @@ export async function previewOrderStageBundle(
       ownerUserId: orders.ownerUserId,
     })
     .from(orders)
-    .where(eq(orders.publicId, access.publicId))
+    .where(and(eq(orders.publicId, access.publicId), liveOrderPredicate()))
     .limit(1);
   if (!orderRow) {
     throw notFound("Order not found.");
@@ -581,12 +582,14 @@ export async function executeOrderStageBundle(
           lockState: orders.lockState,
           completionRevision: orders.completionRevision,
           version: orders.version,
+          trashedAt: orders.trashedAt,
+          purgedAt: orders.purgedAt,
         })
         .from(orders)
         .where(eq(orders.publicId, input.orderPublicId))
         .for("update");
 
-      if (!lockedOrder) {
+      if (!lockedOrder || !isLiveOrderRow(lockedOrder)) {
         throw notFound("Order not found.");
       }
 
@@ -905,6 +908,7 @@ export async function executeOrderStageBundle(
             await deps.mailer.enqueue(
               {
                 to: { userId: lockedOrder.ownerUserId },
+                orderId: lockedOrder.id,
                 template: tpl.key,
                 vars: filteredVars,
                 idempotencyKey: `stage-run:${runPublicId}:email`,
@@ -1182,7 +1186,7 @@ export async function listOrderStageBundleRuns(
   const [orderRow] = await deps.db
     .select({ id: orders.id })
     .from(orders)
-    .where(eq(orders.publicId, input.orderPublicId))
+    .where(and(eq(orders.publicId, input.orderPublicId), liveOrderPredicate()))
     .limit(1);
   if (!orderRow) {
     throw notFound("Order not found.");

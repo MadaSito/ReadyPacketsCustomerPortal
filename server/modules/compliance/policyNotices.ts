@@ -3,6 +3,7 @@ import type { ModuleDeps } from "../../container.js";
 import { conflict, notFound, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { ClaimedJob, DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
+import { liveUserPredicate } from "../identity/live.js";
 import { users } from "../identity/schema.js";
 import { assertLiveActorInTx, runComplianceTx } from "./actorAuth.js";
 import { policyNoticePreferences, policyNoticeRecipients, policyNotices } from "./policyNoticesSchema.js";
@@ -37,8 +38,12 @@ export interface PolicyNoticesPorts {
 }
 
 export function audienceUserFilter(audience: PolicyAudience) {
-  if (audience === "all") return eq(users.status, "active");
-  return and(eq(users.status, "active"), audience === "customer" ? eq(users.role, "customer") : inArray(users.role, ["staff", "admin"]));
+  if (audience === "all") return and(eq(users.status, "active"), liveUserPredicate());
+  return and(
+    eq(users.status, "active"),
+    liveUserPredicate(),
+    audience === "customer" ? eq(users.role, "customer") : inArray(users.role, ["staff", "admin"]),
+  );
 }
 
 export function hasPortalAcceptance(db: DbOrTx, versionId: number | typeof policyVersions.id, userId: number | typeof users.id) {

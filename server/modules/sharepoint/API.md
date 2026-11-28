@@ -66,6 +66,14 @@ Order sync records one `storage_copy_attempts` row per job attempt (kind `sharep
 
 No remote IDs, list names, paths or provider text are stored. The Copy log has no direct retry for SharePoint; the job queue's own retries (up to 6, safe because items are looked up by RpOrderId) apply. Runs with no assigned destination record nothing.
 
+## Trash, restore, and permanent deletion (increment 09 D2)
+- `init()` registers `sharepoint` as a `TrashParticipant` with `services.trash.register`.
+- While an order is in the trash (`onTrashedInTx` / `orders.isTrashedInTx` / `orders.getOrderSyncView === null`):
+  - Order changes, manual `enqueueOrder`, `resyncAll`, and `backfill` skip trashed and tombstoned orders; trashed orders are hidden from `orderSync.get` counts and `orderSync.status`.
+  - Any sync job already queued or claimed before trashing re-checks live order state inside `beforeWrite` immediately before the external Graph list write (`POST`/`PATCH`) and drops itself (`outcome: "canceled"`, `reasonCode: "ORDER_TRASHED"`, copy log `result: "not_written"`) without marking SharePoint sync configuration unhealthy.
+- Restoring an order (`onRestoredInTx`) clears the trash marker and re-stages `sharepoint.sync_order` when sync is enabled.
+- Permanent deletion (`purge`) erases the portal mapping row in `sharepoint_order_sync` only. Folders, files, and list items already written to SharePoint or OneDrive are intentionally **not** deleted automatically (D2.6).
+
 ## Least privilege (administrator guidance)
 - For SharePoint, use an Entra app with `Sites.Selected`, granted `write` on the single chosen site only.
 - For OneDrive for Business, application permissions are tenant-wide (`Files.ReadWrite.All`). Prefer SharePoint, or restrict the app with an application access policy or RBAC for Applications.

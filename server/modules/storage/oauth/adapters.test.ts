@@ -92,6 +92,7 @@ describe("Dropbox protocol fake", () => {
 describe("Google Drive protocol fake", () => {
   function drive(data: Buffer, location = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=local", mismatch = false) {
     let properties: unknown;
+    let deleted = false;
     const desiredKey = createHash("sha256").update(JSON.stringify([publicId, "root", "ReadyPackets"])).digest("hex");
     const request = vi.fn<StorageRequest>().mockImplementation(async (target, opts) => {
       const url = new URL(target);
@@ -120,7 +121,11 @@ describe("Google Drive protocol fake", () => {
         expect(opts.headers?.["Content-Range"]).toBe(data.length > CHUNK ? `bytes ${CHUNK}-${data.length - 1}/${data.length}` : undefined);
         return answer(201, { id: "fake_object" });
       }
-      if (url.pathname === "/drive/v3/files/fake_object" && opts?.method === "DELETE") return answer(204);
+      if (url.pathname === "/drive/v3/files/fake_object" && opts?.method === "DELETE") {
+        deleted = true;
+        return answer(204);
+      }
+      if (url.pathname === "/drive/v3/files/fake_object" && deleted) return answer(404);
       if (url.pathname === "/drive/v3/files/fake_object") return answer(200, {
         id: "fake_object", name: "café.pdf", size: String(data.length), parents: [mismatch ? "other_parent" : "fake_folder"],
         sha256Checksum: sha(data), appProperties: properties, trashed: false, mimeType: "application/pdf",
@@ -140,7 +145,8 @@ describe("Google Drive protocol fake", () => {
     expect(fence).toHaveBeenCalledTimes(3);
     expect(f.request.mock.calls.filter(([, opts]) => opts?.method === "PUT")).toHaveLength(2);
     await f.adapter.remove("fake_object");
-    expect(f.request.mock.calls.at(-1)?.[1]?.method).toBe("DELETE");
+    expect(f.request.mock.calls.at(-2)?.[1]?.method).toBe("DELETE");
+    expect(new URL(f.request.mock.calls.at(-1)![0]).searchParams.get("fields")).toBe("id");
   });
 
   it("does not follow a supplied non-provider resumable URL and rejects mismatched metadata", async () => {

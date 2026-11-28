@@ -1,3 +1,4 @@
+import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
@@ -34,6 +35,14 @@ beforeEach(async () => {
 });
 
 describe("operations alert persistence", () => {
+  it("accepts a deduplicated retention failure alert from the trash coordinator", async () => {
+    const input = { source: "trash", severity: "error", code: "TRASH_PURGE_FAILED", title: "Trash cleanup needs attention",
+      dedupKey: "retention:synthetic-run" } as const;
+    const first = await service.emit(input);
+    expect(await service.emit(input)).toEqual(first);
+    expect(await service.list({ source: "trash" })).toMatchObject({ items: [{ publicId: first.publicId, code: input.code }] });
+  });
+
   it("deduplicates missing Stripe webhook warnings by environment, not by payment", async () => {
     const test = stripeWebhookDeliveryMissingAlert("test");
     const [first, second] = await Promise.all([service.emit(test), service.emit(test)]);
@@ -81,12 +90,13 @@ describe("operations alert persistence", () => {
       nameEnc: "test", createdAt: now, updatedAt: now,
     });
     const old = new Date(now.getTime() - 72 * 60 * 60 * 1000);
-    const ids = [ulid(), ulid(), ulid()];
+    const ids = [ulid(), ulid(), ulid(), ulid()];
     await database.db.insert(orders).values(ids.map((id, i) => ({
       publicId: id, reference: `RP-TEST-${i}`, ownerUserId: Number(user.insertId), projectName: "Synthetic order",
       workflowVersionId: 1, statusKey: "received", subtotalMinor: 0, totalMinor: 0, currency: "USD",
       attention: i === 1 ? "customer_response" as const : "staff_review" as const,
       attentionSince: i === 2 ? now : old, createdAt: now, updatedAt: now,
+      ...(i === 3 ? { trashedAt: now } : {}),
     })));
     await harness.settings.set(ATTENTION_ALERTS_ENABLED.key, true);
     const kind = "ops.alerts.attention_check";
@@ -101,6 +111,40 @@ describe("operations alert persistence", () => {
     await handler({ ...run, jobId: ulid() });
     expect((await service.list({ source: "attention" })).items.map(({ orderPublicId }) => orderPublicId).sort()).toEqual(ids.slice(0, 2).sort());
     expect(harness.mailer.sent).toHaveLength(0);
+  });
+
+  it("hides historical waiting-order alerts from list, counts and management without hiding payment alerts", async () => {
+    const now = harness.clock.now();
+    const orderPublicId = ulid();
+    const [owner] = await database.db.insert(users).values({
+      publicId: ulid(), role: "customer", status: "active",
+      emailEnc: "test", emailIndex: harness.deps.crypto.blindIndex("buyer@example.test", "users.email"),
+      nameEnc: "test", createdAt: now, updatedAt: now,
+    });
+    await database.db.insert(orders).values({
+      publicId: orderPublicId, reference: "RP-TEST-HISTORY", ownerUserId: Number(owner.insertId), projectName: "Synthetic order",
+      workflowVersionId: 1, statusKey: "received", subtotalMinor: 0, totalMinor: 0, currency: "USD", createdAt: now, updatedAt: now,
+    });
+    const waiting = await service.emit({ ...fixture, source: "attention", orderPublicId, code: "ORDER_ATTENTION_OVERDUE",
+      dedupKey: "waiting:example", title: "Order is waiting" });
+    const payment = await service.emit({ ...fixture, source: "payment", orderPublicId, code: "PAYMENT_REVIEW",
+      dedupKey: "payment:example", title: "Review payment" });
+    expect(await service.summary()).toEqual({ warning: 2, error: 0, critical: 0 });
+    expect((await service.list({ source: "attention" })).items[0]?.publicId).toBe(waiting.publicId);
+
+    const staff = fakePrincipal({ role: "staff" });
+    harness.services.identity = {
+      sessions: { assertCurrent: async () => ({ role: "staff", pendingSteps: [] }) },
+    } as unknown as TestHarness["services"]["identity"];
+    await database.db.update(orders).set({ trashedAt: now }).where(eq(orders.publicId, orderPublicId));
+    expect((await service.list({})).items.map(({ publicId }) => publicId)).toEqual([payment.publicId]);
+    expect(await service.summary()).toEqual({ warning: 1, error: 0, critical: 0 });
+    await expect(service.manage(staff, waiting.publicId, "acknowledged")).rejects.toMatchObject({ reasonCode: "NOT_FOUND" });
+    expect(await service.manage(staff, payment.publicId, "acknowledged")).toEqual({ changed: true });
+    expect(await service.summary()).toEqual({ warning: 0, error: 0, critical: 0 });
+
+    await database.db.update(orders).set({ trashedAt: null }).where(eq(orders.publicId, orderPublicId));
+    expect(await service.manage(staff, waiting.publicId, "acknowledged")).toEqual({ changed: true });
   });
 
   it("registers a single daily, retry-safe SAML slot", async () => {

@@ -111,6 +111,11 @@ export const CAPABILITIES = [
   "ops.alerts.read",
   "ops.alerts.manage",
   "files.archive.order",
+  // increment 09: trash centre (orders and customer accounts), permanent deletion, retention
+  "trash.read",
+  "trash.manage",
+  "trash.purge",
+  "trash.retention.manage",
   // portable / backup
   "portable.export",
   "portable.import",
@@ -213,6 +218,8 @@ export const STEP_UP_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>
   "orders.stage.reopen",
   "orders.statuses.manage",
   "files.archive.order",
+  "trash.purge",
+  "trash.retention.manage",
   "portable.export",
   "portable.import",
   "backup.run",

@@ -37,7 +37,7 @@ export default defineConfig(({ mode }) => {
               filename: "sw.ts",
               strategies: "injectManifest",
               injectManifest: {
-                globPatterns: ["offline.html", "offline.css", "assets/**/*.{js,css}", "fonts/*.woff2", "brand/*.png", "favicon.ico", "manifest.webmanifest"],
+                globPatterns: ["offline.html", "offline.css", "assets/**/*.{js,css}", "fonts/*.woff2", "brand/*.{png,svg,ico}", "favicon.ico", "manifest.webmanifest"],
               },
             }),
           ]),

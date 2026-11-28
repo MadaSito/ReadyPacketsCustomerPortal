@@ -1,12 +1,13 @@
 /** Console order list (/admin/orders) with filters and cursor pagination. Owner: orders_engineer. */
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { Package } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Link, useSearch } from "wouter";
 import { useSession } from "@/lib/session";
 import { useTRPC } from "@/lib/trpc";
 import { Button, DataTable, DateTime, EmptyState, Field, FilterBar, Input, LoadMore, Money, PageHeader, Select } from "@/ui";
 import { NewOrderForCustomerButton } from "../ConsoleOrderTools";
+import { MoveOrderToTrashButton, useCanTrashOrders } from "../MoveOrderToTrash";
 import { LOCK_LABELS, LockBadge, OrderStatusBadge, money, type LockState } from "../shared";
 import { OrderListProgress } from "../stages/OrderListProgress";
 
@@ -42,6 +43,8 @@ function toInput(filters: Filters) {
 export default function AdminOrdersPage() {
   const trpc = useTRPC();
   const { me } = useSession();
+  const canTrash = useCanTrashOrders();
+  const resultsRef = useRef<HTMLDivElement>(null);
   const search = useSearch();
   // Deep links such as /admin/orders?status=in_review or /admin/orders?attention=staff_review pre-select filters.
   const [draft, setDraft] = useState<Filters>(() => {
@@ -136,6 +139,8 @@ export default function AdminOrdersPage() {
             <Input type="date" value={draft.to} onChange={set("to")} />
           </Field>
         </FilterBar>
+        {/* Increment 09: focus lands here after a row was moved to the trash (the row itself disappears). */}
+        <div ref={resultsRef} tabIndex={-1} aria-label="Order results" role="region" className="min-w-0 rounded-md">
         <DataTable
           caption="Customer orders"
           rows={rows}
@@ -143,6 +148,13 @@ export default function AdminOrdersPage() {
           error={list.error}
           onRetry={() => void list.refetch()}
           rowKey={(order) => order.publicId}
+          rowActions={
+            canTrash
+              ? (order) => (
+                  <MoveOrderToTrashButton orderPublicId={order.publicId} reference={order.reference} projectName={order.projectName} placement="row" successFocusRef={resultsRef} />
+                )
+              : undefined
+          }
           columns={[
             {
               key: "reference",
@@ -201,6 +213,7 @@ export default function AdminOrdersPage() {
           ]}
           empty={<EmptyState icon={Package} title="No orders match" description="Adjust or reset the filters." />}
         />
+        </div>
         <LoadMore hasMore={!!list.hasNextPage} loading={list.isFetchingNextPage} onLoadMore={() => void list.fetchNextPage()} summary={rows ? `Showing ${rows.length} orders` : undefined} />
       </div>
     </>

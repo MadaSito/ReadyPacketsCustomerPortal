@@ -69,6 +69,10 @@ export interface NotifyInput {
    * live `staff` or `admin` role at write time, and hides the row from customer sessions on list/count/read.
    */
   staffOnly?: boolean;
+  /** Optional internal order ID (`orders.id`) for trash/purge gating and outbound mail gating. */
+  orderId?: number | null;
+  /** Optional internal support ticket ID (`engagement_support_tickets.id`) for trash/purge gating. */
+  ticketId?: number | null;
 }
 
 export interface NotifyResult {

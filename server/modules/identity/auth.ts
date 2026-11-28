@@ -2,6 +2,7 @@
  * Public account flows: registration, sign-in, e-mail verification, password reset, invitation activation,
  * change password, sign-out. Uniform responses + timing; no account enumeration.
  */
+import { isLiveUserRow } from "./live.js";
 import { and, eq, sql } from "drizzle-orm";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, validation } from "../../core/errors.js";
@@ -32,6 +33,12 @@ export const PASSWORD_RESET_JOB = "identity.password_reset.dispatch";
 export interface PasswordResetJob {
   /** Blind index only — never the address, never auth material. */
   emailIndex: string;
+  /**
+   * D2.8: the immutable id the address belonged to AT INTAKE (null = no account then). Dispatch serves only that
+   * account, so a request queued before a purge never reaches an account registered later on the freed address
+   * (it inherits nothing). Missing on jobs queued before this field existed → refused (fail closed).
+   */
+  userId?: number | null;
 }
 
 export interface CallMeta {
@@ -342,13 +349,16 @@ export function createAuthService(i: AuthInternals) {
       const greetingParts = input.nameParts ?? deriveNameParts(name);
       assertPasswordAcceptable(input.password, { email, name });
       const passwordHash = await hasher.hash(input.password); // always hash: uniform timing
-      const existing = await repo.byEmail(email);
+      // Increment 09 (D2.2): a trashed account keeps its address reserved, so the lookup includes it. It is
+      // answered exactly like an existing account, but it receives no mail (trashed accounts get none).
+      const existing = await repo.byEmail(email, { includeGone: true });
       if (existing) {
+        const gone = !isLiveUserRow(existing);
         // Same shape of work as the create branch (one transaction, one mail enqueue, one audit row) so the
         // response and its timing do not distinguish existing addresses (review ID-04). Residual timing
         // differences (row insert vs none) are documented in VERIFICATION.md as not benchmarked.
         await deps.db.transaction(async (tx) => {
-          await deps.mailer.enqueue(
+          if (!gone) await deps.mailer.enqueue(
             {
               template: "auth.account_exists",
               to: { userId: existing.id },
@@ -363,7 +373,7 @@ export function createAuthService(i: AuthInternals) {
               eventName: "auth.register.requested",
               action: "register",
               outcome: "refused",
-              reasonCode: "EXISTING_ACCOUNT",
+              reasonCode: gone ? "TRASHED_ACCOUNT" : "EXISTING_ACCOUNT",
               actor: { role: "anonymous" },
               resource: { type: "user", publicId: existing.publicId },
             },
@@ -547,7 +557,9 @@ export function createAuthService(i: AuthInternals) {
       const slot = Math.floor(deps.clock.now().getTime() / RESEND_MIN_INTERVAL_MS);
       // Durable intake and its audit row commit together (audit failure ⇒ no accepted work).
       await deps.db.transaction(async (tx) => {
-        await deps.jobs.enqueue<PasswordResetJob>(PASSWORD_RESET_JOB, { emailIndex }, { idempotencyKey: `${emailIndex}:${slot}`, maxAttempts: 3 }, tx);
+        // The same single indexed read for every address (gone accounts included: they are refused at dispatch).
+        const [owner] = await tx.select({ id: users.id }).from(users).where(eq(users.emailIndex, emailIndex)).limit(1);
+        await deps.jobs.enqueue<PasswordResetJob>(PASSWORD_RESET_JOB, { emailIndex, userId: owner?.id ?? null }, { idempotencyKey: `${emailIndex}:${slot}`, maxAttempts: 3 }, tx);
         await deps.audit.record(
           {
             category: "security",
@@ -569,9 +581,10 @@ export function createAuthService(i: AuthInternals) {
       // Resolve the id OUTSIDE the transaction, so the transaction's first statement is the locking read of
       // the users row: under REPEATABLE READ the read view (used by the cooldown query) is then created only
       // after the lock is held, and therefore sees any token committed by a concurrent dispatch (review ID-03).
-      const [peek] = await deps.db.select({ id: users.id }).from(users).where(eq(users.emailIndex, payload.emailIndex)).limit(1);
+      // D2.8: bound to the account that owned the address at intake (never re-resolved by address).
+      const boundId = typeof payload.userId === "number" && Number.isSafeInteger(payload.userId) && payload.userId > 0 ? payload.userId : null;
       return deps.db.transaction(async (tx) => {
-        const locked = peek ? await repo.byId(peek.id, { tx, forUpdate: true }) : null;
+        const locked = boundId !== null ? await repo.byId(boundId, { tx, forUpdate: true }) : null;
         const user = locked && locked.emailIndex === payload.emailIndex ? locked : null; // re-validated under lock
         if (!user || user.status !== "active" || user.authSource !== "local") {
           await deps.audit.record(

@@ -11,6 +11,7 @@ const ulid = z.string().regex(ULID_PATTERN);
 const receiptInput = z.strictObject({
   receiptPublicId: ulid,
   recipientUserId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  orderId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
   receiptNumber: receiptNumberSchema,
   orderReference: z.string().trim().min(1).max(64).optional(),
   projectName: z.string().trim().min(1).max(160).optional(),
@@ -23,12 +24,13 @@ export type PaymentReceiptMailInput = z.input<typeof receiptInput>;
 export async function enqueuePaymentReceipt(mailer: Mailer, input: PaymentReceiptMailInput, tx?: Tx) {
   const parsed = receiptInput.safeParse(input);
   if (!parsed.success) throw validation("INVALID_RECEIPT_MAIL", "The receipt message is invalid.");
-  const { receiptPublicId, recipientUserId, receiptNumber, orderReference, projectName, pdf, resendRequestPublicId } = parsed.data;
+  const { receiptPublicId, recipientUserId, orderId, receiptNumber, orderReference, projectName, pdf, resendRequestPublicId } = parsed.data;
   const idempotencyKey = `payment-receipt:${receiptPublicId}${resendRequestPublicId ? `:resend:${resendRequestPublicId}` : ""}`;
   const attach = pdf.byteLength <= RECEIPT_PDF_MAX_BYTES;
   await mailer.enqueue({
     template: PAYMENT_RECEIPT_TEMPLATE,
     to: { userId: recipientUserId },
+    ...(orderId !== undefined ? { orderId } : {}),
     vars: { receiptNumber, ...(orderReference ? { orderReference } : {}), ...(projectName ? { projectName } : {}) },
     idempotencyKey,
     ...(attach ? { attachments: [{ filename: `${receiptNumber}.pdf`, contentType: "application/pdf", content: pdf }] } : {}),

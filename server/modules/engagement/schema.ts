@@ -119,6 +119,7 @@ export const engagementSupportTickets = mysqlTable(
     index("eng_tickets_queue_idx").on(table.status, table.priority, table.id),
     index("eng_tickets_assignee_idx").on(table.assigneeUserId, table.status, table.id),
     index("eng_tickets_order_pub_idx").on(table.relatedOrderPublicId),
+    index("eng_tickets_order_id_idx").on(table.relatedOrderId, table.id),
   ],
 );
 
@@ -169,6 +170,10 @@ export const engagementNotifications = mysqlTable(
     userId: refColumn("user_id")
       .notNull()
       .references(() => users.id),
+    /** Increment 09 (D2): internal order reference when this notification concerns an order (gated & purged with the order). */
+    orderId: refColumn("order_id"),
+    /** Increment 09 (D2): internal ticket reference when this notification concerns a support ticket (gated & purged with the ticket). */
+    ticketId: refColumn("ticket_id"),
     kind: varchar("kind", { length: 64 }).notNull(),
     category: mysqlEnum("category", NOTIFICATION_PREFERENCE_CATEGORIES).notNull(),
     title: varchar("title", { length: 160 }).notNull(),
@@ -183,6 +188,8 @@ export const engagementNotifications = mysqlTable(
   (table) => [
     index("eng_notif_user_read_idx").on(table.userId, table.readAt, table.id),
     index("eng_notif_user_id_idx").on(table.userId, table.id),
+    index("eng_notif_order_id_idx").on(table.orderId, table.id),
+    index("eng_notif_ticket_id_idx").on(table.ticketId, table.id),
     index("eng_notif_created_idx").on(table.createdAt),
     uniqueIndex("eng_notif_idem_uq").on(table.userId, table.idempotencyKey),
   ],

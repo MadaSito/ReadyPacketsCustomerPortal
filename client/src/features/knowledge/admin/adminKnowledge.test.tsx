@@ -13,10 +13,11 @@ import { knowledgeFeature } from "../routes";
 import { moveItem, slugify } from "./AdminKnowledgeListPage";
 import { validateArticle } from "./AdminKnowledgeEditorPage";
 
-/** Queries every full-session shell makes (policy enforcement prompt, increment 06); empty = no prompt. */
+/** Queries every full-session shell makes (policy enforcement prompt, increment 06; trash nav badge, increment 09). */
 const SHELL_PROMPT_HANDLERS: Record<string, () => unknown> = {
   "compliance.policies.enforcement.pending": () => [],
   "compliance.policies.myStatus": () => ({ pendingRequired: [] }),
+  "trash.counts": () => ({ orders: 0, customers: 0, dueWithin7d: 0 }),
 };
 
 vi.mock("@/app/slots", () => ({

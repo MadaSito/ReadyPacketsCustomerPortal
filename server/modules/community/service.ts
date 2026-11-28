@@ -8,14 +8,16 @@
  *  - all lookups are by public id; topics/posts the caller may not see are indistinguishable from missing ones;
  *  - every state change writes an audit record in the same transaction (fail closed) without bodies or names.
  */
-import { and, asc, count, desc, eq, gte, inArray, like, lt, or, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, inArray, like, lt, or, sql, type SQL } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { UserRole } from "../../../shared/domain.js";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
 import type { AuditEventInput, SessionPrincipal, Tx } from "../../core/types.js";
+import { isLiveUserRow, liveUserPredicate } from "../identity/live.js";
 import { users } from "../identity/schema.js";
 import { isFlagEnabled, readSetting, writeSetting } from "../platform/index.js";
+import { DELETED_ACCOUNT_LABEL, DELETED_TOPIC_TITLE } from "./trash.js";
 import {
   communityCategories,
   communityModerationLog,
@@ -182,11 +184,40 @@ export function createCommunityService(deps: ModuleDeps) {
     return readSetting(deps.settings, COMMUNITY_CONFIG, tx);
   }
 
+  function liveAuthorSql(userIdCol: typeof communityTopics.authorUserId | typeof communityPosts.authorUserId | typeof communityReports.reporterUserId) {
+    return sql`exists (select 1 from ${users} where ${users.id} = ${userIdCol} and ${users.trashedAt} is null and ${users.purgedAt} is null)`;
+  }
+
+  /** A topic opened by a trashed/purged author stays visible ONLY when live replies from other members exist. */
+  function liveTopicIntegritySql() {
+    return sql`(${liveAuthorSql(communityTopics.authorUserId)} or exists (
+      select 1 from ${communityPosts} cp
+      inner join ${users} u on u.id = cp.author_user_id
+      where cp.topic_id = ${communityTopics.id}
+        and cp.is_opening = false
+        and cp.state = 'published'
+        and u.trashed_at is null
+        and u.purged_at is null
+    ))`;
+  }
+
+  async function isLiveUserId(tx: Tx, userId: number): Promise<boolean> {
+    const [u] = await tx
+      .select({ trashedAt: users.trashedAt, purgedAt: users.purgedAt })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1);
+    return u ? isLiveUserRow(u) : false;
+  }
+
   async function actorInTx(principal: SessionPrincipal, tx: Tx): Promise<Actor> {
     const sessions = deps.services.identity?.sessions;
     if (!sessions?.assertCurrent) throw forbidden("IDENTITY_UNAVAILABLE");
     const current = await sessions.assertCurrent(principal, tx);
     if (current.pendingSteps.length > 0) throw forbidden("SESSION_NOT_FULL");
+    if (!(await isLiveUserId(tx, principal.userId))) {
+      throw new DomainError("UNAUTHENTICATED", "SESSION_NOT_CURRENT", "Sign in again.");
+    }
     const role = current.role;
     return {
       principal,
@@ -267,7 +298,11 @@ export function createCommunityService(deps: ModuleDeps) {
   }
 
   async function loadTopic(publicId: string, tx: Tx, actor: Actor, lock = false): Promise<CommunityTopicRow> {
-    const q = tx.select().from(communityTopics).where(eq(communityTopics.publicId, publicId)).limit(1);
+    const q = tx
+      .select()
+      .from(communityTopics)
+      .where(and(eq(communityTopics.publicId, publicId), liveTopicIntegritySql()))
+      .limit(1);
     const [row] = lock ? await q.for("update") : await q;
     if (!row || !topicVisibleTo(row, actor)) throw notFound();
     return row;
@@ -283,26 +318,74 @@ export function createCommunityService(deps: ModuleDeps) {
     const q = tx.select().from(communityPosts).where(eq(communityPosts.publicId, publicId)).limit(1);
     const [post] = lock ? await q.for("update") : await q;
     if (!post) throw notFound();
-    const [topic] = await tx.select().from(communityTopics).where(eq(communityTopics.id, post.topicId)).limit(1);
+    const [topic] = await tx
+      .select()
+      .from(communityTopics)
+      .where(and(eq(communityTopics.id, post.topicId), liveTopicIntegritySql()))
+      .limit(1);
     if (!topic || !topicVisibleTo(topic, actor) || !postVisibleTo(post, actor)) throw notFound();
     return { post, topic };
   }
 
-  async function authors(userIds: number[], tx: Tx): Promise<Map<number, AuthorView>> {
-    const map = new Map<number, AuthorView>();
+  interface ResolvedAuthorInfo {
+    view: AuthorView;
+    live: boolean;
+  }
+
+  async function authorsInfo(userIds: number[], tx: Tx): Promise<Map<number, ResolvedAuthorInfo>> {
+    const map = new Map<number, ResolvedAuthorInfo>();
     const unique = [...new Set(userIds)];
     if (unique.length === 0) return map;
-    const rows = await tx
-      .select({ userId: communityProfiles.userId, publicId: communityProfiles.publicId, displayName: communityProfiles.displayName, anonymised: communityProfiles.anonymised, role: users.role })
+    const userRows = await tx
+      .select({
+        id: users.id,
+        role: users.role,
+        trashedAt: users.trashedAt,
+        purgedAt: users.purgedAt,
+      })
+      .from(users)
+      .where(inArray(users.id, unique));
+    const profileRows = await tx
+      .select({
+        userId: communityProfiles.userId,
+        publicId: communityProfiles.publicId,
+        displayName: communityProfiles.displayName,
+        anonymised: communityProfiles.anonymised,
+      })
       .from(communityProfiles)
-      .innerJoin(users, eq(users.id, communityProfiles.userId))
       .where(inArray(communityProfiles.userId, unique));
-    for (const r of rows) {
-      map.set(r.userId, r.anonymised
-        ? { publicId: null, displayName: FORMER_MEMBER, staff: false }
-        : { publicId: r.publicId, displayName: r.displayName, staff: r.role !== "customer" });
+    const profileByUser = new Map(profileRows.map((p) => [p.userId, p]));
+
+    for (const u of userRows) {
+      const live = isLiveUserRow(u);
+      const p = profileByUser.get(u.id);
+      if (!live || p?.displayName === DELETED_ACCOUNT_LABEL) {
+        map.set(u.id, {
+          view: { publicId: null, displayName: DELETED_ACCOUNT_LABEL, staff: false },
+          live: false,
+        });
+      } else if (!p || p.anonymised) {
+        map.set(u.id, {
+          view: { publicId: null, displayName: FORMER_MEMBER, staff: false },
+          live: true,
+        });
+      } else {
+        map.set(u.id, {
+          view: { publicId: p.publicId, displayName: p.displayName, staff: u.role !== "customer" },
+          live: true,
+        });
+      }
     }
     return map;
+  }
+
+  async function authors(userIds: number[], tx: Tx): Promise<Map<number, AuthorView>> {
+    const info = await authorsInfo(userIds, tx);
+    const out = new Map<number, AuthorView>();
+    for (const [id, entry] of info) {
+      out.set(id, entry.view);
+    }
+    return out;
   }
 
   function authorOf(map: Map<number, AuthorView>, userId: number): AuthorView {
@@ -335,29 +418,33 @@ export function createCommunityService(deps: ModuleDeps) {
   }
 
   async function topicViews(rows: CommunityTopicRow[], tx: Tx): Promise<TopicSummaryView[]> {
-    const map = await authors(rows.map((r) => r.authorUserId), tx);
+    const infoMap = await authorsInfo(rows.map((r) => r.authorUserId), tx);
     const catIds = [...new Set(rows.map((r) => r.categoryId))];
     const cats = catIds.length ? await tx.select({ id: communityCategories.id, publicId: communityCategories.publicId }).from(communityCategories).where(inArray(communityCategories.id, catIds)) : [];
     const catMap = new Map(cats.map((c) => [c.id, c.publicId]));
-    return rows.map((t) => ({
-      publicId: t.publicId,
-      categoryPublicId: catMap.get(t.categoryId) ?? "",
-      title: t.title,
-      author: authorOf(map, t.authorUserId),
-      pinned: t.pinned,
-      locked: t.locked,
-      state: t.state,
-      visible: t.visible,
-      replyCount: t.replyCount,
-      lastPostAt: iso(t.lastPostAt),
-      createdAt: iso(t.createdAt),
-    }));
+    return rows.map((t) => {
+      const info = infoMap.get(t.authorUserId);
+      const authorLive = info?.live ?? false;
+      return {
+        publicId: t.publicId,
+        categoryPublicId: catMap.get(t.categoryId) ?? "",
+        title: authorLive ? t.title : DELETED_TOPIC_TITLE,
+        author: info?.view ?? { publicId: null, displayName: DELETED_ACCOUNT_LABEL, staff: false },
+        pinned: t.pinned,
+        locked: t.locked,
+        state: t.state,
+        visible: t.visible,
+        replyCount: t.replyCount,
+        lastPostAt: iso(t.lastPostAt),
+        createdAt: iso(t.createdAt),
+      };
+    });
   }
 
   async function postViews(rows: CommunityPostRow[], tx: Tx, actor: Actor, cfg: CommunityConfig): Promise<PostView[]> {
     const quoteIds = rows.map((r) => r.quotePostId).filter((id): id is number => id !== null);
     const quotes = quoteIds.length ? await tx.select().from(communityPosts).where(inArray(communityPosts.id, quoteIds)) : [];
-    const map = await authors([...rows.map((r) => r.authorUserId), ...quotes.map((q) => q.authorUserId)], tx);
+    const infoMap = await authorsInfo([...rows.map((r) => r.authorUserId), ...quotes.map((q) => q.authorUserId)], tx);
     const quoteMap = new Map(quotes.map((q) => [q.id, q]));
     const ids = rows.map((r) => r.id);
     const mine = ids.length
@@ -365,24 +452,37 @@ export function createCommunityService(deps: ModuleDeps) {
       : new Set<number>();
     const windowMs = cfg.editWindowMinutes * 60_000;
     return rows.map((p) => {
-      const readable = p.state === "published" || actor.canModerate || (p.state === "pending" && p.authorUserId === actor.userId);
+      const authorInfo = infoMap.get(p.authorUserId);
+      const authorLive = authorInfo?.live ?? false;
+      const effectiveState: PostState = !authorLive ? (p.state === "removed" ? "removed" : "deleted") : p.state;
+      const purgedBody = effectiveState === "deleted" && p.bodyText === "";
+      const readable =
+        authorLive &&
+        !purgedBody &&
+        (effectiveState === "published" || actor.canModerate || (effectiveState === "pending" && p.authorUserId === actor.userId));
       const q = p.quotePostId !== null ? quoteMap.get(p.quotePostId) : undefined;
-      const isMine = p.authorUserId === actor.userId;
+      const qInfo = q ? infoMap.get(q.authorUserId) : undefined;
+      const qAuthorLive = qInfo?.live ?? false;
+      const isMine = authorLive && p.authorUserId === actor.userId;
       return {
         publicId: p.publicId,
-        author: authorOf(map, p.authorUserId),
+        author: authorInfo?.view ?? { publicId: null, displayName: DELETED_ACCOUNT_LABEL, staff: false },
         isOpening: p.isOpening,
         body: readable ? p.bodyText : null,
-        state: p.state,
+        state: effectiveState,
         quote: q
-          ? { publicId: q.publicId, author: authorOf(map, q.authorUserId).displayName, excerpt: q.state === "published" ? q.bodyText.slice(0, 280) : null }
+          ? {
+              publicId: q.publicId,
+              author: (qInfo?.view ?? { publicId: null, displayName: DELETED_ACCOUNT_LABEL, staff: false }).displayName,
+              excerpt: qAuthorLive && q.state === "published" ? q.bodyText.slice(0, 280) : null,
+            }
           : null,
         createdAt: iso(p.createdAt),
         editedAt: p.editedAt ? iso(p.editedAt) : null,
         helpfulCount: p.helpfulCount,
         reactedByMe: mine.has(p.id),
         mine: isMine,
-        canEdit: isMine && (p.state === "published" || p.state === "pending") && now().getTime() - p.createdAt.getTime() <= windowMs,
+        canEdit: isMine && (effectiveState === "published" || effectiveState === "pending") && now().getTime() - p.createdAt.getTime() <= windowMs,
         version: p.version,
       };
     });
@@ -434,6 +534,7 @@ export function createCommunityService(deps: ModuleDeps) {
     const subs = await tx
       .select({ userId: communitySubscriptions.userId })
       .from(communitySubscriptions)
+      .innerJoin(users, and(eq(users.id, communitySubscriptions.userId), liveUserPredicate(users)))
       .where(and(eq(communitySubscriptions.topicId, topic.id), sql`${communitySubscriptions.userId} <> ${post.authorUserId}`))
       .orderBy(asc(communitySubscriptions.id))
       .limit(NOTIFY_CAP);
@@ -502,7 +603,12 @@ export function createCommunityService(deps: ModuleDeps) {
         const enabled = await isEnabled(tx);
         const canModerate = roleHasCapability(principal.role, "community.moderate");
         const canManage = roleHasCapability(principal.role, "community.manage");
-        if (!enabled) return { enabled, profile: null, suspended: false, suspendedUntil: null, canModerate, canManage };
+        if (!(await isLiveUserId(tx, principal.userId))) {
+          throw new DomainError("UNAUTHENTICATED", "SESSION_NOT_CURRENT", "Sign in again.");
+        }
+        if (!enabled) {
+          return { enabled, profile: null, suspended: false, suspendedUntil: null, canModerate, canManage };
+        }
         const p = await profileOf(principal.userId, tx);
         return {
           enabled,
@@ -547,7 +653,7 @@ export function createCommunityService(deps: ModuleDeps) {
       const offset = decodeOffset(input.cursor);
       const limit = Math.min(input.limit ?? 20, PAGE_LIMIT);
       return memberTx(principal, async (tx, actor) => {
-        const conds = [];
+        const conds: (SQL | undefined)[] = [liveTopicIntegritySql()];
         if (input.categoryPublicId) conds.push(eq(communityTopics.categoryId, (await loadCategory(input.categoryPublicId, tx, actor)).id));
         if (!actor.canModerate) conds.push(eq(communityTopics.state, "open"), or(eq(communityTopics.visible, true), eq(communityTopics.authorUserId, actor.userId)));
         const rows = await tx
@@ -639,7 +745,9 @@ export function createCommunityService(deps: ModuleDeps) {
         let quoteId: number | null = null;
         if (input.quotePostPublicId) {
           const { post: quoted } = await loadPost(input.quotePostPublicId, tx, actor);
-          if (quoted.topicId !== topic.id || quoted.state !== "published") throw validation("COMMUNITY_BAD_QUOTE", "That post cannot be quoted.");
+          if (quoted.topicId !== topic.id || quoted.state !== "published" || !(await isLiveUserId(tx, quoted.authorUserId))) {
+            throw validation("COMMUNITY_BAD_QUOTE", "That post cannot be quoted.");
+          }
           quoteId = quoted.id;
         }
         const cfg = await config(tx);
@@ -731,7 +839,7 @@ export function createCommunityService(deps: ModuleDeps) {
       return memberTx(principal, async (tx, actor) => {
         await postingProfile(actor, tx);
         const { post } = await loadPost(input.postPublicId, tx, actor, true);
-        if (post.state !== "published") throw notFound();
+        if (post.state !== "published" || !(await isLiveUserId(tx, post.authorUserId))) throw notFound();
         if (post.authorUserId === actor.userId) throw validation("COMMUNITY_OWN_POST", "You cannot mark your own post as helpful.");
         const [existing] = await tx.select({ id: communityReactions.id }).from(communityReactions).where(and(eq(communityReactions.postId, post.id), eq(communityReactions.userId, actor.userId))).limit(1);
         if (input.helpful && !existing) {
@@ -751,7 +859,7 @@ export function createCommunityService(deps: ModuleDeps) {
       return memberTx(principal, async (tx, actor) => {
         await postingProfile(actor, tx);
         const { post, topic } = await loadPost(input.postPublicId, tx, actor, true);
-        if (post.state !== "published") throw notFound();
+        if (post.state !== "published" || !(await isLiveUserId(tx, post.authorUserId))) throw notFound();
         if (post.authorUserId === actor.userId) throw validation("COMMUNITY_OWN_POST", "You cannot report your own post.");
         const [open] = await tx.select({ id: communityReports.id }).from(communityReports).where(and(eq(communityReports.postId, post.id), eq(communityReports.openReporterUserId, actor.userId))).limit(1);
         if (open) throw conflict("COMMUNITY_ALREADY_REPORTED", "You have already reported this post. A moderator will review it.");
@@ -808,8 +916,12 @@ export function createCommunityService(deps: ModuleDeps) {
             and(
               eq(communityTopics.state, "open"),
               eq(communityTopics.visible, true),
+              liveTopicIntegritySql(),
               eq(communityPosts.state, "published"),
-              or(like(communityTopics.title, pattern), like(communityPosts.bodyText, pattern)),
+              or(
+                and(liveAuthorSql(communityTopics.authorUserId), like(communityTopics.title, pattern)),
+                and(liveAuthorSql(communityPosts.authorUserId), like(communityPosts.bodyText, pattern)),
+              ),
             ),
           )
           .orderBy(desc(communityTopics.lastPostAt), desc(communityTopics.id))
@@ -825,7 +937,12 @@ export function createCommunityService(deps: ModuleDeps) {
 
     async queue(principal: SessionPrincipal): Promise<QueueView> {
       return moderatorTx(principal, async (tx, actor) => {
-        const pendingRows = await tx.select().from(communityPosts).where(inArray(communityPosts.state, ["pending", "hidden"])).orderBy(asc(communityPosts.id)).limit(PAGE_LIMIT);
+        const pendingRows = await tx
+          .select()
+          .from(communityPosts)
+          .where(and(inArray(communityPosts.state, ["pending", "hidden"]), liveAuthorSql(communityPosts.authorUserId)))
+          .orderBy(asc(communityPosts.id))
+          .limit(PAGE_LIMIT);
         const topicIds = [...new Set(pendingRows.map((p) => p.topicId))];
         const topics = topicIds.length ? await tx.select().from(communityTopics).where(inArray(communityTopics.id, topicIds)) : [];
         const tmap = new Map(topics.map((t) => [t.id, t]));
@@ -835,7 +952,13 @@ export function createCommunityService(deps: ModuleDeps) {
           .select({ r: communityReports, postPublicId: communityPosts.publicId, topicId: communityPosts.topicId, openReports: communityPosts.openReportCount })
           .from(communityReports)
           .innerJoin(communityPosts, eq(communityPosts.id, communityReports.postId))
-          .where(eq(communityReports.state, "open"))
+          .where(
+            and(
+              eq(communityReports.state, "open"),
+              liveAuthorSql(communityReports.reporterUserId),
+              liveAuthorSql(communityPosts.authorUserId),
+            ),
+          )
           .orderBy(asc(communityReports.id))
           .limit(PAGE_LIMIT);
         const rTopicIds = [...new Set(reports.map((r) => r.topicId).filter((id) => !tmap.has(id)))];
@@ -861,7 +984,7 @@ export function createCommunityService(deps: ModuleDeps) {
     async resolveReport(principal: SessionPrincipal, input: { reportPublicId: string; outcome: "dismissed" | "actioned"; note?: string }): Promise<{ state: "dismissed" | "actioned" }> {
       return moderatorTx(principal, async (tx, actor) => {
         const [rep] = await tx.select().from(communityReports).where(eq(communityReports.publicId, input.reportPublicId)).limit(1).for("update");
-        if (!rep) throw notFound();
+        if (!rep || !(await isLiveUserId(tx, rep.reporterUserId))) throw notFound();
         if (rep.state !== "open") throw conflict("COMMUNITY_REPORT_RESOLVED", "This report has already been resolved.");
         await tx
           .update(communityReports)
@@ -876,6 +999,7 @@ export function createCommunityService(deps: ModuleDeps) {
     async moderatePost(principal: SessionPrincipal, input: { postPublicId: string; action: "approve" | "hide" | "unhide" | "remove"; reason?: string }): Promise<{ state: PostState; notified: number }> {
       return moderatorTx(principal, async (tx, actor) => {
         const { post, topic } = await loadPost(input.postPublicId, tx, actor, true);
+        if (!(await isLiveUserId(tx, post.authorUserId))) throw notFound();
         const from = post.state;
         let to: PostState;
         switch (input.action) {
@@ -935,7 +1059,13 @@ export function createCommunityService(deps: ModuleDeps) {
       const reason = input.reason.normalize("NFC").replace(/\s+/gu, " ").trim();
       if (reason.length < 3 || reason.length > 200) throw validation("COMMUNITY_REASON_LENGTH", "Give a reason of 3 to 200 characters.");
       return moderatorTx(principal, async (tx, actor) => {
-        const [target] = await tx.select({ p: communityProfiles, role: users.role }).from(communityProfiles).innerJoin(users, eq(users.id, communityProfiles.userId)).where(eq(communityProfiles.publicId, input.memberPublicId)).limit(1).for("update");
+        const [target] = await tx
+          .select({ p: communityProfiles, role: users.role })
+          .from(communityProfiles)
+          .innerJoin(users, and(eq(users.id, communityProfiles.userId), liveUserPredicate(users)))
+          .where(eq(communityProfiles.publicId, input.memberPublicId))
+          .limit(1)
+          .for("update");
         if (!target) throw notFound();
         if (target.p.userId === actor.userId) throw validation("COMMUNITY_SELF_SUSPEND", "You cannot suspend yourself.");
         if (target.role !== "customer" && actor.role !== "admin") throw forbidden("COMMUNITY_CANNOT_SUSPEND_STAFF");
@@ -949,8 +1079,15 @@ export function createCommunityService(deps: ModuleDeps) {
 
     async unsuspend(principal: SessionPrincipal, input: { memberPublicId: string; reason?: string }): Promise<{ suspended: false }> {
       return moderatorTx(principal, async (tx, actor) => {
-        const [target] = await tx.select().from(communityProfiles).where(eq(communityProfiles.publicId, input.memberPublicId)).limit(1).for("update");
-        if (!target) throw notFound();
+        const [targetRow] = await tx
+          .select({ p: communityProfiles })
+          .from(communityProfiles)
+          .innerJoin(users, and(eq(users.id, communityProfiles.userId), liveUserPredicate(users)))
+          .where(eq(communityProfiles.publicId, input.memberPublicId))
+          .limit(1)
+          .for("update");
+        if (!targetRow) throw notFound();
+        const target = targetRow.p;
         await tx.update(communityProfiles).set({ suspendedUntil: null, suspendedIndefinitely: false, suspensionReason: null, suspendedByUserId: null, version: sql`${communityProfiles.version} + 1` }).where(eq(communityProfiles.id, target.id));
         await logModeration(tx, actor, "unsuspend", "member", target.publicId, input.reason?.trim().slice(0, 200) || null);
         await audit(tx, actor, { category: "admin", eventName: "community.member.unsuspended", action: "unsuspend", outcome: "completed", resource: { type: "community_profile", publicId: target.publicId } });

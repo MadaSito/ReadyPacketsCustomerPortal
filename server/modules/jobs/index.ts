@@ -4,6 +4,8 @@ import { createJobsAdmin } from "./admin.js";
 import { mailEngineFor, type SmtpDeliveryResult } from "./mail.js";
 import type { MailTemplate, ModuleLifecycle } from "../../core/types.js";
 import type { MailSenderIdentity, MailTemplateStore, MailTransport } from "./mailPorts.js";
+import { TRASH_JOB_RETENTION_CLEANUP, TRASH_SCHEDULE_RETENTION_EVERY_HOUR } from "../trash/jobNames.js";
+import { createMailTrashGuard, createMailTrashParticipant } from "./mailTrash.js";
 import { engineFor, ensureMaintenanceGate } from "./queue.js";
 import { registerRefundNotice } from "./refundSupport.js";
 import { startWorker, type WorkerHandle } from "./worker.js";
@@ -32,10 +34,14 @@ export type JobsModule = ReturnType<typeof createJobsAdmin> & ModuleLifecycle & 
 
 export function createJobsModule(deps: ModuleDeps): JobsModule {
   registerRefundNotice(deps.mailer);
+  deps.jobs.registerSchedule({
+    name: TRASH_SCHEDULE_RETENTION_EVERY_HOUR, type: TRASH_JOB_RETENTION_CLEANUP, everyMs: 60 * 60_000,
+  });
   const mailer = mailEngineFor(deps.mailer);
   // Call these ports lazily, after the container has attached peer modules.
   mailer?.registerDelivery({
     findRecipient: (userId) => deps.services.identity.getUser(userId),
+    trashGuard: createMailTrashGuard(deps),
     getLegacySender: async () => {
       const { fromAddress, fromName, replyToAddress } = await deps.services.integrations.smtp.getConfig();
       return fromAddress ? { fromAddress, fromName, ...(replyToAddress ? { replyToAddress } : {}) } : null;
@@ -54,6 +60,7 @@ export function createJobsModule(deps: ModuleDeps): JobsModule {
   let worker: WorkerHandle | undefined;
   return {
     ...createJobsAdmin(deps),
+    init: () => deps.services.trash.register(createMailTrashParticipant(deps)),
     registerMailTransport: (transport) => { mailer?.registerMailTransport(transport); },
     registerMailTemplateStore: (store) => { mailer?.registerMailTemplateStore(store); },
     getBuiltinMailTemplates: () => mailer?.getBuiltinMailTemplates() ?? [],

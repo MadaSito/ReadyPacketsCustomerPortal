@@ -5,6 +5,8 @@ import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, notFound, validation } from "../../core/errors.js";
 import type { ModuleHealth, SessionPrincipal, Tx } from "../../core/types.js";
 import { jobAttempts, jobRuns } from "../jobs/schema.js";
+import { orders } from "../orders/schema.js";
+import { liveOrderPredicate } from "../orders/trashGate.js";
 import { COPY_KINDS, COPY_STATES, type CopyState } from "./copyLogTypes.js";
 import { copyAttemptPrivateAad } from "./copyLogWriter.js";
 import { storageConnections, storageCopyAttempts as attempts } from "./schema.js";
@@ -32,6 +34,8 @@ export const copyLogList = z.strictObject({
 export const copyLogDetail = z.strictObject({ publicId: storagePublicId });
 export const copyLogConnections = z.strictObject(forwardPage);
 type Filters = z.infer<typeof copyLogFilters>;
+// Keep historical audit evidence, but never surface transfers for an order in the trash or a tombstone.
+const visibleOrderAttempt = () => sql`not exists (select 1 from ${orders} where ${orders.publicId} = ${attempts.orderPublicId} and not (${liveOrderPredicate()}))`;
 
 // Interrupted workers may not be able to commit an owner outcome. Use the durable queue's
 // state only to report an unconfirmed write; queue completion is never proof of a copy.
@@ -96,6 +100,7 @@ function conditions(filters: Filters, now: Date) {
   }
   const text = filters.text;
   return and(
+    visibleOrderAttempt(),
     ...(!filters.orderPublicId || filters.from || filters.through ? [gte(attempts.createdAt, from), lte(attempts.createdAt, through)] : []),
     filters.kind ? eq(attempts.kind, filters.kind) : undefined,
     filters.state ? eq(state, filters.state) : undefined,
@@ -148,7 +153,7 @@ export function createCopyLogService(deps: ModuleDeps) {
   }
 
   async function lookup(tx: Tx, publicId: string) {
-    const [row] = await loggedRows(tx, eq(attempts.publicId, publicId), 1);
+    const [row] = await loggedRows(tx, and(eq(attempts.publicId, publicId), visibleOrderAttempt()), 1);
     if (!row) throw notFound("COPY_ATTEMPT_NOT_FOUND");
     return row;
   }
@@ -228,7 +233,7 @@ export async function copyLogHealth(deps: ModuleDeps): Promise<ModuleHealth> {
   const [failure] = await deps.db.select({ id: attempts.id }).from(attempts)
     .leftJoin(jobRuns, eq(jobRuns.publicId, attempts.jobPublicId))
     .leftJoin(jobAttempts, and(eq(jobAttempts.jobId, jobRuns.id), eq(jobAttempts.attempt, attempts.attempt)))
-    .where(and(or(eq(attempts.state, "failed"), eq(attempts.state, "queued")),
+    .where(and(visibleOrderAttempt(), or(eq(attempts.state, "failed"), eq(attempts.state, "queued")),
       gte(attempts.createdAt, recent), eq(state, "failed"))).limit(1);
   return { component: "storage.copies", state: failure ? "degraded" : "ok", checkedAt,
     summary: failure ? "Copies failing: at least one attempt logged in the last 24 hours failed or could not be confirmed." :

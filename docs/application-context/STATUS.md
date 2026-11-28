@@ -1,6 +1,6 @@
 # ReadyPackets Portal — Status
 
-Last updated: 2026-11-26 (increment 07 merged to `main` as `c337492` through PR #16; fix pack 07.1 merged to `main` as `547a31d` through PR #19; fix pack 07.2 merged to `main` as `762ea41` through PR #21; increment 08 in progress on `feat/increment-08`). Keep this file current; it is the honest state of the build,
+Last updated: 2026-11-28 (increment 07 merged to `main` as `c337492` through PR #16; fix pack 07.1 merged as `547a31d` through PR #19; fix pack 07.2 merged as `762ea41` through PR #21; increment 08 merged as `1587d11` through PR #23; increment 09 verified by the lead on `feat/increment-09` at `cf02944` and `6f54429`, PR and merge pending). Keep this file current; it is the honest state of the build,
 not a certification. "Verified" below means the integrator ran the check and saw the result. Anything not
 listed under "Verified" has not been proven and must not be described as working in production.
 
@@ -381,6 +381,132 @@ Details are in `docs/session-logs/2026-11-22-session-03.md`.
   `bundle_scope_manifest` as a JSON string); a second "Start Phase I" was refused; Phase II was offered and
   not started; the pipeline switch was turned off afterwards. webhook.site is a request inspector, so this
   proves delivery and format, not the production receiver.
+
+## Increment 09
+
+Owner's prompt 37 of 2026-11-27 ([session log](../session-logs/2026-11-27-session-01.md), [contract](../engineering/INCREMENT_09_CONTRACT.md)). Migration `0009_increment_09` (final at `d358237`), additive only: 56 statements, see [UPGRADE.md](../operations/UPGRADE.md#increment-09-and-migration-0009).
+
+| Decision | What | Owner | State |
+| --- | --- | --- | --- |
+| D1 | Clickable links in e-mail; e-mail addresses in the console as `mailto` links | jobs_engineer, ui_foundation_engineer, page owners | implemented; the UI `mailto` links were verified by the lead on QA. Mail anchors are checked by tests only (eeee72e, 69378d7, cd822d3, bfca43a, eb57918) |
+| D2 | Trash centre: move to trash, restore, permanent deletion, retention clean-up, legal hold | recovery_ops_engineer, audit_engineer, identity_engineer, orders_engineer, every data-owning module | implemented; verified by the lead on QA at `cf02944` and `6f54429` (3ed7b75, 1acae2c, a764b69, 851cf45, 9d9a0ba, fc4562b, 700ff9c, 0413d5a, 164b9c4, 33d8ac5, 6d93d94, e3b9e92, d7497b5, 8837890, 13f2a1d, 5c94588, 21b4149, 980f4ec, bcd27cc, cf02944, f57c510, 6f54429) |
+| D3 | New square logo and brand files, package 2026.10.15.2 | ui_foundation_engineer, compliance_engineer | implemented; verified by the lead on QA (da419de, 14dcade, 8bfdf73, aad7083, 6ed8d1c, 884213d, cf02944) |
+| D4 | Documents; go-live checklist; security review record | platform_engineer, assurance_engineer | documents a22e302, acd4ab4, 465427a, 980f4ec, 5aa212a, ee46c7c, c97c86f and this update; checklist 8f4155a (to be run on the owner's server); [security review record](../verification/INCREMENT_09_SECURITY_REVIEW.md) |
+
+### Verification for increment 09
+
+Branch HEAD `6f54429` (the first checks below ran on `cf02944`); base `main` at `44d04bf`. PR and merge commit: (filled at merge).
+
+**Verified by the lead** on a QA production build of `feat/increment-09` at `cf02944`, in Chromium only. The build ran on a copy of the QA database with synthetic data, in pay-by-invoice mode, with mail not configured and local storage only.
+- **Static checks.**
+  - The type check was clean at `cf02944`, and eslint over the whole repository exited 0.
+  - Full vitest run before `cf02944`: 254 files, 3,399 passed, 4 todo. After `cf02944`, the 5 touched test files were run again: 125 passed.
+  - gitleaks found no leaks, and the production build exited 0.
+  - Migration 0009 applied to the QA copy: "Migrations are up to date (10 applied)".
+- **D1, links in e-mail.** Not checked in a real mail client. The evidence is at test level only:
+  - In the lead's full run, `deliveryLinks.test.ts` renders every registered shipped template. It asserts an anchor for each link variable, and no anchor for free-form or hostile values.
+  - Anchors are produced only when the portal address is HTTPS. QA runs on http, and the development mail capture stores only the text part, so no live anchor was inspected.
+  - In the console, e-mail addresses on the customers list and on the customer page are `mailto` links.
+- **D2, orders.**
+  - Shown and working: the **Move to trash** dialog (what moves with the order, the due date, the reason), the **Undo** message, the Trash centre list, the sidebar badge and the restore dialog.
+  - **Delete permanently** needs the typed order number (the button stays disabled otherwise) and a fresh two-step check (403, then "Confirm it's you").
+  - After the deletion:
+    - the order row is a tombstone: the project shows "Deleted order" and `purged_at` is set;
+    - the working data is gone, while line items, invoice and receipt are kept;
+    - the administrator view returns 404.
+- **D2, customers.**
+  - An account that is not suspended gets 409 "Suspend this account first.", and the button is disabled with a hint.
+  - After suspending and moving the account to the trash, it returns 404, and sign-in is refused with the generic message.
+  - **Restore** brings the account back suspended, with its orders, and the restore dialog lists what returns.
+  - An order that went to the trash with its account shows **Restore** disabled, with "Restore the customer account first." This was checked again on the `cf02944` build.
+  - Permanent deletion needs the typed customer ID.
+  - A large synthetic account (20 orders with files, invoices and receipts) was deleted in about 3.6 s:
+    - all 21 orders became tombstones;
+    - notes, files, history, messages, intake, sessions and the billing profile all counted 0;
+    - 8 unpaid invoices were voided, and 5 paid invoices and 4 receipts were kept;
+    - the account row became a tombstone with its password cleared.
+  - The same e-mail address registered again and received a new customer ID. Reusing the old customer ID returned 409.
+- **Legal hold.**
+  - Moving an order on hold to the trash returns 409 "Release the legal hold first.", shown in the dialog.
+  - Moving a customer who owns a held order returns 409.
+- **Bulk actions.** Restoring 3 selected items worked. A bulk permanent deletion needs exactly `DELETE 3`.
+- **Retention settings.**
+  - A value of 0 shows "Enter a whole number of days from 1 to 3650."
+  - Every change needs a fresh two-step check.
+  - Lengthening a period saves directly.
+  - Shortening one shows how many items become due and asks for `DELETE <count>`. The due count and the row dates update.
+- **Kept invoice.** The detail of a kept invoice shows the "Retained finance record" banner, with the frozen buyer name, e-mail and address.
+- **Audit events seen:**
+  - `order.trashed`, `order.restored`, `order.purge_started`, `order.purged`;
+  - `customer.trashed`, `customer.restored`, `customer.purge_started`, `customer.purged`;
+  - `trash.retention_changed`, `trash.cleanup_completed`.
+- **D3, logo.**
+  - The new square logo appears in light and dark on sign-in, registration, forgot password, the 404 page and the sidebar.
+  - The web manifest lists the square 192 and 512 px icons and the maskable utility icon.
+  - These return 200 with the right content type: the favicon (`.ico`, plus light and dark 32 px), the Apple touch icon, the 800 px square share image, the offline page logos and every manifest icon.
+  - Sign-in has no sideways scrolling at 240 and 390 px.
+- **Accessibility and widths.** The pages are designed and tested against WCAG 2.2 AA.
+  - The axe-core WCAG 2.0, 2.1 and 2.2 A and AA rules found 0 violations in light and dark themes on `/admin/trash`, `/admin/customers`, the customer page, `/admin/orders`, the order page and the permanent-deletion dialog (390 px light, 240 px dark).
+  - No sideways scrolling at 240, 320, 390, 768, 1024 or 1440 px on those routes.
+- **Security review.** http_security_engineer gave D1, D2 and D3 CLEAR after several rounds. It was a source review, not a penetration test. See the [security review record](../verification/INCREMENT_09_SECURITY_REVIEW.md).
+
+**Verified by the lead on 2026-11-28** on the QA build at `6f54429`, in Chromium, with synthetic data. The earlier checks above ran on the `cf02944` build.
+- **Automatic clean-up.**
+  - An order in the trash was made overdue: its moved-to-trash date was set back in the database, with order retention at 5 days. The panel showed "1 item is due at the next clean-up".
+  - The hourly clean-up ran on the hour (07:00 UTC) and deleted the order permanently. The sweep recorded 1 deleted and 0 failed, and the deletion run is marked as started by retention, with no acting user.
+  - The Trash panel then showed the last clean-up with 1 item deleted and 0 due.
+  - The clean-up runs once an hour, on the hour. It does not run at the start-up of every restart.
+- **Customer side** (signed in as the synthetic customer).
+  - An order in the trash is absent from the customer's order list, and its direct address shows "Order unavailable".
+  - The unpaid invoice of an order in the trash is absent from the customer's invoice list. Its direct address gives the same message as an invoice that does not exist.
+  - The paid invoice and receipt of an order in the trash stay visible, and their PDFs download.
+  - After the permanent deletion, the paid invoice and receipt remain and their PDFs still download. They show "Deleted order" in place of the project name. The unpaid invoice is void, with the reason "Order permanently deleted".
+  - The invoice list has no sideways scrolling at 390 px.
+- **Stored files.** With local storage, permanently deleting two orders that held 5 and 3 files took the stored objects from 12 to 4. The 4 left belong to other orders, and the file rows of the deleted orders are gone.
+- **A storage failure stops the deletion.**
+  - The stored files were given unsafe permissions (group- and world-readable), a test artefact placed by hand. Permanent deletion then stopped with "Private storage is unavailable.": the order stayed in the trash and nothing was deleted.
+  - After the permissions were corrected, the retry completed as the second attempt of the same run.
+- **Move, Undo, move again.** On the same order page, **Move to trash**, then **Undo**, then **Move to trash** again really moves the order the second time. The trash count was 1 each time.
+- **Customer restore dialog.** It lists what returns: "Returns with it: 3 line items, 2 refunds, 1 note, 1 order, 1 paid invoice, 1 payment, 1 policy acceptance". It also says the account comes back suspended.
+- **Two defects found in this pass and fixed by the lead:**
+  - **f57c510.** Customers saw the staff label "In trash" on a kept paid invoice or receipt whose order is in the trash. Customers now see "Order unavailable", and staff still see "In trash". A unit test was added.
+  - **6f54429.** After a failed action on one item in the Trash centre, the next item sent the same request key and was refused with "This request key was already used for a different action."
+    - Each target now has its own request key. A retry of the same item keeps its key, so the server resumes it. A success renews the key, and the move dialog renews its key after a success.
+    - The new unit test fails without the fix.
+    - Checked again live: two permanent deletions in a row, in one page session, both completed.
+
+**Re-run by the lead after both fixes** (source at `6f54429`): the type check was clean, eslint over the whole repository exited 0, and the full vitest suite passed with 254 files, 3,402 tests passed and 4 todo. The production build of `6f54429` exited 0 and is the build the 2026-11-28 checks ran on.
+
+**Reported by owners, not re-run individually by the lead.** These test files are part of the lead's full vitest run above, but the lead did not exercise them one by one.
+- **Cross-module journey.** `tests/integration/journey-trash.test.ts` (ede33a1, 14c63ab) covers Trash isolation, the lifecycle and scheduled retention across modules. Every Trash capability is probed against a customer and a staff member who completed the two-step check.
+- **Participants.** Each module that owns data registers a trash participant and tests its own purge. Since 700ff9c this includes a test that a lost purge fence (`PURGE_FENCE_LOST`) leaves data unchanged. The modules are: identity, orders, files and storage, compliance, billing profile, payments, integrations, SharePoint, engagement, community, knowledge, public API, promotions, referrals, automations, cart, portable, assurance and platform.
+- **Platform** (platform_engineer's own runs):
+  - `consent.test.ts` 14/14, including the fence case;
+  - `settingFields.test.ts` 8/8, `router.example.test.ts` 7/7 and `configTransfer.example.test.ts` 9/9, which cover owner-managed settings: the generic write and configuration import refuse the trash retention keys;
+  - `module.example.test.ts` 10/10.
+- **QA scaffold.** `QA_SUITE=increment-09` (7774033, e5fe15e, 5fb8c3b, 2457541; portable_ops_engineer) holds the Trash and contact-link routes and fixtures for named-state checks at narrow and wide widths.
+- **Go-live checklist.** 47 new rows, 210 IDs in total (8f4155a; assurance_engineer), to be run on the owner's server.
+
+**Not verified by anyone:**
+- real mail clients (Outlook, Gmail, Apple Mail), and therefore clickable anchors in a delivered message;
+- real storage providers and real payment providers;
+- Windows forced colours and screen readers;
+- browsers other than Chromium;
+- a real backup and restore after a permanent deletion;
+- install or upgrade with migration 0009 on the owner's server.
+
+## Accepted risks and known gaps (increment 09)
+
+Each item is a limit of what was built, recorded by /root, not a defect that blocks release.
+
+1. **Share image path.** The share image path in `index.html` is relative. Some link-preview services need an absolute URL. The portal is `noindex` and sign-in only.
+2. **Mail links need HTTPS.** Links in e-mail become clickable only when the portal address is HTTPS.
+3. **Old password resets.** Password-reset requests queued before the upgrade are refused. Users request a new one.
+4. **Old queued mail.** Queued mail from before the upgrade that has no customer binding may be suppressed after that customer is deleted permanently. The portal does not send what it cannot check.
+5. **No manual clean-up retry.** A manual retry of the retention clean-up job is refused. The job runs on its hourly schedule, and failed items are retried from the Trash centre.
+6. **Unreachable storage copies.** These stop a permanent deletion until an administrator chooses "Finish and leave N external copies in place" (two-step check, typed order number, audited).
+7. **What permanent deletion does not reach.** Backups, SIEM copies, delivered mail, Stripe objects and SharePoint folders. Backups keep deleted data until they expire, and a restore brings deleted items back ([BACKUP_AND_RESTORE.md](../operations/BACKUP_AND_RESTORE.md)).
+8. **No legal hold inside the Trash centre** (lead ruling). To hold a trashed order, restore it, then place the hold. The clean-up job still skips a held row in the trash.
 
 ## Increment 08
 

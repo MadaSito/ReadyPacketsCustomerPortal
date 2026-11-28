@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { describeSchema, describeSettingFields, humanizeKey } from "./settingFields.js";
-import { defineSecret, defineSetting } from "./settingsRegistry.js";
+import { DomainError } from "../../core/errors.js";
+import { assertGenericWriteAllowed, defineSecret, defineSetting, isOwnerWriteOnly } from "./settingsRegistry.js";
 
 describe("describeSchema", () => {
   it("describes scalars, enums, bounds, defaults, optional and nullable fields", () => {
@@ -91,5 +92,33 @@ describe("defineSetting extras", () => {
     expect(() => defineSetting({ ...base, key: "test_fields.bad_cap", writeCapability: "nope" as never })).toThrow(/capability/);
     expect(() => defineSetting({ ...base, key: "test_fields.bad_href", managedBy: { href: "https://evil.example", label: "x" } })).toThrow(/href/);
     expect(() => defineSetting({ ...base, key: "test_fields.bad_href2", managedBy: { href: "//evil.example/admin", label: "x" } })).toThrow(/href/);
+  });
+
+  it("owner-managed settings require managedBy, are never exportable and refuse generic writes", () => {
+    const base = { owner: "platform", group: "general" as const, label: "L", description: "d", schema: z.number(), default: 1 };
+    const managedBy = { href: "/admin/trash", label: "Trash centre" };
+    expect(() => defineSetting({ ...base, key: "test_fields.owner_no_page", ownerWriteOnly: true })).toThrow(/requires managedBy/);
+    expect(() => defineSetting({ ...base, key: "test_fields.owner_exportable", ownerWriteOnly: true, managedBy, exportable: true })).toThrow(/exportable/);
+    const owned = defineSetting({ ...base, key: "test_fields.owner_managed", ownerWriteOnly: true, managedBy });
+    expect(owned).toMatchObject({ ownerWriteOnly: true, exportable: false });
+    expect(isOwnerWriteOnly(owned)).toBe(true);
+    const error = (() => {
+      try {
+        assertGenericWriteAllowed(owned.key);
+      } catch (e) {
+        return e;
+      }
+      return null;
+    })();
+    expect(error).toBeInstanceOf(DomainError);
+    expect(error).toMatchObject({ code: "FORBIDDEN", reasonCode: "SETTING_OWNER_MANAGED", safeMessage: "Change this in the Trash centre.", details: { href: "/admin/trash" } });
+    const secret = defineSecret({ key: "test_fields.owner_secret", owner: "platform", group: "general", label: "S", description: "d", ownerWriteOnly: true, managedBy });
+    expect(secret.exportable).toBe(false);
+    expect(() => assertGenericWriteAllowed(secret.key)).toThrow(DomainError);
+    // Ordinary managedBy settings (mail, consent pages use the generic write) stay writable.
+    const linked = defineSetting({ ...base, key: "test_fields.linked_only", managedBy });
+    expect(isOwnerWriteOnly(linked)).toBe(false);
+    expect(() => assertGenericWriteAllowed(linked.key)).not.toThrow();
+    expect(() => assertGenericWriteAllowed("test_fields.undeclared")).not.toThrow();
   });
 });

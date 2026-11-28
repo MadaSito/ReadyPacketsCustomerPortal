@@ -1,6 +1,7 @@
 import type { Readable } from "node:stream";
 import type { z } from "zod";
 import type { DbOrTx, ModuleLifecycle, SessionPrincipal, Tx } from "../../core/types.js";
+import type { TrashPurgeRun } from "../trash/ports.js";
 import type { CopyLogService } from "./copyLog.js";
 import type { OrderCopiesService } from "./orderCopies.js";
 import type { ManagedFileSync } from "./managedFileSync.js";
@@ -23,10 +24,14 @@ export interface StoragePutInput {
   beforeWrite?: () => Promise<void>;
   /** Managed intents never adopt by weak checksum or try a different filename. */
   exactCreate?: true;
+  /** Do not overwrite a user-controlled object at the requested path. */
+  protectExisting?: true;
 }
 
 export interface StoragePutResult {
   remoteId: string;
+  /** A matching provider object was reused; the portal did not create it. */
+  reusedExisting?: true;
   /** Provider-observed path segments relative to the configured root, including the final file name. */
   targetPath?: readonly string[];
   /** A byte count independently observed by the provider, not echoed from the request. */
@@ -62,8 +67,17 @@ export interface StorageAdapter {
   inspectExact?(path: readonly string[], name: string, signal: AbortSignal): Promise<"missing" | "present">;
   ensureFolder(path: readonly string[], signal?: AbortSignal, beforeWrite?: () => Promise<void>): Promise<void>;
   put(input: StoragePutInput): Promise<StoragePutResult>;
-  /** Explicit removal only. Never called by an automatic copy, retry, retention or assignment change. */
-  remove(remoteId: string, signal?: AbortSignal): Promise<void>;
+  /**
+   * Explicit removal only, including a permanent Trash purge. Availability errors may be raised only
+   * before a delete can take effect; use OUTCOME_UNKNOWN if submission or verification is ambiguous.
+   */
+  remove(remoteId: string, signal?: AbortSignal): Promise<void | { providerRecycleBin: true }>;
+}
+
+/** At this point a mutation could have occurred, so no availability error can justify abandoning verification. */
+export async function verifyRemoval<T>(verify: () => Promise<T>): Promise<T> {
+  try { return await verify(); }
+  catch { throw new StorageAdapterError("OUTCOME_UNKNOWN"); }
 }
 
 export type StorageConfig = Record<string, string | number | boolean>;
@@ -132,6 +146,11 @@ export interface StorageCopyInput extends StoragePutInput {
 }
 
 export interface StorageModule extends ModuleLifecycle {
+  trashOrderCopiesInTx(tx: Tx, orderId: number, orderPublicId: string): Promise<void>;
+  purgeOrderCopies(orderId: number, orderPublicId: string, run: TrashPurgeRun): Promise<{
+    deleted: number; external: number; shared: number; receipts: number; providerRecycleBin: number;
+    unverifiedExternalCopies: Record<string, number>; acknowledgedExternalCopies: Record<string, number>;
+  }>;
   copies: CopyLogService;
   orderCopies: OrderCopiesService;
   fileSync: ManagedFileSync;

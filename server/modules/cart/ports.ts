@@ -434,6 +434,10 @@ export interface CartCompliancePort {
     totalMinor: number;
     issuedAt: Date;
   }>;
+  getInvoiceForCheckout?(
+    invoicePublicId: string,
+    opts?: { principal?: SessionPrincipal; tx?: DbOrTx; forUpdate?: boolean },
+  ): Promise<{ status: string }>;
 }
 
 export function cartCompliancePort(services: Services): CartCompliancePort {
@@ -451,6 +455,10 @@ export function cartCompliancePort(services: Services): CartCompliancePort {
   const issueCheckoutInvoiceInTx = method<CartCompliancePort["issueCheckoutInvoiceInTx"]>(
     complianceMod,
     "issueCheckoutInvoiceInTx",
+  );
+  const getInvoiceForCheckout = method<NonNullable<CartCompliancePort["getInvoiceForCheckout"]>>(
+    complianceMod,
+    "getInvoiceForCheckout",
   );
 
   if (!requiredAcceptancesFor || !assertRequiredPoliciesAccepted) {
@@ -472,6 +480,7 @@ export function cartCompliancePort(services: Services): CartCompliancePort {
       if (!issueCheckoutInvoiceInTx) throw unavailable("COMPLIANCE_CHECKOUT_INVOICE_UNAVAILABLE");
       return issueCheckoutInvoiceInTx(input, tx);
     },
+    ...(getInvoiceForCheckout ? { getInvoiceForCheckout } : {}),
   };
 }
 

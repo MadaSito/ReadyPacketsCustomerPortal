@@ -7,6 +7,9 @@ import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { DomainError } from "../../core/errors.js";
 import { createJobQueue } from "../jobs/queue.js";
+import { users } from "../identity/schema.js";
+import { orders } from "../orders/schema.js";
+import { createTrashRegistry, unfencedPurgeRunForTests } from "../trash/ports.js";
 import type { SessionPrincipal } from "../../core/types.js";
 import { TOKEN_RE, computeSignature, generateKeyToken, hasControlChar, ipAllowed, normaliseCidr, parseBearer } from "./credentials.js";
 import type { ApiHttpRequest } from "./engine.js";
@@ -16,7 +19,7 @@ import { apiIdempotency, apiKeys, apiRateWindows, apiRequestLog, apiSettings, ap
 const CUSTOMER = "01JCVSTMR00000000000000001";
 const ORDER = "01JQRDER000000000000000001";
 const PRODUCT = "01JPRDCT000000000000000001";
-const tables = [apiRequestLog, apiIdempotency, apiSignatureNonces, apiRateWindows, apiKeys, apiSettings];
+const tables = [apiRequestLog, apiIdempotency, apiSignatureNonces, apiRateWindows, apiKeys, apiSettings, orders, users];
 
 let db: TestDb;
 let h: TestHarness;
@@ -45,7 +48,7 @@ const order = (): OrderDto => ({
 });
 
 beforeAll(async () => {
-  db = await createTestDb({ schema: { apiSettings, apiKeys, apiRequestLog, apiIdempotency, apiSignatureNonces, apiRateWindows } });
+  db = await createTestDb({ schema: { apiSettings, apiKeys, apiRequestLog, apiIdempotency, apiSignatureNonces, apiRateWindows, users, orders } });
 });
 afterAll(() => db?.cleanup());
 
@@ -408,5 +411,277 @@ describe("public API administration", () => {
     h.clock.advance(31 * 86_400_000);
     expect(await handler({ payload: {} } as never)).toMatchObject({ outcome: "completed" });
     expect(await db.db.select().from(apiRequestLog)).toHaveLength(0);
+  });
+
+  it("Increment 09 D2.2 / D2.6: hides trashed and tombstoned orders & customers (404 + absent from lists) and revokes/erases API keys on purge", async () => {
+    const LIVE_CUSTOMER = "01JCVSTMR00000000000000002";
+    const TRASHED_CUSTOMER = "01JCVSTMR00000000000000003";
+    const PURGED_CUSTOMER = "01JCVSTMR00000000000000004";
+    const LIVE_ORDER = "01JQRDER000000000000000002";
+    const TRASHED_ORDER = "01JQRDER000000000000000003";
+    const PURGED_ORDER = "01JQRDER000000000000000004";
+
+    const now = h.clock.now();
+    const [liveCustRes] = await db.db.insert(users).values({
+      publicId: LIVE_CUSTOMER,
+      customerRef: "RPCUS-A1B2CJJG5",
+      role: "customer",
+      status: "active",
+      emailEnc: h.deps.crypto.encrypt("zeus.greene@example.test", `users.email:${LIVE_CUSTOMER}`),
+      emailIndex: h.deps.crypto.blindIndex("zeus.greene@example.test", "users.email"),
+      nameEnc: h.deps.crypto.encrypt("Zeus Greene", `users.name:${LIVE_CUSTOMER}`),
+    });
+    const liveCustId = Number(liveCustRes.insertId);
+
+    const [trashedCustRes] = await db.db.insert(users).values({
+      publicId: TRASHED_CUSTOMER,
+      customerRef: "RPCUS-TRSH00001",
+      role: "customer",
+      status: "suspended",
+      emailEnc: h.deps.crypto.encrypt("trashed.synthetic@example.test", `users.email:${TRASHED_CUSTOMER}`),
+      emailIndex: h.deps.crypto.blindIndex("trashed.synthetic@example.test", "users.email"),
+      nameEnc: h.deps.crypto.encrypt("Synthetic Trashed", `users.name:${TRASHED_CUSTOMER}`),
+      trashedAt: now,
+      trashBatchId: "01JETRASHBATCH000000000001",
+    });
+    const trashedCustId = Number(trashedCustRes.insertId);
+
+    const [purgedCustRes] = await db.db.insert(users).values({
+      publicId: PURGED_CUSTOMER,
+      role: "customer",
+      status: "deactivated",
+      emailEnc: "tombstone",
+      emailIndex: h.deps.crypto.blindIndex(`purged:${PURGED_CUSTOMER}`, "users.email"),
+      nameEnc: "tombstone",
+      trashedAt: now,
+      purgedAt: now,
+      trashBatchId: "01JETRASHBATCH000000000002",
+    });
+    const purgedCustId = Number(purgedCustRes.insertId);
+
+    await db.db.insert(orders).values([
+      {
+        publicId: LIVE_ORDER,
+        reference: "RP-2026-1001",
+        ownerUserId: liveCustId,
+        projectName: "Ice Queen",
+        workflowVersionId: 1,
+        statusKey: "new",
+        subtotalMinor: 1000,
+        totalMinor: 1000,
+        currency: "USD",
+      },
+      {
+        publicId: TRASHED_ORDER,
+        reference: "RP-2026-1002",
+        ownerUserId: liveCustId,
+        projectName: "Ice Queen",
+        workflowVersionId: 1,
+        statusKey: "new",
+        subtotalMinor: 1000,
+        totalMinor: 1000,
+        currency: "USD",
+        trashedAt: now,
+        trashBatchId: "01JETRASHBATCH000000000003",
+      },
+      {
+        publicId: PURGED_ORDER,
+        reference: "RP-2026-1003",
+        ownerUserId: purgedCustId,
+        projectName: "erased",
+        workflowVersionId: 1,
+        statusKey: "new",
+        subtotalMinor: 1000,
+        totalMinor: 1000,
+        currency: "USD",
+        trashedAt: now,
+        purgedAt: now,
+        trashBatchId: "01JETRASHBATCH000000000002",
+      },
+    ]);
+
+    const trashRegistry = createTrashRegistry();
+    h.services.trash = trashRegistry;
+    await mod.init?.();
+
+    const custDto = (id: string) => ({
+      id,
+      customerRef: id === LIVE_CUSTOMER ? "RPCUS-A1B2CJJG5" : null,
+      displayName: "Zeus Greene",
+      email: "zeus.greene@example.test",
+      status: "active",
+      createdAt: "2026-11-20T10:00:00.000Z",
+      updatedAt: "2026-11-20T10:00:00.000Z",
+    });
+
+    mod.registerProvider("customers", {
+      list: async () => ({
+        items: [custDto(LIVE_CUSTOMER), custDto(TRASHED_CUSTOMER), custDto(PURGED_CUSTOMER)],
+        nextCursor: null,
+      }),
+      get: async (id) => custDto(id),
+    });
+    mod.registerProvider("orderFiles", {
+      list: async (orderId) => ({
+        items: [
+          {
+            id: "01JFILE0000000000000000001",
+            orderId,
+            displayName: "packet.pdf",
+            category: "deliverable",
+            contentType: "application/pdf",
+            size: 512,
+            version: 1,
+            createdAt: "2026-11-20T10:00:00.000Z",
+          },
+        ],
+        nextCursor: null,
+      }),
+    });
+
+    orderList = async () => ({
+      items: [
+        { ...order(), id: LIVE_ORDER, customerId: LIVE_CUSTOMER },
+        { ...order(), id: TRASHED_ORDER, customerId: LIVE_CUSTOMER },
+        { ...order(), id: PURGED_ORDER, customerId: PURGED_CUSTOMER },
+      ],
+      nextCursor: null,
+    });
+
+    await enable();
+    const { token } = await newKey({
+      scopes: ["customers:read", "orders:read", "orders:write", "files:read"],
+    });
+
+    // Lists exclude trashed and tombstoned orders & customers
+    const custListRes = await mod.handle(req(token, { target: "/customers" }));
+    expect(custListRes.status).toBe(200);
+    expect((json(custListRes.body).data as { id: string }[]).map((c) => c.id)).toEqual([LIVE_CUSTOMER]);
+
+    const ordListRes = await mod.handle(req(token, { target: "/orders" }));
+    expect(ordListRes.status).toBe(200);
+    expect((json(ordListRes.body).data as { id: string }[]).map((o) => o.id)).toEqual([LIVE_ORDER]);
+
+    // Single-item GET / files / transitions / create against trashed or tombstoned items answer 404
+    expect((await mod.handle(req(token, { target: `/customers/${TRASHED_CUSTOMER}` }))).status).toBe(404);
+    expect((await mod.handle(req(token, { target: `/customers/${PURGED_CUSTOMER}` }))).status).toBe(404);
+    expect((await mod.handle(req(token, { target: `/orders/${TRASHED_ORDER}` }))).status).toBe(404);
+    expect((await mod.handle(req(token, { target: `/orders/${PURGED_ORDER}` }))).status).toBe(404);
+    expect((await mod.handle(req(token, { target: `/orders/${TRASHED_ORDER}/files` }))).status).toBe(404);
+    expect(
+      (
+        await mod.handle(
+          req(token, {
+            method: "POST",
+            target: `/orders/${TRASHED_ORDER}/transitions`,
+            headers: {
+              authorization: `Bearer ${token}`,
+              "content-type": "application/json",
+              "idempotency-key": "idem-trans-trashed",
+            },
+            body: Buffer.from(JSON.stringify({ toStatusKey: "closed", expectedVersion: 1 })),
+          }),
+        )
+      ).status,
+    ).toBe(404);
+    expect(
+      (
+        await mod.handle(
+          post(
+            token,
+            "idem-create-trashed-cust",
+            JSON.stringify({ customerId: TRASHED_CUSTOMER, items: [{ productId: PRODUCT, tierKey: "gold", quantity: 1 }] }),
+          ),
+        )
+      ).status,
+    ).toBe(404);
+
+    // TrashParticipant: API keys belonging to a customer are revoked on trash and erased on purge
+    const customerKeyPrincipal = fakePrincipal({ userId: trashedCustId, role: "admin", stepUpAt: h.clock.now() });
+    const { token: custKeyToken } = await mod.keys.create(customerKeyPrincipal, keyInput({ name: "Customer key" }));
+    // Because trashedCustId has trashedAt set, auth immediately refuses with 401
+    expect((await mod.handle(req(custKeyToken))).status).toBe(401);
+
+    const participant = trashRegistry.participants().find((p) => p.module === "publicApi")!;
+    expect(participant).toBeDefined();
+    expect(
+      await participant.summarize!({
+        kind: "customer",
+        id: trashedCustId,
+        publicId: TRASHED_CUSTOMER,
+        batchId: "01JETRASHBATCH000000000001",
+      }),
+    ).toEqual({ apiKeys: 1 });
+
+    await db.db.transaction(async (tx) => {
+      await participant.onTrashedInTx!(
+        tx,
+        {
+          kind: "customer",
+          id: trashedCustId,
+          publicId: TRASHED_CUSTOMER,
+          batchId: "01JETRASHBATCH000000000001",
+        },
+        { kind: "system", job: "test" },
+      );
+    });
+
+    // Throwing fence (`PURGE_FENCE_LOST`) leaves API key rows untouched
+    const lostFenceRun = unfencedPurgeRunForTests("01JEPURGERUNLOST0000000001", {
+      async assertCurrentInTx() {
+        throw new DomainError("CONFLICT", "PURGE_FENCE_LOST", "Purge worker replaced.");
+      },
+    });
+    await expect(
+      participant.purge!(
+        {
+          kind: "customer",
+          id: trashedCustId,
+          publicId: TRASHED_CUSTOMER,
+          batchId: "01JETRASHBATCH000000000001",
+        },
+        lostFenceRun,
+      ),
+    ).rejects.toMatchObject({ reasonCode: "PURGE_FENCE_LOST" });
+    expect(
+      await participant.summarize!({
+        kind: "customer",
+        id: trashedCustId,
+        publicId: TRASHED_CUSTOMER,
+        batchId: "01JETRASHBATCH000000000001",
+      }),
+    ).toEqual({ apiKeys: 1 });
+
+    const purgeResult = await participant.purge!(
+      {
+        kind: "customer",
+        id: trashedCustId,
+        publicId: TRASHED_CUSTOMER,
+        batchId: "01JETRASHBATCH000000000001",
+      },
+      unfencedPurgeRunForTests("01JEPURGERUN00000000000001"),
+    );
+    expect(purgeResult.deleted.apiKeys).toBe(1);
+    expect(
+      await participant.summarize!({
+        kind: "customer",
+        id: trashedCustId,
+        publicId: TRASHED_CUSTOMER,
+        batchId: "01JETRASHBATCH000000000001",
+      }),
+    ).toEqual({});
+    // Idempotent repeat purge
+    expect(
+      await participant.purge!(
+        {
+          kind: "customer",
+          id: trashedCustId,
+          publicId: TRASHED_CUSTOMER,
+          batchId: "01JETRASHBATCH000000000001",
+        },
+        unfencedPurgeRunForTests("01JEPURGERUN00000000000002"),
+      ),
+    ).toEqual({ deleted: {} });
+    expect((await mod.handle(req(custKeyToken))).status).toBe(401);
   });
 });

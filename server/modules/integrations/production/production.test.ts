@@ -20,7 +20,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import mysql from "mysql2/promise";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { DomainError, forbidden } from "../../../core/errors.js";
+import { DomainError, conflict, forbidden } from "../../../core/errors.js";
 import { newRequestContext, runWithRequestContext } from "../../../core/requestContext.js";
 import type { Db, SessionPrincipal, Tx } from "../../../core/types.js";
 import type { UserView } from "../../identity/index.js";
@@ -51,7 +51,13 @@ import {
 import { integrationsRouter } from "../router.js";
 import {
   integrationProductionDispatches,
+  integrationWebhookDeliveries,
 } from "../schema.js";
+import {
+  createTrashRegistry,
+  unfencedPurgeRunForTests,
+  type TrashRegistry,
+} from "../../trash/ports.js";
 import {
   INTEGRATIONS_PRODUCTION_AUTH_VALUE,
   INTEGRATIONS_PRODUCTION_P101_URL,
@@ -119,6 +125,9 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
     }
   >();
   const mockUsers = new Map<number, UserView>();
+  const trashedOrderIds = new Set<number>();
+  let trash: TrashRegistry;
+  let onDnsLookup: (() => Promise<void>) | null = null;
 
   let dnsCalls: string[] = [];
   let dnsAnswers: Record<string, Array<{ address: string; family: 4 | 6 }>> = {};
@@ -237,12 +246,23 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
     } as never;
 
     targetHarness.services.orders = {
+      isTrashedInTx: vi.fn(async (_tx: Tx, orderId: number) => trashedOrderIds.has(orderId)),
+      getOrderRefByPublicId: vi.fn(async (orderPublicId: string) => {
+        const entry = mockOrders.get(orderPublicId);
+        if (!entry || trashedOrderIds.has(entry.access.id)) return null;
+        return {
+          id: entry.access.id,
+          publicId: entry.access.publicId,
+          reference: entry.access.reference,
+          ownerUserId: entry.access.ownerUserId,
+        };
+      }),
       assertCanReadOrder: vi.fn(async (principal: SessionPrincipal, orderPublicId: string) => {
         if (principal.role === "customer") {
           throw forbidden("STAFF_ONLY");
         }
         const entry = mockOrders.get(orderPublicId);
-        if (!entry) {
+        if (!entry || trashedOrderIds.has(entry.access.id)) {
           throw new DomainError("NOT_FOUND", "ORDER_NOT_FOUND", "Order not found.");
         }
         return {
@@ -251,6 +271,7 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
         };
       }),
       getProductionScope: vi.fn(async (orderId: number) => {
+        if (trashedOrderIds.has(orderId)) return null;
         for (const entry of mockOrders.values()) {
           if (entry.scope.orderId === orderId) return entry.scope;
         }
@@ -299,6 +320,8 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
 
     mockOrders.clear();
     mockUsers.clear();
+    trashedOrderIds.clear();
+    onDnsLookup = null;
     dnsCalls = [];
     dnsAnswers = {
       "hooks.production.example.test": [{ address: "93.184.216.34", family: 4 }],
@@ -311,12 +334,15 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
     });
 
     h = createTestDeps();
+    trash = createTrashRegistry();
+    h.services.trash = trash as never;
     wireMockServices(h, tdb.db);
 
     mod = createIntegrationsModule(h.deps, {
       egress: {
         dnsLookup: async (hostname) => {
           dnsCalls.push(hostname);
+          await onDnsLookup?.();
           return dnsAnswers[hostname] ?? [];
         },
         httpsRequester: async (pinned, url, options) => {
@@ -340,6 +366,7 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
       },
     });
     h.services.integrations = mod;
+    mod.init();
   });
 
   function createCaller(session: SessionPrincipal | null) {
@@ -3627,5 +3654,245 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
     expect(thirdRedeliver.idempotencyKey).not.toBe(rdlvWireKey);
     await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
     expect(downstreamRuns).toBe(3);
+  });
+
+  it("Increment 09 D2 & D2.8: refuses queueing while trashed, cancels queued dispatches, drops claimed in-flight delivery before socket send, re-enables on restore, and erases stored payload copies on purge", async () => {
+    const stepUpAdmin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    await configureEnabledProduction(stepUpAdmin);
+
+    const staffCaller = createCaller(staff);
+    const adminCaller = createCaller(stepUpAdmin);
+    const participant = trash.participants().find((p) => p.module === "integrations")!;
+    expect(participant).toBeDefined();
+    const actor = { kind: "user" as const, userId: stepUpAdmin.userId, publicId: stepUpAdmin.userPublicId };
+
+    // 1. D2: Queued dispatch cancelled by onTrashedInTx; new queueing refused while trashed; restore re-enables fresh P101.
+    const o1 = seedOrderAndCustomer({
+      orderId: 990,
+      orderPublicId: "01JORDER000000000000000990",
+      reference: "ORD-2026-0990",
+      customerRef: "RPCUS-TRASH0990",
+    });
+    const queued = await staffCaller.production.order.requestP101({ orderPublicId: o1.orderPublicId });
+    expect(queued.state).toBe("queued");
+
+    const entity1 = { kind: "order" as const, id: o1.orderId, publicId: o1.orderPublicId, batchId: "01JBATCH000000000000000990" };
+    expect(await participant.summarize!(entity1)).toEqual({ productionDispatches: 1 });
+
+    trashedOrderIds.add(o1.orderId);
+    await tdb.db.transaction((tx) => participant.onTrashedInTx!(tx, entity1, actor));
+
+    const [afterTrashRow] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, queued.publicId));
+    expect(afterTrashRow).toMatchObject({
+      state: "stopped",
+      lastReasonCode: "ORDER_TRASHED",
+      payloadEnc: null,
+    });
+
+    // Queued job sees stopped row and drops without network send.
+    const [jobOut1] = await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(jobOut1).toEqual({ outcome: "canceled", reasonCode: "ORDER_TRASHED" });
+    expect(httpCalls).toHaveLength(0);
+
+    // Queueing while trashed is refused via both tRPC and workflow dispatch port; listDispatches hides trashed orders.
+    await expect(
+      staffCaller.production.order.requestP101({ orderPublicId: o1.orderPublicId }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    const wfRefused = await tdb.db.transaction((tx) =>
+      mod.production.enqueueWorkflowDispatch(
+        {
+          phase: "P101",
+          orderPublicId: o1.orderPublicId,
+          stageKey: "intake",
+          triggerSource: "lifecycle_payment_confirmed",
+          idempotencyKey: "wf-trashed-990",
+          actor: null,
+        },
+        tx,
+      ),
+    );
+    expect(wfRefused).toMatchObject({ outcome: "refused_precondition", reasonCode: "ORDER_NOT_FOUND" });
+    const listedWhileTrashed = await adminCaller.production.admin.listDispatches({});
+    expect(listedWhileTrashed.items.some((i) => i.orderPublicId === o1.orderPublicId)).toBe(false);
+
+    // Restore re-enables fresh P101 without requiring step-up resend for the never-sent trash-cancelled row.
+    trashedOrderIds.delete(o1.orderId);
+    await tdb.db.transaction((tx) => participant.onRestoredInTx!(tx, entity1, actor));
+    const reQueued = await staffCaller.production.order.requestP101({ orderPublicId: o1.orderPublicId });
+    expect(reQueued.state).toBe("queued");
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(httpCalls).toHaveLength(1);
+
+    // 2. D2.8 Interleaving: delivery already claimed (`queued -> sending`) before the order is trashed
+    // re-checks trash state in `beforeSend` immediately before opening the HTTPS socket and drops itself.
+    const o2 = seedOrderAndCustomer({
+      orderId: 991,
+      orderPublicId: "01JORDER000000000000000991",
+      reference: "ORD-2026-0991",
+      customerRef: "RPCUS-TRASH0991",
+    });
+    const inFlight = await staffCaller.production.order.requestP101({ orderPublicId: o2.orderPublicId });
+    const entity2 = { kind: "order" as const, id: o2.orderId, publicId: o2.orderPublicId, batchId: "01JBATCH000000000000000991" };
+
+    let sawSendingDuringDns = false;
+    onDnsLookup = async () => {
+      onDnsLookup = null;
+      const [midRow] = await tdb.db
+        .select({ state: integrationProductionDispatches.state })
+        .from(integrationProductionDispatches)
+        .where(eq(integrationProductionDispatches.publicId, inFlight.publicId));
+      sawSendingDuringDns = midRow?.state === "sending";
+      trashedOrderIds.add(o2.orderId);
+      await tdb.db.transaction((tx) => participant.onTrashedInTx!(tx, entity2, actor));
+    };
+
+    const httpCountBefore = httpCalls.length;
+    const [inFlightOut] = await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(sawSendingDuringDns).toBe(true);
+    expect(inFlightOut).toEqual({ outcome: "canceled", reasonCode: "ORDER_TRASHED" });
+    expect(httpCalls).toHaveLength(httpCountBefore);
+
+    const [afterInFlightRow] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, inFlight.publicId));
+    expect(afterInFlightRow).toMatchObject({
+      state: "stopped",
+      lastReasonCode: "ORDER_TRASHED",
+      attemptCount: 0,
+      payloadEnc: null,
+    });
+
+    // 3. Permanent purge erases stored production dispatch & outbound webhook payload copies idempotently.
+    await mod.webhooks.updateSettings(stepUpAdmin, { enabled: true });
+    const sub = await mod.webhooks.createSubscription(stepUpAdmin, {
+      name: "Order events sink",
+      targetUrl: "https://hooks.production.example.test/webhooks/orders",
+      events: ["order.created"],
+    });
+    await tdb.db.insert(integrationWebhookDeliveries).values({
+      publicId: "01JWHKDELIV000000000000991",
+      direction: "outbound",
+      subscriptionId: 1,
+      subscriptionPublicId: sub.subscription.publicId,
+      orderPublicId: o2.orderPublicId,
+      targetLabel: "Order events sink (hooks.production.example.test)",
+      eventKey: "order.created",
+      deduplicationKey: "test-purge-991",
+      status: "stopped",
+      httpMethod: "POST",
+      httpPath: "https://hooks.production.example.test/***",
+      correlationId: "corr-purge-991",
+      actorLabel: "system",
+      payloadSha256: "a".repeat(64),
+      payloadEnc: "enc-payload",
+      bodyPurged: false,
+      searchText: "01jwhkdeliv000000000000991",
+      expiresAt: new Date("2026-12-01T00:00:00.000Z"),
+    });
+
+    const purgeRes = await participant.purge!(
+      entity2,
+      unfencedPurgeRunForTests("01JRUN00000000000000000991"),
+    );
+    expect(purgeRes).toEqual({
+      deleted: {
+        productionPayloadCopies: 1,
+        webhookPayloadCopies: 1,
+      },
+    });
+    // Idempotent retry:
+    expect(
+      await participant.purge!(entity2, unfencedPurgeRunForTests("01JRUN00000000000000000991")),
+    ).toEqual({
+      deleted: {},
+    });
+    expect(
+      await tdb.db
+        .select()
+        .from(integrationProductionDispatches)
+        .where(eq(integrationProductionDispatches.orderId, o2.orderId)),
+    ).toHaveLength(0);
+    expect(
+      await tdb.db
+        .select()
+        .from(integrationWebhookDeliveries)
+        .where(eq(integrationWebhookDeliveries.orderPublicId, o2.orderPublicId)),
+    ).toHaveLength(0);
+  });
+
+  it("Increment 09 D2.8: integrations purge aborts and leaves dispatches and webhook deliveries unchanged when TrashPurgeRun.assertCurrentInTx throws PURGE_FENCE_LOST", async () => {
+    const stepUpAdmin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    await configureEnabledProduction(stepUpAdmin);
+    await mod.webhooks.updateSettings(stepUpAdmin, { enabled: true });
+    const sub = await mod.webhooks.createSubscription(stepUpAdmin, {
+      name: "Fence sink",
+      targetUrl: "https://hooks.production.example.test/webhooks/fence",
+      events: ["order.created"],
+    });
+
+    const staffCaller = createCaller(staff);
+    const participant = trash.participants().find((p) => p.module === "integrations")!;
+    const o = seedOrderAndCustomer({
+      orderId: 992,
+      orderPublicId: "01JORDER000000000000000992",
+      reference: "ORD-2026-0992",
+      customerRef: "RPCUS-TRASH0992",
+    });
+    await staffCaller.production.order.requestP101({ orderPublicId: o.orderPublicId });
+    await tdb.db.insert(integrationWebhookDeliveries).values({
+      publicId: "01JWHKDELIV000000000000992",
+      direction: "outbound",
+      subscriptionId: 1,
+      subscriptionPublicId: sub.subscription.publicId,
+      orderPublicId: o.orderPublicId,
+      targetLabel: "Fence sink (hooks.production.example.test)",
+      eventKey: "order.created",
+      deduplicationKey: "test-purge-992",
+      status: "stopped",
+      httpMethod: "POST",
+      httpPath: "https://hooks.production.example.test/***",
+      correlationId: "corr-purge-992",
+      actorLabel: "system",
+      payloadSha256: "b".repeat(64),
+      payloadEnc: "enc-payload-992",
+      bodyPurged: false,
+      searchText: "01jwhkdeliv000000000000992",
+      expiresAt: new Date("2026-12-01T00:00:00.000Z"),
+    });
+
+    const entity = { kind: "order" as const, id: o.orderId, publicId: o.orderPublicId, batchId: "01JBATCH000000000000000992" };
+    trashedOrderIds.add(o.orderId);
+    await tdb.db.transaction((tx) =>
+      participant.onTrashedInTx!(tx, entity, { kind: "user", userId: stepUpAdmin.userId, publicId: stepUpAdmin.userPublicId }),
+    );
+
+    const lostFenceRun = unfencedPurgeRunForTests("01JRUN00000000000000000992", {
+      async assertCurrentInTx() {
+        throw conflict("PURGE_FENCE_LOST", "Worker replaced.");
+      },
+    });
+    await expect(participant.purge!(entity, lostFenceRun)).rejects.toMatchObject({
+      code: "CONFLICT",
+      reasonCode: "PURGE_FENCE_LOST",
+    });
+
+    expect(
+      await tdb.db
+        .select()
+        .from(integrationProductionDispatches)
+        .where(eq(integrationProductionDispatches.orderId, o.orderId)),
+    ).toHaveLength(1);
+    expect(
+      await tdb.db
+        .select()
+        .from(integrationWebhookDeliveries)
+        .where(eq(integrationWebhookDeliveries.orderPublicId, o.orderPublicId)),
+    ).toHaveLength(1);
   });
 });

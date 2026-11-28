@@ -225,7 +225,26 @@ type InboundRow = typeof integrationWebhookInboundEndpoints.$inferSelect;
 type DeliveryRow = typeof integrationWebhookDeliveries.$inferSelect;
 type AttemptRow = typeof integrationWebhookDeliveryAttempts.$inferSelect;
 
+class OrderTrashedWebhookAbortError extends Error {
+  constructor() {
+    super("ORDER_TRASHED");
+    this.name = "OrderTrashedWebhookAbortError";
+  }
+}
+
 export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): WebhooksService {
+  async function isOrderPublicIdTrashed(orderPublicId: string, tx?: Tx): Promise<boolean> {
+    const orders = deps.services.orders;
+    if (
+      !orders ||
+      typeof orders.isTrashedInTx !== "function" ||
+      typeof orders.getOrderRefByPublicId !== "function"
+    ) {
+      return false;
+    }
+    const ref = await orders.getOrderRefByPublicId(orderPublicId, tx);
+    return ref === null;
+  }
   function getFullCatalogue(): readonly TriggerCatalogueEntry[] {
     return deps.services.automations?.listTriggerCatalogue() ?? TRIGGER_CATALOGUE;
   }
@@ -555,7 +574,29 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
       return { outcome: "canceled", reasonCode: "DELIVERY_NOT_FOUND" };
     }
     if (row.status === "stopped") {
-      return { outcome: "canceled", reasonCode: "DELIVERY_STOPPED" };
+      return {
+        outcome: "canceled",
+        reasonCode: row.reasonCode === "ORDER_TRASHED" ? "ORDER_TRASHED" : "DELIVERY_STOPPED",
+      };
+    }
+    if (row.orderPublicId && (await isOrderPublicIdTrashed(row.orderPublicId))) {
+      await deps.db
+        .update(integrationWebhookDeliveries)
+        .set({
+          status: "stopped",
+          reasonCode: "ORDER_TRASHED",
+          stopReason: "ORDER_TRASHED",
+          stoppedAt: now,
+          nextAttemptAt: null,
+          tapEventEnc: null,
+          payloadEnc: null,
+          bodyPurged: true,
+          completedAt: now,
+          updatedAt: now,
+          version: sql`${integrationWebhookDeliveries.version} + 1`,
+        })
+        .where(eq(integrationWebhookDeliveries.id, row.id));
+      return { outcome: "canceled", reasonCode: "ORDER_TRASHED" };
     }
     if (
       row.status === "delivered" ||
@@ -689,6 +730,17 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
         publicAddressesOnly: true,
         beforeSend: async () => {
           if (input.assertStillOwned) await input.assertStillOwned();
+          if (row.orderPublicId && (await isOrderPublicIdTrashed(row.orderPublicId))) {
+            throw new OrderTrashedWebhookAbortError();
+          }
+          const [fresh] = await deps.db
+            .select({ status: integrationWebhookDeliveries.status })
+            .from(integrationWebhookDeliveries)
+            .where(eq(integrationWebhookDeliveries.id, row.id))
+            .limit(1);
+          if (!fresh || fresh.status === "stopped") {
+            throw new OrderTrashedWebhookAbortError();
+          }
           requestSent = true;
         },
       });
@@ -910,6 +962,30 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
       };
     } catch (err) {
       const finishedAt = deps.clock.now();
+      if (err instanceof OrderTrashedWebhookAbortError) {
+        await deps.db.transaction(async (tx) => {
+          if (input.assertStillOwned) await input.assertStillOwned(tx);
+          await tx
+            .update(integrationWebhookDeliveries)
+            .set({
+              status: "stopped",
+              attemptCount: Math.max(0, attemptNumber - 1),
+              activeFencingToken: 0,
+              reasonCode: "ORDER_TRASHED",
+              stopReason: "ORDER_TRASHED",
+              stoppedAt: finishedAt,
+              nextAttemptAt: null,
+              tapEventEnc: null,
+              payloadEnc: null,
+              bodyPurged: true,
+              completedAt: finishedAt,
+              updatedAt: finishedAt,
+              version: sql`${integrationWebhookDeliveries.version} + 1`,
+            })
+            .where(eq(integrationWebhookDeliveries.id, row.id));
+        });
+        return { outcome: "canceled", reasonCode: "ORDER_TRASHED" };
+      }
       const durationMs = Math.max(0, finishedAt.getTime() - startedMs);
       const reasonCode =
         err instanceof DomainError
@@ -1159,6 +1235,9 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
           : typeof event.attributes?.order_public_id === "string"
             ? event.attributes.order_public_id
             : null;
+      if (tapOrderPublicId && (await isOrderPublicIdTrashed(tapOrderPublicId, tx))) {
+        return;
+      }
       const tapStageKey =
         typeof event.attributes?.stage_key === "string" ? event.attributes.stage_key.slice(0, 64) : null;
 
@@ -3074,6 +3153,14 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
           message: "Outbound webhook subscriptions are currently disabled.",
         };
       }
+      if (input.orderPublicId && (await isOrderPublicIdTrashed(input.orderPublicId, tx))) {
+        return {
+          outcome: "refused_precondition" as const,
+          deliveryPublicId: null,
+          reasonCode: "ORDER_NOT_FOUND",
+          message: "Order was not found.",
+        };
+      }
 
       const subRows = await tx
         .select()
@@ -3655,6 +3742,73 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
         createdAt: view.createdAt.toISOString(),
         updatedAt: view.updatedAt.toISOString(),
       };
+    },
+
+    async onOrderTrashedInTx(tx, entity) {
+      if (entity.kind !== "order") return;
+      const now = deps.clock.now();
+      await tx
+        .update(integrationWebhookDeliveries)
+        .set({
+          status: "stopped",
+          reasonCode: "ORDER_TRASHED",
+          stopReason: "ORDER_TRASHED",
+          stoppedAt: now,
+          nextAttemptAt: null,
+          tapEventEnc: null,
+          payloadEnc: null,
+          bodyPurged: true,
+          completedAt: now,
+          updatedAt: now,
+          version: sql`${integrationWebhookDeliveries.version} + 1`,
+        })
+        .where(
+          and(
+            eq(integrationWebhookDeliveries.orderPublicId, entity.publicId),
+            inArray(integrationWebhookDeliveries.status, ["queued", "retrying"]),
+          ),
+        );
+    },
+
+    async purgeOrderDeliveriesInTx(tx, entity) {
+      if (entity.kind !== "order") return { deleted: {} };
+      const deliveries = await tx
+        .select({ id: integrationWebhookDeliveries.id })
+        .from(integrationWebhookDeliveries)
+        .where(eq(integrationWebhookDeliveries.orderPublicId, entity.publicId));
+      if (deliveries.length === 0) return { deleted: {} };
+      const ids = deliveries.map((d) => d.id);
+      await tx
+        .delete(integrationWebhookDeliveryAttempts)
+        .where(inArray(integrationWebhookDeliveryAttempts.deliveryId, ids));
+      const [res] = await tx
+        .delete(integrationWebhookDeliveries)
+        .where(inArray(integrationWebhookDeliveries.id, ids));
+      const deleted: Record<string, number> = {};
+      if (res.affectedRows > 0) deleted.webhookPayloadCopies = res.affectedRows;
+      return { deleted };
+    },
+
+    async purgeOrderDeliveries(entity, run) {
+      if (entity.kind !== "order") return { deleted: {} };
+      return deps.db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
+        const deliveries = await tx
+          .select({ id: integrationWebhookDeliveries.id })
+          .from(integrationWebhookDeliveries)
+          .where(eq(integrationWebhookDeliveries.orderPublicId, entity.publicId));
+        if (deliveries.length === 0) return { deleted: {} };
+        const ids = deliveries.map((d) => d.id);
+        await tx
+          .delete(integrationWebhookDeliveryAttempts)
+          .where(inArray(integrationWebhookDeliveryAttempts.deliveryId, ids));
+        const [res] = await tx
+          .delete(integrationWebhookDeliveries)
+          .where(inArray(integrationWebhookDeliveries.id, ids));
+        const deleted: Record<string, number> = {};
+        if (res.affectedRows > 0) deleted.webhookPayloadCopies = res.affectedRows;
+        return { deleted };
+      });
     },
   };
 }

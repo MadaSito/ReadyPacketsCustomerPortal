@@ -195,6 +195,38 @@ Existing orders keep their pinned workflow version. The start-up job `orders.inc
   - **Receipts issued before the upgrade** keep their original PDF.
 - **Default workflow.** Nothing changes by itself. To use another published workflow for new orders, choose **Set as default** in **Workflows**.
 
+## Increment 09 and migration `0009`
+
+`0009_increment_09` is additive only: new tables, new nullable columns or columns with defaults, new indexes, and enum widening. It drops and renames nothing, and does no backfill in SQL.
+
+- **Schema.** `migrations/0009_increment_09.sql` (commit d358237, which replaces the earlier 8b76e87 and 2a76f92) has 56 statements: 6 new tables, 1 enum widening, 23 new nullable columns, 25 new indexes and 1 foreign key.
+  - **New tables:** `trash_purge_runs` (one row per permanent deletion, with per-module counts and a safe error code), `trash_purge_run_targets` (the fixed list of items each deletion works on), `trash_cleanup_sweeps` (retention job runs), `trash_retention_deferrals` (items the clean-up job has put off and will try again, for example an order on legal hold), `trash_idempotency_keys` and `trash_retention_state`.
+  - **Foreign key:** `trash_purge_target_run_fk` links `trash_purge_run_targets.run_id` to `trash_purge_runs`.
+  - **`users` and `orders`:** `trashed_at`, `trashed_by_user_id`, `trash_batch_id`, `trash_reason`, `purge_started_at` and `purged_at`, with indexes `users_trashed_idx` and `orders_trashed_idx` on `(trashed_at, id)`, and `orders_trash_batch_idx`.
+  - **Other new columns:**
+    - `engagement_notifications.order_id` and `ticket_id`;
+    - `compliance_invoices`: `issuer_contact_snapshot`, `order_reference_snapshot`, `customer_ref_snapshot` and `buyer_snapshot_enc` (the frozen copies that are kept);
+    - `mail_outbox.order_id` and `recipient_account_id`;
+    - `automation_runs.subject_user_id`;
+    - `payment_attempts.trash_cancelled_at` and `provider_cancelled_at`.
+  - **Widened:** `operational_alerts.source` gains `trash`.
+  - **Indexes** for the trash tables and for the new lookups on notifications, support tickets, the mail outbox, automation runs, API keys, community reports and topics, and payment attempts.
+  - Nothing is dropped or renamed. Existing rows keep `NULL` in the new columns, so nothing is in the trash.
+- **Native upgrade and Docker Compose.** These are the same as for increment 08: sections 2–5, with the backup, fence and `BACKUP-VERIFIED` gates. Release validation and the image build require the SQL file and the journal entry `0009_increment_09`. Never run the SQL by hand. If you mistype a confirmation, see the box at the top of [section 6](#6-recovery-if-an-upgrade-stops-mid-way).
+- **What stays the same:**
+  - nothing is in the trash after the upgrade, and every order and customer stays visible as before;
+  - order numbers and customer IDs are unchanged;
+  - API v1 responses stay backward compatible.
+- **What behaves differently:**
+  - **Password reset.** Password-reset requests still queued from before the upgrade are refused. Users request a new reset.
+  - **Queued mail after a deletion.** Older queued mail that is not tied to an order or account can be suppressed after a customer is deleted permanently. When the portal cannot tell whether a message concerns the deleted customer, it does not send it.
+  - **Retention clean-up job.** A manual retry of `trash.retention_cleanup` is refused. The job runs only on its hourly schedule.
+- **After the upgrade:**
+  - **Retention.** Open **Administration → Trash** and check the retention settings. **Automatic trash clean-up** is **on**, with 30 days for both **Order retention in trash (days)** and **Customer account retention in trash (days)**. Change these before moving anything to the trash if your policy differs.
+  - **E-mail links.** Send a test from the template editor and check that links are clickable. Stored templates are fixed when the message is produced; you do not need to edit them.
+  - **Logo.** Reload the portal. The new square logo replaces the old one. If an installed app still shows the old icon, reopen it once, so that it picks up the updated service worker.
+  - **Go-live checklist.** Run the increment 09 rows of [GO_LIVE_CHECKLIST.md](GO_LIVE_CHECKLIST.md).
+
 ## Increment 08 and migration `0008`
 
 `0008_increment_08` is additive: new tables, nullable columns or columns with defaults, and new indexes. It drops and renames nothing. Backfill runs in code, at start-up or lazily, never in SQL.
@@ -218,6 +250,10 @@ Existing orders keep their pinned workflow version. The start-up job `orders.inc
   - existing users keep signing in, and their name parts are filled in the next time the profile is saved;
   - active Stripe configurations stay active;
   - API v1 responses stay backward compatible.
+- **What behaves differently:**
+  - **Password reset.** Password-reset requests still queued from before the upgrade are refused. Users request a new reset.
+  - **Queued mail after a deletion.** Older queued mail that is not tied to an order or account can be suppressed after a customer is deleted permanently. When the portal cannot tell whether a message concerns the deleted customer, it does not send it.
+  - **Retention clean-up job.** A manual retry of `trash.retention_cleanup` is refused. The job runs only on its hourly schedule.
 - **After the upgrade:**
   - **Stripe.** Open `/admin/payments/setup` and check the webhook section. Payments are now booked from a signed webhook or from the server's own lookup at Stripe, which replaces increment 07 decision 12. If webhooks are not arriving, the page shows the alert "Stripe is not delivering webhooks to this server" and the usual causes.
   - **Repairing older payments.** For an invoice that was paid on Stripe before the upgrade but still shows "Issued", open `/admin/invoices/<invoice>` (or the attempt in `/admin/payments`) and press **Check with Stripe now**. This needs `payments.manage` and a fresh two-step check. If Stripe confirms the payment, it is booked once and the check is audited.
@@ -228,6 +264,34 @@ Existing orders keep their pinned workflow version. The start-up job `orders.inc
 ## 6. Recovery if an upgrade stops mid-way
 
 Never delete `/etc/readypackets/upgrade-state` or `/etc/nginx/readypackets-maintenance` blindly. Inspect `/etc/readypackets/upgrade-state` (`sudo cat /etc/readypackets/upgrade-state` — read as data, never `source` it):
+
+> **Mistyped confirmation**
+>
+> `deploy/upgrade.sh` stops with `confirmation did not match` whenever the typed word differs from the one asked for, even by case or a space. Retyping will not resume it. Read `sudo cat /etc/readypackets/upgrade-state` (as data) and follow the row for the word you mistyped. The words are case-sensitive.
+>
+> | Mistyped word | State file | What already happened | Recover |
+> | --- | --- | --- | --- |
+> | `DRAINED` | none | Nothing: the script stops before it fences traffic or stops anything. | Run the same `sudo bash deploy/upgrade.sh "$TARGET_SHA"` again. |
+> | `BACKUP-VERIFIED` | `phase=backup` | Traffic is fenced. The services and the backup timer are stopped and disabled, and a verified `pre_upgrade` backup was taken. **No migration has run**, and `current` still points to the old release. | The five steps below. |
+> | `REOPEN` | `phase=verifying` | The migrations ran, the new release is `current`, and its local and edge health checks passed. On exit the script stopped and disabled the services and the timer. Traffic is still fenced. | Do not roll back. Finish by hand (see below). |
+>
+> **After a mistyped `BACKUP-VERIFIED`** (the same applies to `phase=draining`). If the state file shows `phase=migration_started`, stop: that is not this case, so use the general guidance below.
+>
+> 1. Start the old release while traffic is still fenced: `sudo systemctl start readypackets-worker.service readypackets-portal.service`.
+> 2. Check that it is ready: `curl -fsS http://127.0.0.1:5000/readyz`, and check that `systemctl is-active readypackets-portal.service readypackets-worker.service` shows `active` twice.
+> 3. Re-enable the services: `sudo systemctl enable readypackets-worker.service readypackets-portal.service`. If the state file says `backup_timer_enabled=yes`, also run `sudo systemctl enable --now readypackets-backup.timer`. If it says `no`, leave the timer as it was.
+> 4. Remove the two state files, and only these two: `sudo rm -f /etc/nginx/readypackets-maintenance /etc/readypackets/upgrade-state`. The script refuses to start while either one exists.
+> 5. Run the same `sudo bash deploy/upgrade.sh "$TARGET_SHA"` again, and type the words exactly. It takes a new pre-upgrade backup.
+>
+> **After a mistyped `REOPEN`.** Only use this if the last prompt you saw was the `REOPEN` question, which appears only after the health checks passed. These are the steps the script would have run next:
+>
+> 1. `sudo systemctl enable --now readypackets-worker.service readypackets-portal.service`
+> 2. `curl -fsS http://127.0.0.1:5000/readyz`
+> 3. If `backup_timer_enabled=yes`: `sudo systemctl enable --now readypackets-backup.timer`
+> 4. `sudo rm -f /etc/nginx/readypackets-maintenance /etc/readypackets/upgrade-state`
+> 5. End maintenance in **Administration → Maintenance** with fresh MFA, if it is on.
+>
+> If you are unsure which prompt you mistyped, treat `phase=verifying` with the general guidance below.
 
 - **`phase=draining` or `phase=backup` (before `migration_started`)**:
   - Database migrations have **not** started and `/opt/readypackets/current` still points to the old release.

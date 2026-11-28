@@ -30,11 +30,12 @@ export function plainText(max: number, options: { multiline?: boolean; min?: num
 
 /**
  * Reviewed, self-hosted images that may appear on the sign-in page. Paths are under client/public.
- * Adding an entry is a code change (review), never an admin action.
+ * Adding an entry is a code change (review), never an admin action. The ids are stable (stored slides refer to
+ * them); increment 09 points them at brand package 2026.10.15.2 (square full lockup; utility maskable icon).
  */
 export const BRAND_IMAGE_ALLOWLIST = {
-  "brand-icon-light-512": { path: "/brand/readypackets-approved-icon-light-512.png", width: 512, height: 512 },
-  "brand-icon-maskable-512": { path: "/brand/readypackets-approved-icon-maskable-512.png", width: 512, height: 512 },
+  "brand-icon-light-512": { path: "/brand/readypackets-square-light-512-v2026101502.png", width: 512, height: 512 },
+  "brand-icon-maskable-512": { path: "/brand/readypackets-utility-maskable-512-v2026101502.png", width: 512, height: 512 },
 } as const;
 export type BrandImageId = keyof typeof BRAND_IMAGE_ALLOWLIST;
 const BRAND_IDS = Object.keys(BRAND_IMAGE_ALLOWLIST) as [BrandImageId, ...BrandImageId[]];

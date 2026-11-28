@@ -133,6 +133,8 @@ export const automationRuns = mysqlTable(
     orderPublicId: char("order_public_id", { length: 26 }),
     stageStepKey: varchar("stage_step_key", { length: 48 }),
     triggeredByUserId: refColumn("triggered_by_user_id"),
+    /** Nullable subject customer `users.id` (Increment 09 D2.6) so non-order customer runs can be cancelled/erased on trash/purge. */
+    subjectUserId: refColumn("subject_user_id"),
     dedupKey: varchar("dedup_key", { length: 120 }).notNull(),
     correlationId: varchar("correlation_id", { length: 64 }).notNull(),
     isTest: boolean("is_test").notNull().default(false),
@@ -152,6 +154,8 @@ export const automationRuns = mysqlTable(
     uniqueIndex("automation_runs_auto_dedup_uq").on(t.automationId, t.dedupKey),
     index("automation_runs_auto_queued_idx").on(t.automationId, t.queuedAt, t.id),
     index("automation_runs_order_queued_idx").on(t.orderPublicId, t.queuedAt, t.id),
+    index("automation_runs_subject_user_idx").on(t.subjectUserId),
+    index("automation_runs_triggered_by_idx").on(t.triggeredByUserId),
     index("automation_runs_state_queued_idx").on(t.state, t.queuedAt, t.id),
     index("automation_runs_queued_idx").on(t.queuedAt, t.id),
   ],

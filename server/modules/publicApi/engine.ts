@@ -16,6 +16,7 @@ import { hasControlChar, ipAllowed, parseBearer, sha256Hex, verifySignature } fr
 import { type ApiCaller, type ApiScope, type PublicApiProviders } from "./ports.js";
 import { type ApiRoute, ResourceUnavailable, buildOpenApiDocument, matchRoute } from "./routes.js";
 import { apiIdempotency, apiKeys, apiRateWindows, apiRequestLog, apiSettings, apiSignatureNonces } from "./schema.js";
+import { isKeyOwnerTrashed, isStoredIdempotentResponseTrashed } from "./trash.js";
 
 export const API_PREFIX = "/api/v1";
 export const LOG_BODY_LIMIT = 64 * 1024;
@@ -127,7 +128,8 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
     const stored = Buffer.from(row?.secretHash ?? crypto.hashToken(`${DUMMY_HASH_TOKEN}x`), "utf8");
     const valid = presented.length === stored.length && timingSafeEqual(presented, stored);
     const now = clock.now();
-    if (!bearer || !row || !valid || row.state !== "active" || (row.expiresAt && row.expiresAt <= now)) {
+    const creatorTrashed = row && valid ? await isKeyOwnerTrashed(db, row.createdByUserId) : false;
+    if (!bearer || !row || !valid || row.state !== "active" || (row.expiresAt && row.expiresAt <= now) || creatorTrashed) {
       const limited = await deps.rateLimiter.consume("auth_high_risk", `api:${req.ipAddress ?? "unknown"}`);
       audit.note({ category: "security", eventName: "api.auth.denied", action: "authenticate", outcome: "denied", reasonCode: "API_KEY_INVALID", actor: { role: "anonymous" } });
       if (!limited.allowed) throw fail(429, "RATE_LIMITED", { "retry-after": String(limited.retryAfterSeconds) });
@@ -332,7 +334,10 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
     try {
       if (replay) {
         const [row] = await db.select().from(apiKeys).where(eq(apiKeys.id, replay.keyId));
-        if (!row || row.state !== "active" || (row.expiresAt && row.expiresAt <= clock.now())) throw fail(401, "API_KEY_INVALID");
+        const creatorTrashed = row ? await isKeyOwnerTrashed(db, row.createdByUserId) : false;
+        if (!row || row.state !== "active" || (row.expiresAt && row.expiresAt <= clock.now()) || creatorTrashed) {
+          throw fail(401, "API_KEY_INVALID");
+        }
         key = row;
       } else {
         try {
@@ -363,6 +368,12 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
         caller.idempotencyKey = header;
         reservation = await reserveIdempotency(key, header, sha256Hex(`${method}\n${req.target}\n${req.body.toString("base64")}`));
         if ("stored" in reservation && reservation.stored) {
+          if (
+            reservation.stored.status < 300 &&
+            (await isStoredIdempotentResponseTrashed(db, routeTemplate, reservation.stored.body))
+          ) {
+            throw fail(404, "NOT_FOUND");
+          }
           status = reservation.stored.status;
           responseBody = reservation.stored.body;
           extraHeaders["idempotent-replayed"] = "true";

@@ -5,6 +5,7 @@ import type { ModuleDeps } from "../../container.js";
 import type { UserRole } from "../../../shared/domain.js";
 import { conflict, forbidden, notFound, validation } from "../../core/errors.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
+import { isLiveUserRow, liveUserPredicate } from "../identity/live.js";
 import { users, userSessions } from "../identity/schema.js";
 import { defineSetting } from "../platform/settingsRegistry.js";
 import { assertLiveActorInTx, runComplianceTx } from "./actorAuth.js";
@@ -263,9 +264,21 @@ export function createPolicyEnforcement(deps: ModuleDeps) {
     if (disabledByHost) throw forbidden("POLICY_ENFORCEMENT_DISABLED");
     return runComplianceTx(deps, principal, { type: "user", publicId: input.userPublicId }, async (tx) => {
       const actor = await assertLiveActorInTx(deps, principal, tx, "sessions.revoke_any");
-      const [target] = await tx.select({ id: users.id, role: users.role, status: users.status }).from(users)
-        .where(eq(users.publicId, input.userPublicId)).for("update").limit(1);
-      if (!target || target.status !== "active") throw notFound("POLICY_ENFORCEMENT_ITEM_NOT_FOUND");
+      const [target] = await tx
+        .select({
+          id: users.id,
+          role: users.role,
+          status: users.status,
+          trashedAt: users.trashedAt,
+          purgedAt: users.purgedAt,
+        })
+        .from(users)
+        .where(eq(users.publicId, input.userPublicId))
+        .for("update")
+        .limit(1);
+      if (!target || target.status !== "active" || !isLiveUserRow(target)) {
+        throw notFound("POLICY_ENFORCEMENT_ITEM_NOT_FOUND");
+      }
       const [row] = await pendingRows(target.id, target.role, tx, input.versionPublicId);
       if (!row) throw notFound("POLICY_ENFORCEMENT_ITEM_NOT_FOUND");
       return terminate(tx, target.id, row, "admin", actor);
@@ -274,8 +287,11 @@ export function createPolicyEnforcement(deps: ModuleDeps) {
 
   async function targetStatus(input: { userPublicId: string; versionPublicId?: string | undefined }) {
     if (disabledByHost) return { canEndSessions: false };
-    const [target] = await deps.db.select({ id: users.id, role: users.role }).from(users)
-      .where(and(eq(users.publicId, input.userPublicId), eq(users.status, "active"))).limit(1);
+    const [target] = await deps.db
+      .select({ id: users.id, role: users.role })
+      .from(users)
+      .where(and(eq(users.publicId, input.userPublicId), eq(users.status, "active"), liveUserPredicate()))
+      .limit(1);
     return { canEndSessions: Boolean(target && (await pendingRows(target.id, target.role, deps.db, input.versionPublicId)).length > 0) };
   }
 
@@ -289,7 +305,7 @@ export function createPolicyEnforcement(deps: ModuleDeps) {
         and(eq(policyDocuments.audience, "customer"), eq(users.role, "customer")),
         and(eq(policyDocuments.audience, "staff"), inArray(users.role, ["staff", "admin"]))))
       .where(and(eq(preference.mode, "required_to_continue"), eq(policyDocuments.active, true),
-        eq(policyDocuments.requiresAcceptance, true), eq(users.status, "active"), latestEffective(deps.db, now), lte(deadlineSql, now),
+        eq(policyDocuments.requiresAcceptance, true), eq(users.status, "active"), liveUserPredicate(), latestEffective(deps.db, now), lte(deadlineSql, now),
         notExists(hasPortalAcceptance(deps.db, policyVersions.id, users.id)), notExists(processed(deps.db, users.id)),
         exists(deps.db.select({ id: userSessions.id }).from(userSessions).where(and(eq(userSessions.userId, users.id),
           isNull(userSessions.revokedAt), gt(userSessions.absoluteExpiresAt, now), sql`${userSessions.authenticatedAt} < ${deadlineSql}`))),
@@ -299,8 +315,13 @@ export function createPolicyEnforcement(deps: ModuleDeps) {
       claim.signal.throwIfAborted();
       ended += await deps.db.transaction(async (tx) => {
         await claim.assertStillOwned(tx);
-        const [user] = await tx.select({ role: users.role, status: users.status }).from(users).where(eq(users.id, target.id)).for("update").limit(1);
-        if (!user || user.status !== "active") return 0;
+        const [user] = await tx
+          .select({ role: users.role, status: users.status, trashedAt: users.trashedAt, purgedAt: users.purgedAt })
+          .from(users)
+          .where(eq(users.id, target.id))
+          .for("update")
+          .limit(1);
+        if (!user || user.status !== "active" || !isLiveUserRow(user)) return 0;
         const [row] = await pendingRows(target.id, user.role, tx, target.versionPublicId);
         if (!row || row.handled || deadline(row) > deps.clock.now()) return 0;
         // The candidate query can go stale before the user lock (e.g. old sessions signed out).

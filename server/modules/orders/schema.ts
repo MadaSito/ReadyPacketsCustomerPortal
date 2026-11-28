@@ -277,6 +277,17 @@ export const orders = mysqlTable(
     groupRootOrderId: refColumn("group_root_order_id"),
     /** Increment 08 (D2): the frozen `PREFIX-C4-F3L3-P6` stem of a generated reference (NULL for older references). */
     referenceStem: varchar("reference_stem", { length: 32 }),
+    /**
+     * Increment 09 (D2.1): trash. Orthogonal to the workflow status, so restore returns the exact earlier state.
+     * `purgedAt` set = tombstone (content overwritten, never visible, never restorable). Live = trashedAt IS NULL AND
+     * purgedAt IS NULL (`liveOrderPredicate` in trashGate.ts).
+     */
+    trashedAt: utcDateTime("trashed_at"),
+    trashedByUserId: refColumn("trashed_by_user_id"),
+    trashBatchId: char("trash_batch_id", { length: 26 }),
+    trashReason: varchar("trash_reason", { length: 200 }),
+    purgeStartedAt: utcDateTime("purge_started_at"),
+    purgedAt: utcDateTime("purged_at"),
     version: versionColumn(),
     createdAt: createdAtColumn(),
     updatedAt: updatedAtColumn(),
@@ -293,6 +304,10 @@ export const orders = mysqlTable(
     index("orders_workflow_version_idx").on(t.workflowVersionId),
     /** Increment 08 (D3): members of an order group. */
     index("orders_group_root_idx").on(t.groupRootOrderId, t.id),
+    /** Increment 09 (D2.1): trash centre and retention clean-up. */
+    index("orders_trashed_idx").on(t.trashedAt, t.id),
+    /** Increment 09 (D2.2): restore/trash of one batch (a customer's orders, a root and its additions). */
+    index("orders_trash_batch_idx").on(t.trashBatchId),
   ],
 );
 

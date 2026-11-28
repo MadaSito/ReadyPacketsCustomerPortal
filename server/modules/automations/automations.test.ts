@@ -24,6 +24,7 @@ import * as orderTables from "../orders/schema.js";
 import { writeSetting } from "../platform/index.js";
 import { platformSettings } from "../platform/schema.js";
 import { createSettingsStore } from "../platform/settingsStore.js";
+import { unfencedPurgeRunForTests, type TrashParticipant } from "../trash/ports.js";
 import {
   JOB_EVALUATE_EVENT,
   JOB_EXECUTE_RUN,
@@ -123,6 +124,7 @@ describe("automations module (Package J)", () => {
   let orders: OrdersModule;
   let engagement: EngagementModule;
   let automationsMod: AutomationsModule;
+  let trashParticipants: Map<string, TrashParticipant>;
   let capturedWebhooks: CapturedWebhookCall[];
   let nextWebhookHandler:
     | ((url: string, purpose: EgressPurpose, opts: EgressFetchOptions) => Promise<EgressFetchResponse>)
@@ -273,6 +275,15 @@ describe("automations module (Package J)", () => {
 
     capturedWebhooks = [];
     nextWebhookHandler = null;
+    trashParticipants = new Map<string, TrashParticipant>();
+    mutableServices.trash = {
+      register(participant: TrashParticipant) {
+        trashParticipants.set(participant.module, participant);
+      },
+      list() {
+        return [...trashParticipants.values()];
+      },
+    };
 
     mutableServices.integrations = {
       egress: {
@@ -1612,5 +1623,295 @@ describe("automations module (Package J)", () => {
       .where(eq(users.id, staff.id));
     expect(customerRowAfter!.role).toBe("customer");
     expect(staffRowAfter!.role).toBe("staff");
+  });
+
+  it("Increment 09: registers automations TrashParticipant synchronously, resolves preferredName greeting, and passes orderId to mailer.enqueue", async () => {
+    const participant = trashParticipants.get("automations");
+    expect(participant).toBeDefined();
+    expect(participant?.module).toBe("automations");
+
+    const admin = await insertSyntheticUser(h, t.db, {
+      role: "admin",
+      stepUp: true,
+      name: "Admin Operator",
+    });
+    const customer = await insertSyntheticUser(h, t.db, {
+      role: "customer",
+      name: "Zeus Greene",
+    });
+    // Store structured first/preferred name parts on customer.
+    await t.db
+      .update(users)
+      .set({
+        firstNameEnc: h.deps.crypto.encrypt("Zeus", `users.first_name:${customer.publicId}`),
+        preferredNameEnc: h.deps.crypto.encrypt("Zee", `users.preferred_name:${customer.publicId}`),
+      })
+      .where(eq(users.id, customer.id));
+
+    const caller = callerFor(admin.principal);
+    await caller.automations.settings.update({ enabled: true });
+
+    const capturedOrderIds: Array<number | undefined> = [];
+    const origEnqueue = h.deps.mailer.enqueue.bind(h.deps.mailer);
+    h.deps.mailer.enqueue = async (msg, tx) => {
+      capturedOrderIds.push(msg.orderId);
+      return origEnqueue(msg, tx);
+    };
+
+    await caller.automations.create({
+      name: "Greeting + orderId check",
+      enabled: true,
+      trigger: { kind: "event", triggerKey: "order.created" },
+      actions: [
+        {
+          stepKey: "mail_1",
+          actionKey: "email.send_template",
+          config: {
+            recipientMode: "trigger",
+            recipientKey: "order_owner",
+            subject: "Welcome {{order_reference}}",
+            body: "Hi {{recipient_name}}, your project {{order_reference}} is in.",
+          },
+        },
+      ],
+    });
+
+    h.mailer.sent = [];
+    const placed = await placeCustomerOrder(
+      admin.principal,
+      customer.principal,
+      4000,
+      "Ice Queen",
+    );
+    await drainAutomationJobs();
+
+    const [orderRow] = await t.db
+      .select({ id: orderTables.orders.id })
+      .from(orderTables.orders)
+      .where(eq(orderTables.orders.publicId, placed.publicId));
+
+    const autoMail = h.mailer.sent.find((m) => m.template === "automations.generic_notice");
+    expect(autoMail).toBeDefined();
+    expect(autoMail!.vars.body).toContain("Hi Zee,");
+    expect(capturedOrderIds).toContain(orderRow!.id);
+  });
+
+  it("Increment 09 D2.2 & D2.8: suppresses triggers for trashed orders/customers, halts mid-flight queued runs at worker fence, and hides trashed runs from lists/detail", async () => {
+    const admin = await insertSyntheticUser(h, t.db, {
+      role: "admin",
+      stepUp: true,
+      name: "Admin Operator",
+    });
+    const customer = await insertSyntheticUser(h, t.db, {
+      role: "customer",
+      name: "Zeus Greene",
+    });
+    const caller = callerFor(admin.principal);
+    await caller.automations.settings.update({ enabled: true });
+
+    const createdAuto = await caller.automations.create({
+      name: "Order placed notice",
+      enabled: true,
+      trigger: { kind: "event", triggerKey: "order.created" },
+      actions: [
+        {
+          stepKey: "mail_1",
+          actionKey: "email.send_template",
+          config: {
+            recipientMode: "trigger",
+            recipientKey: "order_owner",
+            subject: "Order {{order_reference}}",
+            body: "Hello {{recipient_name}}",
+          },
+        },
+      ],
+    });
+
+    // Case 1: Order is placed and evaluated (`JOB_EVALUATE_EVENT` queues run), then order is trashed
+    // BEFORE `JOB_EXECUTE_RUN` executes -> worker fence cancels run without sending mail, and run is hidden!
+    const order1 = await placeCustomerOrder(
+      admin.principal,
+      customer.principal,
+      5000,
+      "Ice Queen",
+    );
+    await h.jobs.runAll(JOB_EVALUATE_EVENT);
+
+    const beforeTrashList = await caller.automations.runs.list({
+      automationPublicId: createdAuto.publicId,
+    });
+    expect(beforeTrashList.items).toHaveLength(1);
+    const queuedRunPublicId = beforeTrashList.items[0]!.publicId;
+
+    h.mailer.sent = [];
+    await t.db
+      .update(orderTables.orders)
+      .set({ trashedAt: h.clock.now(), trashBatchId: ulid() })
+      .where(eq(orderTables.orders.publicId, order1.publicId));
+
+    await h.jobs.runAll(JOB_EXECUTE_RUN);
+    expect(h.mailer.sent.filter((m) => m.template === "automations.generic_notice")).toHaveLength(0);
+
+    // D2.2 visibility: trashed order's run is absent from `runs.list` and returns NOT_FOUND on `runs.get`.
+    const afterTrashList = await caller.automations.runs.list({
+      automationPublicId: createdAuto.publicId,
+    });
+    expect(afterTrashList.items).toHaveLength(0);
+    await expect(
+      caller.automations.runs.get({ runPublicId: queuedRunPublicId }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    // Case 2: Event arrives after customer is already trashed -> `JOB_EVALUATE_EVENT` queues ZERO runs.
+    const order2 = await placeCustomerOrder(
+      admin.principal,
+      customer.principal,
+      5000,
+      "Second Filing",
+    );
+    await t.db
+      .update(users)
+      .set({ trashedAt: h.clock.now(), trashBatchId: ulid() })
+      .where(eq(users.id, customer.id));
+
+    await drainAutomationJobs();
+    const [order2Run] = await t.db
+      .select()
+      .from(automationTables.automationRuns)
+      .where(eq(automationTables.automationRuns.orderPublicId, order2.publicId));
+    expect(order2Run).toBeUndefined();
+  });
+
+  it("Increment 09 D2.6 & D2.8: purge participant enforces assertCurrentInTx fence, leaves data intact on PURGE_FENCE_LOST, and erases run payloads idempotently", async () => {
+    const participant = trashParticipants.get("automations")!;
+    expect(participant).toBeDefined();
+
+    const admin = await insertSyntheticUser(h, t.db, {
+      role: "admin",
+      stepUp: true,
+      name: "Admin Operator",
+    });
+    const customer = await insertSyntheticUser(h, t.db, {
+      role: "customer",
+      name: "Zeus Greene",
+    });
+    const caller = callerFor(admin.principal);
+    await caller.automations.settings.update({ enabled: true });
+
+    await caller.automations.create({
+      name: "Purge payload test",
+      enabled: true,
+      trigger: { kind: "event", triggerKey: "order.created" },
+      actions: [
+        {
+          stepKey: "notif_1",
+          actionKey: "notification.send_in_app",
+          config: {
+            recipientKey: "order_owner",
+            title: "Order {{order_reference}}",
+            body: "Created for {{recipient_name}}",
+          },
+        },
+      ],
+    });
+
+    const placed = await placeCustomerOrder(
+      admin.principal,
+      customer.principal,
+      3000,
+      "Ice Queen",
+    );
+    await drainAutomationJobs();
+
+    const [orderRow] = await t.db
+      .select({ id: orderTables.orders.id, publicId: orderTables.orders.publicId })
+      .from(orderTables.orders)
+      .where(eq(orderTables.orders.publicId, placed.publicId));
+    const [runBefore] = await t.db
+      .select()
+      .from(automationTables.automationRuns)
+      .where(eq(automationTables.automationRuns.orderPublicId, placed.publicId));
+    expect(runBefore).toBeDefined();
+    expect(runBefore!.evaluatedFieldsJson).not.toBe("{}");
+
+    // Seed an order stage run row to verify order-scoped cleanup on purge.
+    await t.db.insert(automationTables.orderStageRuns).values({
+      publicId: ulid(),
+      orderId: orderRow!.id,
+      orderPublicId: orderRow!.publicId,
+      workflowVersionId: 1,
+      stageKey: "in_review",
+      stageLabel: "In Review",
+      triggeredByUserId: admin.id,
+      idempotencyKey: "stage-idem-1",
+      correlationId: ulid(),
+      state: "completed",
+      bundleSnapshotJson: "[]",
+      resultsJson: "[]",
+      finishedAt: h.clock.now(),
+    });
+
+    const batchId = ulid();
+    const entity = {
+      kind: "order" as const,
+      id: orderRow!.id,
+      publicId: orderRow!.publicId,
+      batchId,
+    };
+
+    const summaryBefore = await participant.summarize!(entity);
+    expect(summaryBefore.automationRuns).toBeGreaterThanOrEqual(1);
+    expect(summaryBefore.stageRuns).toBe(1);
+
+    // 1) Throwing fence (`PURGE_FENCE_LOST`) MUST abort and leave all data unchanged!
+    const lostFenceRun = unfencedPurgeRunForTests("run-lost-fence", {
+      async assertCurrentInTx() {
+        throw new DomainError("CONFLICT", "PURGE_FENCE_LOST", "Purge run ownership lost.");
+      },
+    });
+    await expect(participant.purge!(entity, lostFenceRun)).rejects.toMatchObject({
+      reasonCode: "PURGE_FENCE_LOST",
+    });
+
+    const [runAfterFailedFence] = await t.db
+      .select()
+      .from(automationTables.automationRuns)
+      .where(eq(automationTables.automationRuns.id, runBefore!.id));
+    expect(runAfterFailedFence!.evaluatedFieldsJson).not.toBe("{}");
+    const stageAfterFailedFence = await t.db
+      .select()
+      .from(automationTables.orderStageRuns)
+      .where(eq(automationTables.orderStageRuns.orderId, orderRow!.id));
+    expect(stageAfterFailedFence).toHaveLength(1);
+
+    // 2) Valid purge run erases payload copies, clears step summaries/refs, and deletes stage runs idempotently.
+    const validRun = unfencedPurgeRunForTests("run-valid-1");
+    const purgeRes1 = await participant.purge!(entity, validRun);
+    expect(purgeRes1.deleted.automationRunPayloads).toBeGreaterThanOrEqual(1);
+    expect(purgeRes1.deleted.stageRuns).toBe(1);
+
+    const [runAfterPurge] = await t.db
+      .select()
+      .from(automationTables.automationRuns)
+      .where(eq(automationTables.automationRuns.id, runBefore!.id));
+    expect(runAfterPurge!.evaluatedFieldsJson).toBe("{}");
+    expect(runAfterPurge!.contextSnapshotEnc).toBeNull();
+
+    const stepsAfterPurge = await t.db
+      .select()
+      .from(automationTables.automationRunSteps)
+      .where(eq(automationTables.automationRunSteps.runId, runBefore!.id));
+    expect(stepsAfterPurge.every((s) => s.safeSummary === null && s.externalRef === null)).toBe(
+      true,
+    );
+
+    const stageAfterPurge = await t.db
+      .select()
+      .from(automationTables.orderStageRuns)
+      .where(eq(automationTables.orderStageRuns.orderId, orderRow!.id));
+    expect(stageAfterPurge).toHaveLength(0);
+
+    // 3) Re-running purge is idempotent (`deleted: {}`).
+    const purgeRes2 = await participant.purge!(entity, unfencedPurgeRunForTests("run-valid-2"));
+    expect(purgeRes2.deleted).toEqual({});
   });
 });

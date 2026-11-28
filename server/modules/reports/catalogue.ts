@@ -5,7 +5,7 @@
  * are never output; public ids and customer numbers only. `personal: true` columns are shown only to roles that
  * may already see customer data (administrators); staff never receive them.
  */
-import { eq, sql, type SQL, type SQLWrapper } from "drizzle-orm";
+import { and, eq, isNull, or, sql, type SQL, type SQLWrapper } from "drizzle-orm";
 import type { AnyMySqlColumn, MySqlTable } from "drizzle-orm/mysql-core";
 import { USER_ROLES } from "../../../shared/domain.js";
 import { carts, CART_STATUSES } from "../cart/schema.js";
@@ -16,8 +16,10 @@ import {
 import { engagementSupportTickets } from "../engagement/schema.js";
 import { TICKET_CATEGORIES, TICKET_PRIORITIES, TICKET_STATUSES } from "../engagement/types.js";
 import { audioConversionStates, fileCategories, fileVisibilities, orderFiles } from "../files/schema.js";
+import { liveUserPredicate } from "../identity/live.js";
 import { signInEvents, SIGN_IN_EVENT_KINDS, USER_STATUSES, users } from "../identity/schema.js";
 import { orderLineItems, orders, orderWorkflows, orderWorkflowVersions, ORDER_LOCK_STATES, ORDER_ORIGINS, PACKET_TIERS } from "../orders/schema.js";
+import { liveOrderPredicate } from "../orders/trashGate.js";
 import { promoBatches, promoRedemptions, PROMO_REDEMPTION_STATUSES } from "../promotions/schema.js";
 import { referrals, REFERRAL_STATUSES } from "../referrals/schema.js";
 import { AGGREGATES, BUCKETS, type Aggregate, type Bucket, type DatasetView, type FieldType, type FilterOp } from "./spec.js";
@@ -66,6 +68,7 @@ const DATASETS: readonly DatasetDef[] = [
       { table: orderWorkflowVersions, on: eq(orderWorkflowVersions.id, orders.workflowVersionId) },
       { table: orderWorkflows, on: eq(orderWorkflows.id, orderWorkflowVersions.workflowId) },
     ],
+    base: and(liveOrderPredicate(), liveUserPredicate()),
     timeField: "createdAt",
     fields: [
       f("orderPublicId", "Order ID", "string", orders.publicId),
@@ -94,7 +97,11 @@ const DATASETS: readonly DatasetDef[] = [
     label: "Order lines",
     description: "One row per order line with its product snapshot.",
     from: orderLineItems,
-    joins: [{ table: orders, on: eq(orders.id, orderLineItems.orderId) }],
+    joins: [
+      { table: orders, on: eq(orders.id, orderLineItems.orderId) },
+      { table: users, on: eq(users.id, orders.ownerUserId) },
+    ],
+    base: and(liveOrderPredicate(), liveUserPredicate()),
     timeField: "orderCreatedAt",
     fields: [
       f("reference", "Order number", "string", orders.reference),
@@ -116,7 +123,7 @@ const DATASETS: readonly DatasetDef[] = [
     description: "Customer accounts. Names and e-mail addresses are encrypted and never reported.",
     from: users,
     joins: [],
-    base: eq(users.role, "customer"),
+    base: and(eq(users.role, "customer"), liveUserPredicate()),
     timeField: "createdAt",
     fields: [
       f("customerPublicId", "Customer ID", "string", users.publicId, { personal: true }),
@@ -133,7 +140,11 @@ const DATASETS: readonly DatasetDef[] = [
     label: "Support tickets",
     description: "One row per ticket. Subjects and messages are encrypted and never reported.",
     from: engagementSupportTickets,
-    joins: [],
+    joins: [
+      { table: users, on: eq(users.id, engagementSupportTickets.requesterUserId) },
+      { table: orders, on: eq(orders.id, engagementSupportTickets.relatedOrderId) },
+    ],
+    base: and(liveUserPredicate(), or(isNull(engagementSupportTickets.relatedOrderId), liveOrderPredicate())),
     timeField: "createdAt",
     fields: [
       f("ticketPublicId", "Ticket ID", "string", engagementSupportTickets.publicId),
@@ -160,6 +171,10 @@ const DATASETS: readonly DatasetDef[] = [
     description: "One row per attributed referral. Reward amounts are in minor units.",
     from: referrals,
     joins: [],
+    base: and(
+      sql`EXISTS (SELECT 1 FROM ${users} u_rfr WHERE u_rfr.id = ${referrals.referrerUserId} AND u_rfr.trashed_at IS NULL AND u_rfr.purged_at IS NULL)`,
+      sql`EXISTS (SELECT 1 FROM ${users} u_rfd WHERE u_rfd.id = ${referrals.referredUserId} AND u_rfd.trashed_at IS NULL AND u_rfd.purged_at IS NULL)`,
+    ),
     timeField: "attributedAt",
     fields: [
       f("referralPublicId", "Referral ID", "string", referrals.publicId),
@@ -246,7 +261,7 @@ const DATASETS: readonly DatasetDef[] = [
       f("label", "Promotion", "string", promoRedemptions.labelSnapshot),
       e("status", "Status", promoRedemptions.status, PROMO_REDEMPTION_STATUSES),
       f("reference", "Order number", "string", orders.reference),
-      f("currency", "Currency", "string", orders.currency),
+      f("currency", "Currency", "string", promoRedemptions.currency),
       f("promoDiscount", "Promo discount", "money", promoRedemptions.promoDiscountMinor),
       f("discount", "Total discount", "money", promoRedemptions.discountMinor),
       f("total", "Order total", "money", promoRedemptions.totalMinor),
@@ -258,7 +273,11 @@ const DATASETS: readonly DatasetDef[] = [
     label: "Carts",
     description: "One row per cart. Notes, billing details and applied codes are encrypted and never reported.",
     from: carts,
-    joins: [],
+    joins: [
+      { table: users, on: eq(users.id, carts.ownerUserId) },
+      { table: orders, on: eq(orders.id, carts.checkoutOrderId) },
+    ],
+    base: and(liveUserPredicate(), or(isNull(carts.checkoutOrderId), liveOrderPredicate())),
     timeField: "createdAt",
     fields: [
       f("cartPublicId", "Cart ID", "string", carts.publicId),
@@ -278,7 +297,11 @@ const DATASETS: readonly DatasetDef[] = [
     label: "Files and recordings",
     description: "One row per stored file version. File names and transcripts are encrypted and never reported.",
     from: orderFiles,
-    joins: [{ table: orders, on: eq(orders.id, orderFiles.orderId) }],
+    joins: [
+      { table: orders, on: eq(orders.id, orderFiles.orderId) },
+      { table: users, on: eq(users.id, orders.ownerUserId) },
+    ],
+    base: and(liveOrderPredicate(), liveUserPredicate()),
     timeField: "createdAt",
     fields: [
       f("filePublicId", "File ID", "string", orderFiles.publicId),

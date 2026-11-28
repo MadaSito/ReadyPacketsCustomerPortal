@@ -5,7 +5,7 @@ import { useState, type FormEvent } from "react";
 import { Link } from "wouter";
 import { errorMessage, safeError, useTRPC, type useTRPCClient } from "@/lib/trpc";
 import {
-  Button, Callout, DataTable, DateTime, Dialog, EmptyState, Field, FilterBar, Input, LoadMore, PageHeader, Select,
+  Button, Callout, DataTable, DateTime, Dialog, EmailLink, EmptyState, Field, FilterBar, Input, LoadMore, PageHeader, Select,
   StepUpCancelledError, useStepUp, useToast,
 } from "@/ui";
 import { EMPTY_NAME, NameFields, validateNameParts, type NameErrors, type NameValues } from "../NameFields";
@@ -64,7 +64,7 @@ export default function CustomersPage() {
             ),
           },
           { key: "reference", header: "Reference", cell: (row) => row.customerRef ?? "—" },
-          { key: "email", header: "E-mail", cell: (row) => <span className="break-all">{row.email}</span> },
+          { key: "email", header: "E-mail", cell: (row) => <EmailLink email={row.email} /> },
           { key: "status", header: "Status", cell: (row) => <UserStatusBadge status={row.status} /> },
             { key: "signIn", header: "Sign-in method", hideOnMobile: true, cell: (row) => <SignInMethodBadges methods={row.signInMethods} /> },
           { key: "createdAt", header: "Created", hideOnMobile: true, cell: (row) => <DateTime value={row.createdAt} format="date" /> },

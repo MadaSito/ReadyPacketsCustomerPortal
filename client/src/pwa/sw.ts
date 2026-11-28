@@ -7,8 +7,9 @@ import { offlineNavigation, offlinePath, precacheableResponse, publicPrecacheUrl
 declare const self: ServiceWorkerGlobalScope;
 
 const origin = self.location.origin;
-// Do not reuse the old credentialed precache. Workbox removes it at activation.
-setCacheNameDetails({ precache: "precache-v3" });
+// Do not reuse an older precache (v3 held the credentialed precache, then the superseded logo). Workbox
+// removes outdated precaches at activation, so the offline page never shows the old lockup (increment 09 D3).
+setCacheNameDetails({ precache: "precache-v4" });
 const precache = new PrecacheController({
   fallbackToNetwork: false,
   plugins: [{

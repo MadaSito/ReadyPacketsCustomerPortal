@@ -92,6 +92,11 @@ pnpm tsx scripts/ops/backup/prune-backups.ts
 
 ## 5. Operator CLI Isolated Restore Procedure
 
+> **Items deleted permanently from the Trash (increment 09).**
+> - **Backups keep deleted data.** A backup is a copy taken at one moment. A permanent deletion never rewrites existing backups. Data deleted after a backup was taken stays in that backup until the backup expires under the retention above (local pruning) and the remote lifecycle you set for off-site copies. A legal hold on a backup keeps it longer.
+> - **A restore brings deleted items back.** Orders and customers deleted permanently after the backup's moment return in the state they had then. The restored `trash_purge_runs` table and audit tables are just as old.
+> - **Delete them again before reopening.** Use the audit copy kept outside the database, in your SIEM or syslog destination, to list the `order.purged` and `customer.purged` events recorded after the backup's timestamp. Delete those items again from **Administration → Trash** before you reopen the portal to users.
+
 Restores **never** overwrite the live database or live object storage directory in place. Instead, `restore-isolated.ts` decrypts and verifies any local or downloaded `.rpbk` archive (even if the live MySQL instance is completely unreachable during full-loss DR) into a brand-new `--target-db` and empty `--target-storage` directory.
 
 ### Exact Operator Restore Command

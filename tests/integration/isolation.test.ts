@@ -10,6 +10,7 @@ import type { AnyTRPCProcedure } from "@trpc/server";
 import { eq } from "drizzle-orm";
 import superjson from "superjson";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { ulid } from "../../server/core/ids.js";
 import { carts } from "../../server/modules/cart/schema.js";
 import type { CartView, CheckoutCartResult } from "../../server/modules/cart/types.js";
 import { complianceInvoices } from "../../server/modules/compliance/schema.js";
@@ -27,6 +28,7 @@ import {
   Browser, bootstrapAdmin, createSystem, registerCustomer, seedProduct, stepUp, STRONG_PASSWORD,
   type ReadyAdmin, type ReadyCustomer, type System, type TrpcResult,
 } from "./harness.js";
+import { trashAccessProbes } from "./trash-probes.js";
 
 let sys: System;
 let admin: ReadyAdmin;
@@ -114,6 +116,11 @@ function probes(): Record<string, Probe> {
   const noticeAudience = () => ({ ...notice(), confirmedCount: policyNoticePending });
   const enforcementTarget = () => ({ userPublicId: o.customerPublicId, versionPublicId: o.enforcementVersionId });
   return {
+    ...trashAccessProbes({
+      target: { kind: "order", publicId: o.orderId, batchId: ulid() },
+      secondTarget: { kind: "order", publicId: o.phaseOrderId, batchId: ulid() },
+      livePublicId: o.orderId, movedByPublicId: admin.publicId, orderPublicId: o.orderId, confirmation: "RP-SYNTHETIC-ORDER",
+    }),
     "orders.get": { kind: "query", input: () => ({ orderId: o.orderId }) },
     // Increment 08 D3: B cannot attach an add-on order, or its cart, to A's project (and learns nothing about it).
     "orders.addOnTarget": { kind: "query", input: () => ({ orderId: o.orderId }), denial: { code: "EMPTY" } },

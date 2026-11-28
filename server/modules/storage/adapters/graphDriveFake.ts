@@ -283,7 +283,9 @@ export class FakeGraph implements GraphHttpPort {
       this.sessions.set(token, { driveId: drive.id, parentId, name, size: Number.NaN, received: [], next: 0 });
       return ok(200, { uploadUrl: `https://${this.uploadHost}/_api/v2.0/drives/x/uploadSession?token=${token}`, expirationDateTime: "2030-01-01T00:00:00Z" });
     }
-    if (method === "DELETE" && (m = /^\/items\/([^/:]+)$/.exec(rest))) {
+    m = method === "POST" ? /^\/items\/([^/:]+)\/permanentDelete$/.exec(rest)
+      : method === "DELETE" ? /^\/items\/([^/:]+)$/.exec(rest) : null;
+    if (m) {
       return drive.items.delete(decodeURIComponent(m[1]!)) ? ok(204) : err(404);
     }
     return err(400);

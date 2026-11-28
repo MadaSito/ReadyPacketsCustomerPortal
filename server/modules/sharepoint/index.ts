@@ -54,6 +54,7 @@ export function createSharepointModule(deps: ModuleDeps, options: { port?: Graph
       deps.services.storageConnections.registerAdapter("sharepoint", definitions.sharepoint);
       deps.services.storageConnections.registerAdapter("onedrive", definitions.onedrive);
       deps.services.orders.registerChangeListener((event, tx) => service.onOrderChange(event, tx));
+      deps.services.trash?.register(service.trashParticipant);
     },
     async health(): Promise<ModuleHealth[]> {
       return [{ component: "sharepoint.order_sync", state: "disabled", summary: "SharePoint order sync health is reported in its settings view.", checkedAt: deps.clock.now() }];

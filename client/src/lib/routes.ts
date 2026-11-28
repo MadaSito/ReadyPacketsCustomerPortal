@@ -60,6 +60,12 @@ export interface NavItem {
    * everything else → primary. Primary is capped (extra entries go to "More"), so labels can never collide.
    */
   placement?: "primary" | "account" | "hidden";
+  /**
+   * Optional count shown after the label in the console sidebar (hidden while the sidebar is collapsed).
+   * The component renders nothing when there is nothing to count and carries its own screen-reader text.
+   * It must live in a small module of its own so that the page it belongs to stays lazily loaded.
+   */
+  badge?: ComponentType;
 }
 
 /**

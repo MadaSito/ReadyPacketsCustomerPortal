@@ -1,20 +1,25 @@
 /** /admin/customers/:customerId — customer summary, lifecycle actions, reference history and CUSTOMER_TABS. */
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
-import { useParams } from "wouter";
+import { useLocation, useParams } from "wouter";
 import { CUSTOMER_TABS } from "@/app/registry";
 import { useSession } from "@/lib/session";
 import { errorMessage, safeError, useTRPC, type useTRPCClient } from "@/lib/trpc";
 import {
-  Badge, Breadcrumbs, Button, Callout, Card, ConfirmDialog, DataTable, DateTime, Dialog, DropdownMenu, ErrorState, Field,
+  Badge, Breadcrumbs, Button, Callout, Card, ConfirmDialog, DataTable, DateTime, Dialog, DropdownMenu, EmailLink, ErrorState, Field,
   Input, KeyValueList, PageHeader, Select, Skeleton, StepUpCancelledError, Tabs, useStepUp, useToast,
 } from "@/ui";
 import { NameFields, validateNameParts, type NameErrors, type NameValues } from "../NameFields";
 import { PreviewLinkNotice, REFERENCE_REASONS, UserStatusBadge } from "../shared";
+import { MoveToTrashDialog } from "@/features/trash/TrashDialogs";
 import { StatusDialog, type StatusTarget } from "./StatusActions";
 
 type Detail = Awaited<ReturnType<ReturnType<typeof useTRPCClient>["identity"]["admin"]["customers"]["get"]["query"]>>;
 type HistoryRow = Detail["referenceHistory"][number];
+
+/** Increment 09 (D2.7): the visible reason shown next to the disabled button (not a tooltip only). */
+export const TRASH_BLOCKED_REASON = "Suspend this account first";
+export const MOVE_TO_TRASH_LABEL = "Move to trash";
 
 const TAB_ACCESS = { customer: ["customer", "staff", "admin"], staff: ["staff", "admin"], admin: ["admin"] } as const;
 
@@ -35,6 +40,8 @@ export default function CustomerDetailPage() {
   const [referenceOpen, setReferenceOpen] = useState(false);
   const [nameOpen, setNameOpen] = useState(false);
   const [previewLink, setPreviewLink] = useState<string>();
+  const [trashOpen, setTrashOpen] = useState(false);
+  const [, navigate] = useLocation();
 
   const crumbs = (label: string) => <Breadcrumbs items={[{ label: "Customers", href: "/admin/customers" }, { label }]} />;
   if (detail.isPending) {
@@ -98,7 +105,7 @@ export default function CustomerDetailPage() {
                 { label: "First name", value: customer.firstName || "—" },
                 { label: "Last name", value: customer.lastName || "—" },
                 { label: "Preferred name", value: customer.preferredName ?? "—" },
-                { label: "E-mail address", value: <span className="break-all">{customer.email}</span> },
+                { label: "E-mail address", value: <EmailLink email={customer.email} /> },
                 { label: "E-mail verified", value: customer.emailVerified ? "Yes" : "Not yet" },
                 { label: "Customer reference", value: customer.customerRef ?? "—" },
                 { label: "Created", value: <DateTime value={customer.createdAt} format="datetime" /> },
@@ -123,6 +130,26 @@ export default function CustomerDetailPage() {
             />
           </Card>
         </div>
+        {isAdmin ? (
+          <Card title="Trash">
+            <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <p id="customer-trash-help" className="text-sm text-body">
+                {customer.status === "suspended"
+                  ? "Moves the account and all of its orders to the trash. You can restore them until they are deleted permanently."
+                  : TRASH_BLOCKED_REASON}
+              </p>
+              <Button
+                variant="danger"
+                className="shrink-0"
+                disabled={customer.status !== "suspended"}
+                aria-describedby="customer-trash-help"
+                onClick={() => setTrashOpen(true)}
+              >
+                {MOVE_TO_TRASH_LABEL}
+              </Button>
+            </div>
+          </Card>
+        ) : null}
         {tabs.length > 0 ? (
           <Tabs
             label="Customer sections"
@@ -131,6 +158,17 @@ export default function CustomerDetailPage() {
           />
         ) : null}
       </div>
+      {isAdmin && customer.status === "suspended" ? (
+        <MoveToTrashDialog
+          open={trashOpen}
+          onOpenChange={setTrashOpen}
+          kind="customer"
+          publicId={customer.publicId}
+          itemLabel={customer.customerRef ?? customer.publicId}
+          onMoved={() => navigate("/admin/customers")}
+          onRestored={() => navigate(`/admin/customers/${customer.publicId}`)}
+        />
+      ) : null}
       <StatusDialog
         target={statusTarget}
         onOpenChange={(open) => { if (!open) setStatusTarget(null); }}

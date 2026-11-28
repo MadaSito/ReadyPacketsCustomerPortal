@@ -3,6 +3,7 @@
  * Facts here must match the shipped portal; the canonical company policy lives on the marketing site.
  */
 import { BRAND } from "@shared/brand";
+import { EmailLink } from "@/ui";
 import { ExternalPolicyLink, LegalLayout, LegalSection, MARKETING_POLICY_URLS, PRIVACY_CONTACT_EMAIL } from "../legal/LegalLayout";
 
 export default function PrivacyPage() {
@@ -126,9 +127,7 @@ export default function PrivacyPage() {
       <LegalSection id="rights" title="Your choices and requests">
         <p>
           You can update your profile and security settings in the portal. To ask for a copy of your information, a correction or deletion, email{" "}
-          <a href={`mailto:${PRIVACY_CONTACT_EMAIL}?subject=Privacy%20Rights%20Request`} className="text-action underline underline-offset-2">
-            {PRIVACY_CONTACT_EMAIL}
-          </a>{" "}
+          <EmailLink email={PRIVACY_CONTACT_EMAIL} subject="Privacy Rights Request" />{" "}
           with the subject “Privacy Rights Request”. We may need to verify your identity first.
         </p>
       </LegalSection>
@@ -136,9 +135,7 @@ export default function PrivacyPage() {
       <LegalSection id="contact" title="Contact">
         <p>
           Questions about this notice:{" "}
-          <a href={`mailto:${PRIVACY_CONTACT_EMAIL}`} className="text-action underline underline-offset-2">
-            {PRIVACY_CONTACT_EMAIL}
-          </a>
+          <EmailLink email={PRIVACY_CONTACT_EMAIL} />
           , or use the <ExternalPolicyLink href={MARKETING_POLICY_URLS.contact}>contact page</ExternalPolicyLink>.
         </p>
       </LegalSection>

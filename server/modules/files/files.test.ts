@@ -12,6 +12,9 @@ import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { DomainError, notFound } from "../../core/errors.js";
 import { sanitiseAttribute } from "../audit/envelope.js";
+import { users } from "../identity/schema.js";
+import { orders } from "../orders/schema.js";
+import { createTrashRegistry } from "../trash/ports.js";
 import { newRequestContext } from "../../core/requestContext.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
 import type { StageGovernance, StageUploadIntent } from "../../../shared/workflowStages.js";
@@ -55,13 +58,17 @@ let extraSlots: FileUploadSlot[];
   let gateActions: { action: string; statusKey: string | null }[];
 
 beforeAll(async () => {
-  t = await createTestDb({ schema: { orderFiles, fileDownloadTickets, filePlaybackGrants, fileAccessLog, lockRows } });
+  t = await createTestDb({ schema: { users, orders, orderFiles, fileDownloadTickets, filePlaybackGrants, fileAccessLog, lockRows } });
   await t.db.insert(lockRows).values({ id: orderId });
+  await t.db.insert(users).values({ id: 1, publicId: userPublicId, emailEnc: "synthetic", emailIndex: "a".repeat(64), nameEnc: "synthetic", role: "customer" });
+  await t.db.insert(orders).values({ id: orderId, publicId: orderPublicId, reference: "RP-TEST", projectName: "Synthetic", ownerUserId: 1,
+    workflowVersionId: 1, statusKey: "intake", subtotalMinor: 0, totalMinor: 0, currency: "USD" });
 });
 afterAll(() => t?.cleanup());
 beforeEach(async () => {
   for (const table of [fileDownloadTickets, filePlaybackGrants, fileAccessLog, orderFiles]) await t.db.delete(table);
   h = createTestDeps({ db: t.db });
+  h.services.trash = createTrashRegistry();
   files = createFilesModule(h.deps);
   h.services.files = files;
   owner = fakePrincipal({ userPublicId });
@@ -296,6 +303,7 @@ describe("private file admission and authorization", () => {
       provider = registered;
     } } });
     files.init?.();
+    expect(h.services.trash.participants().map((participant) => participant.module)).toEqual(["files"]);
     const v1 = await add(owner);
     const v2 = await add(owner, { ...upload, versionOf: v1.publicId });
     const active = await add(owner);
@@ -992,6 +1000,29 @@ describe("raw multipart admission", () => {
 });
 
 describe("portable classification and backup traversal", () => {
+  it("lists a trashed order in a read-only Portable snapshot, but excludes it after purge starts", async () => {
+    owner = fakePrincipal({ userId: 1, userPublicId });
+    orderOwner = owner;
+    const saved = await add(owner);
+    const now = h.clock.now();
+    const admin = fakePrincipal({ role: "admin", stepUpAt: now });
+    const sessionCheck = vi.spyOn(h.services.identity.sessions, "assertCurrent");
+    const list = (includeTrashedOrders: boolean) => t.db.transaction(
+      (tx) => files.portableFiles(tx, { principal: admin, limit: 10, includeTrashedOrders }),
+      { isolationLevel: "repeatable read", accessMode: "read only" },
+    );
+    try {
+      await t.db.update(orders).set({ trashedAt: now, trashBatchId: orderPublicId }).where(eq(orders.id, orderId));
+      await expect(list(false)).resolves.toMatchObject({ items: [] });
+      await expect(list(true)).resolves.toMatchObject({ items: [{ publicId: saved.publicId }] });
+      expect(sessionCheck).not.toHaveBeenCalled();
+      await t.db.update(orders).set({ purgeStartedAt: now }).where(eq(orders.id, orderId));
+      await expect(list(true)).resolves.toMatchObject({ items: [] });
+    } finally {
+      await t.db.update(orders).set({ trashedAt: null, trashBatchId: null, purgeStartedAt: null }).where(eq(orders.id, orderId));
+    }
+  });
+
   it("reclassifies staged bytes canonically and binds the owner/order on adoption", async () => {
     const admin = fakePrincipal({ role: "admin", stepUpAt: h.clock.now() });
     orderOrigin = "import";

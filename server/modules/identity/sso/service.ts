@@ -1299,7 +1299,8 @@ export function createSsoService(i: SsoInternals) {
     if (config.jitMode === "off") throw refusal("SSO_NOT_LINKED", "IDENTITY_NOT_LINKED");
     // No privilege from an e-mail address, and no silent linking to an existing account.
     if (!result.email) throw refusal("SSO_NOT_LINKED", "JIT_EMAIL_MISSING");
-    if (await repo.byEmail(result.email, { tx })) throw refusal("SSO_ACCOUNT_EXISTS", "EMAIL_COLLISION_WITHOUT_LINK");
+    // Increment 09: a trashed account keeps its address reserved (includeGone) — never provision over it.
+    if (await repo.byEmail(result.email, { tx, includeGone: true })) throw refusal("SSO_ACCOUNT_EXISTS", "EMAIL_COLLISION_WITHOUT_LINK");
     const role = jitRoleFor(config, result.roles, await samlAdmin.roleMappings(tx));
     if (!role) throw refusal("SSO_ROLE_NOT_ASSIGNED", "JIT_APP_ROLE_MISSING");
     if (!allowedRolesOf(config).includes(role)) throw refusal("SSO_ROLE_NOT_ALLOWED", "JIT_ROLE_NOT_ALLOWED");

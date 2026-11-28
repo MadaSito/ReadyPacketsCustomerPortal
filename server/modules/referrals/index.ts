@@ -5,6 +5,7 @@ import "./settings.js";
 import type { ModuleDeps } from "../../container.js";
 import type { ModuleHealth, ModuleLifecycle } from "../../core/types.js";
 import { registerReferralsMailTemplates } from "./mail.js";
+import { createReferralsTrashParticipant } from "./trash.js";
 import {
   createReferralsService,
   type AdminReferralItemView,
@@ -49,9 +50,13 @@ export interface ReferralsModule extends ModuleLifecycle, ReferralsService {}
 export function createReferralsModule(deps: ModuleDeps): ReferralsModule {
   registerReferralsMailTemplates(deps.mailer);
   const service = createReferralsService(deps);
+  const trashParticipant = createReferralsTrashParticipant(deps);
 
   return {
     ...service,
+    init(): void {
+      deps.services.trash?.register(trashParticipant);
+    },
     async health(): Promise<ModuleHealth[]> {
       const checkedAt = deps.clock.now();
       try {

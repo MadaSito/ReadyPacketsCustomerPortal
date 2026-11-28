@@ -2,7 +2,8 @@ export const offlinePath = "/offline.html";
 
 const FIXED_ASSETS = new Set([offlinePath, "/offline.css", "/favicon.ico", "/manifest.webmanifest"]);
 const BUILD_ASSET = /^\/assets\/[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,}\.(?:js|css)$/;
-const PUBLIC_MEDIA = /^\/(?:brand\/[a-z0-9-]+\.png|fonts\/[a-z0-9-]+\.woff2)$/;
+// Brand files are versioned by name (increment 09 D3); the SVG lockups are vetted static artwork (no script).
+const PUBLIC_MEDIA = /^\/(?:brand\/[a-z0-9-]+\.(?:png|svg|ico)|fonts\/[a-z0-9-]+\.woff2)$/;
 
 export function publicPrecacheUrl(url: URL, origin: string): boolean {
   return url.origin === origin && !url.username && !url.password && !url.search && !url.hash &&
@@ -33,6 +34,7 @@ export function precacheableResponse(response: Response, origin: string): boolea
   if (url.pathname.endsWith(".css")) return /^text\/css(?:;|$)/i.test(type);
   if (url.pathname.endsWith(".js")) return /^(?:text|application)\/javascript(?:;|$)/i.test(type);
   if (url.pathname.endsWith(".png")) return /^image\/png(?:;|$)/i.test(type);
+  if (url.pathname.endsWith(".svg")) return /^image\/svg\+xml(?:;|$)/i.test(type);
   if (url.pathname.endsWith(".ico")) return /^image\/(?:x-icon|vnd\.microsoft\.icon)(?:;|$)/i.test(type);
   if (url.pathname.endsWith(".woff2")) return /^font\/woff2(?:;|$)/i.test(type);
   return /^application\/(?:manifest\+json|json)(?:;|$)/i.test(type);

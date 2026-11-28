@@ -9,6 +9,8 @@ import { conflict, DomainError, forbidden, notFound, validation } from "../../co
 import { ulid } from "../../core/ids.js";
 import type { ClaimedJob, JobResult, SessionPrincipal, Tx } from "../../core/types.js";
 import { jobRuns } from "../jobs/schema.js";
+import { orders } from "../orders/schema.js";
+import { liveOrderPredicate } from "../orders/trashGate.js";
 import { assertCurrentStorageAdmin } from "./authz.js";
 import { StorageAdapterError, type StorageAdapter } from "./contracts.js";
 import { storageAssignments, storageConnections as connections, storageManagedFileCopies as copies, storageManagedOrderRoots as roots } from "./schema.js";
@@ -44,6 +46,7 @@ const modeFor = (role: ManagedFileSyncRole) => role === "receipt" ? "receipts" :
 const inactive = () => notFound("STORAGE_COPY_SOURCE_INACTIVE");
 const targetInactive = () => notFound("STORAGE_FILE_SYNC_TARGET_INACTIVE");
 const sha256 = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
+const liveCopyOrder = () => sql`exists (select 1 from ${orders} where ${orders.publicId} = ${copies.orderPublicId} and ${liveOrderPredicate()})`;
 
 export function createManagedFileSync(deps: ModuleDeps, adapterFor: (row: Connection) => StorageAdapter) {
   const { clock, audit, db, crypto, services, jobs, storage } = deps;
@@ -136,7 +139,9 @@ export function createManagedFileSync(deps: ModuleDeps, adapterFor: (row: Connec
     if (!parsed.success) return { outcome: "failed", reasonCode: "STORAGE_FILE_SYNC_INVALID_JOB", retryable: false };
     const { publicId, inspect, tryNo } = parsed.data;
     const [row] = await db.select().from(copies).where(eq(copies.publicId, publicId)).limit(1);
-    if (!row || row.jobPublicId !== job.jobId || row.state === "copied") return { outcome: "completed" };
+    if (!row || row.jobPublicId !== job.jobId || row.state === "copied" || row.reasonCode === "STORAGE_COPY_ORDER_TRASHED") {
+      return { outcome: "completed" };
+    }
     let body: Readable | undefined;
     const readOnly = inspect || row.state === "copying" || row.state === "unknown";
     try {
@@ -144,10 +149,11 @@ export function createManagedFileSync(deps: ModuleDeps, adapterFor: (row: Connec
       if (destination.invalidPath) throw validation("STORAGE_FILE_SYNC_FOLDER_INVALID", "The configured phase folder is too long or invalid.");
       const prepared = await transaction(async (tx) => {
         await job.assertStillOwned(tx);
+        if (readOnly && !await services.orders.getOrderRefByPublicId(row.orderPublicId, tx, { forUpdate: true })) throw inactive();
         const source = readOnly ? null : await readSource(row, destination, tx);
         const connection = await assertDestination(row, tx);
         const [locked] = await tx.select().from(copies).where(eq(copies.id, row.id)).for("update");
-        if (!locked || locked.jobPublicId !== job.jobId) throw inactive();
+        if (!locked || locked.jobPublicId !== job.jobId || locked.reasonCode === "STORAGE_COPY_ORDER_TRASHED") throw inactive();
         if (!readOnly) await tx.update(copies).set({ state: "copying", updatedAt: clock.now() }).where(eq(copies.id, row.id));
         await audit.record({ category: "integration", eventName: "storage.file_sync.attempted", action: readOnly ? "inspect" : "copy",
           outcome: "attempted", actor: { role: "system" }, orderPublicId: row.orderPublicId, jobId: job.jobId,
@@ -211,7 +217,7 @@ export function createManagedFileSync(deps: ModuleDeps, adapterFor: (row: Connec
       await job.assertStillOwned(tx);
       // An interrupted copy never schedules another write. Start a read-only inspection once.
       const interrupted = await tx.select({ copy: copies }).from(copies).innerJoin(jobRuns, eq(jobRuns.publicId, copies.jobPublicId))
-        .where(and(inArray(copies.state, ["queued", "copying"]), inArray(jobRuns.state, ["unknown", "failed"])))
+        .where(and(liveCopyOrder(), inArray(copies.state, ["queued", "copying"]), inArray(jobRuns.state, ["unknown", "failed"])))
         .orderBy(copies.id).limit(50);
       let inspected = 0;
       for (const { copy } of interrupted) {
@@ -231,7 +237,7 @@ export function createManagedFileSync(deps: ModuleDeps, adapterFor: (row: Connec
       and(eq(copies.orderPublicId, scope.orderPublicId), scope.scope === "file" ? eq(copies.sourcePublicId, scope.filePublicId) : undefined);
     const rows = await tx.select({ copy: copies, jobState: jobRuns.state }).from(copies)
       .leftJoin(jobRuns, eq(jobRuns.publicId, copies.jobPublicId)).leftJoin(connections, eq(connections.publicId, copies.connectionPublicId))
-      .where(and(condition, or(inArray(copies.state, ["failed", "blocked", "unknown"]), eq(jobRuns.state, "unknown")),
+      .where(and(liveCopyOrder(), condition, or(inArray(copies.state, ["failed", "blocked", "unknown"]), eq(jobRuns.state, "unknown")),
         sql`coalesce(${jobRuns.state}, '') not in ('queued', 'running')`,
         eq(connections.enabled, true), isNotNull(connections.credentialsEnc), inArray(connections.kind, ["sharepoint", "onedrive"]),
         eq(connections.destinationVersion, copies.destinationVersion), eq(connections.fileSyncWriteTestVersion, connections.destinationVersion),
@@ -409,7 +415,7 @@ export function createManagedFileSync(deps: ModuleDeps, adapterFor: (row: Connec
           lastSuccessAt: sql<Date | null>`max(case when ${copies.state} = 'copied' then ${copies.finishedAt} end)`.mapWith(copies.finishedAt),
           backlog: sql<number>`coalesce(sum(${copies.state} in ('queued','copying') and coalesce(${jobRuns.state}, '') <> 'unknown'), 0)`.mapWith(Number),
           blocked: sql<number>`coalesce(sum(${copies.state} in ('blocked','failed','unknown') or ${jobRuns.state} = 'unknown'), 0)`.mapWith(Number),
-        }).from(connections).leftJoin(copies, eq(copies.connectionPublicId, connections.publicId))
+        }).from(connections).leftJoin(copies, and(eq(copies.connectionPublicId, connections.publicId), liveCopyOrder()))
           .leftJoin(jobRuns, eq(jobRuns.publicId, copies.jobPublicId))
           .where(inArray(connections.kind, ["sharepoint", "onedrive"])).groupBy(connections.id).orderBy(connections.name).limit(100);
         return rows;

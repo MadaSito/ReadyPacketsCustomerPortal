@@ -13,11 +13,17 @@
  *  - Logs, audit and errors carry only order public ids, counts and fixed codes; never list item content,
  *    customer data, site/list labels, URLs or provider bodies.
  */
-import { and, asc, count, eq, gt, sql } from "drizzle-orm";
+import { and, asc, count, eq, gt, ne, or, isNull, sql } from "drizzle-orm";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, conflict, notFound, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { ClaimedJob, DbOrTx, JobResult, SessionPrincipal, Tx } from "../../core/types.js";
+import type {
+  TrashEntityRef,
+  TrashParticipant,
+  TrashPurgeResult,
+  TrashPurgeRun,
+} from "../trash/ports.js";
 import { graphDriveDiscovery } from "../storage/adapters/graphDrive.js";
 import { StorageAdapterError } from "../storage/adapters/graphDriveErrors.js";
 import type { GraphCredentials, GraphHttpPort } from "../storage/adapters/graphDrivePort.js";
@@ -43,6 +49,13 @@ const CONFIG_ID = 1;
 const MAX_STATUS_PAGE = 100;
 const RESYNC_BATCH = 500;
 const CLAIM_MS = 10 * 60 * 1000;
+const ORDER_TRASHED_REASON = "ORDER_TRASHED";
+
+class OrderTrashedSyncAbort extends Error {
+  constructor() {
+    super(ORDER_TRASHED_REASON);
+  }
+}
 
 export interface SyncJobPayload {
   orderPublicId: string;
@@ -159,9 +172,10 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
 
   /** orders change listener: runs inside the order write transaction; a throw aborts that write. */
   async function onOrderChange(event: { orderId: number; orderPublicId: string; kind: string }, tx: Tx): Promise<void> {
-    if (event.kind === "deleted") return; // orders are never deleted; remote items are never removed automatically
+    if (event.kind === "deleted" || event.kind === "trashed" || event.kind === "purged") return; // orders in trash are never synced; remote items are never removed automatically
     const config = await readConfig(tx);
     if (!config?.enabled || !config.listId) return;
+    if (typeof deps.services.orders.isTrashedInTx === "function" && (await deps.services.orders.isTrashedInTx(tx, event.orderId))) return;
     await stage(event.orderPublicId, tx);
   }
 
@@ -216,6 +230,52 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
     });
   }
 
+  /**
+   * Increment 09 D2.8: release a claimed sync when the order moved to the trash (or was purged) before the
+   * external Graph write. Never marks `sharepoint_sync_config.last_error_code`, and records `not_written`.
+   */
+  async function dropTrashedSync(orderPublicId: string, job: ClaimedJob<SyncJobPayload>, claimToken: string, connectionPublicId?: string): Promise<void> {
+    await db.transaction(async (tx) => {
+      await job.assertStillOwned(tx);
+      if (connectionPublicId) {
+        await copyAttempt(tx, attemptOf(job, connectionPublicId), { phase: "finished", result: "not_written", errorCode: ORDER_TRASHED_REASON, alreadyAudited: true });
+      }
+      const [existing] = await tx
+        .select({ remoteItemId: sharepointOrderSync.remoteItemId, desiredVersion: sharepointOrderSync.desiredVersion })
+        .from(sharepointOrderSync)
+        .where(eq(sharepointOrderSync.orderPublicId, orderPublicId))
+        .for("update");
+      if (existing) {
+        await tx
+          .update(sharepointOrderSync)
+          .set({
+            syncedVersion: existing.desiredVersion,
+            state: existing.remoteItemId ? "synced" : "pending",
+            reasonCode: ORDER_TRASHED_REASON,
+            claimJobId: null,
+            claimToken: null,
+            claimedUntil: null,
+          })
+          .where(eq(sharepointOrderSync.orderPublicId, orderPublicId));
+      }
+      await audit.record(
+        {
+          category: "integration",
+          eventName: "sharepoint.order.sync",
+          action: "sync",
+          outcome: "canceled",
+          reasonCode: ORDER_TRASHED_REASON,
+          actor: { role: "system" },
+          resource: { type: "order", publicId: orderPublicId },
+          jobId: job.jobId,
+          correlationId: job.correlationId,
+          provider: "sharepoint",
+        },
+        tx,
+      );
+    });
+  }
+
   async function runSync(job: ClaimedJob<SyncJobPayload>): Promise<JobResult> {
     const { orderPublicId } = job.payload;
     const config = await readConfig(db);
@@ -231,12 +291,14 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
       await job.assertStillOwned(tx);
       const [locked] = await tx.select().from(sharepointOrderSync).where(eq(sharepointOrderSync.orderPublicId, orderPublicId)).for("update");
       if (!locked) return { kind: "missing" as const };
+      if (locked.reasonCode === ORDER_TRASHED_REASON) return { kind: "trashed" as const };
       if (locked.claimToken && locked.claimJobId !== job.jobId && locked.claimedUntil && locked.claimedUntil > now) return { kind: "busy" as const };
       if (locked.syncedVersion >= locked.desiredVersion && locked.listId === listId) return { kind: "caught_up" as const };
       await tx.update(sharepointOrderSync).set({ claimJobId: job.jobId, claimToken, claimedUntil: new Date(now.getTime() + CLAIM_MS) }).where(eq(sharepointOrderSync.orderPublicId, orderPublicId));
       return { kind: "claimed" as const, row: locked };
     });
     if (claim.kind === "missing") return { outcome: "canceled", reasonCode: "SHAREPOINT_SYNC_NOT_STAGED" };
+    if (claim.kind === "trashed") return { outcome: "canceled", reasonCode: ORDER_TRASHED_REASON };
     if (claim.kind === "caught_up") {
       // Nothing to write: close this attempt as an intentional no-op (no result audit for no-ops).
       const caughtUpConnection = await assignedConnection(db);
@@ -281,8 +343,8 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
 
       const order = await deps.services.orders.getOrderSyncView(orderPublicId);
       if (!order) {
-        await markFailure(orderPublicId, "SHAREPOINT_ORDER_NOT_FOUND", "failed", job, claimToken, targetVersion, connectionPublicId);
-        return { outcome: "failed", reasonCode: "SHAREPOINT_ORDER_NOT_FOUND", retryable: false };
+        await dropTrashedSync(orderPublicId, job, claimToken, connectionPublicId);
+        return { outcome: "canceled", reasonCode: ORDER_TRASHED_REASON };
       }
       const owner = await deps.services.identity.getUser(order.ownerUserId);
       const fields = buildOrderFields(order, {
@@ -291,7 +353,7 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
       });
       const hash = fieldsHash(fields);
 
-      // Revocation recheck before every write: fence, live assignment/credentials generation, sync settings.
+      // Revocation + D2.8 trash recheck immediately before every external Graph write.
       const beforeWrite = async () => {
         await job.assertStillOwned();
         const live = await readProvider();
@@ -303,7 +365,13 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
         const current = await readConfig(db);
         // Any settings change (list, portal-link policy, disable) invalidates the rendered fields.
         if (!current?.enabled || current.listId !== listId || current.version !== settingsVersion) throw new StorageAdapterError("NOT_CONFIGURED", false);
-        const [mine] = await db.select({ token: sharepointOrderSync.claimToken, until: sharepointOrderSync.claimedUntil }).from(sharepointOrderSync).where(eq(sharepointOrderSync.orderPublicId, orderPublicId));
+        const [mine] = await db
+          .select({ token: sharepointOrderSync.claimToken, until: sharepointOrderSync.claimedUntil, reasonCode: sharepointOrderSync.reasonCode })
+          .from(sharepointOrderSync)
+          .where(eq(sharepointOrderSync.orderPublicId, orderPublicId));
+        if (mine?.reasonCode === ORDER_TRASHED_REASON) throw new OrderTrashedSyncAbort();
+        const liveOrder = await deps.services.orders.getOrderSyncView(orderPublicId);
+        if (!liveOrder) throw new OrderTrashedSyncAbort();
         if (mine?.token !== claimToken || !mine.until || mine.until <= clock.now()) throw new StorageAdapterError("OUTCOME_UNKNOWN", false);
       };
 
@@ -379,6 +447,10 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
       });
       return { outcome: "completed", safeCounts: { [action]: 1 } };
     } catch (error) {
+      if (error instanceof OrderTrashedSyncAbort) {
+        await dropTrashedSync(orderPublicId, job, claimToken, connectionPublicId);
+        return { outcome: "canceled", reasonCode: ORDER_TRASHED_REASON };
+      }
       if (!(error instanceof StorageAdapterError) && !(error instanceof DomainError)) throw error; // lost fence etc.
       const { reasonCode, retryable } = reasonFor(error);
       await markFailure(orderPublicId, reasonCode, retryable ? "pending" : "failed", job, claimToken, targetVersion, connectionPublicId);
@@ -449,7 +521,11 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
     const { config, connectionPublicId, counts } = await guard(principal, async (tx) => {
       const config = await readConfig(tx);
       const connectionPublicId = await assignedConnection(tx);
-      const grouped = await tx.select({ state: sharepointOrderSync.state, n: count() }).from(sharepointOrderSync).groupBy(sharepointOrderSync.state);
+      const grouped = await tx
+        .select({ state: sharepointOrderSync.state, n: count() })
+        .from(sharepointOrderSync)
+        .where(or(isNull(sharepointOrderSync.reasonCode), ne(sharepointOrderSync.reasonCode, ORDER_TRASHED_REASON)))
+        .groupBy(sharepointOrderSync.state);
       const n = (s: SharepointSyncState) => grouped.find((g) => g.state === s)?.n ?? 0;
       return { config, connectionPublicId, counts: { pending: n("pending"), synced: n("synced"), failed: n("failed") + n("unknown") } };
     });
@@ -563,10 +639,78 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
     });
   }
 
+  const trashParticipant: TrashParticipant = {
+    module: "sharepoint",
+    async onTrashedInTx(tx: Tx, entity: TrashEntityRef): Promise<void> {
+      if (entity.kind !== "order") return;
+      const [existing] = await tx
+        .select({ remoteItemId: sharepointOrderSync.remoteItemId, desiredVersion: sharepointOrderSync.desiredVersion })
+        .from(sharepointOrderSync)
+        .where(eq(sharepointOrderSync.orderPublicId, entity.publicId))
+        .for("update");
+      if (!existing) return;
+      await tx
+        .update(sharepointOrderSync)
+        .set({
+          syncedVersion: existing.desiredVersion,
+          state: existing.remoteItemId ? "synced" : "pending",
+          reasonCode: ORDER_TRASHED_REASON,
+          claimJobId: null,
+          claimToken: null,
+          claimedUntil: null,
+        })
+        .where(eq(sharepointOrderSync.orderPublicId, entity.publicId));
+    },
+    async onRestoredInTx(tx: Tx, entity: TrashEntityRef): Promise<void> {
+      if (entity.kind !== "order") return;
+      const [existing] = await tx
+        .select({ id: sharepointOrderSync.id })
+        .from(sharepointOrderSync)
+        .where(eq(sharepointOrderSync.orderPublicId, entity.publicId))
+        .for("update");
+      if (existing) {
+        await tx
+          .update(sharepointOrderSync)
+          .set({ reasonCode: null })
+          .where(eq(sharepointOrderSync.orderPublicId, entity.publicId));
+      }
+      const config = await readConfig(tx);
+      if (config?.enabled && config.listId) {
+        await stage(entity.publicId, tx);
+      }
+    },
+    async summarize(entity: TrashEntityRef): Promise<Record<string, number>> {
+      if (entity.kind !== "order") return {};
+      const [row] = await db
+        .select({ n: count() })
+        .from(sharepointOrderSync)
+        .where(eq(sharepointOrderSync.orderPublicId, entity.publicId));
+      const mappings = row?.n ?? 0;
+      const out: Record<string, number> = {};
+      if (mappings > 0) out.sharepointMappings = mappings;
+      return out;
+    },
+    async purge(entity: TrashEntityRef, run: TrashPurgeRun): Promise<TrashPurgeResult> {
+      // Increment 09 D2.6: erase portal SharePoint mapping rows only; folders/items already written
+      // in SharePoint or OneDrive are NOT deleted automatically.
+      if (entity.kind !== "order") return { deleted: {} };
+      return db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
+        const [res] = await tx
+          .delete(sharepointOrderSync)
+          .where(eq(sharepointOrderSync.orderPublicId, entity.publicId));
+        const deleted: Record<string, number> = {};
+        if (res.affectedRows > 0) deleted.sharepointMappings = res.affectedRows;
+        return { deleted };
+      });
+    },
+  };
+
   return {
     onOrderChange,
     runSync,
     runBackfill,
+    trashParticipant,
 
     /** Automation action / manual resync for one order. Returns false when the sync is not enabled. */
     async enqueueOrder(orderPublicId: string, options: { correlationId: string; idempotencyKey: string }): Promise<"queued" | "disabled" | "order_not_found"> {
@@ -686,15 +830,26 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
         return view(principal);
       },
 
-      /** Re-stages every order already known to the sync (bounded batch); new orders stage on their next change. */
+      /** Re-stages every live order already known to the sync (bounded batch); trashed orders are skipped. */
       async resyncAll(principal: SessionPrincipal) {
         return guard(principal, async (tx) => {
           const config = await readConfig(tx);
           if (!config?.enabled || !config.listId) throw new DomainError("NOT_CONFIGURED", "SHAREPOINT_SYNC_DISABLED", "Enable the sync first.");
-          const rows = await tx.select({ orderPublicId: sharepointOrderSync.orderPublicId }).from(sharepointOrderSync).orderBy(asc(sharepointOrderSync.id)).limit(RESYNC_BATCH);
-          for (const r of rows) await stage(r.orderPublicId, tx);
-          await adminAudit(principal, "sharepoint.sync.resync_requested", "sync", tx, { safeCounts: { enqueued: rows.length } });
-          return { enqueued: rows.length };
+          const rows = await tx
+            .select({ orderPublicId: sharepointOrderSync.orderPublicId })
+            .from(sharepointOrderSync)
+            .where(or(isNull(sharepointOrderSync.reasonCode), ne(sharepointOrderSync.reasonCode, ORDER_TRASHED_REASON)))
+            .orderBy(asc(sharepointOrderSync.id))
+            .limit(RESYNC_BATCH);
+          let enqueued = 0;
+          for (const r of rows) {
+            const order = await deps.services.orders.getOrderSyncView(r.orderPublicId, tx);
+            if (!order) continue;
+            await stage(r.orderPublicId, tx);
+            enqueued += 1;
+          }
+          await adminAudit(principal, "sharepoint.sync.resync_requested", "sync", tx, { safeCounts: { enqueued } });
+          return { enqueued };
         });
       },
 
@@ -705,14 +860,21 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
           const rows = await tx
             .select()
             .from(sharepointOrderSync)
-            .where(and(gt(sharepointOrderSync.id, after), input.state ? eq(sharepointOrderSync.state, input.state) : undefined))
+            .where(
+              and(
+                gt(sharepointOrderSync.id, after),
+                or(isNull(sharepointOrderSync.reasonCode), ne(sharepointOrderSync.reasonCode, ORDER_TRASHED_REASON)),
+                input.state ? eq(sharepointOrderSync.state, input.state) : undefined,
+              ),
+            )
             .orderBy(asc(sharepointOrderSync.id))
             .limit(limit + 1);
           const page = rows.slice(0, limit);
           const items = [];
           for (const r of page) {
             const order = await deps.services.orders.getOrderSyncView(r.orderPublicId, tx);
-            items.push({ orderPublicId: r.orderPublicId, reference: order?.reference ?? null, state: r.state, attempts: r.attempts, lastSyncedAt: r.lastSyncedAt, reasonCode: r.reasonCode });
+            if (!order) continue;
+            items.push({ orderPublicId: r.orderPublicId, reference: order.reference, state: r.state, attempts: r.attempts, lastSyncedAt: r.lastSyncedAt, reasonCode: r.reasonCode });
           }
           return { items, nextCursor: rows.length > limit ? String(page[page.length - 1]!.id) : null };
         });

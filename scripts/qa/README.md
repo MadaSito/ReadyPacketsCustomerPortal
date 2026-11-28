@@ -81,6 +81,20 @@ Only supply non-submitting fixture steps. Do not buy, publish, save billing deta
 - **Publishing:** `/admin/workflows` and `/admin/workflows/drafts/:draftId` open Publish dialogs for a valid synthetic draft.
   A separate invalid draft checks that Publish is blocked and explains why. Do not confirm the dialog or authorize step-up.
 
+## Increment 09 focused sweep
+
+Set `QA_SUITE=increment-09` and use [the Increment 09 fixture template](fixtures.increment-09.example.json)
+beside private QA storage-state files. The responsive and axe scripts use the same eight widths from 240 to
+1440 CSS px in both themes. Run responsive first, then axe. `QA_ROUTE_FILTER` can select one named case.
+
+Seed temporary administrator/customer sessions, live and suspended customers, a live order, disposable trashed
+orders and customers, and the billing and email-template view fixtures. The empty case searches for a deliberately
+nonmatching synthetic project; the first listed trash row must be restorable for the restore dialog case.
+Only open menus and confirmation dialogs; do not confirm moving to trash, restoring,
+deleting, changing retention, or sending mail during the sweep. The template preview is inert by design:
+delivery link correctness belongs to the server template tests, not a click in the preview. Missing routes
+or fixtures are `NOT CHECKED`, not passes.
+
 ## Rate limits
 
 Every QA browser shares one client IP, so a full run can exceed the instance's per-IP budgets (each page load makes

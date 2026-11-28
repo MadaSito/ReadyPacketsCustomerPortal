@@ -30,11 +30,21 @@ import {
   type MailTemplateVariableSpec,
   type MailTemplateVersionState,
 } from "./schema.js";
-import { buildSystemTemplateMetadata, systemOrderReferenceSamples, type SystemMailTemplateMetadata } from "./systemCatalogue.js";
+import { buildSystemTemplateMetadata, getShippedSecurityMailOrigin, systemOrderReferenceSamples, type SystemMailTemplateMetadata } from "./systemCatalogue.js";
 
 const VERIFY_AUDIT_KEY = "jobs.mail.verify_audit_copy";
 const TEST_VERSION_PREFIX = "mail_templates.test_v.";
 const TEST_DEFAULT_PREFIX = "mail_templates.test_default.";
+
+function ensureMailSamples(vars: Record<string, string>, hrefVars: readonly string[], origin: string, lockedOrigin?: string) {
+  const linkVars = lockedOrigin && Object.hasOwn(vars, "link") ? new Set([...hrefVars, "link"]) : new Set(hrefVars);
+  for (const name of linkVars) {
+    const candidate = parseAllowedTemplateUrl(vars[name] ?? "", { allowMailto: !lockedOrigin, canonicalOrigin: origin });
+    if (!candidate || (lockedOrigin && !candidate.startsWith(`${lockedOrigin}/`))) {
+      vars[name] = lockedOrigin ? `${lockedOrigin}/sign-in` : "https://portal.readypackets.example";
+    }
+  }
+}
 const CUSTOM_KEY_RE = /^custom\.[a-z][a-z0-9_]{1,63}$/;
 const PHASE_SYSTEM_KEYS = new Set(["orders.phase_update", "orders.status_changed"]);
 const PHASE_VARS = new Set(["reference", "phaseLabel", "statusLabel", "link"]);
@@ -94,7 +104,7 @@ export interface MailTemplateDetailView extends MailTemplateSummaryView {
 export interface MailTemplatePreviewResult {
   subject: string;
   text: string;
-  /** Preview-only projected HTML stripped of all links, images, and network/navigation attributes (`""` for plain text). */
+  /** Preview-only projected HTML stripped of links, images, and network/navigation attributes. */
   previewHtml: string;
 }
 
@@ -210,7 +220,7 @@ export function createMailTemplatesService(deps: ModuleDeps) {
       bodyHtml: string | null;
       bodyText: string;
     },
-    options?: { prefixTestSubject?: boolean },
+    options?: { prefixTestSubject?: boolean; securityTemplateKey?: string },
   ): PublishedMailTemplate => {
     const varNames = declaredVars.map((v) => v.name);
     const sensitiveVars = declaredVars.filter((v) => v.sensitive).map((v) => v.name);
@@ -227,6 +237,7 @@ export function createMailTemplatesService(deps: ModuleDeps) {
           declaredVars: varNames,
           vars,
           canonicalOrigin: deps.config.canonicalOrigin,
+          lockedOrigin: getShippedSecurityMailOrigin(options?.securityTemplateKey ?? key, deps.config.canonicalOrigin),
         });
         return {
           subject: options?.prefixTestSubject ? withTestPrefix(rendered.subject) : rendered.subject,
@@ -260,7 +271,7 @@ export function createMailTemplatesService(deps: ModuleDeps) {
           .where(eq(mailTemplates.id, ver.templateId))
           .limit(1);
         if (!tpl) return null;
-        return buildPublishedAdapter(key, tpl.declaredVarsJson, ver, { prefixTestSubject: true });
+        return buildPublishedAdapter(key, tpl.declaredVarsJson, ver, { prefixTestSubject: true, securityTemplateKey: tpl.templateKey });
       }
 
       // Internal test-send resolution for a system template's un-customised built-in default (`sendTestToMe` only)
@@ -281,7 +292,7 @@ export function createMailTemplatesService(deps: ModuleDeps) {
             bodyHtml: canonicalDefault.html,
             bodyText: sysMeta.defaultBodyText,
           },
-          { prefixTestSubject: true },
+          { prefixTestSubject: true, securityTemplateKey: targetKey },
         );
       }
 
@@ -364,7 +375,7 @@ export function createMailTemplatesService(deps: ModuleDeps) {
         hasWorkingDraft: r.workingDraftVersionId !== null,
         activeFormat:
           (r.activePublishedVersionId ? formatByVersionId.get(r.activePublishedVersionId) : undefined) ??
-          (r.kind === "system" ? "text" : "html"),
+          "html",
         latestVersionNumber: r.latestVersionNumber,
         version: r.version,
         updatedAt: r.updatedAt,
@@ -408,7 +419,7 @@ export function createMailTemplatesService(deps: ModuleDeps) {
         new Set(sysMeta.declaredVars.map((v) => v.name)),
       ).html;
       systemDefault = {
-        format: "text",
+        format: "html",
         subject: sysMeta.defaultSubject,
         bodyHtml: canonicalHtml,
         bodyText: sysMeta.defaultBodyText,
@@ -425,7 +436,7 @@ export function createMailTemplatesService(deps: ModuleDeps) {
       declaredVars: tpl.kind === "system" ? systemOrderReferenceSamples(tpl.declaredVarsJson) : tpl.declaredVarsJson,
       hasPublishedOverride: activePublishedRow !== null,
       hasWorkingDraft: workingDraftRow !== null,
-      activeFormat: activePublishedRow?.format ?? (tpl.kind === "system" ? "text" : "html"),
+      activeFormat: activePublishedRow?.format ?? "html",
       latestVersionNumber: tpl.latestVersionNumber,
       version: tpl.version,
       updatedAt: tpl.updatedAt,
@@ -1133,6 +1144,7 @@ export function createMailTemplatesService(deps: ModuleDeps) {
     async preview(
       principal: SessionPrincipal,
       input: {
+        templateKey?: string;
         format: MailTemplateFormat;
         subject: string;
         bodyHtml?: string | null;
@@ -1161,48 +1173,23 @@ export function createMailTemplatesService(deps: ModuleDeps) {
           varsObj[spec.name] = override !== undefined && override !== "" ? override : spec.sampleValue;
         }
 
-        if (prepared.format === "text") {
-          const rendered = renderMailTemplateVersion({
-            format: "text",
-            subjectTemplate: prepared.subject,
-            bodyHtmlTemplate: null,
-            bodyTextTemplate: prepared.bodyText,
-            declaredVars: normalizedVars.map((v) => v.name),
-            vars: varsObj,
-            canonicalOrigin: deps.config.canonicalOrigin,
-          });
-          return {
-            subject: rendered.subject,
-            text: rendered.text,
-            previewHtml: "",
-          };
-        }
-
         // Ensure sample link variables fallback to a safe canonical URL if the user typed a non-URL sample
-        const htmlCheck = sanitizeTemplateHtmlOnSave(
+        const hrefVars = prepared.format === "html" ? sanitizeTemplateHtmlOnSave(
           prepared.bodyHtml ?? "",
           new Set(normalizedVars.map((v) => v.name)),
-        );
-        for (const hrefVar of htmlCheck.hrefVars) {
-          const candidate = varsObj[hrefVar] ?? "";
-          if (
-            !parseAllowedTemplateUrl(candidate, {
-              allowMailto: true,
-              canonicalOrigin: deps.config.canonicalOrigin,
-            })
-          ) {
-            varsObj[hrefVar] = "https://portal.readypackets.example";
-          }
-        }
+        ).hrefVars : [];
+        const lockedOrigin = getShippedSecurityMailOrigin(input.templateKey ?? "", deps.config.canonicalOrigin);
+        ensureMailSamples(varsObj, hrefVars, deps.config.canonicalOrigin, lockedOrigin);
 
         const rendered = renderMailTemplateVersion({
-          format: "html",
+          format: prepared.format,
           subjectTemplate: prepared.subject,
           bodyHtmlTemplate: prepared.bodyHtml,
           bodyTextTemplate: prepared.bodyText,
           declaredVars: normalizedVars.map((v) => v.name),
           vars: varsObj,
           canonicalOrigin: deps.config.canonicalOrigin,
+          lockedOrigin,
         });
 
         return {
@@ -1297,17 +1284,8 @@ export function createMailTemplatesService(deps: ModuleDeps) {
           const override = input.sampleVars?.[spec.name];
           varsObj[spec.name] = override !== undefined && override !== "" ? override : spec.sampleValue;
         }
-        for (const hrefVar of hrefVarsToEnsure) {
-          const candidate = varsObj[hrefVar] ?? "";
-          if (
-            !parseAllowedTemplateUrl(candidate, {
-              allowMailto: true,
-              canonicalOrigin: deps.config.canonicalOrigin,
-            })
-          ) {
-            varsObj[hrefVar] = "https://portal.readypackets.example";
-          }
-        }
+        const lockedOrigin = getShippedSecurityMailOrigin(tpl.templateKey, deps.config.canonicalOrigin);
+        ensureMailSamples(varsObj, hrefVarsToEnsure, deps.config.canonicalOrigin, lockedOrigin);
 
         const now = deps.clock.now();
         const testDispatchId = ulid(now.getTime());

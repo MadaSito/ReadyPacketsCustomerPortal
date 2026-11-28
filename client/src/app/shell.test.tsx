@@ -374,3 +374,21 @@ describe("07.1 staff/admin in the customer portal (D1–D4)", () => {
     await waitFor(() => expect(readCustomerPortalChoice()).toBe(false));
   });
 });
+
+describe("console header at 240 px (increment 09, WCAG 1.4.10)", () => {
+  it("below 280 px the five actions use 36 px targets and tighter gaps; the menu button never shrinks", () => {
+    renderUi(
+      <ConsoleShell user={user("admin")}>
+        <h1>Page</h1>
+      </ConsoleShell>,
+      { path: "/admin" },
+    );
+    const row = screen.getByTestId("console-header-row");
+    for (const cls of ["max-[279px]:gap-1", "max-[279px]:px-2", "max-[279px]:[&_.size-11]:size-9"]) expect(row.className).toContain(cls);
+    expect(screen.getByRole("button", { name: "Open console navigation" }).className).toContain("shrink-0");
+    // Budget at 240 px: 2x8 padding + 5x36 targets + 2x4 outer gaps + 2x4 inner gaps = 212 px; every target stays >= 24 px.
+    const targets = row.querySelectorAll(".size-11");
+    expect(targets.length).toBeGreaterThanOrEqual(4);
+    expect(screen.getByTestId("console-header-logo").className).toContain("hidden");
+  });
+});

@@ -1,8 +1,11 @@
-import { and, asc, gt, inArray, lte } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, lte } from "drizzle-orm";
 import { z } from "zod";
 import type { ModuleDeps } from "../../container.js";
 import { ULID_PATTERN } from "../../core/ids.js";
+import { liveUserPredicate } from "../identity/live.js";
+import { users } from "../identity/schema.js";
 import { orders } from "../orders/schema.js";
+import { liveOrderPredicate } from "../orders/trashGate.js";
 import { defineSetting, readSetting } from "../platform/index.js";
 import type { OpsAlertsModule } from "./index.js";
 
@@ -38,7 +41,9 @@ export function registerAttentionReminder(deps: ModuleDeps, alerts: Pick<OpsAler
       const cutoff = new Date(deps.clock.now().getTime() - hours * 60 * 60 * 1_000);
       const rows = await tx.select({
         id: orders.id, publicId: orders.publicId, attention: orders.attention, since: orders.attentionSince,
-      }).from(orders).where(and(
+      }).from(orders).innerJoin(users, eq(users.id, orders.ownerUserId)).where(and(
+        liveOrderPredicate(),
+        liveUserPredicate(),
         inArray(orders.attention, ["staff_review", "customer_response"]),
         lte(orders.attentionSince, cutoff), gt(orders.id, cursor?.data.after ?? 0),
       )).orderBy(asc(orders.id)).limit(PAGE).for("update");

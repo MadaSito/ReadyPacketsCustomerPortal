@@ -1,47 +1,52 @@
 /**
- * Approved ReadyPackets lockup assembled from the four supplied PNG components (icon + wordmark/rule/tagline
- * stack) per docs/brand/BRAND_GUIDE.md §2. Never recolour, redraw or typeset the logo. The matching light/dark
- * set is chosen from the resolved theme or forced via `appearance` (e.g. "dark" on navy panels).
+ * ReadyPackets Document-Stack full lockup (brand package 2026.10.15.2, increment 09 D3). One supplied image,
+ * never recoloured, redrawn, re-typeset or CSS-filtered:
+ * - `lockup="square"` (default): square full lockup for tiles, auth, public/legal, error and launch surfaces.
+ * - `lockup="horizontal"`: horizontal full lockup of the same package for narrow bars.
+ * The light/dark file follows the resolved theme, or `appearance` when the surface is fixed (e.g. "dark" on
+ * the navy side panels). In forced-colours mode the image keeps a backplate in its own surface colour so the
+ * artwork stays legible whatever the system Canvas is (see .rp-brand-plate-* in styles/index.css).
  */
-import { BRAND_ASSETS } from "@shared/brand";
+import { BRAND, BRAND_ASSETS } from "@shared/brand";
 import { assetUrl } from "@/lib/runtime";
 import { cn } from "./cn";
 import { useTheme } from "./theme";
 
-export const BRAND_LOGO_LABEL = "ReadyPackets\u2122 \u2014 Your Business, Professionally Packeted\u2122";
+export const BRAND_LOGO_LABEL = BRAND.logoAccessibleName;
+
+export type BrandLockup = "square" | "horizontal";
 
 export interface BrandLogoProps {
-  /** "auto" follows the theme; "dark" = artwork for dark backgrounds. */
+  /** "auto" follows the resolved theme; "dark" = artwork for dark (navy) surfaces. */
   appearance?: "auto" | "light" | "dark";
-  /** "full" lockup or the compact icon only. */
-  variant?: "full" | "icon";
-  /** Accessible label; pass "" when a parent link already names it. */
+  /** "square" full lockup (default) or the "horizontal" full lockup for narrow bars. */
+  lockup?: BrandLockup;
+  /** Accessible name (alt text); pass "" when a parent link already names it or the logo is a duplicate. */
   label?: string;
   className?: string;
 }
 
-export function BrandLogo({ appearance = "auto", variant = "full", label = BRAND_LOGO_LABEL, className }: BrandLogoProps) {
+export function BrandLogo({ appearance = "auto", lockup = "square", label = BRAND_LOGO_LABEL, className }: BrandLogoProps) {
   const { resolved } = useTheme();
-  const set = BRAND_ASSETS[appearance === "auto" ? resolved : appearance];
-  // Artwork for dark backgrounds keeps its navy backdrop in forced-colours mode (where panel backgrounds
-  // become Canvas and the white wordmark would vanish). See .rp-brand-on-dark in styles/index.css.
-  const onDark = appearance === "dark" && "rp-brand-on-dark";
-  const groupProps = label ? { role: "img" as const, "aria-label": label } : { "aria-hidden": true as const };
-  if (variant === "icon") {
-    return (
-      <span {...groupProps} className={cn("inline-flex", onDark, className)}>
-        <img src={assetUrl(set.icon)} alt="" className="h-full w-auto object-contain" draggable={false} />
-      </span>
-    );
-  }
+  const tone = appearance === "auto" ? resolved : appearance;
+  const image = BRAND_ASSETS[tone][lockup];
   return (
-    <span {...groupProps} className={cn("inline-flex items-center gap-2", onDark, className)}>
-      <img src={assetUrl(set.icon)} alt="" className="h-auto w-[18%] shrink-0" draggable={false} />
-      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <img src={assetUrl(set.wordmark)} alt="" className="h-auto w-full" draggable={false} />
-        <img src={assetUrl(set.rule)} alt="" className="h-auto w-full" draggable={false} />
-        <img src={assetUrl(set.tagline)} alt="" className="h-auto w-[95%]" draggable={false} />
-      </span>
-    </span>
+    <img
+      src={assetUrl(image.path)}
+      alt={label}
+      width={image.width}
+      height={image.height}
+      draggable={false}
+      decoding="async"
+      data-brand-lockup={lockup}
+      data-brand-tone={tone}
+      className={cn(
+        "block h-auto max-w-full select-none",
+        tone === "dark" ? "rp-brand-plate-dark" : "rp-brand-plate-light",
+        // Kept for existing selectors: dark artwork on a navy panel.
+        tone === "dark" && "rp-brand-on-dark",
+        className,
+      )}
+    />
   );
 }

@@ -88,3 +88,33 @@ Contract 3.0 gains two OPTIONAL fields; the contract version and record types ar
 - **Account data export and erasure.** These features do not exist in 08 (contract D4 as corrected). Privacy requests are handled by an administrator, and the customer can clear the saved billing profile themselves. The profile row is deleted with its user (`ON DELETE CASCADE`).
 - **Backups** dump every base table, including `customer_billing_profiles` and all new columns. The increment 05 key note still applies: the profile's encrypted details are readable only with the same field-encryption key, because the AAD is bound to the user's public id.
 
+
+## Increment 09 coverage (trash and permanent deletion)
+
+Contract 3.0 gains one OPTIONAL field, `trash`, on `customers` and `orders`: `{ trashedAt, batchId, reason, purgeStartedAt, purgedAt }`. `purgedAt` set means a tombstone. The key is omitted for a live row, so a package with no trash is still readable by increment 07 and 08 installations. Older packages import as before.
+
+- **Export.**
+  - Only an all-records export carries trashed rows and tombstones, so a migration keeps the trash. Selected customer or order exports read live rows only, through the owners' gates.
+  - A tombstone carries only what a tombstone keeps. A tombstoned customer has the placeholder address `deleted-<public id>@tombstone.invalid`, the name "Deleted account", and no name parts or billing profile. A tombstoned order has its reference, totals, currency, dates and "Deleted order", with no lines, history or files.
+  - A row whose permanent deletion has started but not finished is refused: the export fails with `PORTABLE_PURGE_IN_PROGRESS`. Export again after the purge.
+  - File bytes of a trashed order travel in an all-records export. The custody read is ungated by internal id, and purge-started or purged orders are refused.
+  - `trash_purge_runs` is excluded under the new category `trash-operations`.
+- **Planning.**
+  - A half-purged record gives a plan conflict, `PORTABLE_PURGE_IN_PROGRESS`.
+  - These also give a plan conflict, `PORTABLE_TRASH_STATE_INVALID`: an order of a trashed customer that is live; an order of a tombstoned customer that is not a tombstone; a tombstone with lines, history or files; and a tombstoned customer with a billing profile.
+  - A live order added to a trashed or tombstoned root is refused.
+  - An address collision check also sees accounts in the trash, which keep their address. Tombstones skip it. Nothing is ever linked or remapped by e-mail.
+- **Apply.**
+  - Identity creates a trashed account in the trash, or a tombstone with its own placeholder.
+  - Orders writes a trashed order in the trash, or a tombstone. An existing target that is purge-started or purged is refused (`IMPORT_ORDER_PURGED`), so import never reactivates a purge.
+  - Files adopt bytes onto a trashed imported order only (`allowTrashedOrder`).
+  - Reconciliation checks the target trash state, reading customers by id, never by e-mail.
+- **Kept financial records** that point at a tombstone still import, attached by bundle ids only.
+- **Customer-facing exports.** No customer data export exists in 09. ZIP archives and downloads are gated by Orders and Files, which hide trashed orders.
+- **Erasure of this module's copies (trash participant `portable`).** Completed imports keep the sealed source records and the escrowed and prepared copies of imported file bytes. When an imported order or customer is permanently deleted, `purge` does the following for every import of the package that created it:
+  - It deletes the staged objects (escrow and prepared) of that entity's file versions, unless another file version in the same import that is not being erased still uses the same bytes. Each deletion is verified: the object must be absent afterwards, or the run fails and is retried.
+  - It then replaces the sealed records that belong to the entity with `redacted:v1`: the entity itself and every record under it, but not group additions or message attachments that only point at it.
+  - Mappings are kept as id-only receipts. The uploaded package is sealed with a passphrase this installation never stores, so it is reported as kept.
+  - If an import of the package is still executing, the run fails with `PORTABLE_IMPORT_IN_PROGRESS` and is retried. A not-yet-approved import whose records were redacted can no longer be applied: the worker refuses it as a custody failure.
+  - Imports of other packages that were never mapped to the entity, for example failed ones, are not matched.
+- **Backups** dump every base table, so they include `trash_purge_runs` and the new columns. See the backup API for what this means after a permanent deletion.

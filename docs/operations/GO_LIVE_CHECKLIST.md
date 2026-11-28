@@ -234,12 +234,63 @@ In Stripe, open **each** configured endpoint and compare its subscribed events w
 
 ## Mail
 
+For MAIL-09A through MAIL-09P, use two different mail clients (for example, desktop webmail and a phone mail app). Use a fresh message in each client for verification, reset and invitation links: they are single-use. Click the actual link in the received message, not a URL you copied into the browser. Use the approved test mailbox and aliases only; never record full token URLs.
+
 | ID | Priority | Where and what to do | Expected | Result / evidence / tester |
 | --- | --- | --- | --- | --- |
 | MAIL-01 | Blocker | `/register` → **Create account** using the test mailbox. | Verification email arrives with the canonical portal host. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | MAIL-02 | Blocker | `/sign-in` → **Forgot password?**<br>Enter test **Email** → **Send reset link**. | Password reset mail arrives in the test mailbox. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | MAIL-03 | Important | Complete the test payment in PAY-07; inspect the receipt mailbox. | One receipt email for the test order. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | MAIL-04 | Important | `/admin/email-templates` → open a template → **Send test to me** from a test admin mailbox. | Test message reaches that mailbox. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09A | Blocker | Client A: register a fresh alias via MAIL-01. In the message, click **Confirm e-mail address**. | The canonical portal opens the email verification page. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09B | Blocker | Client B: repeat MAIL-09A with a different fresh alias and message. | The canonical portal opens the email verification page. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09C | Blocker | Client A: request a reset via MAIL-02. In the new message, click **Reset password**. | The portal opens the form to choose a new password. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09D | Blocker | Client B: repeat MAIL-09C with a fresh reset request and message. | The portal opens the form to choose a new password. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09E | Blocker | `/admin/staff` → **Invite staff member** → fill synthetic details → **Send invitation**.<br>Client A: click **Activate account**. | The portal opens activation for that invitation. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09F | Blocker | Client B: repeat MAIL-09E with a fresh synthetic invitee and message. | The portal opens activation for that invitation. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09G | Blocker | As staff, move a synthetic order to a new customer-visible status with notifications enabled. In Client A, open the status-change message → **View order details**. | The matching order opens after sign-in as its owner. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09H | Blocker | Client B: open the same order status-change message → **View order details**. | The matching order opens after sign-in as its owner. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09I | Blocker | Client A: place an invoice-only order (INV-01). In the issued-invoice message, click **View invoice**. | The matching invoice opens after sign-in as its owner. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09J | Blocker | Client B: open the same issued-invoice message → **View invoice**. | The matching invoice opens after sign-in as its owner. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09K | Blocker | Pay an issued test invoice in full with an approved test payment, or record a synthetic full payment via **Record payment** on `/admin/invoices/:id`. In Client A, open the payment-recorded invoice message → **Download receipt**. | The matching paid invoice opens after sign-in as its owner, with a downloadable PDF. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09L | Blocker | Client B: open the same payment-recorded invoice message → **Download receipt**. | The matching paid invoice opens after sign-in as its owner, with a downloadable PDF. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09M | Blocker | Client A: send the synthetic customer a support reply as in STF-03.<br>In the message, click **View support ticket**. | The matching ticket opens after sign-in as its owner. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09N | Blocker | Client B: open the same support notification → **View support ticket**. | The matching ticket opens after sign-in as its owner. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09O | Important | In `/admin/email-templates/orders.confirmed` (**Order confirmation**), set **Sample: Action or portal URL** to the isolated portal's full HTTPS sign-in URL. Click **Send test to me**; don't publish. In Client A, open the `[TEST]` message → **View order**. | The configured portal sign-in page opens. This verifies the template's link, not a checkout trigger. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| MAIL-09P | Important | Client B: open the same `[TEST]` order confirmation → **View order**. | The configured portal sign-in page opens. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+
+## Trash, restore, and retention
+
+Run these destructive checks on an isolated installation on your server using only disposable synthetic records. Prepare an order with an issued paid invoice and receipt, a second order with an issued unpaid invoice, and a different customer with an order and a paid invoice and receipt. Record their synthetic references before moving anything. Use an approved test payment or synthetic recorded payment, never a real charge. Backups, delivered mail, Stripe, external SharePoint copies and SIEM copies are outside the purge.
+
+To verify that the MFA prompt actually appears, start each purge and retention confirmation without a current step-up. If you have already completed step-up in that session, wait more than 10 minutes before running the next check.
+
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| TRS-01 | Blocker | `/admin/orders/:id` → **Move to trash** for the paid test order. | Confirmation describes what moves and explains that no refund is issued. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-02 | Blocker | Enter `Go-live trash check` in **Reason (optional)** and confirm **Move to trash**. Open `/admin/trash` → **Orders**. | The matching order appears in Trash with that reason. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-03 | Blocker | Reopen the trashed order's original `/orders/:id` URL as its owner. | Ordinary not-found page. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-04 | Blocker | `/admin/trash` → **Orders** → on that order choose **Restore**, then confirm **Restore**. Reopen the original order URL. | The original order opens with its prior status. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-05 | Blocker | Move the restored order to Trash again. `/admin/trash` → **Orders** → **Delete permanently**.<br>Type its order number, confirm, then complete fresh MFA. | After completion the item is no longer in Trash. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-06 | Blocker | `/admin/invoices` → open that order's issued paid invoice after TRS-05. | Its frozen **Paid** invoice is still accessible. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-07 | Blocker | `/admin/receipts/:id` → open the saved receipt from the synthetic payment after TRS-05. | Its frozen receipt is still accessible. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-08 | Blocker | `/admin/customers/:id` → inspect **Move to trash** for the active test customer. | The action is disabled with **Suspend this account first** visible. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-09 | Blocker | `/admin/customers/:id` → **Suspend account**; confirm. Then **Move to trash** and confirm. | Customer appears in `/admin/trash` → **Customers**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-10 | Blocker | `/admin/trash` → **Orders** → find that customer's order after TRS-09. | The order is listed in Trash. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-11 | Blocker | `/admin/trash` → **Customers** → **Restore** that account and confirm. | The account returns **Suspended**. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-12 | Blocker | Open the batched order's original `/admin/orders/:id` after TRS-11. | The order is back in the normal console. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-13 | Blocker | Move the suspended customer to Trash again. `/admin/trash` → **Customers** → **Delete permanently**.<br>Type its customer ID, confirm, then complete fresh MFA. | After completion the account is no longer in Trash. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-14 | Blocker | After TRS-13, open the original `/admin/customers/:id`. | Ordinary not-found page; there is no Restore action. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-15 | Blocker | `/admin/audit` → **Last 24 hours** → **Apply filters**. Find the events from TRS-05 and TRS-13. | `order.purged` and `customer.purged` remain visible. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-16 | Blocker | In `/admin/trash` → **Automatic clean-up**, with automatic deletion on and order retention initially above one day, set **Orders: days in the trash** to `1`. Click **Save clean-up settings**. In **Shorten the retention period?**, note the due count, type `DELETE <count>` using that number, click **Save and confirm**, then complete fresh MFA. | Reload shows the saved one-day order retention. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-17 | Blocker | Operator: prepare synthetic order and customer fixtures due under their own configured periods. Leave automatic clean-up on. Wait for the hourly job outside maintenance mode, then reload `/admin/trash` → **Last clean-up**. | The run completed in the test window, reports items deleted permanently, and matches the `trash.cleanup_completed` audit record. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-18 | Blocker | `/admin/trash` → **Orders** → search for the due fixture after TRS-17. | The due order no longer appears. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-19 | Blocker | `/admin/trash` → **Customers** → search for a due synthetic suspended-customer fixture after cleanup. | The due account no longer appears. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-20 | Important | `/admin/trash` → **Automatic clean-up**: restore the isolated copy's original settings with **Save clean-up settings** and fresh MFA. | Reload shows the original values. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-21 | Blocker | Move the order with the unpaid invoice to Trash. As its owner, reopen the original unpaid invoice URL. | The invoice is hidden and payment cannot be started. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-22 | Blocker | Permanently delete the order from TRS-21 as in TRS-05. As an admin, inspect the original unpaid invoice by its saved number. | The invoice is voided, not deleted or made available for payment. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-23 | Blocker | After TRS-13, open that customer's saved paid invoice at `/admin/invoices/:id`. | The frozen **Paid** invoice remains accessible. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| TRS-24 | Blocker | After TRS-13, open that customer's saved receipt at `/admin/receipts/:id`. | The frozen receipt remains accessible. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
 ## Staff console
 
@@ -326,6 +377,18 @@ In Stripe, open **each** configured endpoint and compare its subscribed events w
 | ANA-03 | Optional-if-enabled | `/admin/integrations/analytics` → configure approved Clarity project ID; opt in anonymously on `/terms`. | Correct Clarity project receives the test visit. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 | ANA-04 | Blocker | After consent, sign in and open a synthetic `/orders/:id`. Inspect network. | Neither vendor loads on a private order path. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
 
+## ReadyPackets logo and installation
+
+| ID | Priority | Where and what to do | Expected | Result / evidence / tester |
+| --- | --- | --- | --- | --- |
+| BRD-01 | Blocker | `/forgot-password` → **Light** theme. Compare the logo to the approved square lockup. | The new square logo is legible on the light surface. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BRD-02 | Blocker | `/forgot-password` → **Dark** theme. Compare the logo to the approved square lockup. | The new dark-surface square logo is legible. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BRD-03 | Important | Open `/orders` as a customer and `/admin` as an administrator. | Each expanded sidebar shows the new square logo. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BRD-04 | Important | Open `/orders` as a customer on a phone with a viewport about 390 CSS px wide. | The customer header shows the new horizontal lockup without clipping. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BRD-05 | Blocker | With a supported browser, use **Install app** on the isolated portal. Inspect the browser's install prompt. | The install surface shows the new ReadyPackets artwork and name. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BRD-06 | Blocker | Launch the installed portal from its device shortcut. | The shortcut uses the new ReadyPackets icon. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+| BRD-07 | Important | After opening the installed portal online, go offline and reopen. | The offline screen still shows the new logo. | ☐ Pass ☐ Fail<br>Evidence: ___<br>Tester/date: ___ |
+
 ## Final sign-off
 
 | Section | Passed | Failed | Blocked | Excluded |
@@ -343,6 +406,7 @@ In Stripe, open **each** configured endpoint and compare its subscribed events w
 | Order workflow wizard and publishing | ___ | ___ | ___ | ___ |
 | Files and audio | ___ | ___ | ___ | ___ |
 | Mail | ___ | ___ | ___ | ___ |
+| Trash, restore, and retention | ___ | ___ | ___ | ___ |
 | Staff console | ___ | ___ | ___ | ___ |
 | Audit, logging, and SIEM | ___ | ___ | ___ | ___ |
 | Backup and restore drill | ___ | ___ | ___ | ___ |
@@ -352,6 +416,7 @@ In Stripe, open **each** configured endpoint and compare its subscribed events w
 | Responsive devices | ___ | ___ | ___ | ___ |
 | SEO and indexing | ___ | ___ | ___ | ___ |
 | Analytics | ___ | ___ | ___ | ___ |
+| ReadyPackets logo and installation | ___ | ___ | ___ | ___ |
 
 | ID | Priority | Where and what to do | Expected | Result / evidence / tester |
 | --- | --- | --- | --- | --- |

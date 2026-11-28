@@ -53,6 +53,17 @@ export const users = mysqlTable(
     origin: varchar("origin", { length: 16 }).notNull().default("register"),
     statusReasonCode: varchar("status_reason_code", { length: 40 }),
     statusChangedAt: utcDateTime("status_changed_at"),
+    /*
+     * Increment 09 (D2.1): trash state, orthogonal to `status` (restore returns the account suspended). All NULL =
+     * live. `purged_at` set = tombstone (personal columns overwritten; never listed, never restorable).
+     * `trashed_by_user_id` is a plain reference (no self foreign key) so purging the actor never cascades.
+     */
+    trashedAt: utcDateTime("trashed_at"),
+    trashedByUserId: refColumn("trashed_by_user_id"),
+    trashBatchId: char("trash_batch_id", { length: 26 }),
+    trashReason: varchar("trash_reason", { length: 200 }),
+    purgeStartedAt: utcDateTime("purge_started_at"),
+    purgedAt: utcDateTime("purged_at"),
     version: versionColumn(),
     createdAt: createdAtColumn(),
     updatedAt: updatedAtColumn(),
@@ -62,6 +73,7 @@ export const users = mysqlTable(
     index("users_role_status_idx").on(table.role, table.status),
     index("users_name_first_idx").on(table.nameFirstPrefixIndex),
     index("users_name_last_idx").on(table.nameLastPrefixIndex),
+    index("users_trashed_idx").on(table.trashedAt, table.id),
   ],
 );
 export type UserRow = typeof users.$inferSelect;

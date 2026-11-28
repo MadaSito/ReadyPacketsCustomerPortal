@@ -16,6 +16,7 @@ import type { ModuleDeps } from "../../container.js";
 import { DomainError, forbidden } from "../../core/errors.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
+import { isLiveUserRow } from "../identity/live.js";
 import { users, type UserStatus } from "../identity/schema.js";
 
 interface IdentitySessionsPeer {
@@ -151,6 +152,8 @@ export async function assertAutomationsActorInTx(
       publicId: users.publicId,
       role: users.role,
       status: users.status,
+      trashedAt: users.trashedAt,
+      purgedAt: users.purgedAt,
     })
     .from(users)
     .where(inArray(users.id, idsToLock))
@@ -159,13 +162,19 @@ export async function assertAutomationsActorInTx(
 
   const lockedMap = new Map<number, LockedActorSummary>();
   for (const row of lockedRows) {
-    lockedMap.set(row.id, row);
+    lockedMap.set(row.id, {
+      id: row.id,
+      publicId: row.publicId,
+      role: row.role,
+      status: row.status,
+    });
   }
 
-  const actor = lockedMap.get(principal.userId);
-  if (!actor || actor.status !== "active") {
+  const actorRow = lockedRows.find((r) => r.id === principal.userId);
+  if (!actorRow || !isLiveUserRow(actorRow) || actorRow.status !== "active") {
     throw forbidden("ACTOR_NOT_ACTIVE");
   }
+  const actor = lockedMap.get(principal.userId)!;
   if (!roleHasCapability(actor.role, capability)) {
     throw forbidden("ACTOR_CAPABILITY_REVOKED");
   }

@@ -300,6 +300,33 @@ The owner requested this on 2026-11-26 (prompt 34). The contract is [INCREMENT_0
 - **D7 Publish and tiers.** The designer has a persistent **Publish** button, and a **Publish** row action on `/admin/workflows` drafts (shared `PublishDraftDialog`, same procedure and step-up). Choosing a tier expands its deliverables.
 - **D8.** The go-live checklist is in `docs/operations/GO_LIVE_CHECKLIST.md`.
 
+## Increment 09: clickable e-mail links, Trash centre, new square logo
+
+The owner requested this on 2026-11-27 (prompt 37). The contract is [INCREMENT_09_CONTRACT.md](../engineering/INCREMENT_09_CONTRACT.md), decisions D1–D4. Migration `0009_increment_09` (final at `d358237`) is additive only: 56 statements, 6 new tables.
+
+- **D1 Mail links.** Shipped templates render their link variables as anchors in the HTML part. Only template literal text and trusted link variables become anchors, and free-form values are never linked (link provenance). Anchors are produced only when the portal address is HTTPS. In the client, `EmailLink` (`client/src/ui`) renders a safe, wrapping `mailto` link.
+- **D2 Trash.**
+  - **Columns.** `orders` and `users` gain `trashed_at`, `trashed_by_user_id`, `trash_batch_id`, `trash_reason`, `purge_started_at` and `purged_at`. `purged_at` set means a tombstone.
+  - **Coordinator.** `server/modules/trash` (recovery_ops_engineer) holds the router, settings, retention job `trash.retention_cleanup` (hourly), purge runs and targets, sweeps, deferrals, idempotency keys and retention state.
+  - **Participants.** Each data-owning module registers a `TrashParticipant` from `init()` via `services.trash.register`. Its `purge(entity, run)` must call `run.assertCurrentInTx(tx)` first in every data-changing transaction and before any provider call. A lost fence throws `PURGE_FENCE_LOST`.
+  - **Gates.**
+    - A customer must be suspended first (409 `CUSTOMER_NOT_SUSPENDED`).
+    - Legal hold blocks trash and purge (409 `ORDER_ON_LEGAL_HOLD`).
+    - Trashed items read as not found everywhere.
+    - A cascade never runs on a truncated target list.
+  - **Capabilities.** `trash.read`, `trash.manage`, `trash.purge` (step-up) and `trash.retention.manage` (step-up).
+  - **Typed confirmation.** The order number, the customer ID, or `DELETE <count>`. It is checked on the server.
+  - **Kept records.** Invoices carry frozen buyer and order snapshots. Storage copies follow cases A–D (contract D2.8).
+  - **UI.** `/admin/trash`, by audit_engineer.
+- **Owner-managed settings.** `defineSetting({ ownerWriteOnly: true })` requires `managedBy` and implies `exportable: false`. The generic settings write, `setSecret` and configuration import refuse such keys with `SETTING_OWNER_MANAGED`. The three `trash.*` retention keys use it.
+- **Platform participant.** A customer's purge unlinks their consent records (`consent.forgetUser`).
+- **D3 Logo.**
+  - **Files.** Package 2026.10.15.2. The masters are in `docs/brand/master/`. The web derivatives are in `client/public/brand/` with the suffix `-v2026101502`, served with immutable caching and precached.
+  - **Component.** `BrandLogo` (`lockup`, `appearance`, `label`).
+  - **Usage.** The square full lockup is the logo; the horizontal lockup is used in narrow bars and PDFs. See [BRAND_GUIDE.md](../brand/BRAND_GUIDE.md).
+- **D4 Documents.** The Trash centre section of [ADMIN_GUIDE.md](../guides/ADMIN_GUIDE.md), [UPGRADE.md](../operations/UPGRADE.md) (migration 0009 and the mistyped-confirmation box in §6), [BACKUP_AND_RESTORE.md](../operations/BACKUP_AND_RESTORE.md) (deleting items again after a restore), the [threat model](../security/THREAT_MODEL.md) and the [security review record](../verification/INCREMENT_09_SECURITY_REVIEW.md).
+- **Limits.** These were not verifiable here: real mail clients, real storage and payment providers, screen readers, Windows forced colours, other browsers, a real backup and restore, and the owner's server.
+
 ## Deployment profiles
 
 | Profile | Purpose | Session transport | Routing |

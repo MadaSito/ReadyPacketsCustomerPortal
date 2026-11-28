@@ -3,7 +3,7 @@
  * Owner: siem_engineer (Increment 05, Package C1).
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import { and, desc, eq, gte, inArray, lt, lte, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, lt, lte, sql, type SQL } from "drizzle-orm";
 import { ulid as newPublicId } from "../../core/ids.js";
 import { STEP_UP_CAPABILITIES, roleHasCapability, type Capability } from "../../../shared/capabilities.js";
 import {
@@ -18,8 +18,10 @@ import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import type { ModuleDeps, Services } from "../../container.js";
 import { rateLimitAddress } from "../../security/rateLimitAddress.js";
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
+import { isLiveUserRow, liveUserPredicate } from "../identity/live.js";
 import { users, userSessions } from "../identity/schema.js";
 import { orders, orderWorkflowVersions } from "../orders/schema.js";
+import { isLiveOrderRow, liveOrderPredicate } from "../orders/trashGate.js";
 import { isCancelState } from "../orders/workflowTypes.js";
 import {
   assertLabelDistinctFromCode,
@@ -804,12 +806,14 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
         id: users.id,
         role: users.role,
         status: users.status,
+        trashedAt: users.trashedAt,
+        purgedAt: users.purgedAt,
       })
       .from(users)
       .where(eq(users.id, actor.userId))
       .for("update");
 
-    if (!userRow || userRow.status !== "active") {
+    if (!userRow || userRow.status !== "active" || !isLiveUserRow(userRow)) {
       throw forbidden("ACTOR_INACTIVE");
     }
     if (!roleHasCapability(userRow.role, capability)) {
@@ -986,11 +990,17 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
 
     await deps.db.transaction(async (tx) => {
       const [userRow] = await tx
-        .select({ id: users.id, publicId: users.publicId, role: users.role })
+        .select({
+          id: users.id,
+          publicId: users.publicId,
+          role: users.role,
+          trashedAt: users.trashedAt,
+          purgedAt: users.purgedAt,
+        })
         .from(users)
         .where(eq(users.id, actorUserId))
         .limit(1);
-      if (!userRow) return;
+      if (!userRow || !isLiveUserRow(userRow)) return;
 
       // Concurrency-safe first-row initialization before locking (`ON DUPLICATE KEY` no-op).
       await tx
@@ -1167,11 +1177,22 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
     let actorIsStaffOrAdmin = false;
     if (ctx.actorUserId !== ctx.customerUserId) {
       const [actorRow] = await dbOrTx
-        .select({ id: users.id, role: users.role, status: users.status })
+        .select({
+          id: users.id,
+          role: users.role,
+          status: users.status,
+          trashedAt: users.trashedAt,
+          purgedAt: users.purgedAt,
+        })
         .from(users)
         .where(eq(users.id, ctx.actorUserId))
         .limit(1);
-      if (!actorRow || actorRow.status !== "active" || !roleHasCapability(actorRow.role, "orders.manage")) {
+      if (
+        !actorRow ||
+        actorRow.status !== "active" ||
+        !isLiveUserRow(actorRow) ||
+        !roleHasCapability(actorRow.role, "orders.manage")
+      ) {
         throw forbidden("CAPABILITY_NOT_GRANTED");
       }
       actorIsStaffOrAdmin = actorRow.role === "staff" || actorRow.role === "admin";
@@ -1185,12 +1206,14 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
         status: users.status,
         emailEnc: users.emailEnc,
         emailVerifiedAt: users.emailVerifiedAt,
+        trashedAt: users.trashedAt,
+        purgedAt: users.purgedAt,
       })
       .from(users)
       .where(eq(users.id, ctx.customerUserId))
       .limit(1);
 
-    if (!customer || customer.status !== "active") throw promoNotApplicable();
+    if (!customer || customer.status !== "active" || !isLiveUserRow(customer)) throw promoNotApplicable();
     if (customer.role !== "customer") throw promoNotApplicable();
     if (!customer.emailVerifiedAt) throw promoNotApplicable();
 
@@ -1359,12 +1382,12 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
     }
 
     // 7. First order only (`redeemInTx` runs before the new order row is inserted).
-    // Checks any historical order for this customer (including previously paid orders that were later cancelled).
+    // Checks any live historical order for this customer (trashed/tombstoned orders are absent per D2.2).
     if (batch.firstOrderOnly) {
       const priorOrderQuery = dbOrTx
         .select({ id: orders.id })
         .from(orders)
-        .where(eq(orders.ownerUserId, ctx.customerUserId))
+        .where(and(eq(orders.ownerUserId, ctx.customerUserId), liveOrderPredicate()))
         .limit(1);
       const [priorOrder] = opts.lockForRedemption
         ? await priorOrderQuery.for("share")
@@ -1378,6 +1401,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
           and(
             eq(promoRedemptions.customerUserId, ctx.customerUserId),
             eq(promoRedemptions.status, "redeemed"),
+            sql`NOT EXISTS (SELECT 1 FROM ${orders} WHERE ${orders.publicId} = ${promoRedemptions.orderPublicId} AND (${orders.trashedAt} IS NOT NULL OR ${orders.purgedAt} IS NOT NULL))`,
           ),
         )
         .limit(1);
@@ -1853,6 +1877,13 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
     return generatedPlainCodes;
   }
 
+  function liveRedemptionPredicate(): SQL {
+    return and(
+      sql`EXISTS (SELECT 1 FROM ${users} WHERE ${users.id} = ${promoRedemptions.customerUserId} AND ${liveUserPredicate(users)})`,
+      sql`NOT EXISTS (SELECT 1 FROM ${orders} WHERE ${orders.publicId} = ${promoRedemptions.orderPublicId} AND (${orders.trashedAt} IS NOT NULL OR ${orders.purgedAt} IS NOT NULL))`,
+    )!;
+  }
+
   async function hydrateRedemptionViews(
     rows: PromoRedemptionRow[],
     dbOrTx: DbOrTx,
@@ -1881,14 +1912,14 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
           customerRef: users.customerRef,
         })
         .from(users)
-        .where(inArray(users.id, customerIds)),
+        .where(and(inArray(users.id, customerIds), liveUserPredicate())),
       dbOrTx
         .select({
           publicId: orders.publicId,
           reference: orders.reference,
         })
         .from(orders)
-        .where(inArray(orders.publicId, orderPublicIds)),
+        .where(and(inArray(orders.publicId, orderPublicIds), liveOrderPredicate())),
     ]);
 
     const batchMap = new Map(batchRows.map((b) => [b.id, b]));
@@ -2677,7 +2708,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
       async redemptions(actor, input) {
         assertCapabilitySnapshot(actor, "promotions.read");
         const limit = Math.min(Math.max(input.limit ?? 25, 1), 100);
-        const conditions = [];
+        const conditions: SQL[] = [liveRedemptionPredicate()];
 
         if (input.promotionPublicId) {
           const [batch] = await deps.db
@@ -2701,7 +2732,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
         const rows = await deps.db
           .select()
           .from(promoRedemptions)
-          .where(conditions.length > 0 ? and(...conditions) : undefined)
+          .where(and(...conditions))
           .orderBy(desc(promoRedemptions.id))
           .limit(limit + 1);
 
@@ -2744,16 +2775,34 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
                 publicId: orders.publicId,
                 statusKey: orders.statusKey,
                 workflowVersionId: orders.workflowVersionId,
+                trashedAt: orders.trashedAt,
+                purgedAt: orders.purgedAt,
               })
               .from(orders)
               .where(eq(orders.publicId, candidate.orderPublicId))
               .for("update");
 
+            if (orderRow && !isLiveOrderRow(orderRow)) {
+              throw notFound("REDEMPTION_NOT_FOUND");
+            }
             if (!orderRow) {
               throw conflict(
                 "REDEMPTION_RELEASE_NOT_ELIGIBLE",
                 "This redemption can only be released after the order is cancelled.",
               );
+            }
+
+            const [custRow] = await tx
+              .select({
+                id: users.id,
+                trashedAt: users.trashedAt,
+                purgedAt: users.purgedAt,
+              })
+              .from(users)
+              .where(eq(users.id, candidate.customerUserId))
+              .limit(1);
+            if (!custRow || !isLiveUserRow(custRow)) {
+              throw notFound("REDEMPTION_NOT_FOUND");
             }
 
             const [wfVersion] = await tx
@@ -2976,7 +3025,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
         return deps.db.transaction(async (tx) => {
           await revalidateActorInTx(actor, tx, "promotions.manage");
 
-          const conditions = [];
+          const conditions: SQL[] = [liveRedemptionPredicate()];
           let targetPromoPublicId: string | null = null;
 
           if (input.promotionPublicId) {
@@ -2996,7 +3045,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
           const rows = await tx
             .select()
             .from(promoRedemptions)
-            .where(conditions.length > 0 ? and(...conditions) : undefined)
+            .where(and(...conditions))
             .orderBy(desc(promoRedemptions.id))
             .limit(10_000);
 
