@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { INCREMENT_08, increment08FixtureProblem, increment08States } from "./increment-08.mjs";
+import { INCREMENT_09, increment09States } from "./increment-09.mjs";
 
 const run = promisify(execFile);
 const repo = fileURLToPath(new URL("../../../", import.meta.url));
@@ -101,20 +102,28 @@ export function resolveQaScenarios(inventory, config = {}, directory = process.c
 }
 
 export function resolveIncrement08Scenarios(inventory, config = {}, directory = process.cwd(), filter = "") {
-  const { increment08: overrides = {}, sessions } = config;
+  return resolveFocusedScenarios(INCREMENT_08, increment08States, config.increment08, inventory, config, directory, filter);
+}
+
+export function resolveIncrement09Scenarios(inventory, config = {}, directory = process.cwd(), filter = "") {
+  return resolveFocusedScenarios(INCREMENT_09, increment09States, config.increment09, inventory, config, directory, filter);
+}
+
+function resolveFocusedScenarios(suite, states, overrides = {}, inventory, config, directory, filter) {
+  const { sessions } = config;
   const routeMap = new Map(inventory.map((route) => [route.id, route]));
   for (const key of Object.keys(overrides)) {
-    if (!Object.hasOwn(increment08States, key)) throw new Error("QA Increment 08 fixtures contain an unknown state ID.");
+    if (!Object.hasOwn(states, key)) throw new Error(`QA ${suite} fixtures contain an unknown state ID.`);
   }
   const cases = [];
   const missing = [];
-  const exactState = Object.hasOwn(increment08States, filter);
-  for (const [key, spec] of Object.entries(increment08States)) {
+  const exactState = Object.hasOwn(states, filter);
+  for (const [key, spec] of Object.entries(states)) {
     if (exactState ? key !== filter : !key.includes(filter) && !spec.route.includes(filter)) continue;
     const name = `${spec.route} [${spec.role}; ${key}]`;
     const route = routeMap.get(spec.route);
     const fixture = overrides[key] ?? {};
-    const item = { ...fixture, ready: spec.ready ?? fixture.ready, role: spec.role };
+    const item = { ...fixture, ready: spec.ready ?? fixture.ready, steps: spec.steps ?? fixture.steps, role: spec.role };
     const path = item.path ?? route?.path;
     const stop = (reason) => missing.push(`${name}: ${reason}.`);
     if (!route) {
@@ -126,7 +135,7 @@ export function resolveIncrement08Scenarios(inventory, config = {}, directory = 
       continue;
     }
     if (item.redirectsTo !== undefined) {
-      stop("an Increment 08 state must not redirect to another page");
+      stop("a focused QA state must not redirect to another page");
       continue;
     }
     const problem = increment08FixtureProblem(spec, item, path, config.checkoutSandbox);
@@ -139,8 +148,8 @@ export function resolveIncrement08Scenarios(inventory, config = {}, directory = 
     if (matching) cases.push({ ...matching, name });
     else stop("supply a disposable QA storage-state file for this role");
   }
-  if (!cases.length && !missing.length) throw new Error("QA route filter matched no Increment 08 scenarios.");
-  return { cases, missing, partial: true, suite: INCREMENT_08 };
+  if (!cases.length && !missing.length) throw new Error(`QA route filter matched no ${suite} scenarios.`);
+  return { cases, missing, partial: true, suite };
 }
 
 export async function qaRouteScenarios() {
@@ -150,8 +159,9 @@ export async function qaRouteScenarios() {
     try { config = JSON.parse(await readFile(fixturePath, "utf8")); } catch { throw new Error("QA_ROUTE_FIXTURES is unreadable or not valid JSON."); }
   }
   const suite = process.env.QA_SUITE;
-  if (suite && suite !== INCREMENT_08) throw new Error("QA_SUITE must be increment-08 or unset.");
-  const resolver = suite === INCREMENT_08 ? resolveIncrement08Scenarios : resolveQaScenarios;
+  const resolvers = new Map([[INCREMENT_08, resolveIncrement08Scenarios], [INCREMENT_09, resolveIncrement09Scenarios]]);
+  if (suite && !resolvers.has(suite)) throw new Error("QA_SUITE must be increment-08, increment-09, or unset.");
+  const resolver = resolvers.get(suite) ?? resolveQaScenarios;
   const result = resolver(await qaRouteInventory(), config, fixturePath ? dirname(resolve(fixturePath)) : process.cwd(), process.env.QA_ROUTE_FILTER);
   result.cases.sort((a, b) => roleOrder.indexOf(a.role) - roleOrder.indexOf(b.role));
   return result;
