@@ -1,7 +1,7 @@
 {
   "version": "5",
   "dialect": "mysql",
-  "id": "dbe9e00e-be6c-41aa-be8b-a4bdb1019c6f",
+  "id": "7a0219e3-ba2a-41c1-8d90-e207212e0193",
   "prevId": "8fb0b631-ab26-4073-9bc8-d8869623e54c",
   "tables": {
     "customer_ref_history": {
@@ -31125,6 +31125,13 @@
           "autoincrement": false,
           "default": "'running'"
         },
+        "active_slot": {
+          "name": "active_slot",
+          "type": "int unsigned",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "fencing_token": {
           "name": "fencing_token",
           "type": "int unsigned",
@@ -31132,6 +31139,20 @@
           "notNull": true,
           "autoincrement": false,
           "default": 1
+        },
+        "lease_owner": {
+          "name": "lease_owner",
+          "type": "varchar(64)",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "lease_expires_at": {
+          "name": "lease_expires_at",
+          "type": "datetime(3)",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         },
         "purged_count": {
           "name": "purged_count",
@@ -31195,6 +31216,13 @@
         }
       },
       "indexes": {
+        "trash_cleanup_sweep_active_uq": {
+          "name": "trash_cleanup_sweep_active_uq",
+          "columns": [
+            "active_slot"
+          ],
+          "isUnique": true
+        },
         "trash_cleanup_sweep_status_ix": {
           "name": "trash_cleanup_sweep_status_ix",
           "columns": [
@@ -31269,6 +31297,21 @@
           "notNull": true,
           "autoincrement": false
         },
+        "status": {
+          "name": "status",
+          "type": "enum('in_progress','claimed','completed','failed')",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'in_progress'"
+        },
+        "claimed_run_public_id": {
+          "name": "claimed_run_public_id",
+          "type": "char(26)",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "response_json": {
           "name": "response_json",
           "type": "mediumtext",
@@ -31278,6 +31321,14 @@
         },
         "created_at": {
           "name": "created_at",
+          "type": "datetime(3)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "CURRENT_TIMESTAMP(3)"
+        },
+        "updated_at": {
+          "name": "updated_at",
           "type": "datetime(3)",
           "primaryKey": false,
           "notNull": true,
@@ -31295,10 +31346,18 @@
           ],
           "isUnique": true
         },
-        "trash_idem_created_ix": {
-          "name": "trash_idem_created_ix",
+        "trash_idem_status_created_ix": {
+          "name": "trash_idem_status_created_ix",
           "columns": [
+            "status",
             "created_at"
+          ],
+          "isUnique": false
+        },
+        "trash_idem_run_ix": {
+          "name": "trash_idem_run_ix",
+          "columns": [
+            "claimed_run_public_id"
           ],
           "isUnique": false
         }
@@ -31399,6 +31458,13 @@
         "leave_external_copies_actor_user_id": {
           "name": "leave_external_copies_actor_user_id",
           "type": "bigint unsigned",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "leave_external_copies_proof_json": {
+          "name": "leave_external_copies_proof_json",
+          "type": "mediumtext",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
@@ -31561,6 +31627,20 @@
           "autoincrement": false,
           "default": 1
         },
+        "lease_owner": {
+          "name": "lease_owner",
+          "type": "varchar(64)",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "lease_expires_at": {
+          "name": "lease_expires_at",
+          "type": "datetime(3)",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "targets_json": {
           "name": "targets_json",
           "type": "mediumtext",
@@ -31679,6 +31759,7 @@
           "name": "trash_purge_run_status_ix",
           "columns": [
             "status",
+            "lease_expires_at",
             "started_at"
           ],
           "isUnique": false
@@ -31717,6 +31798,122 @@
           ]
         }
       },
+      "checkConstraint": {}
+    },
+    "trash_retention_deferrals": {
+      "name": "trash_retention_deferrals",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "bigint unsigned",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": true
+        },
+        "entity_kind": {
+          "name": "entity_kind",
+          "type": "enum('order','customer')",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "entity_id": {
+          "name": "entity_id",
+          "type": "bigint unsigned",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "entity_public_id": {
+          "name": "entity_public_id",
+          "type": "char(26)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "batch_id": {
+          "name": "batch_id",
+          "type": "char(26)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "reason_code": {
+          "name": "reason_code",
+          "type": "varchar(64)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "attempt_count": {
+          "name": "attempt_count",
+          "type": "int unsigned",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 1
+        },
+        "next_attempt_at": {
+          "name": "next_attempt_at",
+          "type": "datetime(3)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "alerted_at": {
+          "name": "alerted_at",
+          "type": "datetime(3)",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "datetime(3)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "CURRENT_TIMESTAMP(3)"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "datetime(3)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "CURRENT_TIMESTAMP(3)"
+        }
+      },
+      "indexes": {
+        "trash_ret_deferral_entity_batch_uq": {
+          "name": "trash_ret_deferral_entity_batch_uq",
+          "columns": [
+            "entity_kind",
+            "entity_id",
+            "batch_id"
+          ],
+          "isUnique": true
+        },
+        "trash_ret_deferral_next_ix": {
+          "name": "trash_ret_deferral_next_ix",
+          "columns": [
+            "entity_kind",
+            "next_attempt_at",
+            "entity_id"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "trash_retention_deferrals_id": {
+          "name": "trash_retention_deferrals_id",
+          "columns": [
+            "id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
       "checkConstraint": {}
     },
     "trash_retention_state": {
