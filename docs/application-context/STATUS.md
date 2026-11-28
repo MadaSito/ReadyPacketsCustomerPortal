@@ -1,6 +1,6 @@
 # ReadyPackets Portal — Status
 
-Last updated: 2026-11-28 (increment 07 merged to `main` as `c337492` through PR #16; fix pack 07.1 merged as `547a31d` through PR #19; fix pack 07.2 merged as `762ea41` through PR #21; increment 08 merged as `1587d11` through PR #23; increment 09 verified by the lead on `feat/increment-09` at `cf02944`, PR and merge pending). Keep this file current; it is the honest state of the build,
+Last updated: 2026-11-28 (increment 07 merged to `main` as `c337492` through PR #16; fix pack 07.1 merged as `547a31d` through PR #19; fix pack 07.2 merged as `762ea41` through PR #21; increment 08 merged as `1587d11` through PR #23; increment 09 verified by the lead on `feat/increment-09` at `cf02944` and `3eee534`, PR and merge pending). Keep this file current; it is the honest state of the build,
 not a certification. "Verified" below means the integrator ran the check and saw the result. Anything not
 listed under "Verified" has not been proven and must not be described as working in production.
 
@@ -389,13 +389,13 @@ Owner's prompt 37 of 2026-11-27 ([session log](../session-logs/2026-11-27-sessio
 | Decision | What | Owner | State |
 | --- | --- | --- | --- |
 | D1 | Clickable links in e-mail; e-mail addresses in the console as `mailto` links | jobs_engineer, ui_foundation_engineer, page owners | implemented; the UI `mailto` links were verified by the lead on QA. Mail anchors are checked by tests only (eeee72e, 69378d7, cd822d3, bfca43a, eb57918) |
-| D2 | Trash centre: move to trash, restore, permanent deletion, retention clean-up, legal hold | recovery_ops_engineer, audit_engineer, identity_engineer, orders_engineer, every data-owning module | implemented; verified by the lead on QA (3ed7b75, 1acae2c, a764b69, 851cf45, 9d9a0ba, fc4562b, 700ff9c, 0413d5a, 164b9c4, 33d8ac5, 6d93d94, e3b9e92, d7497b5, 8837890, 13f2a1d, 5c94588, 21b4149, 980f4ec, bcd27cc, cf02944) |
+| D2 | Trash centre: move to trash, restore, permanent deletion, retention clean-up, legal hold | recovery_ops_engineer, audit_engineer, identity_engineer, orders_engineer, every data-owning module | implemented; verified by the lead on QA at `cf02944` and `3eee534` (3ed7b75, 1acae2c, a764b69, 851cf45, 9d9a0ba, fc4562b, 700ff9c, 0413d5a, 164b9c4, 33d8ac5, 6d93d94, e3b9e92, d7497b5, 8837890, 13f2a1d, 5c94588, 21b4149, 980f4ec, bcd27cc, cf02944, c1f47f2, 3eee534) |
 | D3 | New square logo and brand files, package 2026.10.15.2 | ui_foundation_engineer, compliance_engineer | implemented; verified by the lead on QA (da419de, 14dcade, 8bfdf73, aad7083, 6ed8d1c, 884213d, cf02944) |
 | D4 | Documents; go-live checklist; security review record | platform_engineer, assurance_engineer | documents a22e302, acd4ab4, 465427a, 980f4ec, 5aa212a, ee46c7c, c97c86f and this update; checklist 8f4155a (to be run on the owner's server); [security review record](../verification/INCREMENT_09_SECURITY_REVIEW.md) |
 
 ### Verification for increment 09
 
-Branch HEAD `cf02944`, 104 commits ahead of `main` (`44d04bf`). PR and merge commit: (filled at merge).
+Branch HEAD `3eee534` (the first checks below ran on `cf02944`); base `main` at `44d04bf`. PR and merge commit: (filled at merge).
 
 **Verified by the lead** on a QA production build of `feat/increment-09` at `cf02944`, in Chromium only. The build ran on a copy of the QA database with synthetic data, in pay-by-invoice mode, with mail not configured and local storage only.
 - **Static checks.**
@@ -450,8 +450,32 @@ Branch HEAD `cf02944`, 104 commits ahead of `main` (`44d04bf`). PR and merge com
   - No sideways scrolling at 240, 320, 390, 768, 1024 or 1440 px on those routes.
 - **Security review.** http_security_engineer gave D1, D2 and D3 CLEAR after several rounds. It was a source review, not a penetration test. See the [security review record](../verification/INCREMENT_09_SECURITY_REVIEW.md).
 
-<!-- ADDENDUM-PENDING-LEAD: automatic clean-up sweep and customer-side checks. /root sends the wording; insert it here unchanged. -->
-> **Addendum (pending from /root):** automatic clean-up sweep and customer-side checks.
+**Verified by the lead on 2026-11-28** on the QA build at `3eee534`, in Chromium, with synthetic data. The earlier checks above ran on the `cf02944` build.
+- **Automatic clean-up.**
+  - An order in the trash was made overdue: its moved-to-trash date was set back in the database, with order retention at 5 days. The panel showed "1 item is due at the next clean-up".
+  - The hourly clean-up ran on the hour (07:00 UTC) and deleted the order permanently. The sweep recorded 1 deleted and 0 failed, and the deletion run is marked as started by retention, with no acting user.
+  - The Trash panel then showed the last clean-up with 1 item deleted and 0 due.
+  - The clean-up runs once an hour, on the hour. It does not run at the start-up of every restart.
+- **Customer side** (signed in as the synthetic customer).
+  - An order in the trash is absent from the customer's order list, and its direct address shows "Order unavailable".
+  - The unpaid invoice of an order in the trash is absent from the customer's invoice list. Its direct address gives the same message as an invoice that does not exist.
+  - The paid invoice and receipt of an order in the trash stay visible, and their PDFs download.
+  - After the permanent deletion, the paid invoice and receipt remain and their PDFs still download. They show "Deleted order" in place of the project name. The unpaid invoice is void, with the reason "Order permanently deleted".
+  - The invoice list has no sideways scrolling at 390 px.
+- **Stored files.** With local storage, permanently deleting two orders that held 5 and 3 files took the stored objects from 12 to 4. The 4 left belong to other orders, and the file rows of the deleted orders are gone.
+- **A storage failure stops the deletion.**
+  - The stored files were given unsafe permissions (group- and world-readable), a test artefact placed by hand. Permanent deletion then stopped with "Private storage is unavailable.": the order stayed in the trash and nothing was deleted.
+  - After the permissions were corrected, the retry completed as the second attempt of the same run.
+- **Move, Undo, move again.** On the same order page, **Move to trash**, then **Undo**, then **Move to trash** again really moves the order the second time. The trash count was 1 each time.
+- **Customer restore dialog.** It lists what returns: "Returns with it: 3 line items, 2 refunds, 1 note, 1 order, 1 paid invoice, 1 payment, 1 policy acceptance". It also says the account comes back suspended.
+- **Two defects found in this pass and fixed by the lead:**
+  - **c1f47f2.** Customers saw the staff label "In trash" on a kept paid invoice or receipt whose order is in the trash. Customers now see "Order unavailable", and staff still see "In trash". A unit test was added.
+  - **3eee534.** After a failed action on one item in the Trash centre, the next item sent the same request key and was refused with "This request key was already used for a different action."
+    - Each target now has its own request key. A retry of the same item keeps its key, so the server resumes it. A success renews the key, and the move dialog renews its key after a success.
+    - The new unit test fails without the fix.
+    - Checked again live: two permanent deletions in a row, in one page session, both completed.
+
+<!-- RERUN-PENDING-LEAD -->
 
 **Reported by owners, not re-run individually by the lead.** These test files are part of the lead's full vitest run above, but the lead did not exercise them one by one.
 - **Cross-module journey.** `tests/integration/journey-trash.test.ts` (ede33a1, 14c63ab) covers Trash isolation, the lifecycle and scheduled retention across modules. Every Trash capability is probed against a customer and a staff member who completed the two-step check.
