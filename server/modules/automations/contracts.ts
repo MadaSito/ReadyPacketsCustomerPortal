@@ -318,6 +318,8 @@ export interface AutomationActionRunContext<C = Record<string, unknown>> {
   recipients: Readonly<Record<string, readonly number[]>>;
   /** Canonical order `publicId` when available in the trigger/manual context, otherwise `null`. */
   orderPublicId: string | null;
+  /** Trusted internal `orders.id` when resolved for `orderPublicId`, otherwise `null` / `undefined`. */
+  orderId?: number | null;
   /** Canonical file `publicId` when triggered by a file event (`file.uploaded`), otherwise `null`. */
   filePublicId: string | null;
   /** True when the trigger is marked `staffOnly: true` (forbids customer recipients, fixed external emails, and webhooks). */

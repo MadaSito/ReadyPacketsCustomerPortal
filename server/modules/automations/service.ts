@@ -11,6 +11,7 @@ import { ULID_PATTERN, ulid } from "../../core/ids.js";
 import { newRequestContext, runWithRequestContext } from "../../core/requestContext.js";
 import type {
   ClaimedJob,
+  DbOrTx,
   JobResult,
   ModuleHealth,
   SafeAttributeValue,
@@ -31,7 +32,10 @@ import {
   type TriggerCatalogueEntry,
   type TriggerField,
 } from "../audit/triggerCatalogue.js";
+import { isLiveUserRow } from "../identity/live.js";
 import { users } from "../identity/schema.js";
+import { orders } from "../orders/schema.js";
+import { isLiveOrderRow } from "../orders/trashGate.js";
 import { readSetting, writeSetting } from "../platform/index.js";
 import {
   assertAutomationsActorInTx,
@@ -116,6 +120,7 @@ import {
   orderStageRuns,
 } from "./schema.js";
 import { AUTOMATIONS_CONFIG, automationsConfigSchema } from "./settings.js";
+import { createAutomationsTrashParticipant } from "./trash.js";
 import {
   STAGE_BUNDLES_DISABLED_MESSAGE,
   buildOrderPhaseBundleSection,
@@ -337,6 +342,7 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
   let tapGloballyEnabled = false;
   let tapEnabledEventNames = new Set<string>();
   let tapRegistered = false;
+  let trashParticipantRegistered = false;
 
   async function refreshTapCache(tx?: Tx): Promise<void> {
     const cfg = await readSetting(settings, AUTOMATIONS_CONFIG, tx);
@@ -1018,6 +1024,141 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
     return JSON.parse(raw) as TransientRunSnapshot;
   }
 
+  function isMissingTableError(err: unknown): boolean {
+    const check = (candidate: unknown): boolean => {
+      if (!candidate || typeof candidate !== "object") return false;
+      const e = candidate as { errno?: number; code?: string; cause?: unknown };
+      if (e.errno === 1146 || e.code === "ER_NO_SUCH_TABLE") return true;
+      return e.cause ? check(e.cause) : false;
+    };
+    return check(err);
+  }
+
+  async function inspectAutomationTrashFence(
+    handle: DbOrTx,
+    input: {
+      orderPublicId?: string | null;
+      subjectUserId?: number | null;
+      customerPublicId?: string | null;
+    },
+  ): Promise<{
+    blockedReason: "ORDER_TRASHED" | "CUSTOMER_TRASHED" | null;
+    orderId: number | null;
+    subjectUserId: number | null;
+  }> {
+    let resolvedOrderId: number | null = null;
+    let resolvedSubjectUserId: number | null =
+      typeof input.subjectUserId === "number" && input.subjectUserId > 0
+        ? input.subjectUserId
+        : null;
+
+    if (input.orderPublicId && ULID_PATTERN.test(input.orderPublicId)) {
+      try {
+        const [orderRow] = await handle
+          .select({
+            id: orders.id,
+            ownerUserId: orders.ownerUserId,
+            trashedAt: orders.trashedAt,
+            purgedAt: orders.purgedAt,
+          })
+          .from(orders)
+          .where(eq(orders.publicId, input.orderPublicId))
+          .limit(1);
+        if (orderRow) {
+          resolvedOrderId = orderRow.id;
+          resolvedSubjectUserId = orderRow.ownerUserId;
+          if (!isLiveOrderRow(orderRow)) {
+            return {
+              blockedReason: "ORDER_TRASHED",
+              orderId: orderRow.id,
+              subjectUserId: orderRow.ownerUserId,
+            };
+          }
+          const [ownerRow] = await handle
+            .select({
+              id: users.id,
+              trashedAt: users.trashedAt,
+              purgedAt: users.purgedAt,
+            })
+            .from(users)
+            .where(eq(users.id, orderRow.ownerUserId))
+            .limit(1);
+          if (ownerRow && !isLiveUserRow(ownerRow)) {
+            return {
+              blockedReason: "CUSTOMER_TRASHED",
+              orderId: orderRow.id,
+              subjectUserId: orderRow.ownerUserId,
+            };
+          }
+        }
+      } catch (err) {
+        if (!isMissingTableError(err)) throw err;
+      }
+    }
+
+    if (input.customerPublicId && ULID_PATTERN.test(input.customerPublicId)) {
+      try {
+        const [custRow] = await handle
+          .select({
+            id: users.id,
+            role: users.role,
+            trashedAt: users.trashedAt,
+            purgedAt: users.purgedAt,
+          })
+          .from(users)
+          .where(eq(users.publicId, input.customerPublicId))
+          .limit(1);
+        if (custRow) {
+          if (custRow.role === "customer") {
+            resolvedSubjectUserId ??= custRow.id;
+          }
+          if (!isLiveUserRow(custRow)) {
+            return {
+              blockedReason: "CUSTOMER_TRASHED",
+              orderId: resolvedOrderId,
+              subjectUserId: custRow.id,
+            };
+          }
+        }
+      } catch (err) {
+        if (!isMissingTableError(err)) throw err;
+      }
+    }
+
+    if (resolvedSubjectUserId && resolvedSubjectUserId > 0) {
+      try {
+        const [userRow] = await handle
+          .select({
+            id: users.id,
+            role: users.role,
+            trashedAt: users.trashedAt,
+            purgedAt: users.purgedAt,
+          })
+          .from(users)
+          .where(eq(users.id, resolvedSubjectUserId))
+          .limit(1);
+        if (userRow && !isLiveUserRow(userRow)) {
+          return {
+            blockedReason: "CUSTOMER_TRASHED",
+            orderId: resolvedOrderId,
+            subjectUserId: userRow.id,
+          };
+        }
+        if (userRow && userRow.role !== "customer" && resolvedOrderId === null) {
+          resolvedSubjectUserId = null;
+        }
+      } catch (err) {
+        if (!isMissingTableError(err)) throw err;
+      }
+    }
+
+    return {
+      blockedReason: null,
+      orderId: resolvedOrderId,
+      subjectUserId: resolvedSubjectUserId,
+    };
+  }
+
   async function createQueuedRunInTx(
     tx: Tx,
     params: {
@@ -1029,6 +1170,7 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       orderPublicId?: string | null;
       stageStepKey?: string | null;
       triggeredByUserId?: number | null;
+      subjectUserId?: number | null;
       dedupKey: string;
       isTest: boolean;
       snapshot: TransientRunSnapshot;
@@ -1068,6 +1210,17 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
           ? params.snapshot.orderPublicId
           : null;
 
+    const createFence = await inspectAutomationTrashFence(tx, {
+      orderPublicId: resolvedOrderPublicId,
+      subjectUserId: params.subjectUserId ?? null,
+    });
+    if (createFence.blockedReason !== null) {
+      if (params.triggerMode !== "event") {
+        throw notFound("ORDER_NOT_FOUND");
+      }
+      return { created: false, runPublicId, jobId: "" };
+    }
+
     let runId: number;
     try {
       const [ins] = await tx.insert(automationRuns).values({
@@ -1082,6 +1235,7 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
         orderPublicId: resolvedOrderPublicId,
         stageStepKey: params.stageStepKey ?? null,
         triggeredByUserId: params.triggeredByUserId ?? null,
+        subjectUserId: createFence.subjectUserId,
         dedupKey: params.dedupKey,
         correlationId,
         isTest: params.isTest,
@@ -1212,6 +1366,35 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       ULID_PATTERN.test(event.resource.publicId)
         ? event.resource.publicId
         : attrOrderPublicId;
+    const inferredEventSubjectUserId =
+      event.actor?.role === "customer" && typeof event.actor.userId === "number"
+        ? event.actor.userId
+        : null;
+    const inferredEventCustomerPublicId =
+      (event.resource?.type === "customer" || event.resource?.type === "user") &&
+      typeof event.resource.publicId === "string" &&
+      ULID_PATTERN.test(event.resource.publicId)
+        ? event.resource.publicId
+        : null;
+
+    // D2.2: No trigger fires for a trashed or tombstoned order or customer.
+    if (
+      event.eventName.startsWith("order.trashed") ||
+      event.eventName.startsWith("order.purge") ||
+      event.eventName.startsWith("customer.trashed") ||
+      event.eventName.startsWith("customer.purge")
+    ) {
+      return { outcome: "completed", safeCounts: { suppressed_trashed: 1 } };
+    }
+
+    const evalFence = await inspectAutomationTrashFence(db, {
+      orderPublicId: inferredOrderPublicId,
+      subjectUserId: inferredEventSubjectUserId,
+      customerPublicId: inferredEventCustomerPublicId,
+    });
+    if (evalFence.blockedReason !== null) {
+      return { outcome: "completed", safeCounts: { suppressed_trashed: 1 } };
+    }
 
     let queuedRuns = 0;
     for (const autoRow of candidateRows) {
@@ -1247,6 +1430,7 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
           triggerKey: entry.key,
           triggerEventId: event.eventId,
           orderPublicId: inferredOrderPublicId,
+          subjectUserId: evalFence.subjectUserId,
           dedupKey: `event:${event.eventId}`,
           isTest: false,
           snapshot,
@@ -1523,6 +1707,49 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
           snapshot,
           signal: job.signal,
         });
+        const resolvedCustomerRecipientId =
+          [...CUSTOMER_RECIPIENT_KEYS].flatMap((k) => resolvedCtx.recipients[k] ?? [])[0] ?? null;
+        const preExecFence = await inspectAutomationTrashFence(db, {
+          orderPublicId: resolvedCtx.orderPublicId ?? runRow.orderPublicId,
+          subjectUserId: runRow.subjectUserId ?? resolvedCustomerRecipientId,
+        });
+        const effectiveSubjectUserId =
+          runRow.subjectUserId ?? preExecFence.subjectUserId ?? resolvedCustomerRecipientId;
+        if (runRow.subjectUserId === null && effectiveSubjectUserId !== null) {
+          await db
+            .update(automationRuns)
+            .set({ subjectUserId: effectiveSubjectUserId })
+            .where(eq(automationRuns.id, runRow.id));
+        }
+        if (preExecFence.blockedReason !== null) {
+          await db.transaction(async (tx) => {
+            await job.assertStillOwned(tx);
+            await tx
+              .update(automationRunSteps)
+              .set({
+                state: "skipped",
+                reasonCode: preExecFence.blockedReason,
+                updatedAt: clock.now(),
+              })
+              .where(
+                and(
+                  eq(automationRunSteps.runId, runRow.id),
+                  eq(automationRunSteps.state, "pending"),
+                ),
+              );
+            await finalizeRunInTx(
+              tx,
+              autoRow,
+              runRow,
+              "canceled",
+              preExecFence.blockedReason,
+              undefined,
+              snapshot.parentCorrelationId,
+            );
+          });
+          return { outcome: "completed", safeCounts: { suppressed_trashed: 1 } };
+        }
+
         const evaluatedFieldsJson = JSON.stringify(resolvedCtx.fields);
         const conditionsTree = parseJsonSafe<AutomationConditionTree>(
           verRow.conditionsJson,
@@ -1777,6 +2004,40 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
             return { outcome: "completed" };
           }
 
+          // D2.8 Worker fence: re-check order & customer trash/purge state immediately before each step's external effect.
+          const stepFence = await inspectAutomationTrashFence(db, {
+            orderPublicId: resolvedCtx.orderPublicId ?? runRow.orderPublicId,
+            subjectUserId: effectiveSubjectUserId,
+          });
+          if (stepFence.blockedReason !== null) {
+            await db.transaction(async (tx) => {
+              await job.assertStillOwned(tx);
+              await tx
+                .update(automationRunSteps)
+                .set({
+                  state: "skipped",
+                  reasonCode: stepFence.blockedReason,
+                  updatedAt: clock.now(),
+                })
+                .where(
+                  and(
+                    eq(automationRunSteps.runId, runRow.id),
+                    eq(automationRunSteps.state, "pending"),
+                  ),
+                );
+              await finalizeRunInTx(
+                tx,
+                autoRow,
+                runRow,
+                "canceled",
+                stepFence.blockedReason,
+                evaluatedFieldsJson,
+                snapshot.parentCorrelationId,
+              );
+            });
+            return { outcome: "completed", safeCounts: { suppressed_trashed: 1 } };
+          }
+
           const stepStartedAt = clock.now();
           const nextAttempt = stepRow.attemptCount + 1;
           const stepIdempotencyKey = `auto:${runRow.publicId}:step:${stepRow.stepKey}`;
@@ -1805,6 +2066,7 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
               fields: resolvedCtx.fields,
               recipients: resolvedCtx.recipients,
               orderPublicId: resolvedCtx.orderPublicId,
+              orderId: stepFence.orderId,
               filePublicId: resolvedCtx.filePublicId,
               staffOnlyTrigger: resolvedCtx.staffOnlyTrigger,
               dryRun: false,
@@ -1827,6 +2089,16 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
               attachWebhookBeforeSendFence(actionCtx, async () => {
                 await db.transaction(async (tx) => {
                   await job.assertStillOwned(tx);
+                  const txFence = await inspectAutomationTrashFence(tx, {
+                    orderPublicId: resolvedCtx.orderPublicId ?? runRow.orderPublicId,
+                    subjectUserId: effectiveSubjectUserId,
+                  });
+                  if (txFence.blockedReason !== null) {
+                    throw conflict(
+                      txFence.blockedReason,
+                      "Target order or customer was moved to trash before dispatch.",
+                    );
+                  }
                   const [freshStep] = await tx
                     .select({ state: automationRunSteps.state })
                     .from(automationRunSteps)
@@ -3588,15 +3860,20 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
           publicId: users.publicId,
           nameEnc: users.nameEnc,
           role: users.role,
+          status: users.status,
+          trashedAt: users.trashedAt,
+          purgedAt: users.purgedAt,
         })
         .from(users)
         .where(inArray(users.id, actorIds));
       for (const a of actorRows) {
-        let displayName: string = a.role;
-        try {
-          displayName = crypto.decrypt(a.nameEnc, `users.name:${a.publicId}`);
-        } catch {
-          // Keep role fallback if decryption fails in synthetic rows.
+        let displayName = isLiveUserRow(a) ? a.role : "Deleted account";
+        if (isLiveUserRow(a)) {
+          try {
+            displayName = crypto.decrypt(a.nameEnc, `users.name:${a.publicId}`);
+          } catch {
+            // Keep role fallback if decryption fails in synthetic rows.
+          }
         }
         actorById.set(a.id, {
           publicId: a.publicId,
@@ -3631,6 +3908,21 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       finishedAt: r.finishedAt,
       durationMs: r.durationMs,
     }));
+  }
+
+  function liveAutomationRunPredicate() {
+    return and(
+      sql`NOT EXISTS (
+        SELECT 1 FROM ${orders}
+        WHERE ${orders.publicId} = ${automationRuns.orderPublicId}
+          AND (${orders.trashedAt} IS NOT NULL OR ${orders.purgedAt} IS NOT NULL)
+      )`,
+      sql`NOT EXISTS (
+        SELECT 1 FROM ${users}
+        WHERE ${users.id} = ${automationRuns.subjectUserId}
+          AND (${users.trashedAt} IS NOT NULL OR ${users.purgedAt} IS NOT NULL OR ${users.status} = 'tombstoned')
+      )`,
+    );
   }
 
   async function listRuns(
@@ -3670,6 +3962,7 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       .from(automationRuns)
       .where(
         and(
+          liveAutomationRunPredicate(),
           filterAutoId !== undefined ? eq(automationRuns.automationId, filterAutoId) : undefined,
           input.orderPublicId !== undefined
             ? eq(automationRuns.orderPublicId, input.orderPublicId)
@@ -3698,7 +3991,7 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
     const [row] = await db
       .select()
       .from(automationRuns)
-      .where(eq(automationRuns.publicId, input.runPublicId))
+      .where(and(eq(automationRuns.publicId, input.runPublicId), liveAutomationRunPredicate()))
       .limit(1);
     if (!row) throw notFound("AUTOMATION_RUN_NOT_FOUND");
     const [hydrated] = await hydrateRunViews([row]);
@@ -4220,6 +4513,11 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
     cancelOrderCompletionJob,
 
     init() {
+      if (!trashParticipantRegistered && deps.services.trash) {
+        deps.services.trash.register(createAutomationsTrashParticipant(deps));
+        trashParticipantRegistered = true;
+      }
+
       syncStaticRegistrations();
       ensureAutomationMailTemplateRegistered(deps.mailer);
 
