@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { errorMessage, safeError } from "@/lib/trpc";
-import { DateTime, formatDateTime, Money } from "@/ui";
+import { DateTime, EmailLink, formatDateTime, Money } from "@/ui";
 import {
   REPORT_LIMITS,
   type Aggregate,
@@ -269,8 +269,13 @@ export function renderCellNode(
     case "enum":
       return <span className="break-words">{humanizeCode(String(value))}</span>;
     case "string":
-    default:
-      return <span className="break-words">{String(value)}</span>;
+    default: {
+      const str = String(value);
+      if (/(^|_|[a-z])email(Address)?$/i.test(col.key)) {
+        return <EmailLink email={str} />;
+      }
+      return <span className="break-words">{str}</span>;
+    }
   }
 }
 
