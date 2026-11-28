@@ -33,3 +33,4 @@ export * from "../../modules/opsAlerts/schema.js";
 export * from "../../modules/files/archivesSchema.js";
 export * from "../../security/rateLimiterSchema.js";
 export * from "../../modules/reports/schema.js";
+export * from "../../modules/trash/schema.js";
