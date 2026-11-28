@@ -24,6 +24,11 @@ export type TrashActor =
 export interface TrashPurgeRun {
   /** Public id of the purge run; stable across retries of the same purge. */
   runId: string;
+  /**
+   * Set by the coordinator ONLY after an administrator with `trash.purge` confirmed (step-up + typed order
+   * number) that known copies on an unreachable destination are left in place. Never set by the retention job.
+   */
+  acknowledgedUnreachableCopies?: boolean;
 }
 
 export interface TrashPurgeResult {

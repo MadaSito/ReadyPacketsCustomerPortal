@@ -6,6 +6,8 @@ import { getHttpState } from "./requestState.js";
 import { isNavigation } from "./edge.js";
 
 const HASHED_ASSET = /^(?:.+\/)?assets\/[^/]+-[A-Za-z0-9_-]{8,}\.[a-z0-9]+$/i;
+/** Brand artwork carries its package version in the file name (`-v2026101502`); new artwork gets a new name. */
+const VERSIONED_BRAND_ASSET = /^brand\/[a-z0-9-]+-v\d{10}\.(?:png|svg|ico)$/;
 const NEVER_SPA = /^\/(?:api|assets|brand|fonts|healthz|readyz|\.well-known)(?:\/|$)/i;
 const MAIL_TEMPLATE_EDITOR = "/admin/email-templates/";
 const DOTTED_MAIL_KEY = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/u;
@@ -68,7 +70,7 @@ export function registerStatic(
       if (res.getHeader("Cache-Control") === "no-store") return;
       // Only build-generated assets are immutable. The service worker, manifest
       // and other fixed filenames must be revalidated.
-      if (HASHED_ASSET.test(relative)) res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+      if (HASHED_ASSET.test(relative) || VERSIONED_BRAND_ASSET.test(relative)) res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
       else res.setHeader("Cache-Control", "no-cache");
     },
   });
