@@ -8,6 +8,7 @@ import type { ModuleHealth, ModuleLifecycle } from "../../core/types.js";
 import { createApiEngine, type ApiHttpRequest, type ApiHttpResponse } from "./engine.js";
 import type { ProviderKey, PublicApiProviders } from "./ports.js";
 import { createPublicApiService, type PublicApiService } from "./service.js";
+import { createPublicApiTrashParticipant, wrapProviderWithTrashGate } from "./trash.js";
 
 export type { ApiHttpRequest, ApiHttpResponse } from "./engine.js";
 export type { KeyInput, KeyView, LogFilter } from "./service.js";
@@ -35,9 +36,12 @@ export function createPublicApiModule(deps: ModuleDeps): PublicApiModule {
 
   return {
     ...service,
+    async init() {
+      deps.services.trash?.register(createPublicApiTrashParticipant(deps));
+    },
     registerProvider(key, provider) {
       if (providers[key]) throw new Error(`publicApi provider already registered: ${key}`);
-      providers[key] = provider;
+      providers[key] = wrapProviderWithTrashGate(deps, key, provider);
     },
     handle: (req) => engine.handle(req),
     async health(): Promise<ModuleHealth[]> {
