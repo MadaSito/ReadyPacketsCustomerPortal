@@ -14,6 +14,7 @@ import { DomainError, notFound } from "../../core/errors.js";
 import { sanitiseAttribute } from "../audit/envelope.js";
 import { users } from "../identity/schema.js";
 import { orders } from "../orders/schema.js";
+import { createTrashRegistry } from "../trash/ports.js";
 import { newRequestContext } from "../../core/requestContext.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
 import type { StageGovernance, StageUploadIntent } from "../../../shared/workflowStages.js";
@@ -67,6 +68,7 @@ afterAll(() => t?.cleanup());
 beforeEach(async () => {
   for (const table of [fileDownloadTickets, filePlaybackGrants, fileAccessLog, orderFiles]) await t.db.delete(table);
   h = createTestDeps({ db: t.db });
+  h.services.trash = createTrashRegistry();
   files = createFilesModule(h.deps);
   h.services.files = files;
   owner = fakePrincipal({ userPublicId });
@@ -301,6 +303,7 @@ describe("private file admission and authorization", () => {
       provider = registered;
     } } });
     files.init?.();
+    expect(h.services.trash.participants().map((participant) => participant.module)).toEqual(["files"]);
     const v1 = await add(owner);
     const v2 = await add(owner, { ...upload, versionOf: v1.publicId });
     const active = await add(owner);
