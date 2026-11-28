@@ -5,7 +5,7 @@
  */
 import { z } from "zod";
 import { DomainError } from "../../core/errors.js";
-import { SETTING_GROUPS, getSettingDefinition, listSettingDefinitions } from "./settingsRegistry.js";
+import { SETTING_GROUPS, assertGenericWriteAllowed, getSettingDefinition, listSettingDefinitions } from "./settingsRegistry.js";
 import type { Capability } from "../../../shared/capabilities.js";
 import type { ActorGuard } from "./actorGuard.js";
 import type { SessionPrincipal } from "../../core/types.js";
@@ -80,6 +80,7 @@ export const platformRouter = router({
       setSecret: manage
         .input(z.strictObject({ key: settingKey, value: z.string().min(1).max(16384).nullable(), expectedVersion: version }))
         .mutation(async ({ ctx, input }) => {
+          assertGenericWriteAllowed(input.key);
           const platform = impl(ctx.services);
           const store = platform.settingsAdmin();
           await store.updateSecret(input.key, input.value, { expectedVersion: input.expectedVersion, guard: settingWriteGuard(platform, ctx.session, [input.key]) });

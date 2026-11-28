@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createTestDeps, fakePrincipal, silentLogger, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { newRequestContext } from "../../core/requestContext.js";
@@ -8,10 +9,30 @@ import { createPlatformModule } from "./module.js";
 import { platformRouter } from "./router.js";
 import { platformPresentationImages, platformSettings } from "./schema.js";
 import { PRESENTATION_SUPPORT_TEXT } from "./settings.js";
-import { defineSecret } from "./settingsRegistry.js";
+import { defineSecret, defineSetting } from "./settingsRegistry.js";
 import { createSettingsStore } from "./settingsStore.js";
 
 const SECRET = defineSecret({ key: "integrations.test_router_secret", owner: "platform", group: "integrations", label: "Router secret", description: "Synthetic." });
+const OWNED = defineSetting({
+  key: "general.test_router_owned",
+  owner: "platform",
+  group: "general",
+  label: "Owned",
+  description: "Synthetic owner-managed setting.",
+  schema: z.number().int().min(1).max(10),
+  default: 3,
+  managedBy: { href: "/admin/trash", label: "Trash centre" },
+  ownerWriteOnly: true,
+});
+const OWNED_SECRET = defineSecret({
+  key: "integrations.test_router_owned_secret",
+  owner: "platform",
+  group: "integrations",
+  label: "Owned secret",
+  description: "Synthetic.",
+  managedBy: { href: "/admin/trash", label: "Trash centre" },
+  ownerWriteOnly: true,
+});
 const transport: SessionTransport = { issue() {}, clear() {} };
 const appRouter = router({ platform: platformRouter });
 
@@ -93,6 +114,17 @@ describe("platform router authorization", () => {
     expect(JSON.stringify(list)).not.toContain("sk-router-synthetic");
     expect(JSON.stringify(secret)).not.toContain("sk-router-synthetic");
     await expect(caller(admin()).admin.settings.update(update)).rejects.toMatchObject({ code: "CONFLICT" });
+  });
+
+  it("refuses owner-managed settings on the generic write; the owning module still writes them", async () => {
+    const refused = { code: "FORBIDDEN", message: "Change this in the Trash centre." };
+    await expect(caller(admin()).admin.settings.update({ key: OWNED.key, value: 7, expectedVersion: 0 })).rejects.toMatchObject(refused);
+    await expect(caller(admin()).admin.settings.setSecret({ key: OWNED_SECRET.key, value: "synthetic-owned", expectedVersion: 0 })).rejects.toMatchObject(refused);
+    const before = (await caller(admin(false)).admin.settings.list()).find((v) => v.key === OWNED.key);
+    expect(before).toMatchObject({ value: 3, version: 0, ownerWriteOnly: true, managedBy: { href: "/admin/trash" } });
+    await h.services.settings.set(OWNED.key, 7);
+    const after = (await caller(admin(false)).admin.settings.list()).find((v) => v.key === OWNED.key);
+    expect(after).toMatchObject({ value: 7, version: 1 });
   });
 
   it("serves health and the setup checklist to administrators", async () => {

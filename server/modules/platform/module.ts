@@ -16,7 +16,7 @@ import { CONSENT_PURGE_JOB, createConsentService, type ConsentService } from "./
 import { createPlatformTrashParticipant } from "./trash.js";
 import { computeSchemaStatus, schemaContractError } from "./schemaContract.js";
 import { PRESENTATION_SLIDES, slidesSchema } from "./settings.js";
-import { getSettingDefinition } from "./settingsRegistry.js";
+import { assertGenericWriteAllowed, getSettingDefinition } from "./settingsRegistry.js";
 import { isPlatformSettingsStore, type PlatformSettingsStore, type SettingView } from "./settingsStore.js";
 
 export const DEFAULT_HEALTH_TIMEOUT_MS = 2_000;
@@ -354,6 +354,7 @@ export function createPlatformModule(deps: ModuleDeps): PlatformModuleImpl {
     const store = settingsAdmin();
     const def = getSettingDefinition(key);
     if (!def) throw validation("UNKNOWN_SETTING", "That setting does not exist.");
+    assertGenericWriteAllowed(key);
     const lockedGuard: ActorGuard =
       key === PRESENTATION_SLIDES.key
         ? async (tx) => {

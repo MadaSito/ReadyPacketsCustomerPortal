@@ -18,7 +18,7 @@ import { z } from "zod";
 import { DomainError, validation } from "../../core/errors.js";
 import type { AuditEmitter, Clock, Db, Tx } from "../../core/types.js";
 import type { PlatformSettingsStore } from "./settingsStore.js";
-import { getSettingDefinition, listSettingDefinitions } from "./settingsRegistry.js";
+import { assertGenericWriteAllowed, getSettingDefinition, isOwnerWriteOnly, listSettingDefinitions } from "./settingsRegistry.js";
 
 export const CONFIG_FORMAT = "readypackets.platform-config";
 export const CONFIG_FORMAT_VERSION = 1;
@@ -155,7 +155,7 @@ export function createConfigTransfer(deps: ConfigTransferDeps) {
     if (options.includeSecrets || options.passphrase !== undefined) assertPassphrase(options.passphrase);
     // Re-validate the actor before touching secrets (short transaction; never held across the KDF).
     await db.transaction(guard);
-    const defs = listSettingDefinitions().filter((def) => def.exportable);
+    const defs = listSettingDefinitions().filter((def) => def.exportable && !isOwnerWriteOnly(def));
     const entries: { key: string; value: z.core.util.JSONType }[] = [];
     const secretValues: { key: string; value: string }[] = [];
     for (const def of defs) {
@@ -287,7 +287,8 @@ export function createConfigTransfer(deps: ConfigTransferDeps) {
         rejected.push({ key: def ? entry.key : "(undeclared)", reason: "UNKNOWN_SETTING" });
         continue;
       }
-      if (!def.exportable) {
+      // Owner-managed settings (e.g. trash retention) are never imported: the target keeps its own values.
+      if (!def.exportable || isOwnerWriteOnly(def)) {
         rejected.push({ key: entry.key, reason: "NOT_EXPORTABLE" });
         continue;
       }
@@ -314,7 +315,8 @@ export function createConfigTransfer(deps: ConfigTransferDeps) {
         rejected.push({ key: def ? entry.key : "(undeclared)", reason: "UNKNOWN_SETTING" });
         continue;
       }
-      if (!def.exportable) {
+      // Owner-managed settings (e.g. trash retention) are never imported: the target keeps its own values.
+      if (!def.exportable || isOwnerWriteOnly(def)) {
         rejected.push({ key: entry.key, reason: "NOT_EXPORTABLE" });
         continue;
       }
@@ -394,8 +396,10 @@ export function createConfigTransfer(deps: ConfigTransferDeps) {
         await guard(tx);
         for (const item of values) {
           const check = deps.afterLock;
+          assertGenericWriteAllowed(item.key);
           await settings.update(item.key, item.value, { expectedVersion: item.version, tx, ...(check ? { afterLock: (t: Tx) => check(item.key, item.value, t) } : {}) });
         }
+        for (const item of secrets) assertGenericWriteAllowed(item.key);
         for (const item of secrets) await settings.updateSecret(item.key, item.value, { expectedVersion: item.version, tx });
         await audit.record(
           {

@@ -648,6 +648,15 @@ You can filter by text, date range, who moved it, and items due within a number 
   - If something has changed in the meantime, the restore is refused with a plain explanation and nothing is half-restored. For example, the project may now have the same packet in another live order.
 - **Numbers are never reused.** Order numbers and customer IDs are never reused, even after a permanent deletion.
 
+### Legal hold
+
+An order on **legal hold** is protected from the trash:
+- it cannot be moved to the trash or deleted permanently, by an administrator, by a customer cascade or by the clean-up job. The answer is "Release the legal hold first." (`ORDER_ON_LEGAL_HOLD`);
+- a customer who owns an order on legal hold cannot be moved to the trash or deleted permanently either;
+- an order placed on hold while it is already in the trash stays there. The clean-up job skips it and raises an operational alert.
+
+Release the hold first, then repeat the action.
+
 ### Deleting permanently
 
 **Delete permanently** needs `trash.purge` and a fresh two-step check.
@@ -656,6 +665,7 @@ You can filter by text, date range, who moved it, and items due within a number 
 - **Restore stops working** as soon as the deletion starts.
 - **A customer's orders first.** For a customer, each of their orders is deleted first, then the account.
 - **If a step fails,** the item shows **failed** and the clean-up job or an administrator retries it. Each run is recorded with its counts and a safe error code.
+- **Complete lists only.** If the list of a customer's orders reaches a query limit, the deletion fails and nothing is deleted. It never works on a cut-off list.
 
 ### What is erased and what is kept
 
@@ -694,11 +704,15 @@ A tombstone never appears in lists, search or pickers, and it cannot be restored
 ### Retention clean-up
 
 The settings are in the Trash centre:
-- **Automatic trash clean-up** (`trash.autoPurge.enabled`): on by default.
-- **Order retention in trash (days)** (`trash.retention.orderDays`): 30 by default.
-- **Customer account retention in trash (days)** (`trash.retention.customerDays`): 30 by default.
+- **Automatic trash clean-up** (`trash.auto_purge.enabled`): on by default.
+- **Order retention in trash (days)** (`trash.retention.order_days`): 30 by default.
+- **Customer account retention in trash (days)** (`trash.retention.customer_days`): 30 by default.
 
 The day settings allow 1 to 3,650 days. Changing them needs `trash.retention.manage` and a fresh two-step check, and is audited.
+
+**Only in the Trash centre.** These three settings can be changed only in the Trash centre:
+- **Settings** (`/admin/settings`) shows them read-only, with a link to the Trash centre. A direct change through the generic settings interface is refused on the server: "Change this in the Trash centre." (`SETTING_OWNER_MANAGED`).
+- **Configuration export** leaves them out, and an import file that contains them is refused. The target installation keeps its own values.
 
 - **Due date.** An item is due on the day it was moved plus the setting **as it is now**. Changing the setting moves the due date of everything already in the trash. Orders moved together with a customer follow the customer's date.
 - **Shortening retention.** The panel shows how many items become due. It asks for the same confirmation as a permanent deletion.
@@ -712,9 +726,11 @@ The day settings allow 1 to 3,650 days. Changing them needs `trash.retention.man
 Permanent deletion only reaches data that the portal itself controls.
 - **Backups** keep their copy until they expire under the backup retention, see [BACKUP_AND_RESTORE.md](../operations/BACKUP_AND_RESTORE.md). **Restoring an older backup brings deleted items back.** After a restore, delete them again from the Trash centre, using the `order.purged` and `customer.purged` audit events as the list.
 - **Stripe.** Customers, payments and checkout sessions at Stripe are not changed.
-- **Storage copies the portal controls** are deleted and checked. If a write to the current destination is still uncertain, the deletion stops and is retried; it never reports success early.
-- **Copies the portal cannot prove it owns,** for example in an older or changed storage destination, are not touched. They are counted as `unverifiedExternalCopies`, with only the connection's public ID. The portal's pointer is removed. Remove them by hand after checking.
-- **Provider recycle bins.** Residual copies left in a provider's retention or recycle bin are counted as `providerRecycleBin`. The portal never empties a whole bin.
+- **Storage copies.** There are four cases:
+  - **A. A copy the portal recorded as its own, on a destination it can reach,** is deleted and checked. If a write to the current destination is still uncertain, the deletion stops and is retried; it never reports success early.
+  - **B. A copy the portal recorded as its own, on a destination that was changed or cannot be reached,** makes the deletion fail with `EXTERNAL_COPIES_UNREACHABLE`. It can be resumed, and the portal keeps the copy's location. You can then choose **Finish and leave N external copies in place**. This needs `trash.purge`, a fresh two-step check and the typed order number, and it is audited. The clean-up job never makes this choice.
+  - **C. Older copies whose ownership the portal never recorded** are left in place and reported as kept (`unverifiedExternalCopies`, with only the connection's public ID). The portal's pointer is removed. Remove them by hand after checking.
+  - **D. Provider recycle bins.** Residual copies in a provider's retention or recycle bin are reported as kept (`providerRecycleBin`). The portal never empties a whole bin.
   - **Microsoft Graph (OneDrive and SharePoint)** deletes the exact item permanently.
   - **Dropbox** user apps only soft-delete, so a copy stays in Dropbox's own bin until Dropbox removes it.
   - **Azure Blob** with soft delete enabled may keep a retained version, under the storage administrator's control.
@@ -1130,6 +1146,8 @@ All of these are audited. You never see a user's existing password or codes.
 - **Settings** (`/admin/settings`, `platform.settings.manage`) — **Available**. Settings are grouped by module. Every
   change requires step-up, uses optimistic concurrency (a conflict if someone changed it first) and is audited. Secrets
   are write-only: the page shows only whether a secret is set and when. **Remove secret** stops dependent features.
+  Settings that belong to a dedicated page show a link to it. Some can be changed only on that page, for example the
+  trash retention settings (increment 09): the generic change and configuration import refuse them.
 - **Features** (`/admin/settings/features`) — **Available**. Installation-wide switches. All default to **off**.
 
 | Feature switch | Owner |
