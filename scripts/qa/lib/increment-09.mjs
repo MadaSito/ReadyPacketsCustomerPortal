@@ -21,6 +21,10 @@ export const increment09States = Object.freeze({
     ],
     ready: 'main :text-is("No orders match these filters")',
   }),
+  "trash-date-filters": trash({
+    steps: [button("Filters", { maxCssWidth: 767 })],
+    ready: 'body:has(input[type="date"]:visible)',
+  }),
   "trash-restore-dialog": trash({
     interactive: true, steps: [button("Restore ", { namePrefix: true, first: true })],
     ready: '[role="alertdialog"]:has(:text-matches("^Restore .+[?]$")):has(button:text-is("Restore"))',

@@ -242,6 +242,10 @@ export async function openQaRoute(page, baseUrl, scenario, theme, beforeSteps) {
   }
 }
 
+export function stepsForQaWidth(steps, width) {
+  return steps.filter((step) => step.maxCssWidth === undefined || width <= step.maxCssWidth);
+}
+
 async function openQaRouteOnce(page, baseUrl, scenario, theme, beforeSteps) {
   const probe = await page.request.get(new URL("/api/trpc/identity.me", baseUrl).href, { timeout: 8_000, maxRedirects: 0 });
   if (probe.status() === 429) {
@@ -288,7 +292,9 @@ async function openQaRouteOnce(page, baseUrl, scenario, theme, beforeSteps) {
     }
     await beforeSteps?.();
     if (scenario.tab) await page.getByRole("tab", { name: scenario.tab, exact: true }).click({ timeout: 5_000 });
-    for (const step of scenario.steps) {
+    const width = scenario.steps.some((step) => step.maxCssWidth !== undefined)
+      ? await page.evaluate(() => document.documentElement.clientWidth) : undefined;
+    for (const step of stepsForQaWidth(scenario.steps, width)) {
       let control = step.testId ? page.getByTestId(step.testId) :
         step.label ? page.getByLabel(step.label, { exact: step.labelPrefix !== true }) :
         page.getByRole(step.role, { name: step.name, exact: step.namePrefix !== true });

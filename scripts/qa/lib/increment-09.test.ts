@@ -3,7 +3,7 @@ import fixtureExample from "../fixtures.increment-09.example.json";
 // @ts-expect-error Native JavaScript QA modules have no declarations.
 import { INCREMENT_09, increment09States } from "./increment-09.mjs";
 // @ts-expect-error Native JavaScript QA modules have no declarations.
-import { resolveIncrement09Scenarios } from "./routes.mjs";
+import { resolveIncrement09Scenarios, stepsForQaWidth } from "./routes.mjs";
 
 const inventory = [
   { id: "/admin/trash", path: "/admin/trash", access: "admin", title: "Trash" },
@@ -51,5 +51,14 @@ describe("Increment 09 sweep evidence", () => {
       steps: [{ role: "button", name: "Move to trash:", namePrefix: true, first: true }],
       ready: expect.stringContaining("alertdialog"),
     })]);
+  });
+
+  it("opens the date filter drawer only where filters are not inline", () => {
+    const [scenario] = resolveIncrement09Scenarios(inventory, fixtureExample, "/qa", "trash-date-filters").cases;
+    for (const width of [240, 640, 767]) {
+      expect(stepsForQaWidth(scenario.steps, width)).toEqual([{ role: "button", name: "Filters", maxCssWidth: 767 }]);
+    }
+    expect(stepsForQaWidth(scenario.steps, 768)).toEqual([]);
+    expect(scenario.ready).toContain('input[type="date"]:visible');
   });
 });
