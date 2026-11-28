@@ -231,7 +231,7 @@ export function createTrashCopies(deps: ModuleDeps, adapterFor: (row: Connection
         await tx.delete(attempts).where(proofScope);
         const now = clock.now();
         for (let i = 0; i < pending.length; i += batchSize) {
-          await tx.insert(attempts).values(pending.slice(i, i + batchSize).map(({ copy, source, connection }) => ({
+          await tx.insert(attempts).values(pending.slice(i, i + batchSize).map<typeof attempts.$inferInsert>(({ copy, source, connection }) => ({
             publicId: ulid(now.getTime()), kind: "order_file", sourcePublicId: source, orderPublicId,
             connectionPublicId: connection, jobPublicId: prefix + copy, attempt: 1,
             state: "not_written", errorCode: blockedExternal, createdAt: now, finishedAt: now,
