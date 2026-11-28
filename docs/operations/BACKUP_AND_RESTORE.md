@@ -92,6 +92,8 @@ pnpm tsx scripts/ops/backup/prune-backups.ts
 
 ## 5. Operator CLI Isolated Restore Procedure
 
+> **Items deleted permanently from the Trash (increment 09).** A backup is a copy taken at one moment. Orders and customers deleted permanently after that moment are present again in a restore. After restoring, list the `order.purged` and `customer.purged` audit events recorded since the backup's timestamp, and delete those items again from **Administration → Trash**. Copies inside backups expire only under the backup retention above (local pruning), and under the remote lifecycle you set for off-site copies.
+
 Restores **never** overwrite the live database or live object storage directory in place. Instead, `restore-isolated.ts` decrypts and verifies any local or downloaded `.rpbk` archive (even if the live MySQL instance is completely unreachable during full-loss DR) into a brand-new `--target-db` and empty `--target-storage` directory.
 
 ### Exact Operator Restore Command

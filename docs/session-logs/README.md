@@ -15,3 +15,4 @@ values redacted. Newest last.
 | 2026-11-25 | [2026-11-25-session-01.md](2026-11-25-session-01.md) | Upgrade command; increment 07.1: staff ordering handoff, visible portal switch, discount code hints, responsive and accessibility sweep |
 | 2026-11-26 | [2026-11-26-session-01.md](2026-11-26-session-01.md) | Increment 07.2: update prompt, Stripe checkout diagnostics, branded invoices and receipts, signing secret validation, default workflow |
 | 2026-11-26 | [2026-11-26-session-02.md](2026-11-26-session-02.md) | Upgrade command; increment 08: go-live checklist, order wizard, payment confirmation by lookup, add-on orders, billing profile, name parts, new order numbers |
+| 2026-11-27 | [2026-11-27-session-01.md](2026-11-27-session-01.md) | Upgrade recovery after a mistyped confirmation; increment 09: clickable e-mail links, trash centre with restore and permanent deletion, new square logo |
