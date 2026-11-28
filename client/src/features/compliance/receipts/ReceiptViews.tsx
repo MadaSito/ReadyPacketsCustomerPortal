@@ -194,7 +194,7 @@ function ReceiptCard({
       }
       actions={
         <div className="flex flex-wrap items-center gap-2">
-          <OrderLifecycleBadge state={receipt.orderLifecycleState} />
+          <OrderLifecycleBadge state={receipt.orderLifecycleState} audience={area} />
           <ReceiptRefundBadge state={receipt.refundState} />
           <Button
             size="sm"
@@ -519,7 +519,7 @@ function ReceiptDetailBody({
         description={projectLabel ? `Order ${receipt.orderReference} · ${projectLabel}` : `Order ${receipt.orderReference}`}
         meta={
           <div className="flex flex-wrap items-center gap-2">
-            <OrderLifecycleBadge state={receipt.orderLifecycleState} />
+            <OrderLifecycleBadge state={receipt.orderLifecycleState} audience={area} />
             <ReceiptRefundBadge state={receipt.refundState} />
           </div>
         }

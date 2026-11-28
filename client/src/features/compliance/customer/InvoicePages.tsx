@@ -274,7 +274,7 @@ function InvoiceList({
           }
           actions={
             <div className="flex flex-wrap items-center gap-2">
-              <OrderLifecycleBadge state={invoice.orderLifecycleState} />
+              <OrderLifecycleBadge state={invoice.orderLifecycleState} audience="customer" />
               <InvoiceStatusBadge status={invoice.status} />
             </div>
           }
@@ -442,7 +442,7 @@ function InvoiceDetail({ invoice }: { invoice: InvoiceDetailView }) {
         description={projectLabel ? `Order ${invoice.orderReference} · ${projectLabel}` : `Order ${invoice.orderReference}`}
         meta={
           <div className="flex flex-wrap items-center gap-2">
-            <OrderLifecycleBadge state={invoice.orderLifecycleState} />
+            <OrderLifecycleBadge state={invoice.orderLifecycleState} audience="customer" />
             <InvoiceStatusBadge status={invoice.status} />
           </div>
         }

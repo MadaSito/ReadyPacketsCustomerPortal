@@ -763,6 +763,27 @@ describe("customer invoices", () => {
     rcptDetailView.unmount();
   });
 
+  it("never names the staff trash to a customer on a paid invoice whose order is in the trash", async () => {
+    mocks.invoice.mockResolvedValue({
+      ...invoice,
+      status: "paid" as const,
+      balanceDueMinor: 0,
+      netPaidMinor: 10825,
+      orderReference: "RP-2026-ICEQ98",
+      orderLifecycleState: "trashed" as const,
+    });
+    const view = renderUi(
+      <Route path="/invoices/:invoiceId">
+        <InvoiceDetailPage />
+      </Route>,
+      { path: `/invoices/${invoice.invoicePublicId}` },
+    );
+    expect(await screen.findByText("Order unavailable")).toBeVisible();
+    expect(screen.queryByText(/in trash/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "RP-2026-ICEQ98" })).not.toBeInTheDocument();
+    view.unmount();
+  });
+
   it("renders kept paid invoice and receipt for a deleted order with EmailLink and without broken order links", async () => {
     const receiptId = publicId("D");
     mocks.invoice.mockResolvedValue({

@@ -15,9 +15,19 @@ export type InvoiceStatus = "draft" | "issued" | "paid" | "void";
 export type OrderLifecycleState = "live" | "trashed" | "deleted";
 export type IntakeSubmissionStatus = "not_started" | "draft" | "submitted" | "returned_for_changes" | "accepted";
 
-export function OrderLifecycleBadge({ state }: { state?: OrderLifecycleState | undefined }) {
+/**
+ * Console users see the working state ("In trash"). Customers only learn that the order itself can no longer
+ * be opened; the staff-side trash is never named to them.
+ */
+export function OrderLifecycleBadge({
+  state,
+  audience = "console",
+}: {
+  state?: OrderLifecycleState | undefined;
+  audience?: "customer" | "console";
+}) {
   if (state === "trashed") {
-    return <Badge tone="warning">In trash</Badge>;
+    return audience === "customer" ? <Badge tone="neutral">Order unavailable</Badge> : <Badge tone="warning">In trash</Badge>;
   }
   if (state === "deleted") {
     return <Badge tone="neutral">Deleted order</Badge>;
