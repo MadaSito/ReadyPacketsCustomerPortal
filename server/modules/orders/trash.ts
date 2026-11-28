@@ -10,7 +10,7 @@
  * Lock order: order rows in ascending id (a group root is always older than its additions, so root → additions),
  * then users rows (identity's isTrashedInTx). Same order as every existing-order write.
  */
-import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, like, lt, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, like, lt, lte, or, sql, type SQL } from "drizzle-orm";
 import { conflict, notFound } from "../../core/errors.js";
 import type { Clock, Db, DbOrTx, Tx } from "../../core/types.js";
 import type { Services } from "../../container.js";
@@ -47,6 +47,7 @@ export const orderRootInTrash = () => conflict("ROOT_IN_TRASH", "Restore the fir
 export const orderOwnerInTrash = () => conflict("OWNER_IN_TRASH", "Restore the customer account first.");
 export const restorePacketConflict = () =>
   conflict("PACKET_ALREADY_IN_PROJECT", "This project now has the same packet in another order, so this order cannot be restored. Nothing was restored.");
+export const orderOnLegalHold = () => conflict("ORDER_ON_LEGAL_HOLD", "Release the legal hold first.");
 const trashStateChanged = () => conflict("ORDER_TRASH_STATE_CHANGED", "This order changed while you were working. Refresh and try again.");
 
 export interface TrashedOrderRow {
@@ -120,12 +121,16 @@ function entityOf(row: { id: number; publicId: string }, batchId: string): Trash
   return { kind: "order", id: row.id, publicId: row.publicId, batchId };
 }
 
-/** Identity's trash gate for the owner (fails closed when identity does not expose it). */
-async function ownerIsTrashed(services: Services, tx: Tx, userId: number): Promise<boolean> {
-  const users = (services as Partial<Services>).identity as unknown as { users?: { isTrashedInTx?: (tx: Tx, userId: number) => Promise<boolean> } } | undefined;
-  const check = users?.users?.isTrashedInTx;
-  if (typeof check !== "function") throw conflict("OWNER_STATE_UNVERIFIABLE", "The customer account could not be checked. Try again later.");
-  return check.call(users!.users, tx, userId);
+/**
+ * Identity's trash gate for the owners of a restore: locks the users rows FOR SHARE (ascending id, unknown ⇒ gone,
+ * held until commit) BEFORE any order-row lock — users → owned rows, the same order as the coordinator's customer
+ * trash (user FOR UPDATE → orders). Returns the locked set and the gone ids. Fails closed without the gate.
+ */
+async function lockOwners(services: Services, tx: Tx, userIds: number[]): Promise<{ locked: Set<number>; gone: Set<number> }> {
+  const users = (services as Partial<Services>).identity?.users;
+  if (typeof users?.lockGoneInTx !== "function") throw conflict("OWNER_STATE_UNVERIFIABLE", "The customer account could not be checked. Try again later.");
+  const ids = [...new Set(userIds)];
+  return { locked: new Set(ids), gone: new Set(await users.lockGoneInTx(tx, ids)) };
 }
 
 export function createOrderTrash(deps: Deps): OrderTrashService {
@@ -133,6 +138,33 @@ export function createOrderTrash(deps: Deps): OrderTrashService {
   async function lockRows(tx: Tx, ids: number[]): Promise<OrderRow[]> {
     if (ids.length === 0) return [];
     return tx.select().from(orders).where(inArray(orders.id, [...new Set(ids)])).orderBy(asc(orders.id)).for("update");
+  }
+
+  /**
+   * Whole groups for many roots: every root FOR UPDATE (ascending), then — current reads under those root locks —
+   * every addition FOR UPDATE (ascending). The same protocol as one group (root before its additions), so an addition
+   * created or reassigned while we waited is seen.
+   */
+  async function lockGroupsOfRoots(tx: Tx, rootIds: number[]): Promise<OrderRow[]> {
+    const roots = await lockRows(tx, rootIds);
+    const live = roots.filter((r) => r.groupRootOrderId === null).map((r) => r.id);
+    const children = live.length ? await tx.select().from(orders).where(inArray(orders.groupRootOrderId, live)).orderBy(asc(orders.id)).for("update") : [];
+    return [...roots, ...children].sort((a, b) => a.id - b.id);
+  }
+
+  async function rootIdsOf(tx: Tx, where: SQL | undefined): Promise<number[]> {
+    const seen = await tx.select({ id: orders.id, groupRootOrderId: orders.groupRootOrderId }).from(orders).where(where).limit(10_001);
+    if (seen.length > 10_000) throw conflict("CUSTOMER_TOO_MANY_ORDERS", "This customer has too many orders to change at once.");
+    return [...new Set(seen.map((r) => r.groupRootOrderId ?? r.id))];
+  }
+
+  async function groupOwnersOf(tx: Tx, publicId: string): Promise<number[]> {
+    if (!ULID.test(publicId)) return [];
+    const [seen] = await tx.select({ id: orders.id, groupRootOrderId: orders.groupRootOrderId }).from(orders).where(eq(orders.publicId, publicId)).limit(1);
+    if (!seen) return [];
+    const rootId = seen.groupRootOrderId ?? seen.id;
+    const rows = await tx.select({ ownerUserId: orders.ownerUserId }).from(orders).where(or(eq(orders.id, rootId), eq(orders.groupRootOrderId, rootId))).limit(1001);
+    return rows.map((r) => r.ownerUserId);
   }
 
   /** Root + every addition (any trash state), locked in ascending id. Group size is bounded by the add-on cap. */
@@ -153,6 +185,8 @@ export function createOrderTrash(deps: Deps): OrderTrashService {
 
   async function setTrashed(tx: Tx, rows: OrderRow[], input: { batchId: string; actor: TrashActor; reason: string | null }) {
     if (rows.length === 0) return;
+    // D2.8 (lead ruling): an order under legal hold never enters the trash; a cascade containing one fails whole.
+    if (rows.some((r) => r.lockState === "legal_hold")) throw orderOnLegalHold();
     const now = deps.clock.now();
     const result = await tx
       .update(orders)
@@ -256,9 +290,7 @@ export function createOrderTrash(deps: Deps): OrderTrashService {
 
     async trashOrdersOfCustomerInTx(tx, input) {
       const reason = normalizeReason(input.reason);
-      const ids = await tx.select({ id: orders.id }).from(orders).where(eq(orders.ownerUserId, input.ownerUserId)).orderBy(asc(orders.id)).limit(10_001);
-      if (ids.length > 10_000) throw conflict("CUSTOMER_TOO_MANY_ORDERS", "This customer has too many orders to move at once.");
-      const rows = await lockRows(tx, ids.map((r) => r.id));
+      const rows = await lockGroupsOfRoots(tx, await rootIdsOf(tx, eq(orders.ownerUserId, input.ownerUserId)));
       // Current re-read under the locks: only rows still owned by this customer.
       const owned = rows.filter((r) => r.ownerUserId === input.ownerUserId);
       const moving = owned.filter(isLiveOrderRow);
@@ -268,6 +300,10 @@ export function createOrderTrash(deps: Deps): OrderTrashService {
     },
 
     async restoreOrderInTx(tx, input) {
+      // Owners first (plain read of the group's owners, then users FOR SHARE), then the order rows; the locked rows'
+      // owners must be within the locked set, else the group changed meanwhile (409, retry).
+      const owners = await groupOwnersOf(tx, input.orderPublicId);
+      const ownerLocks = await lockOwners(deps.services, tx, owners);
       const group = await lockGroupOf(tx, input.orderPublicId);
       if (!group || group.target.purgedAt) throw orderNotFound();
       const { target } = group;
@@ -279,7 +315,9 @@ export function createOrderTrash(deps: Deps): OrderTrashService {
       // A root brings back the additions of its own batch (not those trashed separately).
       const restoring = target.id === root.id ? group.rows.filter((r) => r.trashBatchId === batchId && r.trashedAt && !r.purgedAt) : [target];
       if (restoring.some((r) => r.purgeStartedAt)) throw orderPurgeStarted();
-      if (await ownerIsTrashed(deps.services, tx, target.ownerUserId)) throw orderOwnerInTrash();
+      // Every owner among the restored rows (a root's batch may hold additions reassigned to another customer).
+      if (restoring.some((r) => !ownerLocks.locked.has(r.ownerUserId))) throw trashStateChanged();
+      if (restoring.some((r) => ownerLocks.gone.has(r.ownerUserId))) throw orderOwnerInTrash();
       await assertNoPacketConflict(tx, group.rows, restoring);
       await clearTrash(tx, restoring, batchId);
       return { entities: restoring.map((r) => entityOf(r, batchId)) };
@@ -287,15 +325,9 @@ export function createOrderTrash(deps: Deps): OrderTrashService {
 
     async restoreOrdersOfBatchInTx(tx, input) {
       if (!ULID.test(input.batchId)) throw orderNotInTrash();
-      const ids = await tx.select({ id: orders.id }).from(orders).where(and(eq(orders.ownerUserId, input.ownerUserId), eq(orders.trashBatchId, input.batchId))).orderBy(asc(orders.id)).limit(10_001);
-      if (ids.length > 10_000) throw conflict("CUSTOMER_TOO_MANY_ORDERS", "This customer has too many orders to restore at once.");
-      // Group roots of those orders (a root is older, so locking all in ascending id keeps root → additions).
-      const seen = await tx.select({ id: orders.id, groupRootOrderId: orders.groupRootOrderId }).from(orders).where(inArray(orders.id, ids.length ? ids.map((r) => r.id) : [0]));
-      const rootIds = [...new Set(seen.map((r) => r.groupRootOrderId ?? r.id))];
-      const groupIds = rootIds.length
-        ? (await tx.select({ id: orders.id }).from(orders).where(or(inArray(orders.id, rootIds), inArray(orders.groupRootOrderId, rootIds)))).map((r) => r.id)
-        : [];
-      const rows = await lockRows(tx, [...groupIds, ...ids.map((r) => r.id)]);
+      const rootIds = await rootIdsOf(tx, and(eq(orders.ownerUserId, input.ownerUserId), eq(orders.trashBatchId, input.batchId)));
+      // Groups are re-read under the root locks (current reads), so the packet check sees additions committed meanwhile.
+      const rows = await lockGroupsOfRoots(tx, rootIds);
       const restoring = rows.filter((r) => r.ownerUserId === input.ownerUserId && r.trashBatchId === input.batchId && r.trashedAt && !r.purgedAt);
       if (restoring.some((r) => r.purgeStartedAt)) throw orderPurgeStarted();
       const restoringIds = new Set(restoring.map((r) => r.id));
@@ -317,6 +349,7 @@ export function createOrderTrash(deps: Deps): OrderTrashService {
       if (!row || row.purgedAt) throw orderNotFound();
       if (!row.trashedAt) throw orderNotInTrash();
       if (row.purgeStartedAt) return; // the same purge resumed (the coordinator keeps one run per entity)
+      if (row.lockState === "legal_hold") throw orderOnLegalHold();
       const result = await tx
         .update(orders)
         .set({ purgeStartedAt: deps.clock.now() })
@@ -329,6 +362,7 @@ export function createOrderTrash(deps: Deps): OrderTrashService {
       if (!row) throw orderNotFound();
       if (row.purgedAt) return; // already a tombstone
       if (!row.trashedAt || !row.purgeStartedAt) throw conflict("ORDER_PURGE_NOT_STARTED", "Permanent deletion of this order has not started.");
+      if (row.lockState === "legal_hold") throw orderOnLegalHold();
       const now = deps.clock.now();
       const result = await tx
         .update(orders)
@@ -410,7 +444,9 @@ export function createOrderTrash(deps: Deps): OrderTrashService {
           ),
         )
         .orderBy(asc(orders.id))
-        .limit(10_000);
+        .limit(10_001);
+      // Never a silently truncated target set (a purge must not tombstone an account with residual orders).
+      if (rows.length > 10_000) throw conflict("CUSTOMER_TOO_MANY_ORDERS", "This customer has too many orders to change at once.");
       return rows.map((r) => ({ kind: "order" as const, id: r.id, publicId: r.publicId, batchId: r.batchId ?? "", trashedAt: r.trashedAt, purgeStartedAt: r.purgeStartedAt }));
     },
 
@@ -422,7 +458,8 @@ export function createOrderTrash(deps: Deps): OrderTrashService {
 
     async ordersInBatchInTx(tx, batchId) {
       if (!ULID.test(batchId)) return [];
-      const rows = await refQuery(tx).where(and(eq(orders.trashBatchId, batchId), isNull(orders.purgedAt))).orderBy(asc(orders.id)).limit(10_000);
+      const rows = await refQuery(tx).where(and(eq(orders.trashBatchId, batchId), isNull(orders.purgedAt))).orderBy(asc(orders.id)).limit(10_001);
+      if (rows.length > 10_000) throw conflict("TRASH_BATCH_TOO_LARGE", "This batch has too many orders to change at once.");
       return withRootPublicIds(tx, rows);
     },
 
@@ -450,9 +487,10 @@ export function createOrderTrash(deps: Deps): OrderTrashService {
         if (entity.kind !== "order") return { deleted: {} };
         const orderId = entity.id;
         return deps.db.transaction(async (tx) => {
-          const [row] = await tx.select({ id: orders.id, trashedAt: orders.trashedAt, purgeStartedAt: orders.purgeStartedAt }).from(orders).where(eq(orders.id, orderId)).for("update").limit(1);
+          const [row] = await tx.select({ id: orders.id, trashedAt: orders.trashedAt, purgeStartedAt: orders.purgeStartedAt, lockState: orders.lockState }).from(orders).where(eq(orders.id, orderId)).for("update").limit(1);
           // Fails closed: only an order whose purge has been claimed by the coordinator is erased.
           if (!row || !row.trashedAt || !row.purgeStartedAt) throw conflict("ORDER_PURGE_NOT_STARTED", "Permanent deletion of this order has not started.");
+          if (row.lockState === "legal_hold") throw orderOnLegalHold();
           const deleted: Record<string, number> = {};
           const del = async (label: string, run: () => Promise<unknown>) => {
             deleted[label] = affectedRows(await run());

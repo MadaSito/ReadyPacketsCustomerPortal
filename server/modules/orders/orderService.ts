@@ -1643,11 +1643,13 @@ export function createOrderService(deps: OrderServiceDeps) {
       if (principal.role !== "admin" || !roleHasCapability(principal.role, "orders.reassign")) throw forbidden("CAPABILITY_NOT_GRANTED");
       assertFreshStepUp(principal);
       const [prior] = await deps.db
-        .select({ r: orderReassignments, orderPublicId: orders.publicId, version: orders.version })
+        .select({ r: orderReassignments, orderPublicId: orders.publicId, version: orders.version, trashedAt: orders.trashedAt, purgedAt: orders.purgedAt })
         .from(orderReassignments)
         .innerJoin(orders, eq(orders.id, orderReassignments.orderId))
         .where(eq(orderReassignments.operationId, input.operationId))
         .limit(1);
+      // Increment 09: a replay never reveals an order that is now in the trash or a tombstone.
+      if (prior && !isLiveOrderRow(prior)) throw ORDER_NOT_FOUND();
       if (prior) {
         const target = await identityPort(deps.services).getUser(prior.r.toUserId);
         if (prior.orderPublicId === input.orderId && target?.publicId === input.targetCustomerPublicId) {

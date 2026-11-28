@@ -45,6 +45,7 @@ function proxy(path: string[]): unknown {
     query: run,
     queryKey: (input?: unknown) => [key, input],
     pathKey: () => [key],
+    pathFilter: () => ({ queryKey: [key] }),
   };
   return new Proxy(api, { get: (target, prop: string) => (prop in target ? target[prop as keyof typeof target] : proxy([...path, prop])) });
 }
@@ -802,6 +803,67 @@ describe("console", () => {
     await user.click(within(dialog).getByRole("button", { name: "Save product" }));
     expect(await within(dialog).findByText("Enter a price such as 125 or 125.50.")).toBeInTheDocument();
     expect(calls.some((c) => c.path === "orders.admin.catalog.createProduct")).toBe(false);
+  });
+
+  it("09 D2.7: administrators move an order to the trash from the detail (confirm, summary, no-refund note, reason) and return to the list", async () => {
+    session.role = "admin";
+    handlers.set("orders.admin.get", () => ({ ...detail, accessRole: "admin", transitions: [] }));
+    handlers.set("orders.admin.referenceHistory", () => []);
+    handlers.set("trash.summarize", () => ({ counts: { additions: 1, lineItems: 2 }, dueAt: "2026-12-27T12:00:00.000Z", cascadedOrders: 0, hasPayments: true }));
+    handlers.set("trash.moveToTrash", () => ({ batchId: "01JTESTBATCH0000000000000A", dueAt: "2026-12-27T12:00:00.000Z", cascadedOrders: 0 }));
+    const user = userEvent.setup();
+    const { location } = renderUi(
+      <Route path="/admin/orders/:orderId">
+        <AdminOrderDetailPage />
+      </Route>,
+      { path: `/admin/orders/${ORDER_ID}` },
+    );
+    await user.click(await screen.findByRole("button", { name: "Move to trash" }));
+    const dialog = await screen.findByRole("alertdialog").catch(() => screen.findByRole("dialog"));
+    expect(within(dialog).getByText(/Move RP-2026-000001 · Synthetic project to the trash\?/)).toBeInTheDocument();
+    expect(await within(dialog).findByText(/never refunds anything/)).toBeInTheDocument();
+    await expectNoAxeViolations(dialog);
+    const reason = within(dialog).getByRole("textbox");
+    await user.type(reason, "Synthetic duplicate");
+    await user.click(within(dialog).getByRole("button", { name: "Move to trash" }));
+    await waitFor(() => expect(calls.find((c) => c.path === "trash.moveToTrash")?.input).toMatchObject({ kind: "order", publicId: ORDER_ID, reason: "Synthetic duplicate" }));
+    await waitFor(() => expect(location.history?.at(-1)).toBe("/admin/orders"));
+    expect(await screen.findByRole("button", { name: "Undo" })).toBeInTheDocument();
+  });
+
+  it("09 D2.7: the list row offers Move to trash to administrators only", async () => {
+    handlers.set("orders.admin.list", () => ({ items: [{ ...listItem, ownerName: "Synthetic Customer" }], nextCursor: null }));
+    session.role = "staff";
+    const staffView = renderUi(<AdminOrdersPage />, { path: "/admin/orders" });
+    await screen.findAllByRole("link", { name: "RP-2026-000001" });
+    expect(screen.queryByRole("button", { name: /Move to trash/ })).not.toBeInTheDocument();
+    staffView.unmount();
+    session.role = "admin";
+    const { container } = renderUi(<AdminOrdersPage />, { path: "/admin/orders" });
+    expect((await screen.findAllByRole("button", { name: "Move to trash: RP-2026-000001" })).length).toBeGreaterThan(0);
+    await expectNoAxeViolations(container);
+  });
+
+  it("09 D2.7 focus: Cancel returns focus to the row action; a successful row move focuses the results region", async () => {
+    session.role = "admin";
+    let items = [{ ...listItem, ownerName: "Synthetic Customer" }];
+    handlers.set("orders.admin.list", () => ({ items, nextCursor: null }));
+    handlers.set("trash.summarize", () => ({ counts: {}, dueAt: null, cascadedOrders: 0, hasPayments: false }));
+    handlers.set("trash.moveToTrash", () => {
+      items = [];
+      return { batchId: "01JTESTBATCH0000000000000A", dueAt: null, cascadedOrders: 0 };
+    });
+    const user = userEvent.setup();
+    renderUi(<AdminOrdersPage />, { path: "/admin/orders" });
+    const opener = (await screen.findAllByRole("button", { name: "Move to trash: RP-2026-000001" }))[0]!;
+    await user.click(opener);
+    let dialog = await screen.findByRole("alertdialog").catch(() => screen.findByRole("dialog"));
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(opener).toHaveFocus());
+    await user.click(opener);
+    dialog = await screen.findByRole("alertdialog").catch(() => screen.findByRole("dialog"));
+    await user.click(within(dialog).getByRole("button", { name: "Move to trash" }));
+    await waitFor(() => expect(screen.getByRole("region", { name: "Order results" })).toHaveFocus());
   });
 
   // The workflows pages (list, designer, versions) are covered in pages/workflows/workflows.test.tsx.

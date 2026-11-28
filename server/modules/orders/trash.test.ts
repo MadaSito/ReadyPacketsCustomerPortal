@@ -70,6 +70,9 @@ beforeAll(async () => {
       async isTrashedInTx(_tx: DbOrTx, userId: number) {
         return trashedOwners.has(userId);
       },
+      async lockGoneInTx(_tx: DbOrTx, userIds: readonly number[]) {
+        return userIds.filter((id) => trashedOwners.has(id));
+      },
     },
   } as unknown as Services["identity"];
   h.services.files = new FakeFiles() as unknown as Services["files"];
@@ -215,6 +218,47 @@ describe("restore rules", () => {
     expect((await rowOf(b.publicId)).trashedAt).not.toBeNull();
     const listed = await mod.trash.ordersOfCustomerInTx(t.db, customer.id, { state: "trashed" });
     expect(listed.map((o) => o.publicId)).toEqual([b.publicId]);
+  });
+});
+
+describe("security findings", () => {
+  it("legal hold: no move to trash (alone or in a customer cascade) and no purge claim: ORDER_ON_LEGAL_HOLD", async () => {
+    const customer = await insertUser(h, t.db);
+    const held = await create(customer, [1], { projectName: "Held Peak" });
+    const other = await create(customer, [2], { projectName: "Open Peak" });
+    await t.db.update(orders).set({ lockState: "legal_hold" }).where(eq(orders.publicId, held.publicId));
+    await expectError(trash(held.publicId), "CONFLICT:ORDER_ON_LEGAL_HOLD");
+    await expectError(tx((q) => mod.trash.trashOrdersOfCustomerInTx(q, { ownerUserId: customer.id, batchId: ulid(h.clock.now().getTime()), actor, reason: null })), "CONFLICT:ORDER_ON_LEGAL_HOLD");
+    expect((await rowOf(other.publicId)).trashedAt).toBeNull();
+    // Put on hold after it was trashed: the purge claim is refused.
+    await trash(other.publicId);
+    await t.db.update(orders).set({ lockState: "legal_hold" }).where(eq(orders.publicId, other.publicId));
+    const row = await rowOf(other.publicId);
+    await expectError(tx((q) => mod.trash.markPurgeStartedInTx(q, { orderId: row.id, runId: "r", actor })), "CONFLICT:ORDER_ON_LEGAL_HOLD");
+  });
+
+  it("restoring a root checks every owner in its batch (an addition reassigned to a customer now in the trash)", async () => {
+    const otherOwner = await insertUser(h, t.db);
+    const root = await create(zeus, [1], { projectName: "Split Ice" });
+    const add = await create(zeus, [2], { addToOrderPublicId: root.publicId });
+    await t.db.update(orders).set({ ownerUserId: otherOwner.id }).where(eq(orders.publicId, add.publicId));
+    await trash(root.publicId);
+    trashedOwners.add(otherOwner.id);
+    try {
+      await expectError(restore(root.publicId), "CONFLICT:OWNER_IN_TRASH");
+    } finally {
+      trashedOwners.delete(otherOwner.id);
+    }
+    expect((await rowOf(root.publicId)).trashedAt).not.toBeNull();
+  });
+
+  it("a reassignment replay of an order now in the trash answers not found", async () => {
+    const target = await insertUser(h, t.db);
+    const order = await create(zeus, [3], { projectName: "Moved Floe" });
+    const input = { orderId: order.publicId, targetCustomerPublicId: target.publicId, expectedVersion: (await rowOf(order.publicId)).version, operationId: idemKey(), reasonCode: "MOVE" };
+    await mod.orders.reassign(admin.principal, input);
+    await trash(order.publicId);
+    await expectError(mod.orders.reassign(admin.principal, input), "NOT_FOUND:ORDER_NOT_FOUND");
   });
 });
 

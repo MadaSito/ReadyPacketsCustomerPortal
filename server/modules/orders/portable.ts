@@ -226,6 +226,28 @@ export function createPortableHooks(deps: PortableDeps) {
     return row ?? null;
   }
 
+  /**
+   * Increment 09: the owner of an order imported into the trash or as a tombstone may itself be in the trash or a
+   * tombstone, so it is read UNGATED by internal id, after a locking current read (FOR SHARE) of the users row.
+   * A trashed owner takes a trashed order or a tombstone; a tombstoned owner only a tombstone; never an owner whose
+   * permanent deletion is still running. A tombstone owner is deactivated, so that check is skipped for tombstones.
+   */
+  async function trashedImportOwner(tx: Tx, userId: number, tombstone: boolean): Promise<{ id: number; publicId: string; role: string; status: string } | null> {
+    const identity = (deps.services as Partial<Services>).identity;
+    if (typeof identity?.users?.isTrashedInTx !== "function" || typeof identity.portableCustomerRefInTx !== "function") return null;
+    await identity.users.isTrashedInTx(tx, userId, { lock: "share" });
+    const ref = await identity.portableCustomerRefInTx(tx, { userId });
+    if (!ref || ref.role !== "customer") return null;
+    if (ref.purgeStartedAt && !ref.purged) return null;
+    if (ref.purged && !tombstone) return null;
+    if (!ref.trashed && !ref.purged) {
+      const live = await identityPort(deps.services).getUser(userId, { tx });
+      if (!live) return null;
+      return { id: live.id, publicId: live.publicId, role: live.role, status: tombstone ? "active" : live.status };
+    }
+    return { id: ref.userId, publicId: ref.publicId, role: ref.role, status: "active" };
+  }
+
   return {
     findImportedOrder,
 
@@ -384,7 +406,7 @@ export function createPortableHooks(deps: PortableDeps) {
         return { id: existing.id, publicId: existing.publicId, reference: existing.reference, created: false, receipts: { lineItems: [], statusHistory: [], customerNotes: [] } };
       }
 
-      const owner = await identityPort(deps.services).getUser(input.targetOwnerUserId, { tx, forUpdate: true });
+      const owner = input.trash ? await trashedImportOwner(tx, input.targetOwnerUserId, tombstone) : await identityPort(deps.services).getUser(input.targetOwnerUserId, { tx, forUpdate: true });
       if (!owner || owner.role !== "customer" || owner.status === "deactivated")
         throw validation("IMPORT_OWNER_NOT_ELIGIBLE", "The mapped owner is not an eligible customer account.");
 
