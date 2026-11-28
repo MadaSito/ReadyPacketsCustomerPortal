@@ -33,6 +33,7 @@ import { billingProfileFeature } from "@/features/billingProfile/routes";
 import { reportsFeature } from "@/features/reports/routes";
 import { doceditFeature } from "@/features/docedit/routes";
 import { opsAlertsFeature } from "@/features/opsAlerts/routes";
+import { trashFeature } from "@/features/trash/routes";
 
 export const FEATURES: readonly FeatureRoutes[] = [
   authFeature,
@@ -67,6 +68,7 @@ export const FEATURES: readonly FeatureRoutes[] = [
   reportsFeature,
   doceditFeature,
   opsAlertsFeature,
+  trashFeature,
 ];
 
 export const ROUTE_WRAPPERS: readonly RouteWrapper[] = FEATURES.flatMap((feature) => feature.routeWrappers ?? []).sort((a, b) => a.order - b.order);

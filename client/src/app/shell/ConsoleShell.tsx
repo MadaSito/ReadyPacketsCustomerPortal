@@ -47,6 +47,11 @@ function SideNav({ groups, collapsed, onNavigate }: { groups: ReturnType<typeof 
                 >
                   <item.icon aria-hidden={true} className="size-5 shrink-0" />
                   {collapsed ? null : <span className="min-w-0 truncate whitespace-nowrap">{item.label}</span>}
+                  {!collapsed && item.badge ? (
+                    <span className="ml-auto shrink-0">
+                      <item.badge />
+                    </span>
+                  ) : null}
                 </Link>
               );
               return <li key={item.href}>{collapsed ? <Tooltip content={item.label} side="right">{link}</Tooltip> : link}</li>;
