@@ -12,7 +12,18 @@ export { formatMinorToDecimalInput, parseDecimalToMinor } from "@/lib/moneyInput
 
 export type PolicyContentFormat = "plain_text" | "safe_markdown";
 export type InvoiceStatus = "draft" | "issued" | "paid" | "void";
+export type OrderLifecycleState = "live" | "trashed" | "deleted";
 export type IntakeSubmissionStatus = "not_started" | "draft" | "submitted" | "returned_for_changes" | "accepted";
+
+export function OrderLifecycleBadge({ state }: { state?: OrderLifecycleState | undefined }) {
+  if (state === "trashed") {
+    return <Badge tone="warning">In trash</Badge>;
+  }
+  if (state === "deleted") {
+    return <Badge tone="neutral">Deleted order</Badge>;
+  }
+  return null;
+}
 
 export function newIdempotencyKey(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {

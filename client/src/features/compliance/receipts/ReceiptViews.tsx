@@ -16,6 +16,7 @@ import {
   Card,
   DateTime,
   Dialog,
+  EmailLink,
   EmptyState,
   ErrorState,
   Field,
@@ -32,6 +33,7 @@ import {
 } from "@/ui";
 import { useCan, useGuardedAction } from "../admin/common";
 import {
+  OrderLifecycleBadge,
   ReceiptRefundBadge,
   downloadReceiptPdf,
   downloadRefundNotePdf,
@@ -192,6 +194,7 @@ function ReceiptCard({
       }
       actions={
         <div className="flex flex-wrap items-center gap-2">
+          <OrderLifecycleBadge state={receipt.orderLifecycleState} />
           <ReceiptRefundBadge state={receipt.refundState} />
           <Button
             size="sm"
@@ -203,7 +206,7 @@ function ReceiptCard({
           >
             Download PDF
           </Button>
-          {area === "console" ? (
+          {area === "console" && (!receipt.orderLifecycleState || receipt.orderLifecycleState === "live") ? (
             <ResendReceiptButton
               receiptPublicId={receipt.receiptPublicId}
               receiptNumber={receipt.receiptNumber}
@@ -229,7 +232,9 @@ function ReceiptCard({
                 {
                   label: "Order",
                   value:
-                    area === "console" ? (
+                    receipt.orderLifecycleState && receipt.orderLifecycleState !== "live" ? (
+                      <span className="font-mono break-all">{receipt.orderReference}</span>
+                    ) : area === "console" ? (
                       <Link
                         href={`/admin/orders/${encodeURIComponent(receipt.orderPublicId)}`}
                         className="font-mono break-all text-action underline underline-offset-2"
@@ -489,10 +494,21 @@ function ReceiptDetailBody({
   }
 
   const snap = receipt.snapshot;
+  const isOrderLive = !receipt.orderLifecycleState || receipt.orderLifecycleState === "live";
   const projectLabel = receipt.projectName?.trim() || snap.projectName?.trim() || null;
   const amount = (minor: number) => <MinorAmount minor={minor} currency={receipt.currency} />;
-  const backHref = area === "console" ? `/admin/orders/${encodeURIComponent(receipt.orderPublicId)}` : "/invoices";
-  const backLabel = area === "console" ? `Order ${receipt.orderReference}` : "Invoices & receipts";
+  const backHref =
+    area === "console"
+      ? isOrderLive
+        ? `/admin/orders/${encodeURIComponent(receipt.orderPublicId)}`
+        : "/admin/invoices"
+      : "/invoices";
+  const backLabel =
+    area === "console"
+      ? isOrderLive
+        ? `Order ${receipt.orderReference}`
+        : "Invoices"
+      : "Invoices & receipts";
   const orderHref = area === "console" ? `/admin/orders/${encodeURIComponent(receipt.orderPublicId)}` : `/orders/${encodeURIComponent(receipt.orderPublicId)}`;
 
   return (
@@ -501,7 +517,12 @@ function ReceiptDetailBody({
         breadcrumbs={<Breadcrumbs items={[{ href: backHref, label: backLabel }, { label: receipt.receiptNumber }]} />}
         title={`Receipt ${receipt.receiptNumber}`}
         description={projectLabel ? `Order ${receipt.orderReference} · ${projectLabel}` : `Order ${receipt.orderReference}`}
-        meta={<ReceiptRefundBadge state={receipt.refundState} />}
+        meta={
+          <div className="flex flex-wrap items-center gap-2">
+            <OrderLifecycleBadge state={receipt.orderLifecycleState} />
+            <ReceiptRefundBadge state={receipt.refundState} />
+          </div>
+        }
         actions={
           <div className="flex flex-wrap gap-2">
             <Button
@@ -541,13 +562,15 @@ function ReceiptDetailBody({
           items={[
             {
               label: "Order",
-              value: (
+              value: isOrderLive ? (
                 <Link
                   href={orderHref}
                   className="font-mono font-semibold break-all text-action underline underline-offset-2"
                 >
                   {receipt.orderReference}
                 </Link>
+              ) : (
+                <span className="font-mono font-semibold break-all">{receipt.orderReference}</span>
               ),
             },
             {
@@ -568,7 +591,7 @@ function ReceiptDetailBody({
             items={[
               { label: "Company", value: snap.company.legalName },
               ...(snap.company.address ? [{ label: "Address", value: <span className="whitespace-pre-wrap">{snap.company.address}</span> }] : []),
-              ...(snap.company.contact ? [{ label: "Contact", value: snap.company.contact }] : []),
+              ...(snap.company.contact ? [{ label: "Contact", value: <EmailLink email={snap.company.contact} /> }] : []),
               ...(snap.company.taxId ? [{ label: "Tax ID", value: snap.company.taxId }] : []),
             ]}
           />
@@ -578,7 +601,14 @@ function ReceiptDetailBody({
             columns={1}
             items={[
               { label: "Customer", value: snap.customer.name },
-              { label: "Email", value: snap.customer.email },
+              {
+                label: "Email",
+                value: snap.customer.email ? (
+                  <EmailLink email={snap.customer.email} />
+                ) : (
+                  <span className="text-muted">Not available</span>
+                ),
+              },
               ...(snap.customer.customerRef ? [{ label: "Customer reference", value: snap.customer.customerRef }] : []),
               { label: "Issued on", value: <DateTime value={receipt.issuedAt} /> },
             ]}
@@ -757,6 +787,23 @@ const BRAND_LOGO_OPTIONS = [
 
 type BrandLogoPath = (typeof BRAND_LOGO_OPTIONS)[number]["value"];
 
+function normalizeBrandLogoPath(raw: string): BrandLogoPath {
+  const match = BRAND_LOGO_OPTIONS.find((opt) => opt.value === raw);
+  return match ? match.value : BRAND_LOGO_OPTIONS[0].value;
+}
+
+interface CompanyProfileInitialData {
+  issuerName: string;
+  issuerAddress: string;
+  issuerContact: string;
+  issuerTaxId: string;
+  issuerLogo: {
+    mode: "brand" | "none";
+    brandPath: string;
+  };
+  paymentInstructions: string;
+}
+
 interface CompanyProfileData {
   issuerName: string;
   issuerAddress: string;
@@ -775,7 +822,7 @@ function CompanyProfileForm({
   onCancel,
   onSave,
 }: {
-  initial: CompanyProfileData;
+  initial: CompanyProfileInitialData;
   saving: boolean;
   onCancel: () => void;
   onSave: (next: CompanyProfileData) => Promise<string | null>;
@@ -785,7 +832,9 @@ function CompanyProfileForm({
   const [issuerContact, setIssuerContact] = useState(initial.issuerContact);
   const [issuerTaxId, setIssuerTaxId] = useState(initial.issuerTaxId);
   const [logoMode, setLogoMode] = useState<"brand" | "none">(initial.issuerLogo.mode);
-  const [logoBrandPath, setLogoBrandPath] = useState<BrandLogoPath>(initial.issuerLogo.brandPath);
+  const [logoBrandPath, setLogoBrandPath] = useState<BrandLogoPath>(() =>
+    normalizeBrandLogoPath(initial.issuerLogo.brandPath),
+  );
   const [paymentInstructions, setPaymentInstructions] = useState(initial.paymentInstructions);
   const [error, setError] = useState<string | null>(null);
 

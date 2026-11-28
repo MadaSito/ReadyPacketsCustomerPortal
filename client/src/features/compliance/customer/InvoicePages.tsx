@@ -4,10 +4,10 @@ import { useState, type ReactNode } from "react";
 import { Link, useLocation, useParams, useSearch } from "wouter";
 import type { InvoiceDetailView, InvoicePaymentView, InvoiceSummaryView } from "@server/modules/compliance/invoicesService";
 import { errorMessage, useTRPC } from "@/lib/trpc";
-import { Breadcrumbs, Button, Callout, Card, DateTime, EmptyState, ErrorState, KeyValueList, LoadMore, Money, PageHeader, Section, Skeleton, Tabs } from "@/ui";
+import { Breadcrumbs, Button, Callout, Card, DateTime, EmailLink, EmptyState, ErrorState, KeyValueList, LoadMore, Money, PageHeader, Section, Skeleton, Tabs } from "@/ui";
 import { useCan } from "../admin/common";
 import { ConsoleOrderReceiptsSection, CustomerOrderReceiptsSection, CustomerReceiptsPanel } from "../receipts/ReceiptViews";
-import { downloadInvoicePdf, InvoiceStatusBadge } from "../shared";
+import { downloadInvoicePdf, InvoiceStatusBadge, OrderLifecycleBadge } from "../shared";
 
 const PUBLIC_ID_PATTERN = /^[0-9A-HJKMNP-TV-Z]{26}$/u;
 
@@ -266,20 +266,33 @@ function InvoiceList({
   return <ul className="grid gap-3">
     {items.map((invoice) => (
       <li key={invoice.invoicePublicId}>
-        <Card title={<Link href={`${baseHref}/${encodeURIComponent(invoice.invoicePublicId)}`} className="inline-flex min-h-6 items-center py-0.5 text-action underline underline-offset-2">
-          {invoice.invoiceNumber ?? fallbackLabel}
-        </Link>} actions={<InvoiceStatusBadge status={invoice.status} />}>
+        <Card
+          title={
+            <Link href={`${baseHref}/${encodeURIComponent(invoice.invoicePublicId)}`} className="inline-flex min-h-6 items-center py-0.5 text-action underline underline-offset-2">
+              {invoice.invoiceNumber ?? fallbackLabel}
+            </Link>
+          }
+          actions={
+            <div className="flex flex-wrap items-center gap-2">
+              <OrderLifecycleBadge state={invoice.orderLifecycleState} />
+              <InvoiceStatusBadge status={invoice.status} />
+            </div>
+          }
+        >
           <KeyValueList columns={3} items={[
             ...(showOrder ? [{
               label: "Order",
-              value: (
-                <Link
-                  href={`${orderBaseHref}/${encodeURIComponent(invoice.orderPublicId)}`}
-                  className="font-mono break-all text-action underline underline-offset-2"
-                >
-                  {invoice.orderReference}
-                </Link>
-              ),
+              value:
+                invoice.orderLifecycleState && invoice.orderLifecycleState !== "live" ? (
+                  <span className="font-mono break-all">{invoice.orderReference}</span>
+                ) : (
+                  <Link
+                    href={`${orderBaseHref}/${encodeURIComponent(invoice.orderPublicId)}`}
+                    className="font-mono break-all text-action underline underline-offset-2"
+                  >
+                    {invoice.orderReference}
+                  </Link>
+                ),
             }] : []),
             ...(showOrder && invoice.projectName?.trim()
               ? [{ label: "Project", value: <span className="break-words">{invoice.projectName.trim()}</span> }]
@@ -419,14 +432,20 @@ function InvoiceDetail({ invoice }: { invoice: InvoiceDetailView }) {
     finally { setDownloading(false); }
   }
   const amount = (minor: number) => <Amount minor={minor} currency={invoice.currency} />;
-  const canPayOnline = invoice.onlinePaymentConfigured && invoice.status === "issued" && invoice.balanceDueMinor > 0;
+  const isOrderLive = !invoice.orderLifecycleState || invoice.orderLifecycleState === "live";
+  const canPayOnline = isOrderLive && invoice.onlinePaymentConfigured && invoice.status === "issued" && invoice.balanceDueMinor > 0;
   const projectLabel = invoice.projectName?.trim() || null;
   return (
     <div className="space-y-6">
       <PageHeader breadcrumbs={<Breadcrumbs items={[{ href: "/invoices", label: "Invoices" }, { label: invoice.invoiceNumber ?? "Invoice details" }]} />}
         title={invoice.invoiceNumber ?? "Invoice details"}
         description={projectLabel ? `Order ${invoice.orderReference} · ${projectLabel}` : `Order ${invoice.orderReference}`}
-        meta={<InvoiceStatusBadge status={invoice.status} />}
+        meta={
+          <div className="flex flex-wrap items-center gap-2">
+            <OrderLifecycleBadge state={invoice.orderLifecycleState} />
+            <InvoiceStatusBadge status={invoice.status} />
+          </div>
+        }
         actions={
           <div className="flex flex-wrap items-center gap-2">
             {canPayOnline ? (
@@ -444,13 +463,15 @@ function InvoiceDetail({ invoice }: { invoice: InvoiceDetailView }) {
         <KeyValueList columns={2} items={[
           {
             label: "Order",
-            value: (
+            value: isOrderLive ? (
               <Link
                 href={`/orders/${encodeURIComponent(invoice.orderPublicId)}`}
                 className="font-mono font-semibold break-all text-action underline underline-offset-2"
               >
                 {invoice.orderReference}
               </Link>
+            ) : (
+              <span className="font-mono font-semibold break-all">{invoice.orderReference}</span>
             ),
           },
           {
@@ -461,11 +482,28 @@ function InvoiceDetail({ invoice }: { invoice: InvoiceDetailView }) {
               <span className="text-muted">Not specified</span>
             ),
           },
+          ...(invoice.buyer
+            ? [
+                { label: "Billed to", value: invoice.buyer.name },
+                {
+                  label: "Billing email",
+                  value: invoice.buyer.email ? (
+                    <EmailLink email={invoice.buyer.email} />
+                  ) : (
+                    <span className="text-muted">Not available</span>
+                  ),
+                },
+                ...(invoice.buyer.customerRef
+                  ? [{ label: "Customer reference", value: <span className="font-mono">{invoice.buyer.customerRef}</span> }]
+                  : []),
+              ]
+            : []),
         ]} />
       </Card>
       <Card title="Invoice summary">
         <KeyValueList columns={3} items={[
           { label: "Issued by", value: invoice.issuerName },
+          ...(invoice.issuerContact ? [{ label: "Billing contact", value: <EmailLink email={invoice.issuerContact} /> }] : []),
           { label: "Issued on", value: invoice.issuedAt && <DateTime value={invoice.issuedAt} format="date" /> },
           { label: "Due date", value: <DueDate date={invoice.dueAt} /> },
           { label: "Subtotal", value: amount(invoice.subtotalMinor) },

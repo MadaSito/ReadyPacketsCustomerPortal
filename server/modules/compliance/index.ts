@@ -74,6 +74,7 @@ import {
 import { createPolicyEnforcement, type PolicyEnforcementService } from "./policyEnforcement.js";
 import { createPolicyNoticeRuntime } from "./policyNoticesRuntime.js";
 import { createInvoicesPublicApiProvider } from "./publicApiProvider.js";
+import { createComplianceTrashParticipant } from "./trashParticipant.js";
 
 export type PolicyNoticesService = ReturnType<typeof createPolicyNoticeRuntime>;
 export type { PolicyEnforcementService };
@@ -289,6 +290,11 @@ export function createComplianceModule(deps: ModuleDeps): ComplianceModule {
     acceptance,
 
     async init(): Promise<void> {
+      const trashRegistry = (
+        deps.services as Partial<typeof deps.services>
+      ).trash;
+      trashRegistry?.register(createComplianceTrashParticipant(deps, invoices));
+
       acceptance.register();
       const ordersSvc = (
         deps.services as unknown as {

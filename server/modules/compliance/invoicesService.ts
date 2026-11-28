@@ -5,7 +5,10 @@ import { conflict, DomainError, notFound, validation } from "../../core/errors.j
 import { ulid } from "../../core/ids.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { readSetting, writeSetting } from "../platform/index.js";
+import { users } from "../identity/schema.js";
+import { isLiveUserRow } from "../identity/live.js";
 import { orders } from "../orders/schema.js";
+import { liveOrderIdPredicate } from "../orders/trashGate.js";
 import { sanitizeCardBrand, sanitizeCardLast4 } from "../payments/settings.js";
 import { assertLiveActorInTx, denyComplianceAuthz, runComplianceTx } from "./actorAuth.js";
 import {
@@ -81,11 +84,20 @@ export interface InvoiceRefundView {
   origin: "portal" | "import";
 }
 
+export type InvoiceOrderLifecycleState = "live" | "trashed" | "deleted";
+
+export interface InvoiceBuyerSnapshot {
+  name: string;
+  email: string;
+  customerRef: string | null;
+}
+
 export interface InvoiceSummaryView {
   invoicePublicId: string;
   orderPublicId: string;
   orderReference: string;
   projectName?: string | null;
+  orderLifecycleState?: InvoiceOrderLifecycleState;
   invoiceNumber: string | null;
   status: InvoiceStatus;
   paymentState: InvoicePaymentState;
@@ -114,6 +126,8 @@ export interface InvoiceDetailView extends InvoiceSummaryView {
   promoLabel: string | null;
   issuerName: string;
   issuerAddress: string;
+  issuerContact?: string | null;
+  buyer?: InvoiceBuyerSnapshot | null;
   memo: string | null;
   voidReason: string | null;
   paymentInstructions: string;
@@ -759,49 +773,341 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     return map;
   }
 
+  const invoiceBuyerSnapshotAad = (invoicePublicId: string) =>
+    `compliance_invoices.buyer_snapshot:${invoicePublicId}`;
+
+  function encodeBuyerSnapshot(invoicePublicId: string, buyer: InvoiceBuyerSnapshot): string {
+    return deps.crypto.encrypt(JSON.stringify(buyer), invoiceBuyerSnapshotAad(invoicePublicId));
+  }
+
+  function decodeBuyerSnapshot(
+    invoicePublicId: string,
+    enc: string | null | undefined,
+    customerRefFallback: string | null,
+  ): InvoiceBuyerSnapshot | null {
+    if (!enc) return null;
+    try {
+      const parsed = JSON.parse(
+        deps.crypto.decrypt(enc, invoiceBuyerSnapshotAad(invoicePublicId)),
+      ) as Partial<InvoiceBuyerSnapshot>;
+      const name = typeof parsed.name === "string" && parsed.name.trim() ? parsed.name.trim() : "Customer";
+      const email = typeof parsed.email === "string" ? parsed.email.trim() : "";
+      const customerRef =
+        typeof parsed.customerRef === "string" && parsed.customerRef.trim()
+          ? parsed.customerRef.trim()
+          : customerRefFallback;
+      return { name, email, customerRef };
+    } catch {
+      return null;
+    }
+  }
+
+  async function resolveFreshBuyerProfileInTx(
+    dbOrTx: DbOrTx,
+    ownerUserId: number,
+  ): Promise<InvoiceBuyerSnapshot | null> {
+    if (!Number.isInteger(ownerUserId) || ownerUserId <= 0) return null;
+    try {
+      const [row] = await dbOrTx
+        .select({
+          id: users.id,
+          publicId: users.publicId,
+          emailEnc: users.emailEnc,
+          nameEnc: users.nameEnc,
+          customerRef: users.customerRef,
+          purgedAt: users.purgedAt,
+        })
+        .from(users)
+        .where(eq(users.id, ownerUserId))
+        .limit(1);
+      if (row) {
+        if (row.purgedAt !== null) {
+          return {
+            name: "Deleted account",
+            email: "",
+            customerRef: row.customerRef ?? null,
+          };
+        }
+        const name = deps.crypto.decrypt(row.nameEnc, `users.name:${row.publicId}`).trim();
+        const email = deps.crypto.decrypt(row.emailEnc, `users.email:${row.publicId}`).trim();
+        return {
+          name: name || "Customer",
+          email,
+          customerRef: row.customerRef ?? null,
+        };
+      }
+    } catch {
+      // Standalone compliance unit tests may omit `users` rows.
+    }
+
+    const identitySvc = (deps.services as Partial<typeof deps.services>).identity;
+    if (identitySvc && typeof identitySvc.getUser === "function") {
+      try {
+        const user = await identitySvc.getUser(ownerUserId);
+        if (user) {
+          return {
+            name: user.name?.trim() || "Customer",
+            email: user.email?.trim() || "",
+            customerRef: user.customerRef ?? null,
+          };
+        }
+      } catch {
+        // Ignore lookup error.
+      }
+    }
+    return null;
+  }
+
+  async function captureFreshBuyerSnapshotInTx(
+    tx: Tx,
+    ownerUserId: number,
+    invoicePublicId: string,
+  ): Promise<{ buyerSnapshotEnc: string | null; customerRefSnapshot: string | null }> {
+    const buyer = await resolveFreshBuyerProfileInTx(tx, ownerUserId);
+    if (!buyer || buyer.name === "Deleted account") {
+      return {
+        buyerSnapshotEnc: null,
+        customerRefSnapshot: buyer?.customerRef ?? null,
+      };
+    }
+    return {
+      buyerSnapshotEnc: encodeBuyerSnapshot(invoicePublicId, buyer),
+      customerRefSnapshot: buyer.customerRef,
+    };
+  }
+
+  async function readLiveOrFrozenBuyerInTx(
+    dbOrTx: DbOrTx,
+    ownerUserId: number | null,
+    inv: {
+      publicId: string;
+      buyerSnapshotEnc: string | null;
+      customerRefSnapshot: string | null;
+    },
+  ): Promise<InvoiceBuyerSnapshot | null> {
+    const frozen = decodeBuyerSnapshot(inv.publicId, inv.buyerSnapshotEnc, inv.customerRefSnapshot);
+    if (frozen) return frozen;
+    if (ownerUserId !== null && ownerUserId > 0) {
+      const live = await resolveFreshBuyerProfileInTx(dbOrTx, ownerUserId);
+      if (live) {
+        return {
+          ...live,
+          customerRef: live.customerRef ?? inv.customerRefSnapshot ?? null,
+        };
+      }
+    }
+    if (inv.customerRefSnapshot) {
+      return {
+        name: "Customer",
+        email: "",
+        customerRef: inv.customerRefSnapshot,
+      };
+    }
+    return null;
+  }
+
+  async function freezeInvoicesForOrderInTx(tx: Tx, orderId: number): Promise<void> {
+    const issuedRows = await tx
+      .select()
+      .from(complianceInvoices)
+      .where(eq(complianceInvoices.orderId, orderId))
+      .orderBy(asc(complianceInvoices.id))
+      .for("update");
+
+    const targets = issuedRows.filter((row) => row.issuedAt !== null);
+    if (targets.length === 0) return;
+
+    let orderRef: string | null = null;
+    let ownerUserId: number | null = null;
+    try {
+      const [ord] = await tx
+        .select({
+          reference: orders.reference,
+          ownerUserId: orders.ownerUserId,
+        })
+        .from(orders)
+        .where(eq(orders.id, orderId))
+        .limit(1);
+      if (ord) {
+        orderRef = ord.reference || null;
+        ownerUserId = ord.ownerUserId;
+      }
+    } catch {
+      // Standalone tests may omit `orders` rows.
+    }
+    const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+    if ((!orderRef || ownerUserId === null) && ordersSvc) {
+      if (typeof ordersSvc.retainedOrderRefInTx === "function") {
+        const ret = await ordersSvc.retainedOrderRefInTx(tx, orderId);
+        if (ret) {
+          orderRef = orderRef ?? ret.reference;
+          ownerUserId = ownerUserId ?? ret.ownerUserId;
+        }
+      } else if (typeof ordersSvc.getOrderRefById === "function") {
+        const ref = await ordersSvc.getOrderRefById(orderId, tx);
+        if (ref) {
+          orderRef = orderRef ?? ref.reference;
+          ownerUserId = ownerUserId ?? ref.ownerUserId;
+        }
+      }
+    }
+
+    const [issuerName, issuerAddress, issuerContact] = await Promise.all([
+      readSetting(deps.settings, INVOICE_ISSUER_NAME, tx),
+      readSetting(deps.settings, INVOICE_ISSUER_ADDRESS, tx),
+      readSetting(deps.settings, INVOICE_ISSUER_CONTACT, tx),
+    ]);
+    const freshBuyer =
+      ownerUserId !== null ? await resolveFreshBuyerProfileInTx(tx, ownerUserId) : null;
+
+    const now = deps.clock.now();
+    for (const inv of targets) {
+      const needsBuyer = !inv.buyerSnapshotEnc && freshBuyer && freshBuyer.name !== "Deleted account";
+      const nextBuyerEnc = needsBuyer
+        ? encodeBuyerSnapshot(inv.publicId, freshBuyer)
+        : inv.buyerSnapshotEnc;
+      const nextCustomerRef =
+        inv.customerRefSnapshot ?? freshBuyer?.customerRef ?? null;
+      const nextOrderRef =
+        inv.orderReferenceSnapshot ?? orderRef ?? inv.orderPublicId;
+      const nextIssuerName = inv.issuerNameSnapshot ?? issuerName;
+      const nextIssuerAddress = inv.issuerAddressSnapshot ?? issuerAddress;
+      const nextIssuerContact = inv.issuerContactSnapshot ?? issuerContact;
+
+      if (
+        nextBuyerEnc !== inv.buyerSnapshotEnc ||
+        nextCustomerRef !== inv.customerRefSnapshot ||
+        nextOrderRef !== inv.orderReferenceSnapshot ||
+        nextIssuerName !== inv.issuerNameSnapshot ||
+        nextIssuerAddress !== inv.issuerAddressSnapshot ||
+        nextIssuerContact !== inv.issuerContactSnapshot
+      ) {
+        await tx
+          .update(complianceInvoices)
+          .set({
+            buyerSnapshotEnc: nextBuyerEnc,
+            customerRefSnapshot: nextCustomerRef,
+            orderReferenceSnapshot: nextOrderRef,
+            issuerNameSnapshot: nextIssuerName,
+            issuerAddressSnapshot: nextIssuerAddress,
+            issuerContactSnapshot: nextIssuerContact,
+            updatedAt: now,
+          })
+          .where(eq(complianceInvoices.id, inv.id));
+      }
+    }
+  }
+
   async function resolveOrderMetaMap(
     dbOrTx: DbOrTx,
     orderIds: readonly number[],
-  ): Promise<Map<number, { reference: string; projectName: string | null }>> {
-    const out = new Map<number, { reference: string; projectName: string | null }>();
+  ): Promise<
+    Map<
+      number,
+      {
+        reference: string;
+        projectName: string | null;
+        lifecycle: InvoiceOrderLifecycleState;
+        ownerUserId: number | null;
+      }
+    >
+  > {
+    const out = new Map<
+      number,
+      {
+        reference: string;
+        projectName: string | null;
+        lifecycle: InvoiceOrderLifecycleState;
+        ownerUserId: number | null;
+      }
+    >();
     const uniqueIds = [...new Set(orderIds.filter((id) => Number.isInteger(id) && id > 0))];
     if (uniqueIds.length === 0) return out;
 
+    const seenSqlIds = new Set<number>();
     try {
       const ordRows = await dbOrTx
         .select({
           id: orders.id,
           reference: orders.reference,
           projectName: orders.projectName,
+          ownerUserId: orders.ownerUserId,
+          trashedAt: orders.trashedAt,
+          purgedAt: orders.purgedAt,
         })
         .from(orders)
         .where(inArray(orders.id, uniqueIds));
       for (const row of ordRows) {
+        seenSqlIds.add(row.id);
         const trimmedProject = row.projectName?.trim() || null;
-        out.set(row.id, {
-          reference: row.reference,
-          projectName: trimmedProject,
-        });
+        if (row.purgedAt !== null) {
+          out.set(row.id, {
+            reference: row.reference,
+            projectName: "Deleted order",
+            lifecycle: "deleted",
+            ownerUserId: row.ownerUserId,
+          });
+        } else if (row.trashedAt !== null) {
+          out.set(row.id, {
+            reference: row.reference,
+            projectName: trimmedProject,
+            lifecycle: "trashed",
+            ownerUserId: row.ownerUserId,
+          });
+        } else {
+          out.set(row.id, {
+            reference: row.reference,
+            projectName: trimmedProject,
+            lifecycle: "live",
+            ownerUserId: row.ownerUserId,
+          });
+        }
       }
     } catch {
       // Standalone compliance unit tests may run without `orders` table populated.
     }
 
     const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
-    if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
-      for (const orderId of uniqueIds) {
-        const existing = out.get(orderId);
-        if (existing && existing.projectName) continue;
+    for (const orderId of uniqueIds) {
+      const existing = out.get(orderId);
+      if (existing && (existing.lifecycle !== "live" || existing.projectName)) continue;
+
+      if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
         const ref = await ordersSvc.getOrderRefById(
           orderId,
           dbOrTx !== deps.db ? (dbOrTx as Tx) : undefined,
         );
-        if (!ref) continue;
-        const candidateName =
-          typeof (ref as { name?: unknown }).name === "string" ? ref.name.trim() : "";
+        if (ref) {
+          const candidateName =
+            typeof (ref as { name?: unknown }).name === "string" ? ref.name.trim() : "";
+          out.set(orderId, {
+            reference: existing?.reference || ref.reference,
+            projectName: existing?.projectName ?? (candidateName || null),
+            lifecycle: "live",
+            ownerUserId: existing?.ownerUserId ?? ref.ownerUserId,
+          });
+          continue;
+        }
+      }
+
+      if (!seenSqlIds.has(orderId)) {
+        if (ordersSvc && typeof ordersSvc.retainedOrderRefInTx === "function") {
+          const ret = await ordersSvc.retainedOrderRefInTx(dbOrTx as Tx, orderId);
+          if (ret) {
+            out.set(orderId, {
+              reference: ret.reference,
+              projectName: ret.purged ? "Deleted order" : null,
+              lifecycle: ret.purged ? "deleted" : ret.trashed ? "trashed" : "live",
+              ownerUserId: ret.ownerUserId,
+            });
+            continue;
+          }
+        }
         out.set(orderId, {
-          reference: existing?.reference || ref.reference,
-          projectName: existing?.projectName ?? (candidateName || null),
+          reference: "",
+          projectName: "Deleted order",
+          lifecycle: "deleted",
+          ownerUserId: null,
         });
       }
     }
@@ -814,6 +1120,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     orderReference: string,
     sums: LedgerSums,
     projectName: string | null = null,
+    orderLifecycleState: InvoiceOrderLifecycleState = "live",
   ): InvoiceSummaryView {
     const derivedStatus = deriveInvoiceStatus({
       issuedAt: inv.issuedAt,
@@ -839,8 +1146,9 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     return {
       invoicePublicId: inv.publicId,
       orderPublicId: inv.orderPublicId,
-      orderReference,
-      projectName,
+      orderReference: orderReference || inv.orderReferenceSnapshot || inv.orderPublicId,
+      projectName: orderLifecycleState === "deleted" ? (projectName ?? "Deleted order") : projectName,
+      orderLifecycleState,
       invoiceNumber: inv.invoiceNumber,
       status: derivedStatus,
       paymentState: derivedPaymentState,
@@ -956,19 +1264,48 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     if (principal.state !== "full" || principal.pendingSteps.length > 0) {
       throw notFound("INVOICE_NOT_FOUND");
     }
+    const liveActor = await assertLiveActorInTx(deps, principal, deps.db as unknown as Tx);
+    const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
     const ordersSvc = requireOrdersService();
-    const accessible = await ordersSvc.listAccessibleOrderIds(principal, { limit: 1000 });
+    const accessible = await ordersSvc.listAccessibleOrderIds(livePrincipal, { limit: 1000 });
     const limit = Math.min(Math.max(input.limit ?? 25, 1), 100);
     const afterId = decodeIdCursor(input.cursor);
-    const staffView = isStaffOrAdmin(principal);
+    const staffView = isStaffOrAdmin(livePrincipal);
 
-    if (!accessible.all && accessible.orderIds.length === 0) {
+    // D2.6: while an order is in trash or deleted, paid invoices stay available to the owning customer
+    // while unpaid/void/draft invoices are hidden.
+    const nonLiveOwnedOrderIds = new Set<number>();
+    if (!accessible.all) {
+      try {
+        const ownedRows = await deps.db
+          .select({
+            id: orders.id,
+            trashedAt: orders.trashedAt,
+            purgedAt: orders.purgedAt,
+          })
+          .from(orders)
+          .where(eq(orders.ownerUserId, liveActor.userId));
+        for (const row of ownedRows) {
+          if (row.trashedAt !== null || row.purgedAt !== null) {
+            nonLiveOwnedOrderIds.add(row.id);
+          }
+        }
+      } catch {
+        // Standalone compliance unit tests may omit `orders` rows.
+      }
+    }
+
+    const candidateOrderIds = accessible.all
+      ? []
+      : Array.from(new Set([...accessible.orderIds, ...nonLiveOwnedOrderIds]));
+
+    if (!accessible.all && candidateOrderIds.length === 0) {
       return { items: [], nextCursor: null };
     }
 
     const conds = [];
     if (!accessible.all) {
-      conds.push(inArray(complianceInvoices.orderId, accessible.orderIds));
+      conds.push(inArray(complianceInvoices.orderId, candidateOrderIds));
     }
     if (afterId !== null) {
       conds.push(lt(complianceInvoices.id, afterId));
@@ -982,42 +1319,53 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       .from(complianceInvoices)
       .where(conds.length > 0 ? and(...conds) : undefined)
       .orderBy(desc(complianceInvoices.id))
-      .limit(limit + 25);
+      .limit(limit + 50);
 
     const candidates = staffView ? rows : rows.filter((r) => r.issuedAt !== null);
-    const sumsMap = await computeLedgerSums(
-      deps.db,
-      candidates.map((r) => r.id),
-    );
-    const visible = input.status
-      ? candidates.filter((r) => {
-          const s = sumsMap.get(r.id) ?? EMPTY_LEDGER_SUMS;
-          return (
-            deriveInvoiceStatus({
-              totalMinor: r.totalMinor,
-              issuedAt: r.issuedAt,
-              voidedAt: r.voidedAt,
-              grossPaidMinor: s.settledGrossMinor,
-              refundedMinor: s.refundedMinor,
-            }) === input.status
-          );
-        })
-      : candidates;
+    const candidateUniqueOrderIds = Array.from(new Set(candidates.map((r) => r.orderId)));
+    const [sumsMap, orderMetaMap] = await Promise.all([
+      computeLedgerSums(
+        deps.db,
+        candidates.map((r) => r.id),
+      ),
+      resolveOrderMetaMap(deps.db, candidateUniqueOrderIds),
+    ]);
+
+    const visible = candidates.filter((r) => {
+      const s = sumsMap.get(r.id) ?? EMPTY_LEDGER_SUMS;
+      const derived = deriveInvoiceStatus({
+        totalMinor: r.totalMinor,
+        issuedAt: r.issuedAt,
+        voidedAt: r.voidedAt,
+        grossPaidMinor: s.settledGrossMinor,
+        refundedMinor: s.refundedMinor,
+      });
+      if (!staffView) {
+        const meta = orderMetaMap.get(r.orderId);
+        const isNonLive =
+          nonLiveOwnedOrderIds.has(r.orderId) || (meta !== undefined && meta.lifecycle !== "live");
+        if (isNonLive && derived !== "paid") {
+          return false;
+        }
+      }
+      if (input.status && derived !== input.status) {
+        return false;
+      }
+      return true;
+    });
+
     const hasMore = visible.length > limit;
     const slice = hasMore ? visible.slice(0, limit) : visible;
-
-    // Resolve order references and project names
-    const uniqueOrderIds = Array.from(new Set(slice.map((s) => s.orderId)));
-    const orderMetaMap = await resolveOrderMetaMap(deps.db, uniqueOrderIds);
 
     const items = slice
       .map((inv) => {
         const meta = orderMetaMap.get(inv.orderId);
         return toSummaryView(
           inv,
-          meta?.reference ?? inv.orderPublicId,
+          meta?.reference || inv.orderReferenceSnapshot || inv.orderPublicId,
           sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS,
           meta?.projectName ?? null,
+          meta?.lifecycle ?? "live",
         );
       })
       .filter((view) => (input.status ? view.status === input.status : true));
@@ -1029,6 +1377,136 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     };
   }
 
+  async function resolveInvoiceOrderAccess(
+    principal: SessionPrincipal,
+    inv: typeof complianceInvoices.$inferSelect,
+    sums: LedgerSums,
+    opts?: { tx?: Tx },
+  ): Promise<{
+    liveActor: { userId: number; role: SessionPrincipal["role"] };
+    livePrincipal: SessionPrincipal;
+    staffView: boolean;
+    lifecycle: InvoiceOrderLifecycleState;
+    orderReference: string;
+    ownerUserId: number | null;
+    liveOrderView: Awaited<ReturnType<ReturnType<typeof requireOrdersService>["assertCanReadOrder"]>> | null;
+  }> {
+    const dbOrTx = opts?.tx ?? (deps.db as unknown as Tx);
+    const liveActor = await assertLiveActorInTx(deps, principal, dbOrTx);
+    const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
+    const staffView = isStaffOrAdmin(livePrincipal);
+    const ordersSvc = requireOrdersService();
+
+    try {
+      const orderView = await ordersSvc.assertCanReadOrder(
+        livePrincipal,
+        inv.orderPublicId,
+        opts?.tx ? { tx: opts.tx } : undefined,
+      );
+      return {
+        liveActor,
+        livePrincipal,
+        staffView,
+        lifecycle: "live",
+        orderReference: orderView.reference || inv.orderReferenceSnapshot || inv.orderPublicId,
+        ownerUserId: orderView.ownerUserId,
+        liveOrderView: orderView,
+      };
+    } catch (err) {
+      if (!(err instanceof DomainError && err.code === "NOT_FOUND")) {
+        throw err;
+      }
+    }
+
+    // Order is either not accessible to this caller OR in trash / permanently deleted.
+    let lifecycle: InvoiceOrderLifecycleState = "deleted";
+    let ownerUserId: number | null = null;
+    let retainedReference: string | null = null;
+
+    try {
+      const [ordRow] = await dbOrTx
+        .select({
+          reference: orders.reference,
+          ownerUserId: orders.ownerUserId,
+          trashedAt: orders.trashedAt,
+          purgedAt: orders.purgedAt,
+        })
+        .from(orders)
+        .where(eq(orders.id, inv.orderId))
+        .limit(1);
+      if (ordRow) {
+        if (ordRow.purgedAt === null && ordRow.trashedAt === null) {
+          // Live order that `assertCanReadOrder` denied -> strictly NOT_FOUND (no existence oracle).
+          throw notFound("INVOICE_NOT_FOUND");
+        }
+        lifecycle = ordRow.purgedAt !== null ? "deleted" : "trashed";
+        ownerUserId = ordRow.ownerUserId;
+        retainedReference = ordRow.reference || null;
+      } else if (typeof ordersSvc.retainedOrderRefInTx === "function") {
+        const ret = await ordersSvc.retainedOrderRefInTx(dbOrTx, inv.orderId);
+        if (ret) {
+          if (!ret.trashed && !ret.purged) {
+            throw notFound("INVOICE_NOT_FOUND");
+          }
+          lifecycle = ret.purged ? "deleted" : "trashed";
+          ownerUserId = ret.ownerUserId;
+          retainedReference = ret.reference || null;
+        } else if (typeof ordersSvc.getOrderRefById === "function") {
+          const liveRef = await ordersSvc.getOrderRefById(inv.orderId, opts?.tx);
+          if (liveRef) {
+            throw notFound("INVOICE_NOT_FOUND");
+          }
+        }
+      } else if (typeof ordersSvc.getOrderRefById === "function") {
+        const liveRef = await ordersSvc.getOrderRefById(inv.orderId, opts?.tx);
+        if (liveRef) {
+          throw notFound("INVOICE_NOT_FOUND");
+        }
+      }
+    } catch (err) {
+      if (err instanceof DomainError) throw err;
+    }
+
+    const derivedStatus = deriveInvoiceStatus({
+      issuedAt: inv.issuedAt,
+      voidedAt: inv.voidedAt,
+      totalMinor: inv.totalMinor,
+      grossPaidMinor: sums.settledGrossMinor,
+      refundedMinor: sums.refundedMinor,
+    });
+
+    if (staffView && roleHasCapability(livePrincipal.role, "invoices.read_all")) {
+      return {
+        liveActor,
+        livePrincipal,
+        staffView,
+        lifecycle,
+        orderReference: retainedReference || inv.orderReferenceSnapshot || inv.orderPublicId,
+        ownerUserId,
+        liveOrderView: null,
+      };
+    }
+
+    if (
+      ownerUserId !== null &&
+      ownerUserId === liveActor.userId &&
+      inv.issuedAt !== null &&
+      derivedStatus === "paid"
+    ) {
+      return {
+        liveActor,
+        livePrincipal,
+        staffView: false,
+        lifecycle,
+        orderReference: retainedReference || inv.orderReferenceSnapshot || inv.orderPublicId,
+        ownerUserId,
+        liveOrderView: null,
+      };
+    }
+
+    throw notFound("INVOICE_NOT_FOUND");
+  }
+
   async function get(principal: SessionPrincipal, invoicePublicId: string): Promise<InvoiceDetailView> {
     const [inv] = await deps.db
       .select()
@@ -1037,52 +1515,68 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       .limit(1);
     if (!inv) throw notFound("INVOICE_NOT_FOUND");
 
-    const ordersSvc = requireOrdersService();
-    // Throws NOT_FOUND with no existence oracle if caller cannot read the parent order
-    const orderView = await ordersSvc.assertCanReadOrder(principal, inv.orderPublicId);
-    const staffView = isStaffOrAdmin(principal);
+    const sumsMap = await computeLedgerSums(deps.db, [inv.id]);
+    const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
+    const access = await resolveInvoiceOrderAccess(principal, inv, sums);
+    const { staffView, lifecycle, orderReference, ownerUserId, liveOrderView, livePrincipal } = access;
+
     if (!staffView && inv.issuedAt === null) {
       throw notFound("INVOICE_NOT_FOUND");
     }
 
-    const [lines, payments, refunds, sumsMap, issuerNameFallback, issuerAddrFallback, paymentInstructions, onlineConfigured, orderMetaMap] =
-      await Promise.all([
-        deps.db
-          .select()
-          .from(complianceInvoiceLines)
-          .where(eq(complianceInvoiceLines.invoiceId, inv.id))
-          .orderBy(asc(complianceInvoiceLines.position)),
-        deps.db
-          .select()
-          .from(complianceInvoicePayments)
-          .where(eq(complianceInvoicePayments.invoiceId, inv.id))
-          .orderBy(asc(complianceInvoicePayments.id)),
-        deps.db
-          .select()
-          .from(complianceInvoiceRefunds)
-          .where(eq(complianceInvoiceRefunds.invoiceId, inv.id))
-          .orderBy(asc(complianceInvoiceRefunds.id)),
-        computeLedgerSums(deps.db, [inv.id]),
-        readSetting(deps.settings, INVOICE_ISSUER_NAME),
-        readSetting(deps.settings, INVOICE_ISSUER_ADDRESS),
-        readSetting(deps.settings, INVOICE_PAYMENT_INSTRUCTIONS),
-        isOnlinePaymentConfigured(),
-        resolveOrderMetaMap(deps.db, [inv.orderId]),
-      ]);
+    const [
+      lines,
+      payments,
+      refunds,
+      issuerNameFallback,
+      issuerAddrFallback,
+      issuerContactFallback,
+      paymentInstructions,
+      onlineConfiguredRaw,
+      orderMetaMap,
+      buyer,
+    ] = await Promise.all([
+      deps.db
+        .select()
+        .from(complianceInvoiceLines)
+        .where(eq(complianceInvoiceLines.invoiceId, inv.id))
+        .orderBy(asc(complianceInvoiceLines.position)),
+      deps.db
+        .select()
+        .from(complianceInvoicePayments)
+        .where(eq(complianceInvoicePayments.invoiceId, inv.id))
+        .orderBy(asc(complianceInvoicePayments.id)),
+      deps.db
+        .select()
+        .from(complianceInvoiceRefunds)
+        .where(eq(complianceInvoiceRefunds.invoiceId, inv.id))
+        .orderBy(asc(complianceInvoiceRefunds.id)),
+      readSetting(deps.settings, INVOICE_ISSUER_NAME),
+      readSetting(deps.settings, INVOICE_ISSUER_ADDRESS),
+      readSetting(deps.settings, INVOICE_ISSUER_CONTACT),
+      readSetting(deps.settings, INVOICE_PAYMENT_INSTRUCTIONS),
+      isOnlinePaymentConfigured(),
+      resolveOrderMetaMap(deps.db, [inv.orderId]),
+      readLiveOrFrozenBuyerInTx(deps.db, ownerUserId, inv),
+    ]);
 
     const paymentById = new Map(payments.map((p) => [p.id, p]));
+    const meta = orderMetaMap.get(inv.orderId);
+    const resolvedProjectName =
+      lifecycle === "deleted" ? "Deleted order" : (meta?.projectName ?? null);
     const summary = toSummaryView(
       inv,
-      orderView.reference,
-      sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS,
-      orderMetaMap.get(inv.orderId)?.projectName ?? null,
+      orderReference,
+      sums,
+      resolvedProjectName,
+      lifecycle,
     );
 
-    const orderDiscountMinor = Math.max(0, orderView.discountMinor ?? 0);
-    const orderPromoMinor = Math.max(0, orderView.promoDiscountMinor ?? 0);
+    const orderDiscountMinor = Math.max(0, liveOrderView?.discountMinor ?? 0);
+    const orderPromoMinor = Math.max(0, liveOrderView?.promoDiscountMinor ?? 0);
     const orderBundleMinor = Math.max(
       0,
-      orderView.bundleDiscountMinor ?? orderDiscountMinor - orderPromoMinor,
+      liveOrderView?.bundleDiscountMinor ?? orderDiscountMinor - orderPromoMinor,
     );
 
     let bundleDiscountMinor = 0;
@@ -1093,25 +1587,28 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     if (inv.discountMinor > 0) {
       if (orderPromoMinor > 0 && inv.discountMinor === orderDiscountMinor) {
         promoDiscountMinor = Math.min(inv.discountMinor, orderPromoMinor);
-        promoLabel = orderView.promoLabel ?? "Promotion";
+        promoLabel = liveOrderView?.promoLabel ?? "Promotion";
         bundleDiscountMinor = Math.max(0, inv.discountMinor - promoDiscountMinor);
         discountLabel = bundleDiscountMinor > 0 ? "Bundle discount" : null;
       } else if (orderPromoMinor > 0 && orderBundleMinor === 0 && inv.discountMinor <= orderPromoMinor) {
         promoDiscountMinor = inv.discountMinor;
-        promoLabel = orderView.promoLabel ?? "Promotion";
+        promoLabel = liveOrderView?.promoLabel ?? "Promotion";
         bundleDiscountMinor = 0;
         discountLabel = null;
       } else {
         bundleDiscountMinor = inv.discountMinor;
-        discountLabel = inv.discountMinor === orderDiscountMinor ? (orderView.discountLabel ?? null) : null;
+        discountLabel = inv.discountMinor === orderDiscountMinor ? (liveOrderView?.discountLabel ?? null) : null;
       }
     }
 
     const orderAllowsInvoiceWrite =
-      orderView.lockState !== "legal_hold" &&
-      orderView.lockState !== "imported_read_only" &&
-      !orderView.readOnlyImported &&
+      lifecycle === "live" &&
+      liveOrderView !== null &&
+      liveOrderView.lockState !== "legal_hold" &&
+      liveOrderView.lockState !== "imported_read_only" &&
+      !liveOrderView.readOnlyImported &&
       inv.origin === "portal";
+    const onlineConfigured = lifecycle === "live" && onlineConfiguredRaw;
 
     return {
       ...summary,
@@ -1121,11 +1618,18 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       promoLabel,
       issuerName: inv.issuerNameSnapshot ?? issuerNameFallback,
       issuerAddress: inv.issuerAddressSnapshot ?? issuerAddrFallback,
+      issuerContact: (inv.issuerContactSnapshot ?? issuerContactFallback).trim() || null,
+      buyer,
       memo: inv.memo,
       voidReason: inv.voidReason,
       paymentInstructions,
       onlinePaymentConfigured: onlineConfigured,
-      onlinePaymentMessage: onlineConfigured ? null : "Online payment is not configured",
+      onlinePaymentMessage:
+        lifecycle !== "live"
+          ? "Order is not active"
+          : onlineConfigured
+            ? null
+            : "Online payment is not configured",
       lines: lines.map((l) => ({
         linePublicId: l.publicId,
         position: l.position,
@@ -1166,13 +1670,13 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         refundedAt: r.refundedAt,
         origin: r.origin,
       })),
-      canManage: orderAllowsInvoiceWrite && roleHasCapability(principal.role, "invoices.manage"),
+      canManage: orderAllowsInvoiceWrite && roleHasCapability(livePrincipal.role, "invoices.manage"),
       canRecordPayment:
         orderAllowsInvoiceWrite &&
         summary.status !== "draft" &&
         summary.status !== "void" &&
         summary.balanceDueMinor > 0 &&
-        roleHasCapability(principal.role, "invoices.manage"),
+        roleHasCapability(livePrincipal.role, "invoices.manage"),
     };
   }
 
@@ -1219,9 +1723,10 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         const meta = orderMetaMap.get(inv.orderId);
         return toSummaryView(
           inv,
-          meta?.reference ?? inv.orderPublicId,
+          meta?.reference || inv.orderReferenceSnapshot || inv.orderPublicId,
           sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS,
           meta?.projectName ?? null,
+          meta?.lifecycle ?? "live",
         );
       }),
       nextCursor: hasMore && slice.length > 0 ? encodeIdCursor(slice[slice.length - 1]!.id) : null,
@@ -1480,10 +1985,12 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       }
 
       // Pass tx to all settings reads so we never open a second pool connection inside tx!
-      const [prefix, issuerName, issuerAddress] = await Promise.all([
+      const [prefix, issuerName, issuerAddress, issuerContact, buyerSnapshot] = await Promise.all([
         readSetting(deps.settings, INVOICE_NUMBER_PREFIX, tx),
         readSetting(deps.settings, INVOICE_ISSUER_NAME, tx),
         readSetting(deps.settings, INVOICE_ISSUER_ADDRESS, tx),
+        readSetting(deps.settings, INVOICE_ISSUER_CONTACT, tx),
+        captureFreshBuyerSnapshotInTx(tx, orderView.ownerUserId, inv.publicId),
       ]);
 
       const sequenceNumber = await allocateInvoiceSequenceInTx(tx, now);
@@ -1508,6 +2015,10 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           dueAt,
           issuerNameSnapshot: issuerName,
           issuerAddressSnapshot: issuerAddress,
+          issuerContactSnapshot: issuerContact,
+          orderReferenceSnapshot: orderView.reference,
+          customerRefSnapshot: buyerSnapshot.customerRefSnapshot,
+          buyerSnapshotEnc: buyerSnapshot.buyerSnapshotEnc,
           issuedByUserId: liveActor.userId,
           version: inv.version + 1,
           updatedAt: now,
@@ -1556,6 +2067,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         {
           template: "compliance.invoice_issued",
           to: { userId: orderView.ownerUserId },
+          orderId: orderView.id,
           vars: {
             invoiceNumber,
             orderReference: orderView.reference,
@@ -1922,6 +2434,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           {
             template: "compliance.invoice_paid",
             to: { userId: orderView.ownerUserId },
+            orderId: orderView.id,
             vars: {
               invoiceNumber: inv.invoiceNumber ?? inv.publicId,
               orderReference: orderView.reference,
@@ -2406,16 +2919,8 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
   ): Promise<{ filename: string; contentType: "application/pdf"; buffer: Buffer }> {
     // 1. Read and pre-render outside the transaction so no extra pool connection is acquired inside tx.
     const detail = await get(principal, invoicePublicId);
-    const ordersSvc = requireOrdersService();
-    const orderView = await ordersSvc.assertCanReadOrder(principal, detail.orderPublicId);
 
-    const identitySvc = (deps.services as Partial<typeof deps.services>).identity;
-    const ownerProfile =
-      identitySvc && typeof identitySvc.getUser === "function"
-        ? await identitySvc.getUser(orderView.ownerUserId)
-        : null;
-
-    const [issuerContact, issuerTaxId, issuerLogoRaw] = await Promise.all([
+    const [issuerContactFallback, issuerTaxId, issuerLogoRaw] = await Promise.all([
       readSetting(deps.settings, INVOICE_ISSUER_CONTACT),
       readSetting(deps.settings, INVOICE_ISSUER_TAX_ID),
       deps.settings
@@ -2423,6 +2928,8 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         .catch(() => ({ ...DEFAULT_ISSUER_LOGO_SETTING })),
     ]);
     const issuerLogo = parseIssuerLogoSetting(issuerLogoRaw);
+    const resolvedIssuerContact = detail.issuerContact ?? issuerContactFallback;
+    const buyer = detail.buyer;
 
     const invoiceLabel = detail.invoiceNumber ?? `DRAFT-${detail.invoicePublicId.slice(-8)}`;
     const pdfBuffer = renderInvoicePdf({
@@ -2433,12 +2940,12 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       projectName: detail.projectName,
       issuerName: detail.issuerName,
       issuerAddress: detail.issuerAddress,
-      issuerContact,
+      issuerContact: resolvedIssuerContact,
       issuerTaxId,
       issuerLogo,
-      customerName: ownerProfile?.name ?? "Customer",
-      customerEmail: ownerProfile?.email ?? "",
-      customerRef: ownerProfile?.customerRef ?? null,
+      customerName: buyer?.name ?? "Customer",
+      customerEmail: buyer?.email ?? "",
+      customerRef: buyer?.customerRef ?? null,
       currency: detail.currency,
       issuedAt: detail.issuedAt,
       dueAt: detail.dueAt,
@@ -2476,11 +2983,17 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       })),
     });
 
-    // 2. Re-validate live actor + order read access and emit durable audit BEFORE bytes are streamed.
+    // 2. Re-validate live actor + live/retained order read access and emit durable audit BEFORE bytes are streamed.
     await runComplianceTx(deps, principal, { type: "invoice", publicId: detail.invoicePublicId }, async (tx) => {
-      const liveActor = await assertLiveActorInTx(deps, principal, tx);
-      const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
-      await ordersSvc.assertCanReadOrder(livePrincipal, detail.orderPublicId, { tx });
+      const [inv] = await tx
+        .select()
+        .from(complianceInvoices)
+        .where(eq(complianceInvoices.publicId, detail.invoicePublicId))
+        .limit(1);
+      if (!inv) throw notFound("INVOICE_NOT_FOUND");
+      const sumsMap = await computeLedgerSums(tx, [inv.id]);
+      const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
+      const access = await resolveInvoiceOrderAccess(principal, inv, sums, { tx });
 
       await deps.audit.record(
         {
@@ -2488,7 +3001,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           eventName: "invoice.downloaded",
           action: "download",
           outcome: "completed",
-          actor: { userId: liveActor.userId, role: liveActor.role },
+          actor: { userId: access.liveActor.userId, role: access.liveActor.role },
           resource: { type: "invoice", publicId: detail.invoicePublicId },
           attributes: {
             order_public_id: detail.orderPublicId,
@@ -2580,15 +3093,21 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       taxMinor: resolvedTaxMinor,
     });
 
-    const [prefix, issuerName, issuerAddress] = await Promise.all([
+    const [prefix, issuerName, issuerAddress, issuerContact] = await Promise.all([
       readSetting(deps.settings, INVOICE_NUMBER_PREFIX, tx),
       readSetting(deps.settings, INVOICE_ISSUER_NAME, tx),
       readSetting(deps.settings, INVOICE_ISSUER_ADDRESS, tx),
+      readSetting(deps.settings, INVOICE_ISSUER_CONTACT, tx),
     ]);
 
     const sequenceNumber = await allocateInvoiceSequenceInTx(tx, now);
     const invoiceNumber = formatInvoiceNumber(prefix, now, sequenceNumber);
     const invoicePublicId = ulid(now.getTime());
+    const buyerSnapshot = await captureFreshBuyerSnapshotInTx(
+      tx,
+      orderView.ownerUserId,
+      invoicePublicId,
+    );
     const derivedStatus = deriveInvoiceStatus({
       issuedAt: now,
       voidedAt: null,
@@ -2614,6 +3133,10 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       memo: input.memo ?? null,
       issuerNameSnapshot: issuerName,
       issuerAddressSnapshot: issuerAddress,
+      issuerContactSnapshot: issuerContact,
+      orderReferenceSnapshot: orderView.reference,
+      customerRefSnapshot: buyerSnapshot.customerRefSnapshot,
+      buyerSnapshotEnc: buyerSnapshot.buyerSnapshotEnc,
       origin: "portal",
       version: 1,
       createdByUserId: liveActor.userId,
@@ -2699,6 +3222,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       {
         template: "compliance.invoice_issued",
         to: { userId: orderView.ownerUserId },
+        orderId: orderView.id,
         vars: {
           invoiceNumber,
           orderReference: orderView.reference,
@@ -2727,7 +3251,12 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
 
   async function getInvoiceForCheckout(
     invoicePublicId: string,
-    opts?: { principal?: SessionPrincipal | undefined; tx?: DbOrTx | undefined; forUpdate?: boolean | undefined },
+    opts?: {
+      principal?: SessionPrincipal | undefined;
+      tx?: DbOrTx | undefined;
+      forUpdate?: boolean | undefined;
+      allowTrashedOrder?: boolean | undefined;
+    },
   ): Promise<CheckoutInvoiceSnapshot> {
     const dbOrTx = opts?.tx ?? deps.db;
     const [invRef] = await dbOrTx
@@ -2735,6 +3264,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         id: complianceInvoices.id,
         orderId: complianceInvoices.orderId,
         orderPublicId: complianceInvoices.orderPublicId,
+        orderReferenceSnapshot: complianceInvoices.orderReferenceSnapshot,
       })
       .from(complianceInvoices)
       .where(eq(complianceInvoices.publicId, invoicePublicId))
@@ -2742,10 +3272,11 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     if (!invRef) throw notFound("INVOICE_NOT_FOUND");
 
     const ordersSvc = requireOrdersService();
-    let orderReference = invRef.orderPublicId;
+    let orderReference = invRef.orderReferenceSnapshot ?? invRef.orderPublicId;
     let ownerUserId = 0;
 
     if (opts?.principal) {
+      // Customer/interactive checkout ALWAYS requires a live accessible order; trashed orders are refused.
       const orderView = await ordersSvc.assertCanReadOrder(
         opts.principal,
         invRef.orderPublicId,
@@ -2761,9 +3292,60 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         opts?.tx as Tx | undefined,
         opts?.tx && opts?.forUpdate ? { forUpdate: true } : undefined,
       );
-      if (!ref) throw notFound("INVOICE_NOT_FOUND");
-      orderReference = ref.reference;
-      ownerUserId = ref.ownerUserId;
+      if (ref) {
+        orderReference = ref.reference;
+        ownerUserId = ref.ownerUserId;
+      } else {
+        // D2.8: verified webhook / reconciliation path (`!opts?.principal` or `allowTrashedOrder`) may
+        // inspect invoices on trashed or tombstoned orders to book late payments safely.
+        let resolvedRetained = false;
+        if (typeof ordersSvc.retainedOrderRefInTx === "function") {
+          const ret = await ordersSvc.retainedOrderRefInTx(
+            dbOrTx as Tx,
+            invRef.orderId,
+            opts?.tx && opts?.forUpdate ? { forUpdate: true } : undefined,
+          );
+          if (ret) {
+            orderReference = ret.reference || orderReference;
+            ownerUserId = ret.ownerUserId;
+            resolvedRetained = true;
+          }
+        }
+        if (!resolvedRetained) {
+          try {
+            const ordQuery = dbOrTx
+              .select({
+                reference: orders.reference,
+                ownerUserId: orders.ownerUserId,
+              })
+              .from(orders)
+              .where(eq(orders.id, invRef.orderId))
+              .limit(1);
+            const [ordRow] =
+              opts?.tx && opts?.forUpdate
+                ? await dbOrTx
+                    .select({
+                      reference: orders.reference,
+                      ownerUserId: orders.ownerUserId,
+                    })
+                    .from(orders)
+                    .where(eq(orders.id, invRef.orderId))
+                    .for("update")
+                    .limit(1)
+                : await ordQuery;
+            if (ordRow) {
+              orderReference = ordRow.reference || orderReference;
+              ownerUserId = ordRow.ownerUserId;
+              resolvedRetained = true;
+            }
+          } catch {
+            // Standalone unit tests may omit `orders` rows.
+          }
+        }
+        if (!resolvedRetained) {
+          throw notFound("INVOICE_NOT_FOUND");
+        }
+      }
     }
 
     const [inv] =
@@ -2852,13 +3434,97 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     }
 
     // Canonical lock order: order FOR UPDATE first, then compliance_invoices FOR UPDATE.
+    // D2.8: late verified provider webhooks arriving while the order is in trash still book the payment
+    // and receipt so money and ledger match, while keeping the order in trash and suppressing notifications/mail.
     const ordersSvc = requireOrdersService();
-    const orderRef =
+    let orderRef: {
+      id: number;
+      publicId: string;
+      reference: string;
+      ownerUserId: number;
+      lockState: string;
+      name?: string | null;
+    } | null =
       typeof ordersSvc.getOrderRefById === "function"
         ? await ordersSvc.getOrderRefById(invRef.orderId, tx, { forUpdate: true })
         : null;
+    let isLiveOrder = orderRef !== null;
+
+    if (!orderRef) {
+      if (typeof ordersSvc.retainedOrderRefInTx === "function") {
+        const ret = await ordersSvc.retainedOrderRefInTx(tx, invRef.orderId, { forUpdate: true });
+        if (ret) {
+          let lockState = "none";
+          try {
+            const [ordLockRow] = await tx
+              .select({ lockState: orders.lockState })
+              .from(orders)
+              .where(eq(orders.id, invRef.orderId))
+              .limit(1);
+            if (ordLockRow) lockState = ordLockRow.lockState;
+          } catch {
+            // Standalone tests may omit `orders` rows.
+          }
+          orderRef = {
+            id: ret.id,
+            publicId: ret.publicId,
+            reference: ret.reference,
+            ownerUserId: ret.ownerUserId,
+            lockState,
+          };
+          isLiveOrder = !ret.trashed && !ret.purged;
+        }
+      }
+      if (!orderRef) {
+        try {
+          const [ordRow] = await tx
+            .select({
+              id: orders.id,
+              publicId: orders.publicId,
+              reference: orders.reference,
+              ownerUserId: orders.ownerUserId,
+              lockState: orders.lockState,
+              projectName: orders.projectName,
+              trashedAt: orders.trashedAt,
+              purgedAt: orders.purgedAt,
+            })
+            .from(orders)
+            .where(eq(orders.id, invRef.orderId))
+            .for("update")
+            .limit(1);
+          if (ordRow) {
+            orderRef = {
+              id: ordRow.id,
+              publicId: ordRow.publicId,
+              reference: ordRow.reference,
+              ownerUserId: ordRow.ownerUserId,
+              lockState: ordRow.lockState,
+              name: ordRow.projectName,
+            };
+            isLiveOrder = ordRow.trashedAt === null && ordRow.purgedAt === null;
+          }
+        } catch {
+          // Standalone tests may omit `orders` rows.
+        }
+      }
+    }
+
     if (!orderRef) {
       throw notFound("ORDER_NOT_FOUND");
+    }
+
+    let isLiveCustomer = true;
+    try {
+      const [custRow] = await tx
+        .select({ trashedAt: users.trashedAt, purgedAt: users.purgedAt })
+        .from(users)
+        .where(eq(users.id, orderRef.ownerUserId))
+        .limit(1);
+      if (custRow) {
+        isLiveCustomer = isLiveUserRow(custRow);
+      }
+    } catch {
+      // Standalone tests may omit `users` rows.
     }
 
     const [inv] = await tx
@@ -3020,7 +3686,11 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       tx,
     );
 
-    if (nextStatus === "paid" && inv.status !== "paid") {
+    if (!isLiveOrder || !isLiveCustomer) {
+      await freezeInvoicesForOrderInTx(tx, inv.orderId);
+    }
+
+    if (nextStatus === "paid" && inv.status !== "paid" && isLiveOrder && isLiveCustomer) {
       const engagementSvc = (deps.services as Partial<typeof deps.services>).engagement;
       if (engagementSvc && typeof engagementSvc.notify === "function") {
         await engagementSvc.notify(
@@ -3046,6 +3716,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         {
           template: "compliance.invoice_paid",
           to: { userId: orderRef.ownerUserId },
+          orderId: orderRef.id,
           vars: {
             invoiceNumber: inv.invoiceNumber ?? inv.publicId,
             orderReference: orderRef.reference,
@@ -3922,13 +4593,29 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
   }
 
   async function healthCounts(): Promise<{ issuedUnpaidInvoices: number }> {
-    const [row] = await deps.db
-      .select({ total: count() })
-      .from(complianceInvoices)
-      .where(and(eq(complianceInvoices.status, "issued"), eq(complianceInvoices.origin, "portal")));
-    return {
-      issuedUnpaidInvoices: row?.total ?? 0,
-    };
+    try {
+      const [row] = await deps.db
+        .select({ total: count() })
+        .from(complianceInvoices)
+        .where(
+          and(
+            eq(complianceInvoices.status, "issued"),
+            eq(complianceInvoices.origin, "portal"),
+            liveOrderIdPredicate(complianceInvoices.orderId),
+          ),
+        );
+      return {
+        issuedUnpaidInvoices: row?.total ?? 0,
+      };
+    } catch {
+      const [row] = await deps.db
+        .select({ total: count() })
+        .from(complianceInvoices)
+        .where(and(eq(complianceInvoices.status, "issued"), eq(complianceInvoices.origin, "portal")));
+      return {
+        issuedUnpaidInvoices: row?.total ?? 0,
+      };
+    }
   }
 
   /**
@@ -4165,6 +4852,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     lockOrderPaymentForRefundInTx,
     bookSettledRefundInTx,
     orderPaymentExposureInTx,
+    freezeInvoicesForOrderInTx,
     admin: {
       list: adminList,
       createDraft: adminCreateDraft,

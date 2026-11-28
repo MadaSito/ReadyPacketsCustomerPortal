@@ -163,9 +163,15 @@ export function createPortableComplianceService(deps: ModuleDeps) {
 
     const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
     const ownerUserIdByOrderPublicId = new Map<string, number>();
-    if (ordersSvc?.getOrderRefById) {
+    if (ordersSvc) {
       for (const internalOrderId of internalOrderIds) {
-        const ref = await ordersSvc.getOrderRefById(internalOrderId, tx);
+        const ref =
+          (typeof ordersSvc.getOrderRefById === "function"
+            ? await ordersSvc.getOrderRefById(internalOrderId, tx)
+            : null) ??
+          (typeof ordersSvc.retainedOrderRefInTx === "function"
+            ? await ordersSvc.retainedOrderRefInTx(tx, internalOrderId)
+            : null);
         if (ref) {
           ownerUserIdByOrderPublicId.set(ref.publicId, ref.ownerUserId);
         }

@@ -4,6 +4,7 @@ import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, notFound, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
+import { liveOrderIdPredicate } from "../orders/trashGate.js";
 import { assertLiveActorInTx, denyComplianceAuthz, runComplianceTx } from "./actorAuth.js";
 import {
   canonicalizeIntakeFields,
@@ -806,6 +807,7 @@ export function createIntakeService(deps: ModuleDeps) {
           {
             template: "compliance.intake_returned",
             to: { userId: orderView.ownerUserId },
+            orderId: orderView.id,
             vars: {
               orderReference: orderView.reference,
               questionnaireTitle: q?.title ?? "Intake Questionnaire",
@@ -1245,19 +1247,35 @@ export function createIntakeService(deps: ModuleDeps) {
   }
 
   async function healthCounts(): Promise<{ activeQuestionnaires: number; pendingReviews: number }> {
-    const [[qRow], [subRow]] = await Promise.all([
-      deps.db
-        .select({ total: count() })
-        .from(intakeQuestionnaires)
-        .where(eq(intakeQuestionnaires.active, true)),
-      deps.db
+    const [qRow] = await deps.db
+      .select({ total: count() })
+      .from(intakeQuestionnaires)
+      .where(eq(intakeQuestionnaires.active, true));
+
+    let pendingReviews: number;
+    try {
+      const [subRow] = await deps.db
         .select({ total: count() })
         .from(intakeSubmissions)
-        .where(and(eq(intakeSubmissions.status, "submitted"), eq(intakeSubmissions.origin, "portal"))),
-    ]);
+        .where(
+          and(
+            eq(intakeSubmissions.status, "submitted"),
+            eq(intakeSubmissions.origin, "portal"),
+            liveOrderIdPredicate(intakeSubmissions.orderId),
+          ),
+        );
+      pendingReviews = subRow?.total ?? 0;
+    } catch {
+      const [subRow] = await deps.db
+        .select({ total: count() })
+        .from(intakeSubmissions)
+        .where(and(eq(intakeSubmissions.status, "submitted"), eq(intakeSubmissions.origin, "portal")));
+      pendingReviews = subRow?.total ?? 0;
+    }
+
     return {
       activeQuestionnaires: qRow?.total ?? 0,
-      pendingReviews: subRow?.total ?? 0,
+      pendingReviews,
     };
   }
 

@@ -1,7 +1,9 @@
 import { and, desc, eq, gte, inArray, lt } from "drizzle-orm";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, validation } from "../../core/errors.js";
+import { liveUserPredicate } from "../identity/live.js";
 import { users } from "../identity/schema.js";
+import { liveOrderIdPredicate } from "../orders/trashGate.js";
 import type { ApiCaller, ApiListQuery, ApiPage, InvoiceDto, PublicApiProviders } from "../publicApi/ports.js";
 import { decodeIdCursor, deriveInvoiceStatus, encodeIdCursor } from "./domain.js";
 import {
@@ -85,7 +87,7 @@ export function createInvoicesPublicApiProvider(
         ? await deps.db
             .select({ id: users.id, publicId: users.publicId })
             .from(users)
-            .where(inArray(users.id, uniqueOwnerIds))
+            .where(and(inArray(users.id, uniqueOwnerIds), liveUserPredicate()))
         : [];
     const userPublicIdById = new Map(userRows.map((u) => [u.id, u.publicId]));
 
@@ -134,7 +136,7 @@ export function createInvoicesPublicApiProvider(
     const [customer] = await deps.db
       .select({ id: users.id })
       .from(users)
-      .where(eq(users.publicId, customerPublicId))
+      .where(and(eq(users.publicId, customerPublicId), liveUserPredicate()))
       .limit(1);
     if (!customer) return [];
 
@@ -148,7 +150,7 @@ export function createInvoicesPublicApiProvider(
         ...(after !== undefined ? { after } : {}),
       });
       for (const item of batch.items) {
-        orderIds.push(item.id);
+        if (!item.trash) orderIds.push(item.id);
       }
       if (batch.nextAfter === null) break;
       after = batch.nextAfter;
@@ -164,7 +166,7 @@ export function createInvoicesPublicApiProvider(
         throw validation("INVALID_CURSOR", "Invalid pagination cursor.");
       }
 
-      const conds = [];
+      const conds = [liveOrderIdPredicate(complianceInvoices.orderId)];
       if (afterId !== null) conds.push(lt(complianceInvoices.id, afterId));
       if (query.updatedSince) conds.push(gte(complianceInvoices.updatedAt, query.updatedSince));
 

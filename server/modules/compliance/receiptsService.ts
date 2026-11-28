@@ -18,6 +18,7 @@ import type { ModuleDeps } from "../../container.js";
 import { DomainError, notFound, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
+import { isLiveUserRow } from "../identity/live.js";
 import { users } from "../identity/schema.js";
 import { emailAad, nameAad } from "../identity/users.js";
 import { enqueuePaymentReceipt } from "../jobs/receiptMail.js";
@@ -82,6 +83,8 @@ export interface RefundNoteSummaryView {
   issuedAt: Date;
 }
 
+export type OrderLifecycleState = "live" | "trashed" | "deleted";
+
 export interface ReceiptSummaryView {
   receiptPublicId: string;
   receiptNumber: string;
@@ -91,6 +94,7 @@ export interface ReceiptSummaryView {
   orderPublicId: string;
   orderReference: string;
   projectName?: string | null;
+  orderLifecycleState?: OrderLifecycleState;
   customerRef: string | null;
   currency: string;
   subtotalMinor: number;
@@ -132,6 +136,7 @@ const receiptSnapshotAad = (publicId: string) => `compliance_payment_receipts.sn
 const receiptPdfAad = (publicId: string) => `compliance_payment_receipts.pdf:${publicId}`;
 const refundNoteSnapshotAad = (publicId: string) => `compliance_receipt_refund_notes.snapshot:${publicId}`;
 const refundNotePdfAad = (publicId: string) => `compliance_receipt_refund_notes.pdf:${publicId}`;
+const invoiceBuyerSnapshotAad = (publicId: string) => `compliance_invoices.buyer_snapshot:${publicId}`;
 
 function sha256Hex(buf: Buffer): string {
   return createHash("sha256").update(buf).digest("hex");
@@ -263,10 +268,39 @@ export function createReceiptsService(deps: ModuleDeps) {
     };
   }
 
+  function decodeFrozenInvoiceBuyer(inv: {
+    publicId: string;
+    buyerSnapshotEnc?: string | null;
+    customerRefSnapshot?: string | null;
+  }): { name: string; email: string; customerRef: string | null } | null {
+    if (!inv.buyerSnapshotEnc) return null;
+    try {
+      const parsed = JSON.parse(
+        deps.crypto.decrypt(inv.buyerSnapshotEnc, invoiceBuyerSnapshotAad(inv.publicId)),
+      ) as { name?: unknown; email?: unknown; customerRef?: unknown };
+      return {
+        name: typeof parsed.name === "string" && parsed.name.trim() ? parsed.name.trim() : "Customer",
+        email: typeof parsed.email === "string" ? parsed.email.trim() : "",
+        customerRef:
+          typeof parsed.customerRef === "string" && parsed.customerRef.trim()
+            ? parsed.customerRef.trim()
+            : (inv.customerRefSnapshot ?? null),
+      };
+    } catch {
+      return null;
+    }
+  }
+
   async function readCustomerSnapshotInTx(
     tx: Tx,
     userId: number,
-  ): Promise<{ name: string; email: string; customerRef: string | null }> {
+    fallbackInvoice?: {
+      publicId: string;
+      buyerSnapshotEnc?: string | null;
+      customerRefSnapshot?: string | null;
+    },
+  ): Promise<{ name: string; email: string; customerRef: string | null; live: boolean }> {
+    const frozen = fallbackInvoice ? decodeFrozenInvoiceBuyer(fallbackInvoice) : null;
     const identitySvc = (deps.services as Partial<typeof deps.services>).identity;
     if (identitySvc && typeof identitySvc.getUser === "function") {
       const view = await identitySvc.getUser(userId, { tx });
@@ -275,6 +309,7 @@ export function createReceiptsService(deps: ModuleDeps) {
           name: view.name || "Customer",
           email: view.email || "",
           customerRef: view.customerRef ?? null,
+          live: true,
         };
       }
     }
@@ -284,33 +319,48 @@ export function createReceiptsService(deps: ModuleDeps) {
         nameEnc: users.nameEnc,
         emailEnc: users.emailEnc,
         customerRef: users.customerRef,
+        trashedAt: users.trashedAt,
+        purgedAt: users.purgedAt,
       })
       .from(users)
       .where(eq(users.id, userId))
       .limit(1);
-    if (!row) {
-      return { name: "Customer", email: "", customerRef: null };
+    if (!row || row.purgedAt !== null) {
+      if (frozen) {
+        return { ...frozen, live: false };
+      }
+      return {
+        name: "Deleted account",
+        email: "",
+        customerRef: row?.customerRef ?? fallbackInvoice?.customerRefSnapshot ?? null,
+        live: false,
+      };
     }
-    let name = "Customer";
-    let email = "";
+    let name = frozen?.name || "Customer";
+    let email = frozen?.email || "";
     try {
-      name = deps.crypto.decrypt(row.nameEnc, nameAad(row.publicId)) || "Customer";
+      name = deps.crypto.decrypt(row.nameEnc, nameAad(row.publicId)) || name;
     } catch {
       // keep fallback
     }
     try {
-      email = deps.crypto.decrypt(row.emailEnc, emailAad(row.publicId)) || "";
+      email = deps.crypto.decrypt(row.emailEnc, emailAad(row.publicId)) || email;
     } catch {
       // keep fallback
     }
-    return { name, email, customerRef: row.customerRef ?? null };
+    return {
+      name,
+      email,
+      customerRef: row.customerRef ?? frozen?.customerRef ?? null,
+      live: isLiveUserRow(row),
+    };
   }
 
-  async function resolveProjectNamesByOrderIds(
+  async function resolveOrderMetaByOrderIds(
     dbOrTx: DbOrTx,
     orderIds: readonly number[],
-  ): Promise<Map<number, string>> {
-    const out = new Map<number, string>();
+  ): Promise<Map<number, { projectName: string | null; lifecycle: OrderLifecycleState }>> {
+    const out = new Map<number, { projectName: string | null; lifecycle: OrderLifecycleState }>();
     const uniqueIds = [...new Set(orderIds.filter((id) => Number.isInteger(id) && id > 0))];
     if (uniqueIds.length === 0) return out;
 
@@ -319,33 +369,89 @@ export function createReceiptsService(deps: ModuleDeps) {
         .select({
           id: orders.id,
           projectName: orders.projectName,
+          trashedAt: orders.trashedAt,
+          purgedAt: orders.purgedAt,
         })
         .from(orders)
         .where(inArray(orders.id, uniqueIds));
       for (const row of ordRows) {
-        const trimmed = row.projectName?.trim();
-        if (trimmed) out.set(row.id, trimmed);
+        const lifecycle: OrderLifecycleState =
+          row.purgedAt !== null ? "deleted" : row.trashedAt !== null ? "trashed" : "live";
+        const trimmed = row.projectName?.trim() || null;
+        out.set(row.id, {
+          projectName: lifecycle === "deleted" ? "Deleted order" : trimmed,
+          lifecycle,
+        });
       }
     } catch {
       // Standalone compliance unit tests may mock orders service without populating `orders` rows.
     }
 
     const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
-    if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
-      for (const orderId of uniqueIds) {
-        if (out.has(orderId)) continue;
+    for (const orderId of uniqueIds) {
+      const current = out.get(orderId);
+      if (current) {
+        if (!current.projectName && current.lifecycle === "live" && ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
+          const ref = await ordersSvc.getOrderRefById(
+            orderId,
+            dbOrTx !== deps.db ? (dbOrTx as Tx) : undefined,
+          );
+          const candidateName =
+            ref && typeof (ref as { name?: unknown }).name === "string" ? ref.name.trim() : "";
+          if (candidateName) {
+            out.set(orderId, { projectName: candidateName, lifecycle: "live" });
+          }
+        }
+        continue;
+      }
+
+      if (ordersSvc && typeof ordersSvc.retainedOrderRefInTx === "function" && dbOrTx !== deps.db) {
+        const retained = await ordersSvc.retainedOrderRefInTx(dbOrTx as Tx, orderId);
+        if (retained) {
+          const lifecycle: OrderLifecycleState = retained.purged
+            ? "deleted"
+            : retained.trashed
+              ? "trashed"
+              : "live";
+          out.set(orderId, {
+            projectName: lifecycle === "deleted" ? "Deleted order" : null,
+            lifecycle,
+          });
+          continue;
+        }
+      }
+
+      if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
         const ref = await ordersSvc.getOrderRefById(
           orderId,
           dbOrTx !== deps.db ? (dbOrTx as Tx) : undefined,
         );
-        const candidateName =
-          ref && typeof (ref as { name?: unknown }).name === "string" ? ref.name.trim() : "";
-        if (candidateName) {
-          out.set(orderId, candidateName);
+        if (ref) {
+          const candidateName =
+            typeof (ref as { name?: unknown }).name === "string" ? ref.name.trim() : "";
+          out.set(orderId, {
+            projectName: candidateName || null,
+            lifecycle: "live",
+          });
+          continue;
         }
       }
+
+      out.set(orderId, { projectName: "Deleted order", lifecycle: "deleted" });
     }
 
+    return out;
+  }
+
+  async function resolveProjectNamesByOrderIds(
+    dbOrTx: DbOrTx,
+    orderIds: readonly number[],
+  ): Promise<Map<number, string>> {
+    const meta = await resolveOrderMetaByOrderIds(dbOrTx, orderIds);
+    const out = new Map<number, string>();
+    for (const [id, entry] of meta.entries()) {
+      if (entry.projectName) out.set(id, entry.projectName);
+    }
     return out;
   }
 
@@ -354,6 +460,7 @@ export function createReceiptsService(deps: ModuleDeps) {
     orderId: number,
     fallbackOrderPublicId: string,
     invoiceDiscountMinor: number,
+    fallbackOrderReference?: string | null,
   ): Promise<{
     ownerUserId: number;
     orderReference: string;
@@ -362,10 +469,12 @@ export function createReceiptsService(deps: ModuleDeps) {
     discountLabel: string | null;
     promoDiscountMinor: number;
     promoLabel: string | null;
+    lifecycle: OrderLifecycleState;
   }> {
     let ownerUserId = 0;
-    let orderReference = fallbackOrderPublicId;
+    let orderReference = fallbackOrderReference || fallbackOrderPublicId;
     let projectName: string | null = null;
+    let lifecycle: OrderLifecycleState = "live";
     let orderDiscountMinor = 0;
     let orderPromoMinor = 0;
     let orderDiscountLabel: string | null = null;
@@ -380,6 +489,14 @@ export function createReceiptsService(deps: ModuleDeps) {
         const refName =
           typeof (ref as { name?: unknown }).name === "string" ? ref.name.trim() : "";
         if (refName) projectName = refName;
+      } else if (typeof ordersSvc.retainedOrderRefInTx === "function") {
+        const retained = await ordersSvc.retainedOrderRefInTx(tx, orderId);
+        if (retained) {
+          ownerUserId = retained.ownerUserId;
+          orderReference = retained.reference || orderReference;
+          lifecycle = retained.purged ? "deleted" : retained.trashed ? "trashed" : "live";
+          if (retained.purged) projectName = "Deleted order";
+        }
       }
     }
 
@@ -393,6 +510,8 @@ export function createReceiptsService(deps: ModuleDeps) {
           discountLabel: orders.discountLabel,
           promoDiscountMinor: orders.promoDiscountMinor,
           promoLabel: orders.promoLabel,
+          trashedAt: orders.trashedAt,
+          purgedAt: orders.purgedAt,
         })
         .from(orders)
         .where(eq(orders.id, orderId))
@@ -400,7 +519,11 @@ export function createReceiptsService(deps: ModuleDeps) {
       if (ord) {
         if (!ownerUserId) ownerUserId = ord.ownerUserId;
         orderReference = ord.reference || orderReference;
-        if (ord.projectName?.trim()) {
+        lifecycle =
+          ord.purgedAt !== null ? "deleted" : ord.trashedAt !== null ? "trashed" : "live";
+        if (lifecycle === "deleted") {
+          projectName = "Deleted order";
+        } else if (ord.projectName?.trim()) {
           projectName = ord.projectName.trim();
         }
         orderDiscountMinor = Math.max(0, ord.discountMinor ?? 0);
@@ -441,6 +564,7 @@ export function createReceiptsService(deps: ModuleDeps) {
       discountLabel,
       promoDiscountMinor,
       promoLabel,
+      lifecycle,
     };
   }
 
@@ -488,18 +612,26 @@ export function createReceiptsService(deps: ModuleDeps) {
       .limit(1);
     if (!pmt || pmt.status !== "succeeded") return null;
 
-    const orderCtx = await readOrderDiscountContextInTx(tx, inv.orderId, inv.orderPublicId, inv.discountMinor);
+    const orderCtx = await readOrderDiscountContextInTx(
+      tx,
+      inv.orderId,
+      inv.orderPublicId,
+      inv.discountMinor,
+      inv.orderReferenceSnapshot,
+    );
     if (!orderCtx.ownerUserId) return null;
 
-    const [company, customer, lines] = await Promise.all([
+    const [company, customerRead, lines] = await Promise.all([
       readCompanyProfileInTx(tx),
-      readCustomerSnapshotInTx(tx, orderCtx.ownerUserId),
+      readCustomerSnapshotInTx(tx, orderCtx.ownerUserId, inv),
       tx
         .select()
         .from(complianceInvoiceLines)
         .where(eq(complianceInvoiceLines.invoiceId, inv.id))
         .orderBy(asc(complianceInvoiceLines.position)),
     ]);
+    const { live: customerLive, ...customer } = customerRead;
+    const isLiveContext = orderCtx.lifecycle === "live" && customerLive;
 
     const now = deps.clock.now();
     const issuedAt = pmt.receivedAt ?? now;
@@ -535,7 +667,7 @@ export function createReceiptsService(deps: ModuleDeps) {
       company: {
         legalName: inv.issuerNameSnapshot || company.legalName,
         address: inv.issuerAddressSnapshot ?? company.address,
-        contact: company.contact,
+        contact: inv.issuerContactSnapshot ?? company.contact,
         taxId: company.taxId,
         logoMode: company.logoMode,
         logoBrandPath: company.logoBrandPath,
@@ -571,7 +703,7 @@ export function createReceiptsService(deps: ModuleDeps) {
     const snapshotEnc = deps.crypto.encrypt(JSON.stringify(snapshot), receiptSnapshotAad(receiptPublicId));
     const pdfEnc = deps.crypto.encrypt(pdfBuffer.toString("base64"), receiptPdfAad(receiptPublicId));
 
-    const shouldEmail = receiptSettings.emailCustomer;
+    const shouldEmail = receiptSettings.emailCustomer && isLiveContext;
 
     await tx.insert(compliancePaymentReceipts).values({
       publicId: receiptPublicId,
@@ -645,6 +777,7 @@ export function createReceiptsService(deps: ModuleDeps) {
         {
           receiptPublicId,
           recipientUserId: orderCtx.ownerUserId,
+          orderId: inv.orderId,
           receiptNumber,
           orderReference: orderCtx.orderReference,
           ...(orderCtx.projectName ? { projectName: orderCtx.projectName } : {}),
@@ -654,7 +787,9 @@ export function createReceiptsService(deps: ModuleDeps) {
       );
     }
 
-    await stageReceiptInStorageInTx(tx, { receiptPublicId, orderPublicId: inv.orderPublicId });
+    if (isLiveContext) {
+      await stageReceiptInStorageInTx(tx, { receiptPublicId, orderPublicId: inv.orderPublicId });
+    }
 
     return { receiptPublicId, receiptNumber };
   }
@@ -702,18 +837,26 @@ export function createReceiptsService(deps: ModuleDeps) {
       );
     }
 
-    const orderCtx = await readOrderDiscountContextInTx(tx, inv.orderId, inv.orderPublicId, inv.discountMinor);
+    const orderCtx = await readOrderDiscountContextInTx(
+      tx,
+      inv.orderId,
+      inv.orderPublicId,
+      inv.discountMinor,
+      inv.orderReferenceSnapshot,
+    );
     if (!orderCtx.ownerUserId) return null;
 
-    const [company, customer, lines] = await Promise.all([
+    const [company, customerRead, lines] = await Promise.all([
       readCompanyProfileInTx(tx),
-      readCustomerSnapshotInTx(tx, orderCtx.ownerUserId),
+      readCustomerSnapshotInTx(tx, orderCtx.ownerUserId, inv),
       tx
         .select()
         .from(complianceInvoiceLines)
         .where(eq(complianceInvoiceLines.invoiceId, inv.id))
         .orderBy(asc(complianceInvoiceLines.position)),
     ]);
+    const { live: customerLive, ...customer } = customerRead;
+    const isLiveContext = orderCtx.lifecycle === "live" && customerLive;
 
     const now = deps.clock.now();
     const issuedAt = inv.issuedAt;
@@ -737,7 +880,7 @@ export function createReceiptsService(deps: ModuleDeps) {
       company: {
         legalName: inv.issuerNameSnapshot || company.legalName,
         address: inv.issuerAddressSnapshot ?? company.address,
-        contact: company.contact,
+        contact: inv.issuerContactSnapshot ?? company.contact,
         taxId: company.taxId,
         logoMode: company.logoMode,
         logoBrandPath: company.logoBrandPath,
@@ -772,7 +915,7 @@ export function createReceiptsService(deps: ModuleDeps) {
     const pdfSha256 = sha256Hex(pdfBuffer);
     const snapshotEnc = deps.crypto.encrypt(JSON.stringify(snapshot), receiptSnapshotAad(receiptPublicId));
     const pdfEnc = deps.crypto.encrypt(pdfBuffer.toString("base64"), receiptPdfAad(receiptPublicId));
-    const shouldEmail = receiptSettings.emailCustomer;
+    const shouldEmail = receiptSettings.emailCustomer && isLiveContext;
 
     await tx.insert(compliancePaymentReceipts).values({
       publicId: receiptPublicId,
@@ -845,6 +988,7 @@ export function createReceiptsService(deps: ModuleDeps) {
         {
           receiptPublicId,
           recipientUserId: orderCtx.ownerUserId,
+          orderId: inv.orderId,
           receiptNumber,
           orderReference: orderCtx.orderReference,
           ...(orderCtx.projectName ? { projectName: orderCtx.projectName } : {}),
@@ -854,7 +998,9 @@ export function createReceiptsService(deps: ModuleDeps) {
       );
     }
 
-    await stageReceiptInStorageInTx(tx, { receiptPublicId, orderPublicId: inv.orderPublicId });
+    if (isLiveContext) {
+      await stageReceiptInStorageInTx(tx, { receiptPublicId, orderPublicId: inv.orderPublicId });
+    }
 
     return { receiptPublicId, receiptNumber };
   }
@@ -1058,6 +1204,7 @@ export function createReceiptsService(deps: ModuleDeps) {
     row: typeof compliancePaymentReceipts.$inferSelect,
     notes: RefundNoteSummaryView[],
     projectName: string | null = null,
+    orderLifecycleState: OrderLifecycleState = "live",
   ): ReceiptSummaryView {
     return {
       receiptPublicId: row.publicId,
@@ -1068,6 +1215,7 @@ export function createReceiptsService(deps: ModuleDeps) {
       orderPublicId: row.orderPublicId,
       orderReference: row.orderReference,
       projectName,
+      orderLifecycleState,
       customerRef: row.customerRefSnapshot ?? null,
       currency: row.currency,
       subtotalMinor: row.subtotalMinor,
@@ -1101,9 +1249,10 @@ export function createReceiptsService(deps: ModuleDeps) {
     row: typeof compliancePaymentReceipts.$inferSelect,
     notes: RefundNoteSummaryView[],
     projectName: string | null = null,
+    orderLifecycleState: OrderLifecycleState = "live",
   ): AdminReceiptSummaryView {
     return {
-      ...toSummaryView(row, notes, projectName),
+      ...toSummaryView(row, notes, projectName, orderLifecycleState),
       providerReference: row.providerReference ?? null,
       emailedAt: row.emailedAt ?? null,
       lastResentAt: row.lastResentAt ?? null,
@@ -1204,19 +1353,27 @@ export function createReceiptsService(deps: ModuleDeps) {
 
     const hasMore = rows.length > limit;
     const pageRows = hasMore ? rows.slice(0, limit) : rows;
-    const [notesMap, projectMap] = await Promise.all([
+    const [notesMap, orderMetaMap] = await Promise.all([
       loadNotesMap(
         deps.db,
         pageRows.map((r) => r.id),
       ),
-      resolveProjectNamesByOrderIds(
+      resolveOrderMetaByOrderIds(
         deps.db,
         pageRows.map((r) => r.orderId),
       ),
     ]);
 
     return {
-      items: pageRows.map((r) => toSummaryView(r, notesMap.get(r.id) ?? [], projectMap.get(r.orderId) ?? null)),
+      items: pageRows.map((r) => {
+        const meta = orderMetaMap.get(r.orderId);
+        return toSummaryView(
+          r,
+          notesMap.get(r.id) ?? [],
+          meta?.projectName ?? null,
+          meta?.lifecycle ?? "live",
+        );
+      }),
       nextCursor: hasMore && pageRows.length > 0 ? encodeIdCursor(pageRows[pageRows.length - 1]!.id) : null,
     };
   }
@@ -1247,15 +1404,17 @@ export function createReceiptsService(deps: ModuleDeps) {
       .where(eq(compliancePaymentReceipts.orderPublicId, orderPublicId))
       .orderBy(desc(compliancePaymentReceipts.issuedAt), desc(compliancePaymentReceipts.id));
 
-    const [notesMap, projectMap] = await Promise.all([
+    const [notesMap, orderMetaMap] = await Promise.all([
       loadNotesMap(
         deps.db,
         rows.map((r) => r.id),
       ),
-      resolveProjectNamesByOrderIds(deps.db, [orderView.id]),
+      resolveOrderMetaByOrderIds(deps.db, [orderView.id]),
     ]);
-    const orderProjectName = projectMap.get(orderView.id) ?? null;
-    return rows.map((r) => toSummaryView(r, notesMap.get(r.id) ?? [], orderProjectName));
+    const meta = orderMetaMap.get(orderView.id);
+    return rows.map((r) =>
+      toSummaryView(r, notesMap.get(r.id) ?? [], meta?.projectName ?? null, meta?.lifecycle ?? "live"),
+    );
   }
 
   async function get(principal: SessionPrincipal, receiptPublicId: string): Promise<ReceiptDetailView> {
@@ -1267,30 +1426,45 @@ export function createReceiptsService(deps: ModuleDeps) {
     if (!row) throw notFound("RECEIPT_NOT_FOUND");
 
     const { liveRole } = await assertCanReadReceiptRow(principal, row);
-    const [notesMap, projectMap] = await Promise.all([
+    const [notesMap, orderMetaMap, customerRows] = await Promise.all([
       loadNotesMap(deps.db, [row.id]),
-      resolveProjectNamesByOrderIds(deps.db, [row.orderId]),
+      resolveOrderMetaByOrderIds(deps.db, [row.orderId]),
+      deps.db
+        .select({ trashedAt: users.trashedAt, purgedAt: users.purgedAt })
+        .from(users)
+        .where(eq(users.id, row.customerUserId))
+        .limit(1),
     ]);
     const rawSnapshot = deps.crypto.decrypt(row.snapshotEnc, receiptSnapshotAad(row.publicId));
     const snapshot = JSON.parse(rawSnapshot) as ReceiptSnapshot;
+    const orderMeta = orderMetaMap.get(row.orderId);
+    const orderLifecycleState = orderMeta?.lifecycle ?? "live";
+    const customerLive = customerRows[0] ? isLiveUserRow(customerRows[0]) : true;
+
     const resolvedProjectName =
-      (typeof snapshot.projectName === "string" && snapshot.projectName.trim()
-        ? snapshot.projectName.trim()
-        : null) ??
-      projectMap.get(row.orderId) ??
-      null;
+      orderLifecycleState === "deleted"
+        ? "Deleted order"
+        : ((typeof snapshot.projectName === "string" && snapshot.projectName.trim()
+            ? snapshot.projectName.trim()
+            : null) ??
+          orderMeta?.projectName ??
+          null);
 
     const canResend =
       (liveRole === "staff" || liveRole === "admin") &&
       roleHasCapability(liveRole, "invoices.read_all") &&
-      row.origin === "portal";
+      row.origin === "portal" &&
+      orderLifecycleState === "live" &&
+      customerLive;
 
     return {
-      ...toSummaryView(row, notesMap.get(row.id) ?? [], resolvedProjectName),
+      ...toSummaryView(row, notesMap.get(row.id) ?? [], resolvedProjectName, orderLifecycleState),
       snapshot:
-        snapshot.projectName === undefined && resolvedProjectName !== null
-          ? { ...snapshot, projectName: resolvedProjectName }
-          : snapshot,
+        orderLifecycleState === "deleted"
+          ? { ...snapshot, projectName: "Deleted order" }
+          : snapshot.projectName === undefined && resolvedProjectName !== null
+            ? { ...snapshot, projectName: resolvedProjectName }
+            : snapshot,
       emailedAt: row.emailedAt ?? null,
       lastResentAt: row.lastResentAt ?? null,
       resendCount: row.resendCount,
@@ -1461,7 +1635,26 @@ export function createReceiptsService(deps: ModuleDeps) {
     const liveActor = await assertLiveActorInTx(deps, principal, deps.db as unknown as Tx);
     const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
     const ordersSvc = requireOrdersService();
-    await ordersSvc.assertCanReadOrder(livePrincipal, orderPublicId);
+
+    let orderConfirmed = false;
+    try {
+      await ordersSvc.assertCanReadOrder(livePrincipal, orderPublicId);
+      orderConfirmed = true;
+    } catch (err) {
+      if (!(err instanceof DomainError && err.code === "NOT_FOUND")) {
+        throw err;
+      }
+      try {
+        const [ord] = await deps.db
+          .select({ id: orders.id })
+          .from(orders)
+          .where(eq(orders.publicId, orderPublicId))
+          .limit(1);
+        if (ord) orderConfirmed = true;
+      } catch {
+        // Standalone compliance unit tests may omit `orders` rows.
+      }
+    }
 
     const rows = await deps.db
       .select()
@@ -1469,17 +1662,29 @@ export function createReceiptsService(deps: ModuleDeps) {
       .where(eq(compliancePaymentReceipts.orderPublicId, orderPublicId))
       .orderBy(desc(compliancePaymentReceipts.issuedAt), desc(compliancePaymentReceipts.id));
 
-    const [notesMap, projectMap] = await Promise.all([
+    if (!orderConfirmed && rows.length === 0) {
+      throw notFound("ORDER_NOT_FOUND");
+    }
+
+    const [notesMap, orderMetaMap] = await Promise.all([
       loadNotesMap(
         deps.db,
         rows.map((r) => r.id),
       ),
-      resolveProjectNamesByOrderIds(
+      resolveOrderMetaByOrderIds(
         deps.db,
         rows.map((r) => r.orderId),
       ),
     ]);
-    return rows.map((r) => toAdminSummaryView(r, notesMap.get(r.id) ?? [], projectMap.get(r.orderId) ?? null));
+    return rows.map((r) => {
+      const meta = orderMetaMap.get(r.orderId);
+      return toAdminSummaryView(
+        r,
+        notesMap.get(r.id) ?? [],
+        meta?.projectName ?? null,
+        meta?.lifecycle ?? "live",
+      );
+    });
   }
 
   async function adminListForCustomer(
@@ -1513,21 +1718,27 @@ export function createReceiptsService(deps: ModuleDeps) {
 
     const hasMore = rows.length > limit;
     const pageRows = hasMore ? rows.slice(0, limit) : rows;
-    const [notesMap, projectMap] = await Promise.all([
+    const [notesMap, orderMetaMap] = await Promise.all([
       loadNotesMap(
         deps.db,
         pageRows.map((r) => r.id),
       ),
-      resolveProjectNamesByOrderIds(
+      resolveOrderMetaByOrderIds(
         deps.db,
         pageRows.map((r) => r.orderId),
       ),
     ]);
 
     return {
-      items: pageRows.map((r) =>
-        toAdminSummaryView(r, notesMap.get(r.id) ?? [], projectMap.get(r.orderId) ?? null),
-      ),
+      items: pageRows.map((r) => {
+        const meta = orderMetaMap.get(r.orderId);
+        return toAdminSummaryView(
+          r,
+          notesMap.get(r.id) ?? [],
+          meta?.projectName ?? null,
+          meta?.lifecycle ?? "live",
+        );
+      }),
       nextCursor: hasMore && pageRows.length > 0 ? encodeIdCursor(pageRows[pageRows.length - 1]!.id) : null,
     };
   }
@@ -1563,6 +1774,29 @@ export function createReceiptsService(deps: ModuleDeps) {
         if (!row) throw notFound("RECEIPT_NOT_FOUND");
         if (row.origin !== "portal") {
           throw new DomainError("CONFLICT", "IMPORTED_RECEIPT_READ_ONLY", "Imported historical receipts cannot be resent.");
+        }
+
+        const orderMetaMap = await resolveOrderMetaByOrderIds(tx, [row.orderId]);
+        const orderLifecycle = orderMetaMap.get(row.orderId)?.lifecycle ?? "live";
+        if (orderLifecycle !== "live") {
+          throw new DomainError(
+            "CONFLICT",
+            "ORDER_NOT_LIVE",
+            "Receipts cannot be emailed while the order is in trash or permanently deleted.",
+          );
+        }
+
+        const [customerRow] = await tx
+          .select({ trashedAt: users.trashedAt, purgedAt: users.purgedAt })
+          .from(users)
+          .where(eq(users.id, row.customerUserId))
+          .limit(1);
+        if (customerRow && !isLiveUserRow(customerRow)) {
+          throw new DomainError(
+            "CONFLICT",
+            "CUSTOMER_NOT_LIVE",
+            "Receipts cannot be emailed while the customer account is in trash or permanently deleted.",
+          );
         }
 
         const now = deps.clock.now();
@@ -1626,6 +1860,7 @@ export function createReceiptsService(deps: ModuleDeps) {
           {
             receiptPublicId: row.publicId,
             recipientUserId: row.customerUserId,
+            orderId: row.orderId,
             receiptNumber: row.receiptNumber,
             orderReference: row.orderReference,
             ...(resendProjectName ? { projectName: resendProjectName } : {}),
