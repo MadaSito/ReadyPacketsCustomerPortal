@@ -483,10 +483,12 @@ export function createOrderTrash(deps: Deps): OrderTrashService {
         const [grants] = await deps.db.select({ n: sql<number>`count(*)` }).from(orderGrants).where(and(eq(orderGrants.orderId, row.id), inArray(orderGrants.status, ["pending", "active"])));
         return { additions: Number(additions), lineItems: Number(lines?.n ?? 0), notes: Number(notes?.n ?? 0), shares: Number(grants?.n ?? 0) };
       },
-      async purge(entity): Promise<TrashPurgeResult> {
+      async purge(entity, run): Promise<TrashPurgeResult> {
         if (entity.kind !== "order") return { deleted: {} };
         const orderId = entity.id;
         return deps.db.transaction(async (tx) => {
+          // Fence first: a replaced purge worker must not change anything (throws PURGE_FENCE_LOST).
+          await run.assertCurrentInTx(tx);
           const [row] = await tx.select({ id: orders.id, trashedAt: orders.trashedAt, purgeStartedAt: orders.purgeStartedAt, lockState: orders.lockState }).from(orders).where(eq(orders.id, orderId)).for("update").limit(1);
           // Fails closed: only an order whose purge has been claimed by the coordinator is erased.
           if (!row || !row.trashedAt || !row.purgeStartedAt) throw conflict("ORDER_PURGE_NOT_STARTED", "Permanent deletion of this order has not started.");

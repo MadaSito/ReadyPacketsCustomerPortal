@@ -3,7 +3,7 @@
  * - Central gate: trashed and tombstoned orders answer not-found for every principal and the trusted ports.
  * - Lists, search, groups and add-on targets exclude trashed orders; numbers stay reserved.
  * - Root cascade, same-batch replay, double submit (one winner), restore rules, purge claim and tombstone CAS.
- * - Participant purge erases orders-owned rows and keeps the line items and the reference.
+ * - Participant purge erases orders-owned rows and keeps the line items and the reference; a lost fence changes nothing.
  * All data SYNTHETIC (Zeus Greene, RPCUS-A1B2CJJG5, project "Ice Queen").
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -12,7 +12,7 @@ import { DomainError } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { DbOrTx } from "../../core/types.js";
 import type { Services } from "../../container.js";
-import type { TrashActor } from "../trash/ports.js";
+import { unfencedPurgeRunForTests, type TrashActor } from "../trash/ports.js";
 import { createTestDeps, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createOrdersModule, type OrdersModule } from "./index.js";
@@ -51,7 +51,7 @@ const purgeFully = async (publicId: string) => {
   const row = await rowOf(publicId);
   const runId = ulid(h.clock.now().getTime());
   await tx((q) => mod.trash.markPurgeStartedInTx(q, { orderId: row.id, runId, actor }));
-  await mod.trash.participant.purge!({ kind: "order", id: row.id, publicId, batchId: row.trashBatchId! }, { runId });
+  await mod.trash.participant.purge!({ kind: "order", id: row.id, publicId, batchId: row.trashBatchId! }, unfencedPurgeRunForTests(runId));
   await tx((q) => mod.trash.tombstoneOrderInTx(q, { orderId: row.id, runId, actor }));
 };
 
@@ -268,7 +268,7 @@ describe("purge", () => {
     const row = await rowOf(order.publicId);
     await t.db.insert(orderNotes).values({ publicId: ulid(h.clock.now().getTime()), orderId: row.id, authorUserId: null, authorRole: "staff", visibility: "internal", bodyEnc: "x", createdAt: h.clock.now() });
     await trash(order.publicId);
-    await expectError(mod.trash.participant.purge!({ kind: "order", id: row.id, publicId: order.publicId, batchId: "x" }, { runId: "r" }), "CONFLICT:ORDER_PURGE_NOT_STARTED");
+    await expectError(mod.trash.participant.purge!({ kind: "order", id: row.id, publicId: order.publicId, batchId: "x" }, unfencedPurgeRunForTests("r")), "CONFLICT:ORDER_PURGE_NOT_STARTED");
     await expectError(tx((q) => mod.trash.tombstoneOrderInTx(q, { orderId: row.id, runId: "r", actor })), "CONFLICT:ORDER_PURGE_NOT_STARTED");
     const summary = await mod.trash.participant.summarize!({ kind: "order", id: row.id, publicId: order.publicId, batchId: (await rowOf(order.publicId)).trashBatchId! });
     expect(summary).toMatchObject({ lineItems: 1, notes: 1 });
@@ -288,6 +288,30 @@ describe("purge", () => {
     expect(await mod.trash.trashRefInTx(t.db, order.publicId)).toMatchObject({ purgedAt: expect.any(Date) });
     const listed = await mod.trash.listTrashed({ q: order.reference });
     expect(listed.items).toHaveLength(0);
+  });
+
+  it("a purge whose run fence is lost throws and leaves every row unchanged; a current worker then purges", async () => {
+    const order = await create(zeus, [3], { projectName: "Fenced Floe" });
+    const row = await rowOf(order.publicId);
+    await t.db.insert(orderNotes).values({ publicId: ulid(h.clock.now().getTime()), orderId: row.id, authorUserId: null, authorRole: "staff", visibility: "internal", bodyEnc: "x", createdAt: h.clock.now() });
+    await trash(order.publicId);
+    const runId = ulid(h.clock.now().getTime());
+    await tx((q) => mod.trash.markPurgeStartedInTx(q, { orderId: row.id, runId, actor }));
+    const entity = { kind: "order" as const, id: row.id, publicId: order.publicId, batchId: (await rowOf(order.publicId)).trashBatchId! };
+    const lost = unfencedPurgeRunForTests(runId, {
+      assertCurrentInTx: async () => {
+        throw new DomainError("CONFLICT", "PURGE_FENCE_LOST", "This permanent deletion was taken over by another worker.");
+      },
+    });
+    await expectError(mod.trash.participant.purge!(entity, lost), "CONFLICT:PURGE_FENCE_LOST");
+    expect(await t.db.select().from(orderNotes).where(eq(orderNotes.orderId, row.id))).toHaveLength(1);
+    expect(await t.db.select().from(orderStatusHistory).where(eq(orderStatusHistory.orderId, row.id))).not.toHaveLength(0);
+    expect((await rowOf(order.publicId)).purgedAt).toBeNull();
+    // Idempotent: the current worker purges, and a repeat erases nothing more.
+    await mod.trash.participant.purge!(entity, unfencedPurgeRunForTests(runId));
+    const again = await mod.trash.participant.purge!(entity, unfencedPurgeRunForTests(runId));
+    expect(Object.values(again.deleted).every((n) => n === 0)).toBe(true);
+    expect(await t.db.select().from(orderNotes).where(eq(orderNotes.orderId, row.id))).toHaveLength(0);
   });
 
   it("listTrashed and trashRefInTx return the agreed fields", async () => {
