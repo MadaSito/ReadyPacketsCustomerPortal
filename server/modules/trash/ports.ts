@@ -29,6 +29,19 @@ export interface TrashPurgeRun {
    * number) that known copies on an unreachable destination are left in place. Never set by the retention job.
    */
   acknowledgedUnreachableCopies?: boolean;
+  /**
+   * Ownership fence (D2.8). A participant MUST call this as the first statement of EVERY transaction in which
+   * its `purge` changes data, and directly before any call to an external provider (in a short transaction of
+   * its own). It takes a shared row lock on the purge run and throws `PURGE_FENCE_LOST` (409) when this worker
+   * no longer owns the run, so a worker that was replaced can never change data again, and a takeover waits
+   * for transactions that are still in flight. Deleting at an external provider must stay idempotent.
+   */
+  assertCurrentInTx(tx: Tx): Promise<void>;
+}
+
+/** For unit tests of a participant only: a purge run whose fence always passes. Never use in server code. */
+export function unfencedPurgeRunForTests(runId: string, extra: Partial<Omit<TrashPurgeRun, "runId">> = {}): TrashPurgeRun {
+  return { runId, assertCurrentInTx: async () => undefined, ...extra };
 }
 
 export interface TrashPurgeResult {
