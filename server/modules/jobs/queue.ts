@@ -5,7 +5,7 @@ import { conflict, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import { getRequestContext, newRequestContext, runWithRequestContext } from "../../core/requestContext.js";
 import type {
-  AuditEmitter, AuditOutcome, ClaimedJob, Clock, Db, EnqueueOptions, FieldCrypto,
+  AuditEmitter, AuditOutcome, ClaimedJob, Clock, Db, DbOrTx, EnqueueOptions, FieldCrypto,
   JobHandlerOptions, JobQueue, JobResult, Logger, SettingsStore, Tx,
 } from "../../core/types.js";
 import { jobAttempts, jobMaintenance, jobRuns, mailAttempts, mailOutbox, mailTransportAttempts } from "./schema.js";
@@ -64,7 +64,7 @@ export async function ensureMaintenanceGate(deps: QueueDeps): Promise<void> {
   }
 }
 
-export async function gateDraining(tx: Tx, mode: "share" | "update" = "share"): Promise<boolean> {
+export async function gateDraining(tx: DbOrTx, mode: "share" | "update" = "share"): Promise<boolean> {
   const [gate] = await tx.select({ active: jobMaintenance.active }).from(jobMaintenance)
     .where(eq(jobMaintenance.id, MAINTENANCE_ID)).limit(1).for(mode);
   if (!gate) throw new Error("JOB_MAINTENANCE_GATE_MISSING");

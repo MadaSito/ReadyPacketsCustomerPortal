@@ -2,7 +2,7 @@ import { and, asc, desc, eq, lt, lte, or, sql } from "drizzle-orm";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
 import { ULID_PATTERN } from "../../core/ids.js";
-import type { ModuleHealth, SessionPrincipal, Tx } from "../../core/types.js";
+import type { DbOrTx, ModuleHealth, SessionPrincipal, Tx } from "../../core/types.js";
 import { roleHasCapability, STEP_UP_CAPABILITIES, type Capability } from "../../../shared/capabilities.js";
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
 import { TRASH_JOB_RETENTION_CLEANUP } from "../trash/jobNames.js";
@@ -84,7 +84,8 @@ export function createJobsAdmin(deps: ModuleDeps) {
     throw new DomainError("STEP_UP_REQUIRED", "STEP_UP_REQUIRED", "Confirm your password and authentication code to continue.", { capability });
   }
 
-  async function isDraining(): Promise<boolean> {
+  async function isDraining(tx?: DbOrTx): Promise<boolean> {
+    if (tx) return gateDraining(tx);
     const [gate] = await db.select({ active: jobMaintenance.active }).from(jobMaintenance)
       .where(eq(jobMaintenance.id, MAINTENANCE_ID)).limit(1);
     return gate?.active ?? false;

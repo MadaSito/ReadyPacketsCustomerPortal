@@ -20,7 +20,7 @@ import { createMailTrashGuard, createMailTrashParticipant } from "./mailTrash.js
 import type { MailTransportMessage } from "./mailPorts.js";
 import { MAIL_AUDIT_COPY, MAIL_RETAIN_CONTENT, MAIL_RETENTION_DAYS, MAIL_ROUTING, MAIL_SENDER } from "./mailSettings.js";
 import { enqueuePolicyNoticeMail, policyNoticeMailKey, registerPolicyNoticeJobs } from "./policyNoticeJobs.js";
-import { createJobQueue, createMailer, engineFor, JOB_TYPE } from "./queue.js";
+import { createJobQueue, createMailer, engineFor, ensureMaintenanceGate, JOB_TYPE, MAINTENANCE_ID } from "./queue.js";
 import { enqueuePaymentReceipt, PAYMENT_RECEIPT_TEMPLATE, RECEIPT_PDF_MAX_BYTES } from "./receiptMail.js";
 import {
   REFUND_NOTICE_TEMPLATE_KEY, REFUND_RECONCILE_JOB, REFUND_RECONCILE_MAX_ATTEMPTS,
@@ -487,6 +487,22 @@ describe("MySQL durable job leases", () => {
     expect((await f.admin.detail(f.operator, jobId)).state).toBe("queued");
     expect(await f.admin.isDraining()).toBe(false);
     expect(await t.db.select().from(jobAttempts)).toHaveLength(0);
+  });
+
+  it("holds the shared worker-drain lock through the caller's transaction", async () => {
+    const f = fixture();
+    await expect(t.db.transaction((tx) => f.admin.isDraining(tx))).rejects.toThrow("JOB_MAINTENANCE_GATE_MISSING");
+    await ensureMaintenanceGate(f.h.deps);
+    const gateWriteLock = () => t.db.transaction((tx) => tx.select({ id: jobMaintenance.id }).from(jobMaintenance)
+      .where(eq(jobMaintenance.id, MAINTENANCE_ID)).limit(1).for("update", { noWait: true }));
+    await t.db.transaction(async (tx) => {
+      await expect(f.admin.isDraining(tx)).resolves.toBe(false);
+      await expect(gateWriteLock()).rejects.toMatchObject({ cause: { code: "ER_LOCK_NOWAIT" } });
+    });
+    await expect(gateWriteLock()).resolves.toEqual([{ id: MAINTENANCE_ID }]);
+    await f.admin.setMaintenance(f.operator, { active: true, expectedActive: false });
+    await expect(t.db.transaction((tx) => f.admin.isDraining(tx))).resolves.toBe(true);
+    await expect(f.admin.isDraining()).resolves.toBe(true);
   });
 
   it("writes canonically correlated audit rows, and rolls the audit row back with its caller", async () => {
