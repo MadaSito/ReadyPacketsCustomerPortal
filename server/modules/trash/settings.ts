@@ -3,8 +3,8 @@
  * Owner: recovery_ops_engineer.
  *
  * Keys follow `SETTING_KEY_PATTERN` (`lowercase.snake_case`), default to automatic clean-up ON at 30 days
- * for both orders and customers (`1..3650`), and point generic settings editors to `/admin/trash` (`Trash centre`)
- * with `writeCapability: "trash.retention.manage"`.
+ * for both orders and customers (`1..3650`), and set `ownerWriteOnly: true` (`exportable: false`) so generic
+ * platform settings mutations and portable config imports cannot bypass D2.8 CAS + typed confirmation.
  */
 import { z } from "zod";
 import { defineSetting } from "../platform/index.js";
@@ -18,6 +18,13 @@ export const TRASH_RETENTION_MIN_DAYS = 1;
 export const TRASH_RETENTION_MAX_DAYS = 3650;
 export const TRASH_RETENTION_DEFAULT_DAYS = 30;
 
+export function parseRetentionDays(raw: unknown, fallback = TRASH_RETENTION_DEFAULT_DAYS): number {
+  if (typeof raw === "number" && Number.isInteger(raw) && raw >= TRASH_RETENTION_MIN_DAYS && raw <= TRASH_RETENTION_MAX_DAYS) {
+    return raw;
+  }
+  return fallback;
+}
+
 export const TRASH_AUTO_PURGE_ENABLED = defineSetting({
   key: "trash.auto_purge.enabled",
   owner: "trash",
@@ -30,6 +37,8 @@ export const TRASH_AUTO_PURGE_ENABLED = defineSetting({
   sensitivity: "internal",
   writeCapability: "trash.retention.manage",
   managedBy: managedByTrashCentre,
+  ownerWriteOnly: true,
+  exportable: false,
   fields: {
     "": {
       label: "Automatic trash clean-up",
@@ -50,6 +59,8 @@ export const TRASH_RETENTION_ORDER_DAYS = defineSetting({
   sensitivity: "internal",
   writeCapability: "trash.retention.manage",
   managedBy: managedByTrashCentre,
+  ownerWriteOnly: true,
+  exportable: false,
   fields: {
     "": {
       label: "Order retention in trash (days)",
@@ -70,6 +81,8 @@ export const TRASH_RETENTION_CUSTOMER_DAYS = defineSetting({
   sensitivity: "internal",
   writeCapability: "trash.retention.manage",
   managedBy: managedByTrashCentre,
+  ownerWriteOnly: true,
+  exportable: false,
   fields: {
     "": {
       label: "Customer account retention in trash (days)",
