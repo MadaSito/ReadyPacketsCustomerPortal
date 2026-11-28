@@ -720,6 +720,7 @@ The day settings allow 1 to 3,650 days. Changing them needs `trash.retention.man
   - It does not run during maintenance or an upgrade.
   - One failing item does not block the others. Failures raise an operational alert and are retried.
   - The Trash centre shows the last clean-up run and how many items are due next.
+  - A manual retry of the job is refused. Retry a failed item from the Trash centre instead.
 
 ### Backups, Stripe, SharePoint and other copies
 
@@ -736,6 +737,7 @@ Permanent deletion only reaches data that the portal itself controls.
   - **Azure Blob** with soft delete enabled may keep a retained version, under the storage administrator's control.
 - **SharePoint folders and reused external items.** Folders already written to SharePoint, and external items that were reused, are not deleted. Only the portal's mapping rows are erased. Delete the folders in SharePoint if needed.
 - **E-mail.** Messages already delivered stay in the recipients' mailboxes.
+- **Queued e-mail.** Messages still waiting to be sent for a deleted customer are not sent. Older queued messages that are not tied to an order or account may also be held back, because the portal does not send what it cannot check.
 - **SIEM.** Copies already sent to the SIEM or syslog server stay there.
 
 **Audit.** Every action is audited with the actor, public IDs, batch ID, reason and counts, never with names, e-mail addresses or content. The events are:

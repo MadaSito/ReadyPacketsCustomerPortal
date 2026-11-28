@@ -391,7 +391,7 @@ export function createPlatformModule(deps: ModuleDeps): PlatformModuleImpl {
       // Exactly one startup WARN per process (container calls init once after construction).
       if (preview) log.warn("preview profile active: relaxed framing/CORS, in-memory session transport, synthetic data only", { event: "platform.preview_profile.active" });
       // Increment 09: a customer's permanent deletion unlinks their consent records.
-      deps.services.trash.register(createPlatformTrashParticipant(consent));
+      deps.services.trash.register(createPlatformTrashParticipant(db, consent));
     },
     schemaStatus,
     healthReport,

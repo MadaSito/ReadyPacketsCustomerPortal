@@ -199,8 +199,9 @@ Existing orders keep their pinned workflow version. The start-up job `orders.inc
 
 `0009_increment_09` is additive only: new tables, new nullable columns or columns with defaults, new indexes, and enum widening. It drops and renames nothing, and does no backfill in SQL.
 
-- **Schema.** `migrations/0009_increment_09.sql` (commit 8b76e87) has 48 statements: 4 new tables, 1 enum widening, 23 new nullable columns and 20 new indexes.
-  - **New tables:** `trash_purge_runs` (one row per permanent deletion, with per-module counts and a safe error code), `trash_cleanup_sweeps` (retention job runs), `trash_idempotency_keys` and `trash_retention_state`.
+- **Schema.** `migrations/0009_increment_09.sql` (commit 2731868, which replaces the earlier 8b76e87) has 53 statements: 5 new tables, 1 enum widening, 23 new nullable columns, 23 new indexes and 1 foreign key.
+  - **New tables:** `trash_purge_runs` (one row per permanent deletion, with per-module counts and a safe error code), `trash_purge_run_targets` (the fixed list of items each deletion works on), `trash_cleanup_sweeps` (retention job runs), `trash_idempotency_keys` and `trash_retention_state`.
+  - **Foreign key:** `trash_purge_target_run_fk` links `trash_purge_run_targets.run_id` to `trash_purge_runs`.
   - **`users` and `orders`:** `trashed_at`, `trashed_by_user_id`, `trash_batch_id`, `trash_reason`, `purge_started_at` and `purged_at`, with indexes `users_trashed_idx` and `orders_trashed_idx` on `(trashed_at, id)`, and `orders_trash_batch_idx`.
   - **Other new columns:**
     - `engagement_notifications.order_id` and `ticket_id`;
@@ -209,13 +210,17 @@ Existing orders keep their pinned workflow version. The start-up job `orders.inc
     - `automation_runs.subject_user_id`;
     - `payment_attempts.trash_cancelled_at` and `provider_cancelled_at`.
   - **Widened:** `operational_alerts.source` gains `trash`.
-  - **Indexes** for the new lookups on notifications, support tickets, the mail outbox, automation runs, API keys, community reports and topics, and payment attempts.
+  - **Indexes** for the trash tables and for the new lookups on notifications, support tickets, the mail outbox, automation runs, API keys, community reports and topics, and payment attempts.
   - Nothing is dropped or renamed. Existing rows keep `NULL` in the new columns, so nothing is in the trash.
 - **Native upgrade and Docker Compose.** These are the same as for increment 08: sections 2–5, with the backup, fence and `BACKUP-VERIFIED` gates. Release validation and the image build require the SQL file and the journal entry `0009_increment_09`. Never run the SQL by hand. If you mistype a confirmation, see the box at the top of [section 6](#6-recovery-if-an-upgrade-stops-mid-way).
 - **What stays the same:**
   - nothing is in the trash after the upgrade, and every order and customer stays visible as before;
   - order numbers and customer IDs are unchanged;
   - API v1 responses stay backward compatible.
+- **What behaves differently:**
+  - **Password reset.** Password-reset requests still queued from before the upgrade are refused. Users request a new reset.
+  - **Queued mail after a deletion.** Older queued mail that is not tied to an order or account can be suppressed after a customer is deleted permanently. When the portal cannot tell whether a message concerns the deleted customer, it does not send it.
+  - **Retention clean-up job.** A manual retry of `trash.retention_cleanup` is refused. The job runs only on its hourly schedule.
 - **After the upgrade:**
   - **Retention.** Open **Administration → Trash** and check the retention settings. **Automatic trash clean-up** is **on**, with 30 days for both **Order retention in trash (days)** and **Customer account retention in trash (days)**. Change these before moving anything to the trash if your policy differs.
   - **E-mail links.** Send a test from the template editor and check that links are clickable. Stored templates are fixed when the message is produced; you do not need to edit them.
@@ -245,6 +250,10 @@ Existing orders keep their pinned workflow version. The start-up job `orders.inc
   - existing users keep signing in, and their name parts are filled in the next time the profile is saved;
   - active Stripe configurations stay active;
   - API v1 responses stay backward compatible.
+- **What behaves differently:**
+  - **Password reset.** Password-reset requests still queued from before the upgrade are refused. Users request a new reset.
+  - **Queued mail after a deletion.** Older queued mail that is not tied to an order or account can be suppressed after a customer is deleted permanently. When the portal cannot tell whether a message concerns the deleted customer, it does not send it.
+  - **Retention clean-up job.** A manual retry of `trash.retention_cleanup` is refused. The job runs only on its hourly schedule.
 - **After the upgrade:**
   - **Stripe.** Open `/admin/payments/setup` and check the webhook section. Payments are now booked from a signed webhook or from the server's own lookup at Stripe, which replaces increment 07 decision 12. If webhooks are not arriving, the page shows the alert "Stripe is not delivering webhooks to this server" and the usual causes.
   - **Repairing older payments.** For an invoice that was paid on Stripe before the upgrade but still shows "Issued", open `/admin/invoices/<invoice>` (or the attempt in `/admin/payments`) and press **Check with Stripe now**. This needs `payments.manage` and a fresh two-step check. If Stripe confirms the payment, it is booked once and the check is audited.

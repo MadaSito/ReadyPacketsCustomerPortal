@@ -19,6 +19,7 @@ import {
 } from "./consent.js";
 import { listSettingDefinitions, writeSetting } from "./settingsRegistry.js";
 import { createPlatformTrashParticipant, PLATFORM_TRASH_MODULE } from "./trash.js";
+import { unfencedPurgeRunForTests } from "../trash/ports.js";
 
 let t: TestDb;
 let h: TestHarness;
@@ -181,16 +182,37 @@ describe("consent: retention", () => {
     await enable();
     await svc.record({ policyVersion: 1, choices: NONE, action: "reject_all", source: "banner", gpc: false }, { userPublicId: "usr_trash_a", ipAddress: null });
     await svc.record({ policyVersion: 1, choices: ALL, action: "accept_all", source: "banner", gpc: false }, { userPublicId: "usr_trash_b", ipAddress: null });
-    const participant = createPlatformTrashParticipant(svc);
+    const participant = createPlatformTrashParticipant(t.db, svc);
     expect(participant.module).toBe(PLATFORM_TRASH_MODULE);
     expect(participant.onTrashedInTx).toBeUndefined();
     expect(participant.onRestoredInTx).toBeUndefined();
+    const run = unfencedPurgeRunForTests("run_1");
     const order = { kind: "order" as const, id: 1, publicId: "ord_trash", batchId: "01J0000000000000000000BATCH" };
-    expect(await participant.purge!(order, { runId: "run_1" })).toEqual({ deleted: {} });
+    expect(await participant.purge!(order, run)).toEqual({ deleted: {} });
     const customer = { kind: "customer" as const, id: 2, publicId: "usr_trash_a", batchId: "01J0000000000000000000BATCH" };
-    expect(await participant.purge!(customer, { runId: "run_1" })).toEqual({ deleted: { consents: 1 } });
-    expect(await participant.purge!(customer, { runId: "run_1" })).toEqual({ deleted: { consents: 0 } });
+    expect(await participant.purge!(customer, run)).toEqual({ deleted: { consents: 1 } });
+    expect(await participant.purge!(customer, run)).toEqual({ deleted: { consents: 0 } });
     expect(await svc.mine("usr_trash_a")).toHaveLength(0);
     expect(await svc.mine("usr_trash_b")).toHaveLength(1);
+  });
+
+  it("trash participant: a lost purge fence leaves consent records unchanged; a later current run unlinks them", async () => {
+    await enable();
+    await svc.record({ policyVersion: 1, choices: ALL, action: "accept_all", source: "banner", gpc: false }, { userPublicId: "usr_trash_c", ipAddress: null });
+    const participant = createPlatformTrashParticipant(t.db, svc);
+    const customer = { kind: "customer" as const, id: 3, publicId: "usr_trash_c", batchId: "01J0000000000000000000BATCH" };
+    const fenceLost = new DomainError("CONFLICT", "PURGE_FENCE_LOST", "Another worker took over this deletion.");
+    let fenceCalls = 0;
+    const replaced = unfencedPurgeRunForTests("run_2", {
+      assertCurrentInTx: async () => {
+        fenceCalls += 1;
+        throw fenceLost;
+      },
+    });
+    await expect(participant.purge!(customer, replaced)).rejects.toBe(fenceLost);
+    expect(fenceCalls).toBe(1);
+    expect(await svc.mine("usr_trash_c")).toHaveLength(1);
+    expect(await participant.purge!(customer, unfencedPurgeRunForTests("run_2"))).toEqual({ deleted: { consents: 1 } });
+    expect(await svc.mine("usr_trash_c")).toHaveLength(0);
   });
 });
