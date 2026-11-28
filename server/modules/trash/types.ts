@@ -1,7 +1,7 @@
 /**
  * Trash coordinator public types (Increment 09, Decision D2 & D2.8). Owner: recovery_ops_engineer.
  */
-import type { ModuleLifecycle, SessionPrincipal } from "../../core/types.js";
+import type { ModuleLifecycle, SessionPrincipal, Tx } from "../../core/types.js";
 import type { TrashEntityKind, TrashRegistry } from "./ports.js";
 
 export type TrashState = "in_trash" | "deleting" | "failed";
@@ -186,7 +186,7 @@ export interface TrashSettingsUpdateInput extends RetentionValues {
 
 export interface TrashCleanupJobFence {
   signal: AbortSignal;
-  assertStillOwned(): Promise<void>;
+  assertStillOwned(tx?: Tx): Promise<void>;
 }
 
 export interface TrashCleanupResult {

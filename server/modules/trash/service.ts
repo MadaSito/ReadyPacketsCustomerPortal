@@ -2477,9 +2477,19 @@ export function createTrashCoordinator(
       try {
         // Phase 1: Synchronized lock + durable per-target ownership claim / resume inside TX.
         // Canonical lock order:
-        //   trash_cleanup_sweeps (if sweep) -> trash_purge_runs -> trash_purge_run_targets -> users (id ASC) -> orders (id ASC) -> trash_idempotency_keys.
+        //   job_runs (if jobFence) -> trash_cleanup_sweeps (if sweep) -> trash_purge_runs -> trash_purge_run_targets -> users (id ASC) -> orders (id ASC) -> trash_idempotency_keys.
         claimed = await deps.db.transaction(async (tx) => {
           if (sweepFence) {
+            if (sweepFence.jobFence) {
+              if (sweepFence.jobFence.signal.aborted) {
+                throw conflict("SWEEP_FENCE_LOST", "Retention clean-up job was aborted.");
+              }
+              try {
+                await sweepFence.jobFence.assertStillOwned(tx);
+              } catch {
+                throw conflict("SWEEP_FENCE_LOST", "Retention clean-up job lost ownership.");
+              }
+            }
             const sNow = deps.clock.now();
             const [currSweep] = await tx
               .select({
@@ -2503,16 +2513,6 @@ export function createTrashCoordinator(
               currSweep.leaseExpiresAt.getTime() <= sNow.getTime()
             ) {
               throw conflict("SWEEP_FENCE_LOST", "Retention clean-up sweep lost its lease.");
-            }
-            if (sweepFence.jobFence) {
-              if (sweepFence.jobFence.signal.aborted) {
-                throw conflict("SWEEP_FENCE_LOST", "Retention clean-up job was aborted.");
-              }
-              try {
-                await sweepFence.jobFence.assertStillOwned();
-              } catch {
-                throw conflict("SWEEP_FENCE_LOST", "Retention clean-up job lost ownership.");
-              }
             }
             await tx
               .update(trashCleanupSweeps)
@@ -5076,6 +5076,14 @@ export function createTrashCoordinator(
       let claimOutcome: ClaimSweepOutcome;
       try {
         claimOutcome = await deps.db.transaction(async (tx): Promise<ClaimSweepOutcome> => {
+          if (jobFence) {
+            if (jobFence.signal.aborted) return { acquired: false, reason: "ABORTED" };
+            try {
+              await jobFence.assertStillOwned(tx);
+            } catch {
+              return { acquired: false, reason: "JOB_LEASE_LOST" };
+            }
+          }
           const txNow = deps.clock.now();
           const [activeRow] = await tx
             .select()
@@ -5154,6 +5162,14 @@ export function createTrashCoordinator(
 
       const renewSweepLeaseOrStop = async (): Promise<boolean> => {
         return deps.db.transaction(async (tx) => {
+          if (jobFence) {
+            if (jobFence.signal.aborted) return false;
+            try {
+              await jobFence.assertStillOwned(tx);
+            } catch {
+              return false;
+            }
+          }
           const rNow = deps.clock.now();
           const [curr] = await tx
             .select({
@@ -5374,12 +5390,9 @@ export function createTrashCoordinator(
               stoppedEarly = true;
               break;
             }
-            if (jobFence) {
-              if (jobFence.signal.aborted) {
-                stoppedEarly = true;
-                break;
-              }
-              await jobFence.assertStillOwned();
+            if (jobFence?.signal.aborted) {
+              stoppedEarly = true;
+              break;
             }
 
             try {
@@ -5554,7 +5567,6 @@ export function createTrashCoordinator(
       if (job.signal.aborted) {
         return { outcome: "canceled", reasonCode: "ABORTED" };
       }
-      await job.assertStillOwned();
       const res = await service.runRetentionCleanup(job.jobId, job);
       if (res.failed > 0) {
         return { outcome: "failed", reasonCode: "TRASH_PURGE_FAILED", retryable: true };

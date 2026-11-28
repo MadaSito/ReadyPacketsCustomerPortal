@@ -42,9 +42,18 @@ import {
   orders,
 } from "../orders/schema.js";
 import { createOrderTrash } from "../orders/trash.js";
+import { createJobQueue, engineFor } from "../jobs/queue.js";
+import {
+  jobAttempts,
+  jobMaintenance,
+  jobRuns,
+  mailAttempts,
+  mailOutbox,
+  mailTransportAttempts,
+} from "../jobs/schema.js";
 import { platformSettings } from "../platform/schema.js";
 import { storageCopyAttempts } from "../storage/schema.js";
-import { createTrashModule, type TrashCoordinatorModule } from "./index.js";
+import { createTrashModule, TRASH_JOB_RETENTION_CLEANUP, type TrashCoordinatorModule } from "./index.js";
 import type { TrashEntityRef, TrashParticipant, TrashPurgeResult, TrashPurgeRun } from "./ports.js";
 import { trashRouter } from "./router.js";
 import {
@@ -89,6 +98,12 @@ const schema = {
   orderAdminTasks,
   platformSettings,
   storageCopyAttempts,
+  jobMaintenance,
+  jobRuns,
+  jobAttempts,
+  mailOutbox,
+  mailAttempts,
+  mailTransportAttempts,
   trashPurgeRuns,
   trashPurgeRunTargets,
   trashCleanupSweeps,
@@ -1708,10 +1723,11 @@ describe("durable per-target ownership, pure row-lock participant fence, and ret
     expect(hbDone.results[0]?.ok).toBe(true);
   });
 
-  it("operates end-to-end with RP_DB_POOL_SIZE = 1 without self-deadlock", async () => {
+  it("operates end-to-end with RP_DB_POOL_SIZE = 1 and real ClaimedJob without self-deadlock", async () => {
     const cust = await seedCustomer({ id: 85, status: "active" });
     const ord1 = await seedOrder({ id: 850, ownerUserId: cust.id, reference: "RP-2026-0850" });
     const ord2 = await seedOrder({ id: 851, ownerUserId: cust.id, reference: "RP-2026-0851" });
+    const ord3 = await seedOrder({ id: 852, ownerUserId: cust.id, reference: "RP-2026-0852" });
 
     const singlePool = mysql.createPool({
       uri: t.url,
@@ -1723,6 +1739,11 @@ describe("durable per-target ownership, pure row-lock participant fence, and ret
     try {
       const singleDb = drizzle(singlePool, { mode: "default" }) as unknown as Db;
       const h1 = createTestDeps({ db: singleDb, now: h.clock.now() });
+      // Wire the REAL `JobQueue` (`jobs/queue.ts`) onto the 1-connection pool (`RP_DB_POOL_SIZE = 1`)!
+      const realQueue = createJobQueue(h1.deps);
+      (h1.deps as { jobs: typeof realQueue }).jobs = realQueue;
+      const realEngine = engineFor(realQueue)!;
+
       h1.services.assurance = h.services.assurance;
       h1.services.jobAdmin = h.services.jobAdmin;
       h1.services.opsAlerts = h.services.opsAlerts;
@@ -1770,8 +1791,63 @@ describe("durable per-target ownership, pure row-lock participant fence, and ret
         idempotencyKey: "idem-pool1-move-2",
       });
       h1.clock.advance(31 * 86_400_000);
-      const sweepRes = await trash1.runRetentionCleanup("job-pool1-sweep");
-      expect(sweepRes.purged).toBe(1);
+
+      // Enqueue, claim, and execute `trash.retention_cleanup` through the REAL `JobEngine` & `ClaimedJob` on `connectionLimit: 1`!
+      const enq1 = await realQueue.enqueue(TRASH_JOB_RETENTION_CLEANUP, {});
+      const claim1 = await realEngine.claim();
+      expect(claim1?.job.jobId).toBe(enq1.jobId);
+      await realEngine.execute(claim1!);
+
+      const [ord2After] = await t.db.select().from(orders).where(eq(orders.id, ord2.id));
+      expect(ord2After?.purgedAt).not.toBeNull();
+      const [job1Row] = await t.db.select().from(jobRuns).where(eq(jobRuns.publicId, enq1.jobId));
+      expect(job1Row?.state).toBe("completed");
+
+      // Also verify real `ClaimedJob.assertStillOwned(tx)` inside Phase 1 when `job_runs.fencing_token` advances right before item claim!
+      const adminNow2 = h1.clock.now();
+      await t.db
+        .update(userSessions)
+        .set({
+          authenticatedAt: adminNow2,
+          lastSeenAt: adminNow2,
+          absoluteExpiresAt: new Date(adminNow2.getTime() + 60 * 86_400_000),
+        })
+        .where(eq(userSessions.publicId, adminPrincipal.sessionId));
+      await trash1.moveToTrash(adminPrincipal, {
+        kind: "order",
+        publicId: ord3.publicId,
+        idempotencyKey: "idem-pool1-move-3",
+      });
+      h1.clock.advance(31 * 86_400_000);
+
+      const enq2 = await realQueue.enqueue(TRASH_JOB_RETENTION_CLEANUP, {});
+      const claim2 = await realEngine.claim();
+      expect(claim2?.job.jobId).toBe(enq2.jobId);
+
+      // Wrap ONLY to advance `job_runs.fencing_token` right before the Phase 1 `assertStillOwned(tx)` call (#4: execute -> sweep-claim -> pre-item-renew -> Phase 1),
+      // then delegate 100% to the real `ClaimedJob.assertStillOwned(tx)` on `singleDb`!
+      const realAssertStillOwned = claim2!.job.assertStillOwned.bind(claim2!.job);
+      let realAssertCalls = 0;
+      claim2!.job.assertStillOwned = async (passedTx) => {
+        realAssertCalls += 1;
+        if (realAssertCalls === 4) {
+          // Called inside Phase 1 `tx`: `passedTx` MUST be defined! Advance `job_runs.fencing_token` on a separate connection first?
+          // Wait: inside Phase 1 `tx`, `job_runs` is NOT locked yet before `realAssertStillOwned(passedTx)` runs, so an autocommit update on `t.db` commits immediately!
+          expect(passedTx).toBeDefined();
+          await t.db
+            .update(jobRuns)
+            .set({ fencingToken: claim2!.job.fencingToken + 1 })
+            .where(eq(jobRuns.publicId, enq2.jobId));
+        }
+        return realAssertStillOwned(passedTx);
+      };
+
+      await realEngine.execute(claim2!);
+      expect(realAssertCalls).toBe(4);
+      expect(claim2!.controller.signal.aborted).toBe(true);
+      const [ord3After] = await t.db.select().from(orders).where(eq(orders.id, ord3.id));
+      expect(ord3After?.purgeStartedAt).toBeNull();
+      expect(ord3After?.purgedAt).toBeNull();
     } finally {
       await singlePool.end();
     }
@@ -1880,13 +1956,16 @@ describe("durable per-target ownership, pure row-lock participant fence, and ret
     // 3. Sweep 1 progresses past `failingHead` AND all 8 `heldItems` to purge `healthyTail`, rechecking `jobFence` before EVERY target!
     opsEmitted = [];
     let leaseChecks = 0;
+    let everySweepCheckPassedTx = true;
     const abortCtrl = new AbortController();
     const sweep1 = await sweepTrash.runRetentionCleanup("job-fair-sweep-1", {
       signal: abortCtrl.signal,
-      assertStillOwned: async () => {
+      assertStillOwned: async (passedTx) => {
         leaseChecks += 1;
+        if (!passedTx) everySweepCheckPassedTx = false;
       },
     });
+    expect(everySweepCheckPassedTx).toBe(true);
     expect(leaseChecks).toBeGreaterThanOrEqual(10);
     expect(sweep1.failed).toBe(1);
     expect(sweep1.purged).toBe(1);
@@ -1929,10 +2008,11 @@ describe("durable per-target ownership, pure row-lock participant fence, and ret
     let callNum = 0;
     const fencedSweep = await sweepTrash.runRetentionCleanup("job-phase1-fence-lost", {
       signal: abortCtrl.signal,
-      assertStillOwned: async () => {
+      assertStillOwned: async (passedTx) => {
+        expect(passedTx).toBeDefined();
         callNum += 1;
-        // Pass the outer pre-loop check (`callNum === 1`), then fail inside `executePurgeOne` Phase 1 (`callNum === 2`)!
-        if (callNum >= 2) {
+        // Pass sweep-claim (`callNum === 1`) and pre-item renew (`callNum === 2`), then fail inside `executePurgeOne` Phase 1 (`callNum === 3`)!
+        if (callNum >= 3) {
           throw new Error("JOB_LEASE_STOLEN_BEFORE_CLAIM");
         }
       },
