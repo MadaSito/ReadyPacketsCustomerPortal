@@ -951,17 +951,19 @@ export function createIntegrationsModule(
         async summarize(entity) {
           return production.summarizeOrderForTrash(entity);
         },
-        async purge(entity) {
-          const [prod, wh] = await Promise.all([
-            production.purgeOrderDispatches(entity),
-            webhooks.purgeOrderDeliveries(entity),
-          ]);
-          return {
-            deleted: {
-              ...prod.deleted,
-              ...wh.deleted,
-            },
-          };
+        async purge(entity, run) {
+          if (entity.kind !== "order") return { deleted: {} };
+          return deps.db.transaction(async (tx) => {
+            await run.assertCurrentInTx(tx);
+            const prod = await production.purgeOrderDispatchesInTx(tx, entity);
+            const wh = await webhooks.purgeOrderDeliveriesInTx(tx, entity);
+            return {
+              deleted: {
+                ...prod.deleted,
+                ...wh.deleted,
+              },
+            };
+          });
         },
       };
       deps.services.trash?.register(trashParticipant);

@@ -34,7 +34,7 @@ import {
 } from "../jobs/refundSupport.js";
 import { stripeWebhookDeliveryMissingAlert } from "../opsAlerts/stripeWebhook.js";
 import { isSecretConfigured, readSecret, readSetting, writeSetting } from "../platform/index.js";
-import type { TrashEntityRef, TrashPurgeResult } from "../trash/ports.js";
+import type { TrashEntityRef, TrashPurgeResult, TrashPurgeRun } from "../trash/ports.js";
 import { createSquareProviderAdapter } from "./providers/square.js";
 import { createSquareRefundAdapter } from "./providers/square-refund.js";
 import {
@@ -9131,15 +9131,22 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     return out;
   }
 
-  async function purgeOrderForTrash(entity: TrashEntityRef): Promise<TrashPurgeResult> {
+  async function purgeOrderForTrash(
+    entity: TrashEntityRef,
+    run: TrashPurgeRun,
+  ): Promise<TrashPurgeResult> {
     if (entity.kind !== "order") {
       return { deleted: {} };
     }
-    // Scrub any residual encrypted redirect URLs while retaining all payment, refund, and webhook records.
-    await deps.db
-      .update(paymentAttempts)
-      .set({ redirectUrlEnc: null })
-      .where(and(eq(paymentAttempts.orderPublicId, entity.publicId), isNotNull(paymentAttempts.redirectUrlEnc)));
+    // Scrub any residual encrypted redirect URLs under the purge run's ownership fence
+    // while retaining all payment, refund, and webhook records.
+    await deps.db.transaction(async (tx) => {
+      await run.assertCurrentInTx(tx);
+      await tx
+        .update(paymentAttempts)
+        .set({ redirectUrlEnc: null })
+        .where(and(eq(paymentAttempts.orderPublicId, entity.publicId), isNotNull(paymentAttempts.redirectUrlEnc)));
+    });
 
     const summary = await summarizeOrderForTrash(entity);
     const kept: Record<string, number> = {};

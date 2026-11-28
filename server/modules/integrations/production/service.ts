@@ -29,7 +29,7 @@ import { getRequestContext } from "../../../core/requestContext.js";
 import type { ClaimedJob, DbOrTx, JobResult, SafeAttributeValue, SessionPrincipal, Tx } from "../../../core/types.js";
 import { jobRuns } from "../../jobs/schema.js";
 import type { OrderLockState } from "../../orders/types.js";
-import type { TrashEntityRef } from "../../trash/ports.js";
+import type { TrashEntityRef, TrashPurgeRun } from "../../trash/ports.js";
 import { isSecretConfigured, readSecret, readSetting, writeSetting } from "../../platform/index.js";
 import { flagKey } from "../../platform/settingsRegistry.js";
 import {
@@ -406,7 +406,8 @@ export interface ProductionWebhookService {
   ): Promise<{ items: ProductionDispatchItem[] }>;
   onOrderTrashedInTx(tx: Tx, entity: TrashEntityRef): Promise<void>;
   summarizeOrderForTrash(entity: TrashEntityRef): Promise<Record<string, number>>;
-  purgeOrderDispatches(entity: TrashEntityRef): Promise<{ deleted: Record<string, number> }>;
+  purgeOrderDispatchesInTx(tx: Tx, entity: TrashEntityRef): Promise<{ deleted: Record<string, number> }>;
+  purgeOrderDispatches(entity: TrashEntityRef, run: TrashPurgeRun): Promise<{ deleted: Record<string, number> }>;
 }
 
 class OrderTrashedDeliveryAbortError extends Error {
@@ -5723,9 +5724,9 @@ export function createProductionWebhookService(
       return out;
     },
 
-    async purgeOrderDispatches(entity) {
+    async purgeOrderDispatchesInTx(tx, entity) {
       if (entity.kind !== "order") return { deleted: {} };
-      const [res] = await deps.db
+      const [res] = await tx
         .delete(integrationProductionDispatches)
         .where(
           or(
@@ -5736,6 +5737,24 @@ export function createProductionWebhookService(
       const deleted: Record<string, number> = {};
       if (res.affectedRows > 0) deleted.productionPayloadCopies = res.affectedRows;
       return { deleted };
+    },
+
+    async purgeOrderDispatches(entity, run) {
+      if (entity.kind !== "order") return { deleted: {} };
+      return deps.db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
+        const [res] = await tx
+          .delete(integrationProductionDispatches)
+          .where(
+            or(
+              eq(integrationProductionDispatches.orderId, entity.id),
+              eq(integrationProductionDispatches.orderPublicId, entity.publicId),
+            ),
+          );
+        const deleted: Record<string, number> = {};
+        if (res.affectedRows > 0) deleted.productionPayloadCopies = res.affectedRows;
+        return { deleted };
+      });
     },
   };
 }

@@ -5,11 +5,11 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
-import { DomainError } from "../../core/errors.js";
+import { DomainError, conflict } from "../../core/errors.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
 import { FakeGraph } from "../storage/adapters/graphDriveFake.js";
 import { storageCopyAttempts } from "../storage/schema.js";
-import { createTrashRegistry, type TrashRegistry } from "../trash/ports.js";
+import { createTrashRegistry, unfencedPurgeRunForTests, type TrashRegistry } from "../trash/ports.js";
 import { LIST_COLUMNS, ORDER_ID_COLUMN, buildOrderFields, fieldsHash, isCompatible, packetsSummary, safeText, toMajor, validListName } from "./fields.js";
 import { createSharepointModule, type SharepointModule } from "./index.js";
 import { sharepointOrderSync, sharepointSyncConfig } from "./schema.js";
@@ -545,14 +545,43 @@ describe("sharepoint order sync (local fakes only)", () => {
     // Trash again and permanently purge: portal mapping row is erased, remote SharePoint item stays untouched.
     orderTrashed = true;
     await db.db.transaction((tx) => participant.onTrashedInTx!(tx, entity, actor));
-    expect(await participant.purge!(entity, { runId: "01JRUN00000000000000000001" })).toEqual({
+    expect(
+      await participant.purge!(entity, unfencedPurgeRunForTests("01JRUN00000000000000000001")),
+    ).toEqual({
       deleted: { sharepointMappings: 1 },
     });
     // Idempotent second call on crash-retry:
-    expect(await participant.purge!(entity, { runId: "01JRUN00000000000000000001" })).toEqual({
+    expect(
+      await participant.purge!(entity, unfencedPurgeRunForTests("01JRUN00000000000000000001")),
+    ).toEqual({
       deleted: {},
     });
     expect(await db.db.select().from(sharepointOrderSync)).toHaveLength(0);
     expect(items().size).toBe(1);
+  });
+
+  it("purge aborts and leaves SharePoint mapping rows unchanged when TrashPurgeRun.assertCurrentInTx throws PURGE_FENCE_LOST", async () => {
+    await enable();
+    await changeOrder();
+    await h.jobs.runAll(SYNC_JOB);
+    expect(await db.db.select().from(sharepointOrderSync)).toHaveLength(1);
+
+    const participant = trash.participants().find((p) => p.module === "sharepoint")!;
+    const entity = { kind: "order" as const, id: 7, publicId: ORDER, batchId: "01JBATCH000000000000000002" };
+    orderTrashed = true;
+    await db.db.transaction((tx) =>
+      participant.onTrashedInTx!(tx, entity, { kind: "user", userId: admin.userId, publicId: admin.userPublicId }),
+    );
+
+    const lostFenceRun = unfencedPurgeRunForTests("01JRUN00000000000000000002", {
+      async assertCurrentInTx() {
+        throw conflict("PURGE_FENCE_LOST", "Worker replaced.");
+      },
+    });
+    await expect(participant.purge!(entity, lostFenceRun)).rejects.toMatchObject({
+      code: "CONFLICT",
+      reasonCode: "PURGE_FENCE_LOST",
+    });
+    expect(await db.db.select().from(sharepointOrderSync)).toHaveLength(1);
   });
 });

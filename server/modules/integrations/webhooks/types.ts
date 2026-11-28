@@ -4,7 +4,7 @@
  */
 import type { AuditTap } from "../../audit/tap.js";
 import type { ApiCaller, ApiListQuery, ApiPage, WebhookSubscriptionDto } from "../../publicApi/ports.js";
-import type { TrashEntityRef } from "../../trash/ports.js";
+import type { TrashEntityRef, TrashPurgeRun } from "../../trash/ports.js";
 import type { DbOrTx, ModuleHealth, SessionPrincipal, Tx } from "../../../core/types.js";
 
 export const WEBHOOK_SUBSCRIPTION_STATUSES = ["active", "paused", "disabled_failing"] as const;
@@ -361,5 +361,6 @@ export interface WebhooksService {
   listSubscriptionsPublicApi(query: ApiListQuery, caller: ApiCaller): Promise<ApiPage<WebhookSubscriptionDto>>;
   getSubscriptionPublicApi(publicId: string, caller: ApiCaller): Promise<WebhookSubscriptionDto | null>;
   onOrderTrashedInTx(tx: Tx, entity: TrashEntityRef): Promise<void>;
-  purgeOrderDeliveries(entity: TrashEntityRef): Promise<{ deleted: Record<string, number> }>;
+  purgeOrderDeliveriesInTx(tx: Tx, entity: TrashEntityRef): Promise<{ deleted: Record<string, number> }>;
+  purgeOrderDeliveries(entity: TrashEntityRef, run: TrashPurgeRun): Promise<{ deleted: Record<string, number> }>;
 }

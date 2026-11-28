@@ -20,7 +20,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import mysql from "mysql2/promise";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { DomainError, forbidden } from "../../../core/errors.js";
+import { DomainError, conflict, forbidden } from "../../../core/errors.js";
 import { newRequestContext, runWithRequestContext } from "../../../core/requestContext.js";
 import type { Db, SessionPrincipal, Tx } from "../../../core/types.js";
 import type { UserView } from "../../identity/index.js";
@@ -53,7 +53,11 @@ import {
   integrationProductionDispatches,
   integrationWebhookDeliveries,
 } from "../schema.js";
-import { createTrashRegistry, type TrashRegistry } from "../../trash/ports.js";
+import {
+  createTrashRegistry,
+  unfencedPurgeRunForTests,
+  type TrashRegistry,
+} from "../../trash/ports.js";
 import {
   INTEGRATIONS_PRODUCTION_AUTH_VALUE,
   INTEGRATIONS_PRODUCTION_P101_URL,
@@ -3791,7 +3795,10 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
       expiresAt: new Date("2026-12-01T00:00:00.000Z"),
     });
 
-    const purgeRes = await participant.purge!(entity2, { runId: "01JRUN00000000000000000991" });
+    const purgeRes = await participant.purge!(
+      entity2,
+      unfencedPurgeRunForTests("01JRUN00000000000000000991"),
+    );
     expect(purgeRes).toEqual({
       deleted: {
         productionPayloadCopies: 1,
@@ -3799,7 +3806,9 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
       },
     });
     // Idempotent retry:
-    expect(await participant.purge!(entity2, { runId: "01JRUN00000000000000000991" })).toEqual({
+    expect(
+      await participant.purge!(entity2, unfencedPurgeRunForTests("01JRUN00000000000000000991")),
+    ).toEqual({
       deleted: {},
     });
     expect(
@@ -3814,5 +3823,76 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
         .from(integrationWebhookDeliveries)
         .where(eq(integrationWebhookDeliveries.orderPublicId, o2.orderPublicId)),
     ).toHaveLength(0);
+  });
+
+  it("Increment 09 D2.8: integrations purge aborts and leaves dispatches and webhook deliveries unchanged when TrashPurgeRun.assertCurrentInTx throws PURGE_FENCE_LOST", async () => {
+    const stepUpAdmin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    await configureEnabledProduction(stepUpAdmin);
+    await mod.webhooks.updateSettings(stepUpAdmin, { enabled: true });
+    const sub = await mod.webhooks.createSubscription(stepUpAdmin, {
+      name: "Fence sink",
+      targetUrl: "https://hooks.production.example.test/webhooks/fence",
+      events: ["order.created"],
+    });
+
+    const staffCaller = createCaller(staff);
+    const participant = trash.participants().find((p) => p.module === "integrations")!;
+    const o = seedOrderAndCustomer({
+      orderId: 992,
+      orderPublicId: "01JORDER000000000000000992",
+      reference: "ORD-2026-0992",
+      customerRef: "RPCUS-TRASH0992",
+    });
+    await staffCaller.production.order.requestP101({ orderPublicId: o.orderPublicId });
+    await tdb.db.insert(integrationWebhookDeliveries).values({
+      publicId: "01JWHKDELIV000000000000992",
+      direction: "outbound",
+      subscriptionId: 1,
+      subscriptionPublicId: sub.subscription.publicId,
+      orderPublicId: o.orderPublicId,
+      targetLabel: "Fence sink (hooks.production.example.test)",
+      eventKey: "order.created",
+      deduplicationKey: "test-purge-992",
+      status: "stopped",
+      httpMethod: "POST",
+      httpPath: "https://hooks.production.example.test/***",
+      correlationId: "corr-purge-992",
+      actorLabel: "system",
+      payloadSha256: "b".repeat(64),
+      payloadEnc: "enc-payload-992",
+      bodyPurged: false,
+      searchText: "01jwhkdeliv000000000000992",
+      expiresAt: new Date("2026-12-01T00:00:00.000Z"),
+    });
+
+    const entity = { kind: "order" as const, id: o.orderId, publicId: o.orderPublicId, batchId: "01JBATCH000000000000000992" };
+    trashedOrderIds.add(o.orderId);
+    await tdb.db.transaction((tx) =>
+      participant.onTrashedInTx!(tx, entity, { kind: "user", userId: stepUpAdmin.userId, publicId: stepUpAdmin.userPublicId }),
+    );
+
+    const lostFenceRun = unfencedPurgeRunForTests("01JRUN00000000000000000992", {
+      async assertCurrentInTx() {
+        throw conflict("PURGE_FENCE_LOST", "Worker replaced.");
+      },
+    });
+    await expect(participant.purge!(entity, lostFenceRun)).rejects.toMatchObject({
+      code: "CONFLICT",
+      reasonCode: "PURGE_FENCE_LOST",
+    });
+
+    expect(
+      await tdb.db
+        .select()
+        .from(integrationProductionDispatches)
+        .where(eq(integrationProductionDispatches.orderId, o.orderId)),
+    ).toHaveLength(1);
+    expect(
+      await tdb.db
+        .select()
+        .from(integrationWebhookDeliveries)
+        .where(eq(integrationWebhookDeliveries.orderPublicId, o.orderPublicId)),
+    ).toHaveLength(1);
   });
 });

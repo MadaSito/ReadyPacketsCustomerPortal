@@ -268,8 +268,8 @@ export function createPaymentsModule(
           async summarize(entity) {
             return service.summarizeOrderForTrash(entity);
           },
-          async purge(entity) {
-            return service.purgeOrderForTrash(entity);
+          async purge(entity, run) {
+            return service.purgeOrderForTrash(entity, run);
           },
         });
         trashRegistered = true;

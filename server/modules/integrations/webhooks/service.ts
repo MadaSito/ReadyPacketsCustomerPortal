@@ -3770,23 +3770,45 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
         );
     },
 
-    async purgeOrderDeliveries(entity) {
+    async purgeOrderDeliveriesInTx(tx, entity) {
       if (entity.kind !== "order") return { deleted: {} };
-      const deliveries = await deps.db
+      const deliveries = await tx
         .select({ id: integrationWebhookDeliveries.id })
         .from(integrationWebhookDeliveries)
         .where(eq(integrationWebhookDeliveries.orderPublicId, entity.publicId));
       if (deliveries.length === 0) return { deleted: {} };
       const ids = deliveries.map((d) => d.id);
-      await deps.db
+      await tx
         .delete(integrationWebhookDeliveryAttempts)
         .where(inArray(integrationWebhookDeliveryAttempts.deliveryId, ids));
-      const [res] = await deps.db
+      const [res] = await tx
         .delete(integrationWebhookDeliveries)
         .where(inArray(integrationWebhookDeliveries.id, ids));
       const deleted: Record<string, number> = {};
       if (res.affectedRows > 0) deleted.webhookPayloadCopies = res.affectedRows;
       return { deleted };
+    },
+
+    async purgeOrderDeliveries(entity, run) {
+      if (entity.kind !== "order") return { deleted: {} };
+      return deps.db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
+        const deliveries = await tx
+          .select({ id: integrationWebhookDeliveries.id })
+          .from(integrationWebhookDeliveries)
+          .where(eq(integrationWebhookDeliveries.orderPublicId, entity.publicId));
+        if (deliveries.length === 0) return { deleted: {} };
+        const ids = deliveries.map((d) => d.id);
+        await tx
+          .delete(integrationWebhookDeliveryAttempts)
+          .where(inArray(integrationWebhookDeliveryAttempts.deliveryId, ids));
+        const [res] = await tx
+          .delete(integrationWebhookDeliveries)
+          .where(inArray(integrationWebhookDeliveries.id, ids));
+        const deleted: Record<string, number> = {};
+        if (res.affectedRows > 0) deleted.webhookPayloadCopies = res.affectedRows;
+        return { deleted };
+      });
     },
   };
 }

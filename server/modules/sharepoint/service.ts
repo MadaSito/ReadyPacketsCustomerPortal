@@ -18,7 +18,12 @@ import type { ModuleDeps } from "../../container.js";
 import { DomainError, conflict, notFound, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { ClaimedJob, DbOrTx, JobResult, SessionPrincipal, Tx } from "../../core/types.js";
-import type { TrashEntityRef, TrashParticipant, TrashPurgeResult } from "../trash/ports.js";
+import type {
+  TrashEntityRef,
+  TrashParticipant,
+  TrashPurgeResult,
+  TrashPurgeRun,
+} from "../trash/ports.js";
 import { graphDriveDiscovery } from "../storage/adapters/graphDrive.js";
 import { StorageAdapterError } from "../storage/adapters/graphDriveErrors.js";
 import type { GraphCredentials, GraphHttpPort } from "../storage/adapters/graphDrivePort.js";
@@ -685,16 +690,19 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
       if (mappings > 0) out.sharepointMappings = mappings;
       return out;
     },
-    async purge(entity: TrashEntityRef): Promise<TrashPurgeResult> {
+    async purge(entity: TrashEntityRef, run: TrashPurgeRun): Promise<TrashPurgeResult> {
       // Increment 09 D2.6: erase portal SharePoint mapping rows only; folders/items already written
       // in SharePoint or OneDrive are NOT deleted automatically.
       if (entity.kind !== "order") return { deleted: {} };
-      const [res] = await db
-        .delete(sharepointOrderSync)
-        .where(eq(sharepointOrderSync.orderPublicId, entity.publicId));
-      const deleted: Record<string, number> = {};
-      if (res.affectedRows > 0) deleted.sharepointMappings = res.affectedRows;
-      return { deleted };
+      return db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
+        const [res] = await tx
+          .delete(sharepointOrderSync)
+          .where(eq(sharepointOrderSync.orderPublicId, entity.publicId));
+        const deleted: Record<string, number> = {};
+        if (res.affectedRows > 0) deleted.sharepointMappings = res.affectedRows;
+        return { deleted };
+      });
     },
   };
 

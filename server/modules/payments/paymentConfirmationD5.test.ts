@@ -42,8 +42,13 @@ import { createCartModule } from "../cart/index.js";
 import { cartRouter } from "../cart/router.js";
 import * as opsAlertTables from "../opsAlerts/schema.js";
 import { createOpsAlertsModule } from "../opsAlerts/index.js";
+import { conflict } from "../../core/errors.js";
 import type { EgressFetchOptions, EgressFetchResponse, EgressPurpose } from "../integrations/egress.js";
-import type { TrashEntityRef, TrashParticipant } from "../trash/ports.js";
+import {
+  unfencedPurgeRunForTests,
+  type TrashEntityRef,
+  type TrashParticipant,
+} from "../trash/ports.js";
 import {
   CANCEL_ATTEMPT_PROVIDER_JOB_TYPE,
   createPaymentsModule,
@@ -2045,10 +2050,24 @@ describe("Increment 08 — Package D5 Payment confirmation (authoritative bookin
       refunds: 1,
     });
 
-    const purgeOut = await paymentsParticipant!.purge!(entity2, {
-      runId: "01JRUNPMT00000000000000002",
-    });
+    const purgeOut = await paymentsParticipant!.purge!(
+      entity2,
+      unfencedPurgeRunForTests("01JRUNPMT00000000000000002"),
+    );
     expect(purgeOut).toEqual({
+      deleted: {},
+      kept: {
+        payments: 1,
+        refunds: 1,
+      },
+    });
+    // Idempotent second call:
+    expect(
+      await paymentsParticipant!.purge!(
+        entity2,
+        unfencedPurgeRunForTests("01JRUNPMT00000000000000002"),
+      ),
+    ).toEqual({
       deleted: {},
       kept: {
         payments: 1,
@@ -2122,5 +2141,60 @@ describe("Increment 08 — Package D5 Payment confirmation (authoritative bookin
       c2.invoicePublicId,
     );
     expect(keptPaidInvoiceView.status).toBe("paid");
+  });
+
+  it("Increment 09 D2.8: payments purge aborts and leaves attempt data unchanged when TrashPurgeRun.assertCurrentInTx throws PURGE_FENCE_LOST", async () => {
+    const stack = await buildActivatedStack();
+    const { h, createCustomerCheckout, trashParticipants } = stack;
+    const paymentsParticipant = trashParticipants.get("payments")!;
+
+    const c = await createCustomerCheckout();
+    const [ord] = await tdb.db
+      .select()
+      .from(orderTables.orders)
+      .where(eq(orderTables.orders.publicId, c.orderPublicId));
+    const [attBefore] = await tdb.db
+      .select({ redirectUrlEnc: paymentAttempts.redirectUrlEnc })
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, c.attemptPublicId));
+    expect(attBefore?.redirectUrlEnc).toBeTruthy();
+
+    const entity: TrashEntityRef = {
+      kind: "order",
+      id: ord!.id,
+      publicId: c.orderPublicId,
+      batchId: "01JBATCHPMTFENCE0000000001",
+    };
+    const lostFenceRun = unfencedPurgeRunForTests("01JRUNPMTFENCE000000000001", {
+      async assertCurrentInTx() {
+        throw conflict("PURGE_FENCE_LOST", "Worker replaced.");
+      },
+    });
+
+    await expect(paymentsParticipant.purge!(entity, lostFenceRun)).rejects.toMatchObject({
+      code: "CONFLICT",
+      reasonCode: "PURGE_FENCE_LOST",
+    });
+
+    const [attAfterFailedFence] = await tdb.db
+      .select({ redirectUrlEnc: paymentAttempts.redirectUrlEnc })
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, c.attemptPublicId));
+    expect(attAfterFailedFence?.redirectUrlEnc).toBe(attBefore?.redirectUrlEnc);
+
+    // Once fenced properly, residual redirectUrlEnc is scrubbed while attempt row is kept:
+    await tdb.db
+      .update(orderTables.orders)
+      .set({ trashedAt: h.clock.now(), trashBatchId: entity.batchId })
+      .where(eq(orderTables.orders.id, entity.id));
+    await paymentsParticipant.purge!(
+      entity,
+      unfencedPurgeRunForTests("01JRUNPMTFENCE000000000002"),
+    );
+    const [attAfterValidPurge] = await tdb.db
+      .select({ redirectUrlEnc: paymentAttempts.redirectUrlEnc })
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, c.attemptPublicId));
+    expect(attAfterValidPurge?.redirectUrlEnc).toBeNull();
   });
 });
