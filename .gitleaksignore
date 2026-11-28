@@ -90,3 +90,6 @@ d049499ffec3e9e519ba24b5aa28c241e8b9023d:server/modules/payments/stripeCompletio
 77cdfc3ba04327926381f1c41a8bbc4e378d3ebc:server/modules/orders/stageModel.ts:generic-api-key:181
 4fb93be4aa0a8584cac0048c187ba95e13f189e1:server/modules/orders/workflowDefault.test.ts:generic-api-key:71
 b7ae06403167c16c14bb08efe57ac66b5a326f1c:server/modules/compliance/receiptsAndSmallTotals.test.ts:generic-api-key:1614
+9d9a0baeab5cb5adbf8ce9f007698de3bbc63879:server/modules/trash/trash.test.ts:generic-api-key:844
+8e5da4efbd17ceafaf0acd0ffdf56fa15a9ecd47:server/modules/trash/trash.test.ts:generic-api-key:1014
+0c5287293e8a734c17de9807e2f913648d44e9aa:server/modules/integrations/production/production.test.ts:generic-api-key:3708
