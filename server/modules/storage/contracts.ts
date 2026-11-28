@@ -23,10 +23,14 @@ export interface StoragePutInput {
   beforeWrite?: () => Promise<void>;
   /** Managed intents never adopt by weak checksum or try a different filename. */
   exactCreate?: true;
+  /** Do not overwrite a user-controlled object at the requested path. */
+  protectExisting?: true;
 }
 
 export interface StoragePutResult {
   remoteId: string;
+  /** A matching provider object was reused; the portal did not create it. */
+  reusedExisting?: true;
   /** Provider-observed path segments relative to the configured root, including the final file name. */
   targetPath?: readonly string[];
   /** A byte count independently observed by the provider, not echoed from the request. */
@@ -63,7 +67,7 @@ export interface StorageAdapter {
   ensureFolder(path: readonly string[], signal?: AbortSignal, beforeWrite?: () => Promise<void>): Promise<void>;
   put(input: StoragePutInput): Promise<StoragePutResult>;
   /** Explicit removal only. Never called by an automatic copy, retry, retention or assignment change. */
-  remove(remoteId: string, signal?: AbortSignal): Promise<void>;
+  remove(remoteId: string, signal?: AbortSignal): Promise<void | { providerRecycleBin: true }>;
 }
 
 export type StorageConfig = Record<string, string | number | boolean>;
@@ -132,6 +136,11 @@ export interface StorageCopyInput extends StoragePutInput {
 }
 
 export interface StorageModule extends ModuleLifecycle {
+  trashOrderCopiesInTx(tx: Tx, orderId: number, orderPublicId: string): Promise<void>;
+  purgeOrderCopies(orderId: number, orderPublicId: string): Promise<{
+    deleted: number; external: number; shared: number; receipts: number; providerRecycleBin: number;
+    unverifiedExternalCopies: Record<string, number>;
+  }>;
   copies: CopyLogService;
   orderCopies: OrderCopiesService;
   fileSync: ManagedFileSync;

@@ -103,6 +103,27 @@ export function observedEtag(headers: Record<string, string>): string {
   return etag;
 }
 
+const objectReference = z.tuple([z.string().min(1).max(1024), z.string().regex(/^"[\x21\x23-\x7e]{1,250}"$/u),
+  z.string().min(1).max(1024).regex(/^[\x21-\x7e]+$/u).nullable()]);
+const refPrefix = "rp-object-v1:";
+
+/** Keep the exact provider generation (or a conditional ETag for an unversioned store), never just its path. */
+export function versionedObjectRef(key: string, etag: string, versionId?: string): string {
+  const ref = objectReference.safeParse([key, etag, versionId ?? null]);
+  if (!ref.success) throw new StorageAdapterError("OUTCOME_UNKNOWN");
+  return refPrefix + Buffer.from(JSON.stringify(ref.data)).toString("base64url");
+}
+
+export function readObjectRef(ref: string): { key: string; etag?: string; version?: string } {
+  if (!ref.startsWith(refPrefix)) return { key: ref };
+  try {
+    const [key, etag, version] = objectReference.parse(JSON.parse(Buffer.from(ref.slice(refPrefix.length), "base64url").toString("utf8")));
+    return { key, etag, ...(version === null ? {} : { version }) };
+  } catch {
+    throw new StorageAdapterError("INVALID_INPUT");
+  }
+}
+
 export function measuredBody(input: StoragePutInput, recordMd5 = false) {
   let verified: { md5?: string } | undefined;
   const body = Readable.from((async function* () {

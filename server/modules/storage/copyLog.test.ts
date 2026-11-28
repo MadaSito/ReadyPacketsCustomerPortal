@@ -4,6 +4,7 @@ import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { ulid } from "../../core/ids.js";
 import type { SessionPrincipal } from "../../core/types.js";
 import { jobAttempts, jobRuns } from "../jobs/schema.js";
+import { orders } from "../orders/schema.js";
 import { copyLogConnections, copyLogHealth, copyLogList, createCopyLogService, safeCopyCsvCell } from "./copyLog.js";
 import type { CopyAttemptEvent } from "./copyLogTypes.js";
 import { recordCopyAttempt } from "./copyLogWriter.js";
@@ -19,7 +20,7 @@ let jobPublicId: string;
 let currentRole: SessionPrincipal["role"];
 
 beforeAll(async () => {
-  db = await createTestDb({ schema: { storageConnections, storageCopyAttempts, jobRuns, jobAttempts } });
+  db = await createTestDb({ schema: { orders, storageConnections, storageCopyAttempts, jobRuns, jobAttempts } });
 });
 afterAll(() => db?.cleanup());
 beforeEach(async () => {

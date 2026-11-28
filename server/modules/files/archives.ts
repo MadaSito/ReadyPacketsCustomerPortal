@@ -14,8 +14,10 @@ import { ulid } from "../../core/ids.js";
 import type { ModuleHealth, ModuleLifecycle, SessionPrincipal, Tx } from "../../core/types.js";
 import { hasFreshStepUp } from "../../trpc/trpc.js";
 import { orders } from "../orders/schema.js";
+import { liveOrderIdPredicate, liveOrderPredicate } from "../orders/trashGate.js";
 import { archiveDownloadName, archiveEntryNames, isSafeEntryName } from "./archiveNames.js";
 import { fileArchiveTickets, fileArchives, type FileArchiveManifestEntry, type FileArchiveScope, type FileArchiveState } from "./archivesSchema.js";
+import { archiveObjectAad as keyAad, removeUnsharedArchive } from "./trash.js";
 
 export const ARCHIVE_BUILD_JOB = "files.archive.build";
 export const ARCHIVE_EXPIRE_JOB = "files.archive.expire";
@@ -128,7 +130,6 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
     }
     return files as DeliverablePort;
   };
-  const keyAad = (publicId: string) => `file_archives.object_key:${publicId}`;
   const actor = (p: SessionPrincipal) => ({ userId: p.userId, role: p.role });
 
   async function live(principal: SessionPrincipal, tx: Tx): Promise<SessionPrincipal> {
@@ -188,7 +189,8 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
   }
 
   async function orderIdFor(tx: Tx, orderPublicId: string): Promise<number> {
-    const [row] = await tx.select({ id: orders.id }).from(orders).where(eq(orders.publicId, orderPublicId));
+    const [row] = await tx.select({ id: orders.id }).from(orders)
+      .where(and(eq(orders.publicId, orderPublicId), liveOrderPredicate())).for("update");
     if (!row) throw notFound("ORDER_NOT_FOUND");
     return row.id;
   }
@@ -196,7 +198,11 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
   async function ownArchive(tx: Tx, p: SessionPrincipal, archiveId: string, forUpdate = false): Promise<ArchiveRow> {
     if (!PUBLIC_ID.test(archiveId)) throw notFound("ARCHIVE_NOT_FOUND");
     const query = tx.select().from(fileArchives).where(eq(fileArchives.publicId, archiveId));
-    const [row] = forUpdate ? await query.for("update") : await query;
+    const [initial] = await query;
+    if (!initial || initial.requestedByUserId !== p.userId || (await orderIdFor(tx, initial.orderPublicId)) !== initial.orderId) {
+      throw notFound("ARCHIVE_NOT_FOUND");
+    }
+    const [row] = forUpdate ? await query.for("update") : [initial];
     if (!row || row.requestedByUserId !== p.userId) throw notFound("ARCHIVE_NOT_FOUND");
     return row;
   }
@@ -217,7 +223,7 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
   async function purgeObject(row: ArchiveRow, tx?: Tx) {
     if (row.objectKeyEnc && !row.purgedAt) {
       try {
-        await storage.delete(crypto.decrypt(row.objectKeyEnc, keyAad(row.publicId)));
+        if (!await removeUnsharedArchive(deps, row, tx)) return;
         await (tx ?? db).update(fileArchives).set({ purgedAt: clock.now() }).where(eq(fileArchives.id, row.id));
       } catch {
         // The expire job retries the purge; never surface storage detail.
@@ -268,7 +274,8 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
         const result = await db.transaction(async (tx): Promise<{ view: ArchiveView; retired?: ArchiveRow } | { error: DomainError; retired: ArchiveRow }> => {
           const p = await live(principal, tx);
           assertScope(p, scope);
-          // Identity locks the user before the active slot; match redemption's user → archive → order order.
+          // Keep the target order before its archive row, matching the trash hook.
+          await orderIdFor(tx, input.orderId);
           const [active] = await tx.select().from(fileArchives).where(eq(fileArchives.activeUserId, p.userId)).for("update");
           const current = active && active.expiresAt > clock.now() ? active : undefined;
           const sameScope = current?.orderPublicId === input.orderId && current.stageKey === stageKey && current.scope === scope;
@@ -340,6 +347,9 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
       const stageKey = normaliseStage(input.stageKey);
       return db.transaction(async (tx) => {
         const p = await live(principal, tx);
+        const [liveOrder] = await tx.select({ id: orders.id }).from(orders)
+          .where(and(eq(orders.publicId, input.orderId), liveOrderPredicate())).for("update");
+        if (!liveOrder) return null;
         const [row] = await tx.select().from(fileArchives)
           .where(and(eq(fileArchives.activeUserId, p.userId), eq(fileArchives.orderPublicId, input.orderId),
             stageKey ? eq(fileArchives.stageKey, stageKey) : isNull(fileArchives.stageKey)));
@@ -352,6 +362,7 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
       return guarded(principal, () => db.transaction(async (tx) => {
         const p = await live(principal, tx);
         const row = await ownArchive(tx, p, archiveId, true);
+        if (!(await stillReadable(p, row, tx))) throw notFound("ARCHIVE_NOT_FOUND");
         if (ACTIVE_STATES.includes(row.state)) {
           await finish(row, "revoked", "ARCHIVE_CANCELED", tx);
           await audit.record({ category: "file", eventName: "file.archive.revoked", action: "delete", outcome: "completed", actor: actor(p), resource: { type: "file_archive", publicId: row.publicId }, orderPublicId: row.orderPublicId }, tx);
@@ -364,6 +375,7 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
       return guarded(principal, () => db.transaction(async (tx) => {
         const p = await live(principal, tx);
         const row = await ownArchive(tx, p, archiveId, true);
+        if (!(await stillReadable(p, row, tx))) throw notFound("ARCHIVE_NOT_FOUND");
         if (row.sessionId !== p.sessionId) throw forbidden("ARCHIVE_SESSION_MISMATCH");
         assertScope(p, row.scope);
         if (row.state !== "ready" || row.expiresAt <= clock.now()) throw conflict("ARCHIVE_NOT_READY", "This archive is not ready to download.");
@@ -399,6 +411,8 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
         try {
           return await db.transaction(async (tx) => {
             const p = await live(principal, tx);
+            const [initial] = await tx.select().from(fileArchives).where(eq(fileArchives.id, spent));
+            if (!initial || (await orderIdFor(tx, initial.orderPublicId)) !== initial.orderId) throw notFound("ARCHIVE_NOT_FOUND");
             const [row] = await tx.select().from(fileArchives).where(eq(fileArchives.id, spent)).for("update");
             if (!row || row.requestedByUserId !== p.userId || row.sessionId !== p.sessionId) throw forbidden("DOWNLOAD_TICKET_INVALID");
             assertScope(p, row.scope);
@@ -447,19 +461,35 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
       const [row] = await db.select().from(fileArchives).where(eq(fileArchives.publicId, archivePublicId));
       if (!row || row.state !== "queued") return row?.state ?? "failed";
       if (row.expiresAt <= clock.now()) { await finish(row, "expired", "ARCHIVE_EXPIRED"); return "expired"; }
-      const [claim] = await db.update(fileArchives).set({ state: "building" }).where(and(eq(fileArchives.id, row.id), eq(fileArchives.state, "queued")));
-      if (!claim.affectedRows) {
+      const key = storage.newKey("exports");
+      const claimed = await db.transaction(async (tx) => {
+        await assertOwned?.(tx);
+        const [order] = await tx.select({ id: orders.id }).from(orders).where(and(eq(orders.id, row.orderId),
+          eq(orders.publicId, row.orderPublicId), liveOrderPredicate())).for("update");
+        if (!order) return false;
+        const [claim] = await tx.update(fileArchives).set({ state: "building", objectKeyEnc: crypto.encrypt(key, keyAad(row.publicId)) })
+          .where(and(eq(fileArchives.id, row.id), eq(fileArchives.state, "queued")));
+        return claim.affectedRows > 0;
+      });
+      if (!claimed) {
         const [latest] = await db.select({ state: fileArchives.state }).from(fileArchives).where(eq(fileArchives.id, row.id));
         return latest?.state ?? "failed";
       }
-      let objectKey: string | null = null;
       try {
         const p = await principalFor(row);
         assertScope(p, row.scope);
         for (const entry of row.manifest) if (!isSafeEntryName(entry.entryName)) throw new DomainError("CONFLICT", "ARCHIVE_ENTRY_INVALID", "The archive could not be prepared.");
+        await db.transaction(async (tx) => {
+          await assertOwned?.(tx);
+          await orderIdFor(tx, row.orderPublicId);
+          const [current] = await tx.select({ state: fileArchives.state }).from(fileArchives).where(eq(fileArchives.id, row.id)).for("update");
+          if (current?.state !== "building") throw new DomainError("CONFLICT", "ARCHIVE_CANCELED", "The archive was canceled.");
+        });
         const zip = new yazl.ZipFile();
         // Any member failure (open refused, size or sha256 mismatch) aborts the whole output stream, so put() rejects.
         const output = new PassThrough();
+        // Disk storage opens its destination asynchronously before consuming output.
+        output.on("error", () => undefined);
         const abort = (error: unknown) => output.destroy(error instanceof Error ? error : new Error("archive member failed"));
         for (const entry of row.manifest) {
           zip.addReadStreamLazy(entry.entryName, { size: entry.size, compress: false, mtime: row.createdAt }, (cb) => {
@@ -479,17 +509,17 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
               .catch((error: unknown) => { abort(error); cb(error, new PassThrough()); });
           });
         }
-        zip.end();
-        objectKey = storage.newKey("exports");
         zip.on("error", abort);
+        zip.end();
         zip.outputStream.pipe(output);
-        const info = await storage.put(objectKey, output, { maxBytes: ARCHIVE_LIMITS.maxBytes + 16 * 1024 * 1024 });
+        const info = await storage.put(key, output, { maxBytes: ARCHIVE_LIMITS.maxBytes + 16 * 1024 * 1024 });
         await db.transaction(async (tx) => {
           await assertOwned?.(tx);
+          await orderIdFor(tx, row.orderPublicId);
           const [currentRow] = await tx.select().from(fileArchives).where(eq(fileArchives.id, row.id)).for("update");
           if (!currentRow || currentRow.state !== "building") throw new DomainError("CONFLICT", "ARCHIVE_CANCELED", "The archive was canceled.");
           await tx.update(fileArchives).set({
-            state: "ready", zipBytes: info.size, zipSha256: info.sha256, objectKeyEnc: crypto.encrypt(objectKey!, keyAad(row.publicId)), builtAt: clock.now(),
+            state: "ready", zipBytes: info.size, zipSha256: info.sha256, builtAt: clock.now(),
             version: currentRow.version + 1,
           }).where(eq(fileArchives.id, row.id));
           await audit.record({
@@ -500,10 +530,15 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
         });
         return "ready";
       } catch (error) {
-        if (objectKey) await storage.delete(objectKey).catch(() => undefined);
+        // The durable locator remains if unlink or bookkeeping fails.
+        const publication = await db.select({ state: fileArchives.state }).from(fileArchives).where(eq(fileArchives.id, row.id))
+          .then(([current]) => current?.state ?? null).catch(() => undefined);
+        if (publication === "ready") return "ready"; // A durable commit may have lost its acknowledgement.
+        const removed = publication !== undefined && await storage.delete(key).then(async () => !await storage.stat(key)).catch(() => false);
         const reasonCode = error instanceof DomainError ? error.reasonCode : "ARCHIVE_BUILD_FAILED";
         return db.transaction(async (tx) => {
           const [latest] = await tx.select().from(fileArchives).where(eq(fileArchives.id, row.id)).for("update");
+          if (latest && removed) await tx.update(fileArchives).set({ purgedAt: clock.now() }).where(eq(fileArchives.id, row.id));
           if (latest?.state !== "building") return latest?.state ?? "failed";
           await markTerminal(latest, "failed", reasonCode, tx);
           await audit.record({
@@ -518,7 +553,7 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
     async expire() {
       const now = clock.now();
       const rows = await db.select().from(fileArchives)
-        .where(and(inArray(fileArchives.state, ["queued", "building", "ready"]), lt(fileArchives.expiresAt, now))).limit(200);
+        .where(and(liveOrderIdPredicate(fileArchives.orderId), inArray(fileArchives.state, ["queued", "building", "ready"]), lt(fileArchives.expiresAt, now))).limit(200);
       let expired = 0;
       for (const row of rows) {
         if (!(await finish(row, "expired", "ARCHIVE_EXPIRED"))) continue;
@@ -526,6 +561,7 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
         await audit.record({ category: "file", eventName: "file.archive.expired", action: "delete", outcome: "completed", actor: { role: "system" }, resource: { type: "file_archive", publicId: row.publicId }, orderPublicId: row.orderPublicId }).catch(() => undefined);
       }
       const pendingPurges = await db.select().from(fileArchives).where(and(
+        liveOrderIdPredicate(fileArchives.orderId),
         inArray(fileArchives.state, ["failed", "expired", "revoked"]), isNotNull(fileArchives.objectKeyEnc), isNull(fileArchives.purgedAt),
       )).limit(200);
       for (const row of pendingPurges) await purgeObject(row);

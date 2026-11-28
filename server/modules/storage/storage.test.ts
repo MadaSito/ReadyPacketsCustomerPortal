@@ -7,6 +7,7 @@ import { DomainError } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { SessionPrincipal } from "../../core/types.js";
 import { jobAttempts, jobRuns } from "../jobs/schema.js";
+import { orders } from "../orders/schema.js";
 import { orderFilesCopyAction } from "./automation.js";
 import { StorageAdapterError, type StorageConnectionView } from "./contracts.js";
 import { createStorageModule, type StorageModule } from "./index.js";
@@ -36,7 +37,7 @@ let adapterPuts: ReturnType<typeof vi.fn<(path: readonly string[], name: string,
 let adapterRemovals: ReturnType<typeof vi.fn<() => void>>;
 
 beforeAll(async () => {
-  db = await createTestDb({ schema: { storageConnections, storageAssignments, storageFileCopies, storageManagedFileCopies, storageCopyAttempts, jobRuns, jobAttempts } });
+  db = await createTestDb({ schema: { orders, storageConnections, storageAssignments, storageFileCopies, storageManagedFileCopies, storageCopyAttempts, jobRuns, jobAttempts } });
 });
 afterAll(() => db?.cleanup());
 beforeEach(async () => {

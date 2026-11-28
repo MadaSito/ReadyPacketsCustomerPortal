@@ -11,6 +11,9 @@ import { roleHasCapability, type Capability } from "../../../shared/capabilities
 import { stageKeySchema, type StageUploadIntent } from "../../../shared/workflowStages.js";
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
 import { registerAutomationTrigger } from "../automations/contracts.js";
+import { users } from "../identity/schema.js";
+import { orders } from "../orders/schema.js";
+import { liveOrderIdPredicate } from "../orders/trashGate.js";
 import { readSetting, writeSetting } from "../platform/settingsRegistry.js";
 import type { PublicApiProviders } from "../publicApi/ports.js";
 import { acceptsDeclaredType, allowedExtensions, audioExtensions, classifyFile, displayExtension, documentExtensions, docxMime, sanitizeDisplayName, type FileClassification, type FileExtension } from "./classification.js";
@@ -21,6 +24,7 @@ import { assertPhaseRoom, limitsForPhase, verifyPhaseCapacity, type PhaseUsage, 
 export type { UploadIntent } from "./governance.js";
 import { audioRulesSchema, audioRulesSetting, documentEditingRulesSchema, documentEditingSetting, fileRulesSetting, hardMaxFileBytes, hardMaxFiles, hardMaxRequestBytes, slotKeySchema, transcriptSchema, type AudioRules, type DocumentEditingRules, type FileRules } from "./settings.js";
 import type { LocalObjectStorage } from "./storage.js";
+import { createFilesTrashParticipant } from "./trash.js";
 
 export type { FileCategory, FileVisibility } from "./schema.js";
 const ticketLifetimeMs = 60_000;
@@ -93,6 +97,7 @@ export interface AdoptVerifiedObjectInput {
   destinationKey: string;
   contentType?: string;
   createdAt?: Date;
+  allowTrashedOrder?: boolean;
 }
 
 export type FileUploadSlot = {
@@ -161,7 +166,7 @@ export interface FilesModule extends ModuleLifecycle {
   readTranscript(principal: SessionPrincipal, filePublicId: string): Promise<{ transcript: string | null }>;
   assertCanReadFile(principal: SessionPrincipal, filePublicId: string, orderPublicId?: string): Promise<FileRecord>;
   enumerateOrderFiles(principal: SessionPrincipal, orderPublicId: string, options?: ListOptions): Promise<Page<FileRecord>>;
-  openForExport(principal: SessionPrincipal, filePublicId: string, orderPublicId: string, tx?: Tx): Promise<Download>;
+  openForExport(principal: SessionPrincipal, filePublicId: string, orderPublicId: string, tx?: Tx, options?: { allowTrashedOrder?: boolean }): Promise<Download>;
   listDeliverableFiles(principal: SessionPrincipal, scope: DeliverableScope & { after?: string; limit?: number }, tx?: Tx): Promise<Page<DeliverableFile>>;
   openDeliverableFile(principal: SessionPrincipal, scope: DeliverableScope & { filePublicId: string }, tx?: Tx): Promise<{ file: DeliverableFile; stream: Readable }>;
   issueDownloadTicket(principal: SessionPrincipal, filePublicId: string): Promise<{ ticket: string; expiresAt: Date }>;
@@ -189,7 +194,7 @@ export interface FilesModule extends ModuleLifecycle {
   reassignOrderFiles(orderId: number, ownerUserId: number, tx: Tx): Promise<void>;
   validatePortableObject(input: { stagedObject: StoredObjectInfo; displayName: string; category: FileCategory; contentType?: string }, tx?: Tx): Promise<{ extension: string; contentType: string }>;
   adoptVerifiedObject(input: AdoptVerifiedObjectInput, tx: Tx): Promise<FileRecord>;
-  portableFiles(tx: Tx, options: { principal: SessionPrincipal; after?: string; limit: number; orderIds?: readonly number[] }): Promise<Page<PortableStoredFile>>;
+  portableFiles(tx: Tx, options: { principal: SessionPrincipal; after?: string; limit: number; orderIds?: readonly number[]; includeTrashedOrders?: boolean }): Promise<Page<PortableStoredFile>>;
   backupFiles(tx: Tx, options: { after?: string; limit: number }): Promise<Page<BackupStoredFile>>;
   /** Fenced storage-copy worker only; locks current order/file scope and returns private source metadata. */
   getOrderFileCopySource(filePublicId: string, tx: Tx): Promise<{
@@ -527,6 +532,19 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     enforceVisibility(file, principal, order.ownerUserId);
     if (tx) await requireStageRead(principal, file, tx);
     return file;
+  }
+
+  const portableOrderPredicate = () => and(isNull(orders.purgedAt), isNull(orders.purgeStartedAt),
+    isNull(users.purgedAt), isNull(users.purgeStartedAt));
+  async function portableOrder(principal: SessionPrincipal, id: number, tx: Tx) {
+    if (principal.role !== "admin") throw forbidden("CAPABILITY_NOT_GRANTED");
+    const [order] = await tx.select({ id: orders.id, publicId: orders.publicId, ownerUserId: orders.ownerUserId,
+      ownerPublicId: users.publicId, statusKey: orders.statusKey, origin: orders.origin })
+      .from(orders).innerJoin(users, eq(users.id, orders.ownerUserId))
+      .where(and(eq(orders.id, id), portableOrderPredicate())).limit(1).for("update");
+    if (!order) throw notFound("ORDER_NOT_FOUND");
+    await requireCurrent(principal, tx);
+    return order;
   }
 
   async function getPage(principal: SessionPrincipal, orderPublicId: string, options: ListOptions, tx: Tx) {
@@ -942,7 +960,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     const candidates = await db.select({
       id: orderFiles.id, orderId: orderFiles.orderId, publicId: orderFiles.publicId, purgeAfter: orderFiles.purgeAfter,
     }).from(orderFiles)
-      .where(and(isNotNull(orderFiles.deletedAt), lte(orderFiles.purgeAfter, now), isNull(orderFiles.purgedAt),
+      .where(and(liveOrderIdPredicate(orderFiles.orderId), isNotNull(orderFiles.deletedAt), lte(orderFiles.purgeAfter, now), isNull(orderFiles.purgedAt),
         retentionCursor ? or(gt(orderFiles.purgeAfter, retentionCursor.after),
           and(eq(orderFiles.purgeAfter, retentionCursor.after), gt(orderFiles.id, retentionCursor.id))) : undefined))
       .orderBy(orderFiles.purgeAfter, orderFiles.id).limit(100);
@@ -1089,6 +1107,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
 
   const service: FilesModule = {
     init() {
+      deps.services.trash.register(createFilesTrashParticipant(deps));
       const provider: PublicApiProviders["orderFiles"] = {
         async list(orderPublicId, query, caller) {
           if (caller.kind !== "api_key" || !caller.scopes.includes("files:read")) throw forbidden("FILE_API_SCOPE_REQUIRED");
@@ -1559,12 +1578,19 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     async assertCanReadFile(principal, filePublicId, orderPublicId) {
       return output(await currentTx((tx) => readFile(principal, filePublicId, orderPublicId, tx)));
     },
-    async openForExport(principal, filePublicId, orderPublicId, callerTx) {
+    async openForExport(principal, filePublicId, orderPublicId, callerTx, options) {
       fullCapability(principal, "portable.export");
       let stream: Readable | undefined;
       try {
         const open = async (tx: Tx) => {
-          const row = await readFile(principal, filePublicId, orderPublicId, tx);
+          const row = options?.allowTrashedOrder ? await (async () => {
+            const initial = await findFile(filePublicId, tx);
+            const order = await portableOrder(principal, initial.orderId, tx);
+            const file = await findFile(filePublicId, tx, true);
+            if (file.orderId !== order.id || file.orderPublicId !== order.publicId || order.publicId !== orderPublicId) throw notFound("FILE_NOT_FOUND");
+            enforceVisibility(file, principal, order.ownerUserId);
+            return file;
+          })() : await readFile(principal, filePublicId, orderPublicId, tx);
           await audit.record(event(principal, "file.export.open", "export", "attempted", filePublicId), tx);
           const file = output(row);
           stream = await readObject(row);
@@ -1719,7 +1745,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
         storedFiles: count(orderFiles.id),
         storedBytes: sql<string>`COALESCE(SUM(${orderFiles.byteSize}), 0)`,
         retainedFiles: sql<number>`COALESCE(SUM(${orderFiles.deletedAt} IS NOT NULL), 0)`,
-      }).from(orderFiles).where(isNull(orderFiles.purgedAt));
+      }).from(orderFiles).where(and(liveOrderIdPredicate(orderFiles.orderId), isNull(orderFiles.purgedAt)));
       const conversion = await audioRules();
       return { rules: await rules(), audioRules: conversion, audioVersion: conversion.enabled ? await audioVersion() : null,
         documentEditingRules: await documentRules(),
@@ -1790,7 +1816,8 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       if (input.createdAt && (!Number.isFinite(input.createdAt.getTime()) || input.createdAt.getUTCFullYear() < 1000 || input.createdAt.getUTCFullYear() >= 9999)) {
         throw validation("INVALID_FILE_DATE", "The imported file timestamp is invalid.");
       }
-      const order = await deps.services.orders.assertCanReadOrderById(input.principal, input.orderId, { tx, forUpdate: true });
+      const order = input.allowTrashedOrder ? await portableOrder(input.principal, input.orderId, tx) :
+        await deps.services.orders.assertCanReadOrderById(input.principal, input.orderId, { tx, forUpdate: true });
       if (order.publicId !== input.orderPublicId || order.ownerUserId !== input.ownerUserId || order.origin !== "import") {
         throw notFound("ORDER_NOT_FOUND");
       }
@@ -1808,14 +1835,18 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       if (options.orderIds?.length === 0) return { items: [], nextCursor: null };
       if (options.orderIds && options.orderIds.length > 500) throw validation("INVALID_FILE_SELECTION", "Select fewer orders at a time.");
       const after = cursorValue(options.after);
+      const eligible = tx.select({ id: orders.id }).from(orders).innerJoin(users, eq(users.id, orders.ownerUserId))
+        .where(and(eq(orders.id, orderFiles.orderId), portableOrderPredicate()));
       const rows = await tx.select().from(orderFiles).where(and(
+        options.includeTrashedOrders ? sql`EXISTS (${eligible})` : liveOrderIdPredicate(orderFiles.orderId),
         options.orderIds ? inArray(orderFiles.orderId, [...options.orderIds]) : undefined,
         after ? gt(orderFiles.publicId, after) : undefined,
         isNull(orderFiles.deletedAt), isNull(orderFiles.supersededAt), isNull(orderFiles.purgedAt),
       )).orderBy(orderFiles.publicId).limit(limit + 1);
       const items: PortableStoredFile[] = [];
       for (const row of rows.slice(0, limit)) {
-        const order = await deps.services.orders.assertCanReadOrderById(options.principal, row.orderId, { tx });
+        const order = options.includeTrashedOrders ? await portableOrder(options.principal, row.orderId, tx) :
+          await deps.services.orders.assertCanReadOrderById(options.principal, row.orderId, { tx });
         enforceVisibility(row, options.principal, order.ownerUserId);
         if (row.orderPublicId !== order.publicId) throw notFound("FILE_NOT_FOUND");
         items.push({ ...output(row), storageKey: row.storageKey, orderId: order.id, ownerUserId: order.ownerUserId, ownerPublicId: order.ownerPublicId });
@@ -1905,7 +1936,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       if (!publicIdShape(filePublicId)) return null;
       const [row] = await handle.select({
         orderPublicId: orderFiles.orderPublicId, orderOwnerUserId: orderFiles.ownerUserId, category: orderFiles.category,
-      }).from(orderFiles).where(and(eq(orderFiles.publicId, filePublicId), isNull(orderFiles.deletedAt),
+      }).from(orderFiles).where(and(liveOrderIdPredicate(orderFiles.orderId), eq(orderFiles.publicId, filePublicId), isNull(orderFiles.deletedAt),
         isNull(orderFiles.purgedAt), isNull(orderFiles.supersededAt), eq(orderFiles.visibility, "customer_visible"))).limit(1);
       return row ?? null;
     },

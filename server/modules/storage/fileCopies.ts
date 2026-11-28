@@ -1,5 +1,5 @@
 import type { Readable } from "node:stream";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, ne, sql } from "drizzle-orm";
 import { z } from "zod";
 import { DEFAULT_ORDER_FILE_FOLDER_TEMPLATE, isResolvedOrderFileFolder, resolveOrderFileFolder, safeOrderFileFolderValue } from "../../../shared/orderFileFolder.js";
 import type { ModuleDeps } from "../../container.js";
@@ -19,6 +19,9 @@ const encryptedTarget = z.strictObject({ path: z.array(copySegment).min(1).max(8
   ownerUserId: z.number().int().positive(), phase: z.string().max(160).nullable().optional() });
 const targetAad = (id: string) => `storage_file_copies.target_enc:${id}`;
 const remoteAad = (id: string) => `storage_file_copies.remote_id_enc:${id}`;
+export const COPY_OWNED = "STORAGE_COPY_PORTAL_CREATED";
+export const COPY_EXTERNAL = "STORAGE_COPY_EXTERNAL_REUSED";
+export const COPY_TRASHED = "STORAGE_COPY_ORDER_TRASHED";
 const localCopyStopped = new Set(["STORAGE_ASSIGNMENT_INACTIVE", "STORAGE_COPY_SOURCE_INACTIVE"]);
 const retryable = new Set(["STORAGE_PROVIDER_RETRY", "STORAGE_LOCAL_READ_FAILED"]);
 const safeFailure = new Set([...retryable, ...localCopyStopped, "STORAGE_INTEGRITY_MISMATCH",
@@ -99,9 +102,10 @@ export function registerFileCopies(deps: ModuleDeps, service: StorageModule) {
         if (source.ownerUserId !== target.ownerUserId) {
           throw sourceInactive();
         }
-        await tx.update(storageFileCopies).set({ state: "copying", attempts: job.attempt, reasonCode: null,
+        const [claimed] = await tx.update(storageFileCopies).set({ state: "copying", attempts: job.attempt, reasonCode: null,
           targetEnc: row.targetEnc ?? crypto.encrypt(JSON.stringify(target), targetAad(row.publicId)),
-          updatedAt: clock.now() }).where(eq(storageFileCopies.id, row.id));
+          updatedAt: clock.now() }).where(and(eq(storageFileCopies.id, row.id), ne(storageFileCopies.state, "skipped")));
+        if (!claimed.affectedRows) throw sourceInactive();
         await auditCopy(job, row, "attempted", orderPublicId, undefined, tx);
         await recordCopyAttempt(deps, {
           ...attempt, phase: "started", bytes: source.size, orderPublicId,
@@ -139,7 +143,8 @@ export function registerFileCopies(deps: ModuleDeps, service: StorageModule) {
         await job.assertStillOwned(tx);
         const now = clock.now();
         await tx.update(storageFileCopies).set({ state: "copied", remoteIdEnc: crypto.encrypt(result.remoteId, remoteAad(row.publicId)),
-          digestVerified, updatedAt: now, finishedAt: now }).where(eq(storageFileCopies.id, row.id));
+          digestVerified, reasonCode: result.reusedExisting ? COPY_EXTERNAL :
+            (row.attempts === 0 ? COPY_OWNED : null), updatedAt: now, finishedAt: now }).where(eq(storageFileCopies.id, row.id));
         await auditCopy(job, row, "completed", orderPublicId, undefined, tx);
         const finalPath = result.targetPath && result.targetPath.length === target.path.length + 1 &&
           result.targetPath.every((segment) => segment.length > 0 && segment.length <= 255 &&
@@ -163,7 +168,7 @@ export function registerFileCopies(deps: ModuleDeps, service: StorageModule) {
         const now = clock.now();
         await tx.update(storageFileCopies).set({ state: skipped ? "skipped" : willRetry ? "queued" : "failed",
           attempts: job.attempt, reasonCode: code, updatedAt: now, finishedAt: willRetry ? null : now })
-          .where(eq(storageFileCopies.id, row.id));
+          .where(and(eq(storageFileCopies.id, row.id), ne(storageFileCopies.state, "skipped")));
         await auditCopy(job, row, skipped ? "refused" : code === "STORAGE_COPY_UNCERTAIN" ? "unknown" : "failed", orderPublicId, code, tx);
         await recordCopyAttempt(deps, {
           ...attempt, phase: "finished", result: skipped ? "not_written" : "failed", orderPublicId, errorCode: code, alreadyAudited: true,

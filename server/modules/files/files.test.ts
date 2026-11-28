@@ -12,6 +12,8 @@ import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { DomainError, notFound } from "../../core/errors.js";
 import { sanitiseAttribute } from "../audit/envelope.js";
+import { users } from "../identity/schema.js";
+import { orders } from "../orders/schema.js";
 import { newRequestContext } from "../../core/requestContext.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
 import type { StageGovernance, StageUploadIntent } from "../../../shared/workflowStages.js";
@@ -55,8 +57,11 @@ let extraSlots: FileUploadSlot[];
   let gateActions: { action: string; statusKey: string | null }[];
 
 beforeAll(async () => {
-  t = await createTestDb({ schema: { orderFiles, fileDownloadTickets, filePlaybackGrants, fileAccessLog, lockRows } });
+  t = await createTestDb({ schema: { users, orders, orderFiles, fileDownloadTickets, filePlaybackGrants, fileAccessLog, lockRows } });
   await t.db.insert(lockRows).values({ id: orderId });
+  await t.db.insert(users).values({ id: 1, publicId: userPublicId, emailEnc: "synthetic", emailIndex: "a".repeat(64), nameEnc: "synthetic", role: "customer" });
+  await t.db.insert(orders).values({ id: orderId, publicId: orderPublicId, reference: "RP-TEST", projectName: "Synthetic", ownerUserId: 1,
+    workflowVersionId: 1, statusKey: "intake", subtotalMinor: 0, totalMinor: 0, currency: "USD" });
 });
 afterAll(() => t?.cleanup());
 beforeEach(async () => {

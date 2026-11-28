@@ -8,6 +8,8 @@ import { newRequestContext } from "../../core/requestContext.js";
 import type { SessionPrincipal } from "../../core/types.js";
 import { createCallerFactory } from "../../trpc/trpc.js";
 import { jobAttempts, jobRuns } from "../jobs/schema.js";
+import { users } from "../identity/schema.js";
+import { orders } from "../orders/schema.js";
 import { graphDriveDefinitions } from "./adapters/graphDrive.js";
 import { FakeGraph } from "./adapters/graphDriveFake.js";
 import { createStorageModule, type StorageModule } from "./index.js";
@@ -28,7 +30,7 @@ const copyJob = "storage.copy_managed_order_file";
 const emit = vi.fn();
 const resolve = vi.fn();
 const tables = { storageAssignments, storageConnections, storageCopyAttempts, storageFileCopies,
-  storageManagedFileCopies, storageManagedOrderRoots, jobAttempts, jobRuns };
+  storageManagedFileCopies, storageManagedOrderRoots, jobAttempts, jobRuns, orders, users };
 let files: Map<string, Awaited<ReturnType<TestHarness["services"]["files"]["getOrderFileCopySource"]>>>;
 
 beforeAll(async () => { testDb = await createTestDb({ schema: tables }); });
@@ -70,6 +72,9 @@ beforeEach(async () => {
   name = "Synthetic Customer";
   customerId = ulid();
   orderId = ulid();
+  await testDb.db.insert(users).values({ id: 42, publicId: customerId, emailEnc: "synthetic", emailIndex: "a".repeat(64), nameEnc: "synthetic", role: "customer" });
+  await testDb.db.insert(orders).values({ publicId: orderId, reference: "ORDER-101", projectName: "Synthetic", ownerUserId: 42,
+    workflowVersionId: 1, statusKey: "intake", subtotalMinor: 0, totalMinor: 0, currency: "USD" });
   plan = { key: "intake", folders: DEFAULT_STAGE_FOLDERS, fileSync: { ...DEFAULT_STAGE_FILE_SYNC } };
 });
 

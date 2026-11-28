@@ -439,13 +439,13 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
       // writers can never replace each other; a lost race moves on to the next variant.
       const sameSize: Record<string, unknown>[] = [];
       const identicalTo = (hash: string) => sameSize.find((item) => hashOf(item) === hash) ?? null;
-      const done = async (item: Record<string, unknown>, hash: string, candidate: string) => {
+      const done = async (item: Record<string, unknown>, hash: string, candidate: string, reused = false) => {
         const result = await verify(item, input.size, hash, input.signal).catch((error: unknown) => {
           if (input.exactCreate) throw new StorageAdapterError("OUTCOME_UNKNOWN");
           throw error;
         });
         // The real final path below the configured root: drive casing for folders, the committed file name.
-        return { ...result, targetPath: [...parent.names, str(item.name) ?? candidate] };
+        return { ...result, targetPath: [...parent.names, str(item.name) ?? candidate], ...(reused ? { reusedExisting: true as const } : {}) };
       };
       for (let n = 0; n <= (input.exactCreate ? 0 : MAX_SUFFIX); n++) {
         const candidate = conflictVariant(name, n);
@@ -457,7 +457,7 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
         }
         if (simple && bytes && quickXor) {
           const match = identicalTo(quickXor);
-          if (match) return done(match, quickXor, candidate);
+          if (match) return done(match, quickXor, candidate, true);
           await input.beforeWrite?.();
           const res = await call({
             method: "PUT",
@@ -472,7 +472,7 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
             const raced = await itemByPath([...folderPath, candidate], input.signal);
             if (raced?.file && raced.size === input.size) sameSize.push(raced);
             const again = identicalTo(quickXor);
-            if (again) return done(again, quickXor, candidate);
+            if (again) return done(again, quickXor, candidate, true);
             continue;
           }
           return done(expectOk(res, 200, 201), quickXor, candidate);
@@ -483,7 +483,7 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
           if (raced?.file && raced.size === input.size) sameSize.push(raced);
           continue;
         }
-        if (outcome.kind === "identical") return done(outcome.item, outcome.quickXor, candidate);
+        if (outcome.kind === "identical") return done(outcome.item, outcome.quickXor, candidate, true);
         return done(outcome.item, outcome.quickXor, candidate);
       }
       throw new StorageAdapterError("DESTINATION_CONFLICT", false);
@@ -491,9 +491,15 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
 
     async remove(remoteId: string, signal?: AbortSignal): Promise<void> {
       if (!/^[A-Za-z0-9!._,-]{1,300}$/u.test(remoteId)) throw new StorageAdapterError("INVALID_INPUT", false);
-      const res = await call({ method: "DELETE", path: `${drive}/items/${encodeURIComponent(remoteId)}`, signal });
+      const path = `${drive}/items/${encodeURIComponent(remoteId)}`;
+      const found = await call({ method: "GET", path, signal });
+      if (found.status === 404) return;
+      const item = expectOk(found, 200);
+      if (str(item.id) !== remoteId || !item.file || item.folder) throw new StorageAdapterError("OUTCOME_UNKNOWN");
+      const res = await call({ method: "POST", path: `${path}/permanentDelete`, signal });
       if (res.status === 404) return;
-      expectOk(res, 204, 200);
+      expectOk(res, 204);
+      if ((await call({ method: "GET", path, signal })).status !== 404) throw new StorageAdapterError("OUTCOME_UNKNOWN");
     },
   };
 }

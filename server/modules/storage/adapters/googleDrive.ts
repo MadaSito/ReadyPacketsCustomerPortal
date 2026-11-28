@@ -186,11 +186,13 @@ export function googleDriveAdapter(request: StorageRequest, reserveFolder: Reser
         async remove(remoteId, signal) {
           if (!id.safeParse(remoteId).success) throw validation("STORAGE_REMOTE_ID_INVALID", "The storage object reference is invalid.");
           const path = `/drive/v3/files/${remoteId}`;
-          const details = parseResponse(await api(apiUrl(path, { fields: "id,mimeType,appProperties" }), { signal }),
+          const existing = await api(apiUrl(path, { fields: "id,mimeType,appProperties" }), { signal });
+          if (existing.status === 404) return;
+          const details = parseResponse(existing,
             z.object({ id, mimeType: z.string(), appProperties: z.object({ rpConnection: z.literal(publicId) }) }));
           if (details.id !== remoteId || details.mimeType === FOLDER) throw dataError(403);
           const rsp = await api(apiUrl(path), { method: "DELETE", signal });
-          if (rsp.status !== 204) throw dataError(rsp.status);
+          if (rsp.status !== 204 && rsp.status !== 404) throw dataError(rsp.status);
         },
       };
     },
