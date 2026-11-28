@@ -30,13 +30,19 @@ export const increment09States = Object.freeze({
     ready: '[role="alertdialog"]:has(input#rp-confirm-text):has(button:disabled:text-is("Delete permanently"))',
   }),
   "trash-retention": trash({ ready: 'main form:has(button:text-is("Save clean-up settings"))' }),
-  "order-row-move-to-trash": { route: "/admin/orders", role: "admin", interactive: true },
-  "order-detail-move-to-trash": { route: "/admin/orders/:orderId", role: "admin", publicIdAtEnd: true, interactive: true },
+  "order-row-move-to-trash": {
+    route: "/admin/orders", role: "admin", interactive: true,
+    steps: [button("Move to trash:", { namePrefix: true, first: true })], ready: moveDialog,
+  },
+  "order-detail-move-to-trash": {
+    route: "/admin/orders/:orderId", role: "admin", publicIdAtEnd: true, interactive: true,
+    steps: [{ testId: "order-move-to-trash" }], ready: moveDialog,
+  },
   "customer-move-to-trash-blocked": customer({
-    interactive: true, steps: [button("Manage account")], ready: ':text-matches("^Suspend this account first[.]?$")',
+    ready: 'main:has(button:disabled:text-is("Move to trash")):has(:text-matches("^Suspend this account first[.]?$"))',
   }),
   "customer-move-to-trash-dialog": customer({
-    interactive: true, steps: [button("Manage account"), { role: "menuitem", name: "Move to trash" }], ready: moveDialog,
+    interactive: true, steps: [button("Move to trash")], ready: moveDialog,
   }),
   "customer-email-link": customer({ ready: emailLink }),
   "staff-email-link": { route: "/admin/staff", role: "admin", ready: emailLink },
