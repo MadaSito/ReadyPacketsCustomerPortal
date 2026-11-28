@@ -380,7 +380,7 @@ describe("MoveToTrashDialog", () => {
     await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
     expect(lastCall("trash.moveToTrash")).toMatchObject({ kind: "order", publicId: row(1).publicId, reason: "Duplicate order" });
     await user.click(await screen.findByRole("button", { name: "Undo" }));
-    await waitFor(() => expect(lastCall("trash.restore")).toMatchObject({ items: [{ kind: "order", publicId: row(1).publicId }] }));
+    await waitFor(() => expect(lastCall("trash.restore")).toMatchObject({ items: [{ kind: "order", publicId: row(1).publicId, batchId: "b1" }] }));
   });
 
   it("explains a refused move inside the dialog", async () => {

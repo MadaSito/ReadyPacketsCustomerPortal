@@ -85,14 +85,14 @@ export function MoveToTrashDialog({ open, onOpenChange, kind, publicId, itemLabe
   useEffect(() => flushToast, [flushToast]);
   useEffect(() => { if (open) successFocus.current = null; }, [open]);
 
-  const undo = async () => {
+  const undo = async (batchId: string) => {
     // The Undo button leaves with its toast: right after dismissal, keep keyboard focus somewhere meaningful.
     setTimeout(() => {
       const target = returnFocusRef?.current;
       if (target?.isConnected && (document.activeElement === document.body || !document.activeElement)) target.focus();
     }, 0);
     try {
-      const out = await trpcClient.trash.restore.mutate({ items: [{ kind, publicId }], idempotencyKey: newIdempotencyKey() });
+      const out = await trpcClient.trash.restore.mutate({ items: [{ kind, publicId, batchId }], idempotencyKey: newIdempotencyKey() });
       const failed = out.results.find((r) => !r.ok);
       if (failed) toast.show({ tone: "danger", title: "Not restored", description: trashErrorMessage(failed.reasonCode, failed.safeMessage) });
       else {
@@ -116,7 +116,7 @@ export function MoveToTrashDialog({ open, onOpenChange, kind, publicId, itemLabe
         tone: "success",
         title: "Moved to trash",
         description: `${itemLabel}. ${out.dueAt ? `It will be deleted permanently on ${dueText(out.dueAt)}.` : `${KEPT_SENTENCE}`}`,
-        action: { label: "Undo", onClick: () => void undo() },
+        action: { label: "Undo", onClick: () => void undo(out.batchId) },
       };
       successFocus.current = returnFocusRef?.current ?? null;
       await refresh();
