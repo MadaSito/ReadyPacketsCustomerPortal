@@ -12,7 +12,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { safeError, useTRPCClient } from "@/lib/trpc";
 import { Callout, ConfirmDialog, Field, Skeleton, Textarea, useStepUp, useToast, type ToastInput } from "@/ui";
-import { useTrashApi, type TrashItemRef, type TrashKind, type TrashResults } from "./api";
+import { useTrashApi, type TrashItemRef, type TrashKind } from "./api";
 import {
   ERASED, KEPT, KIND_NOUN, NOT_TOUCHED, PURGE_WARNING, bulkConfirmation, countNoun, dueText, newIdempotencyKey, resultSentence, summaryLines,
   trashErrorMessage,
@@ -41,7 +41,6 @@ function useRefreshTrash() {
   return () => Promise.all([api.list, api.counts, api.settings.get, api.summarize].map((p) => client.invalidateQueries(p.pathFilter())));
 }
 
-type TrashClient = { trash: { restore: { mutate: (input: { items: TrashItemRef[]; idempotencyKey: string }) => Promise<TrashResults> } } };
 
 export interface MoveToTrashDialogProps {
   open: boolean;
@@ -66,7 +65,7 @@ export function MoveToTrashDialog({ open, onOpenChange, kind, publicId, itemLabe
   const api = useTrashApi();
   const toast = useToast();
   const refresh = useRefreshTrash();
-  const trpcClient = useTRPCClient() as unknown as TrashClient;
+  const trpcClient = useTRPCClient();
   const summary = useQuery({ ...api.summarize.queryOptions({ kind, publicId }), enabled: open });
   const move = useMutation(api.moveToTrash.mutationOptions());
   const [reason, setReason] = useState("");
