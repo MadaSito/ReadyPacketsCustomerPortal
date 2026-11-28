@@ -14,7 +14,7 @@ import { conflict, notFound } from "../../core/errors.js";
 import type { Tx } from "../../core/types.js";
 import { users } from "../identity/schema.js";
 import { orders } from "../orders/schema.js";
-import type { TrashEntityRef, TrashParticipant, TrashPurgeResult } from "../trash/ports.js";
+import type { TrashEntityRef, TrashParticipant, TrashPurgeResult, TrashPurgeRun } from "../trash/ports.js";
 import type { NotificationsService } from "./notificationsService.js";
 import {
   engagementImportProvenance,
@@ -223,8 +223,9 @@ export function createEngagementTrashParticipant(
       };
     },
 
-    async purge(entity: TrashEntityRef): Promise<TrashPurgeResult> {
+    async purge(entity: TrashEntityRef, run: TrashPurgeRun): Promise<TrashPurgeResult> {
       return db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
         await assertPurgeTargetAuthorizedInTx(tx, entity);
         await notifications.backfillLegacyTargets(tx);
 

@@ -22,7 +22,7 @@ import { conflict, notFound } from "../../core/errors.js";
 import type { Tx } from "../../core/types.js";
 import { liveUserPredicate } from "../identity/live.js";
 import { users } from "../identity/schema.js";
-import type { TrashEntityRef, TrashParticipant, TrashPurgeResult } from "../trash/ports.js";
+import type { TrashEntityRef, TrashParticipant, TrashPurgeResult, TrashPurgeRun } from "../trash/ports.js";
 import {
   communityCategories,
   communityPosts,
@@ -92,12 +92,13 @@ export function createCommunityTrashParticipant(deps: ModuleDeps): TrashParticip
       return communityPostsCount > 0 ? { communityPosts: communityPostsCount } : {};
     },
 
-    async purge(entity: TrashEntityRef): Promise<TrashPurgeResult> {
+    async purge(entity: TrashEntityRef, run: TrashPurgeRun): Promise<TrashPurgeResult> {
       if (entity.kind !== "customer") {
         return { deleted: {} };
       }
 
       return db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
         await assertCustomerPurgeAuthorizedInTx(tx, entity);
         const at = clock.now();
         const emptyHash = bodyHash("");

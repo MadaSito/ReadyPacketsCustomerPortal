@@ -12,7 +12,7 @@ import { conflict, notFound } from "../../core/errors.js";
 import type { Tx } from "../../core/types.js";
 import { liveUserPredicate } from "../identity/live.js";
 import { users } from "../identity/schema.js";
-import type { TrashEntityRef, TrashParticipant, TrashPurgeResult } from "../trash/ports.js";
+import type { TrashEntityRef, TrashParticipant, TrashPurgeResult, TrashPurgeRun } from "../trash/ports.js";
 import {
   knowledgeArticleFeedback,
   knowledgeArticles,
@@ -61,12 +61,13 @@ export function createKnowledgeTrashParticipant(deps: ModuleDeps): TrashParticip
       return {};
     },
 
-    async purge(entity: TrashEntityRef): Promise<TrashPurgeResult> {
+    async purge(entity: TrashEntityRef, run: TrashPurgeRun): Promise<TrashPurgeResult> {
       if (entity.kind !== "customer") {
         return { deleted: {} };
       }
 
       return db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
         await assertCustomerPurgeAuthorizedInTx(tx, entity);
 
         const ticketRes = await tx

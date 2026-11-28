@@ -4,7 +4,7 @@ import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import type { UserRole } from "../../../shared/domain.js";
 import type { Services } from "../../container.js";
-import { DomainError, forbidden } from "../../core/errors.js";
+import { conflict, DomainError, forbidden } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import { newRequestContext } from "../../core/requestContext.js";
 import type { Db, DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
@@ -14,7 +14,7 @@ import { users, type UserStatus } from "../identity/schema.js";
 import { createOrdersModule, type OrdersModule } from "../orders/index.js";
 import * as orderTables from "../orders/schema.js";
 import { platformSettings } from "../platform/schema.js";
-import { createTrashRegistry, type TrashRegistry } from "../trash/ports.js";
+import { createTrashRegistry, unfencedPurgeRunForTests, type TrashRegistry } from "../trash/ports.js";
 import { createEngagementModule, type EngagementModule } from "./index.js";
 import {
   MAIL_GENERIC_NOTIFICATION,
@@ -633,7 +633,12 @@ describe("engagement module — Trash & Permanent Erasure (increment 09)", () =>
       .set({ trashedAt: now })
       .where(eq(orderTables.orders.id, ordRow!.id));
 
-    const runMeta = { runId: ulid() };
+    const runMeta = unfencedPurgeRunForTests(ulid());
+    const fencedLostRun = unfencedPurgeRunForTests(ulid(), {
+      assertCurrentInTx: async () => {
+        throw conflict("PURGE_FENCE_LOST", "Worker no longer owns purge run.");
+      },
+    });
 
     await expect(
       participant.purge!({ kind: "order", id: ordRow!.id, publicId: ord.publicId, batchId }, runMeta),
@@ -643,11 +648,18 @@ describe("engagement module — Trash & Permanent Erasure (increment 09)", () =>
       participant.purge!({ kind: "customer", id: cust.id, publicId: cust.publicId, batchId }, runMeta),
     ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "PURGE_NOT_STARTED" });
 
-    // Authorize & purge order first (matching Trash service customer-purge sequence: orders -> customer), then replay
+    // Authorize & verify throwing ownership fence leaves data completely unchanged before purging order
     await tdb.db
       .update(orderTables.orders)
       .set({ purgeStartedAt: now, purgedAt: now })
       .where(eq(orderTables.orders.id, ordRow!.id));
+
+    await expect(
+      participant.purge!({ kind: "order", id: ordRow!.id, publicId: ord.publicId, batchId }, fencedLostRun),
+    ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "PURGE_FENCE_LOST" });
+    expect(
+      await participant.summarize!({ kind: "order", id: ordRow!.id, publicId: ord.publicId, batchId }),
+    ).toEqual({ messages: 1, tickets: 1 });
 
     const ordPurge1 = await participant.purge!(
       { kind: "order", id: ordRow!.id, publicId: ord.publicId, batchId },
@@ -662,11 +674,18 @@ describe("engagement module — Trash & Permanent Erasure (increment 09)", () =>
     );
     expect(ordPurge2.deleted).toEqual({});
 
-    // Authorize & purge customer, then replay
+    // Authorize & verify fence loss on customer purge leaves preferences/tickets intact, then purge & replay
     await tdb.db
       .update(users)
       .set({ purgeStartedAt: now, purgedAt: now })
       .where(eq(users.id, cust.id));
+
+    await expect(
+      participant.purge!({ kind: "customer", id: cust.id, publicId: cust.publicId, batchId }, fencedLostRun),
+    ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "PURGE_FENCE_LOST" });
+    expect(
+      await participant.summarize!({ kind: "customer", id: cust.id, publicId: cust.publicId, batchId }),
+    ).toEqual({ messages: 0, tickets: 1 });
 
     const custPurge1 = await participant.purge!(
       { kind: "customer", id: cust.id, publicId: cust.publicId, batchId },

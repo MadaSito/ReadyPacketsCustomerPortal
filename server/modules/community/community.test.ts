@@ -4,7 +4,7 @@ import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import type { UserRole } from "../../../shared/domain.js";
 import type { Services } from "../../container.js";
-import { DomainError } from "../../core/errors.js";
+import { conflict, DomainError } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import { newRequestContext } from "../../core/requestContext.js";
 import type { Db, SessionPrincipal, Tx } from "../../core/types.js";
@@ -13,7 +13,7 @@ import { users } from "../identity/schema.js";
 import { platformSettings } from "../platform/schema.js";
 import { createSettingsStore } from "../platform/settingsStore.js";
 import { TRIGGER_CATALOGUE } from "../audit/triggerCatalogue.js";
-import { createTrashRegistry, type TrashRegistry } from "../trash/ports.js";
+import { createTrashRegistry, unfencedPurgeRunForTests, type TrashRegistry } from "../trash/ports.js";
 import { createCommunityModule, type CommunityModule } from "./index.js";
 import { communityRouter } from "./router.js";
 import * as tables from "./schema.js";
@@ -497,7 +497,12 @@ describe("community forum (package M)", () => {
       expect(restoredShared.posts[0]!.body).toBe("UniqueSharedZeusToken opening body");
 
       // Re-trash Zeus and verify fail-closed purge guard before purgeStartedAt
-      const runMeta = { runId: ulid() };
+      const runMeta = unfencedPurgeRunForTests(ulid());
+      const lostFenceRun = unfencedPurgeRunForTests(ulid(), {
+        assertCurrentInTx: async () => {
+          throw conflict("PURGE_FENCE_LOST", "Worker no longer owns purge run.");
+        },
+      });
       await tdb.db.update(users).set({ trashedAt: now }).where(eq(users.id, zeus.id));
       await expect(
         participant!.purge!(
@@ -506,8 +511,21 @@ describe("community forum (package M)", () => {
         ),
       ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "PURGE_NOT_STARTED" });
 
-      // Authorize purgeStartedAt and execute purge (thread integrity model)
+      // Authorize purgeStartedAt; verify throwing ownership fence leaves posts and profile unchanged
       await tdb.db.update(users).set({ purgeStartedAt: now, purgedAt: now }).where(eq(users.id, zeus.id));
+      await expect(
+        participant!.purge!(
+          { kind: "customer", id: zeus.id, publicId: zeus.principal.userPublicId, batchId },
+          lostFenceRun,
+        ),
+      ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "PURGE_FENCE_LOST" });
+      const zeusPostsBeforePurge = await tdb.db
+        .select()
+        .from(tables.communityPosts)
+        .where(eq(tables.communityPosts.authorUserId, zeus.id));
+      expect(zeusPostsBeforePurge.every((p) => p.bodyText !== "" && p.state === "published")).toBe(true);
+
+      // Execute purge (thread integrity model)
       const firstPurge = await participant!.purge!(
         { kind: "customer", id: zeus.id, publicId: zeus.principal.userPublicId, batchId },
         runMeta,

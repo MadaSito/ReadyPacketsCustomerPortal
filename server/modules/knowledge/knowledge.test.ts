@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import type { UserRole } from "../../../shared/domain.js";
+import { conflict } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import { newRequestContext } from "../../core/requestContext.js";
 import type { Db, SessionPrincipal } from "../../core/types.js";
@@ -15,7 +16,7 @@ import * as orderTables from "../orders/schema.js";
 import { platformSettings } from "../platform/schema.js";
 import { createSettingsStore } from "../platform/settingsStore.js";
 import type { ApiCaller, PublicApiProviders } from "../publicApi/ports.js";
-import { createTrashRegistry, type TrashRegistry } from "../trash/ports.js";
+import { createTrashRegistry, unfencedPurgeRunForTests, type TrashRegistry } from "../trash/ports.js";
 import {
   createKnowledgeModule,
   KNOWLEDGE_RETENTION_JOB,
@@ -691,7 +692,12 @@ describe("knowledge module (Package F) + Public API v1 providers (knowledge & ti
 
     // Purge fails closed before purgeStartedAt is set
     const batchId = ulid();
-    const runMeta = { runId: ulid() };
+    const runMeta = unfencedPurgeRunForTests(ulid());
+    const lostFenceRun = unfencedPurgeRunForTests(ulid(), {
+      assertCurrentInTx: async () => {
+        throw conflict("PURGE_FENCE_LOST", "Worker no longer owns purge run.");
+      },
+    });
     await expect(
       kbParticipant!.purge!(
         { kind: "customer", id: trashedCustomer.id, publicId: trashedCustomer.publicId, batchId },
@@ -699,11 +705,23 @@ describe("knowledge module (Package F) + Public API v1 providers (knowledge & ti
       ),
     ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "PURGE_NOT_STARTED" });
 
-    // Authorize purgeStartedAt and execute purge twice (idempotent)
+    // Authorize purgeStartedAt; verify throwing fence leaves feedback unchanged, then execute purge twice (idempotent)
     await tdb.db
       .update(users)
       .set({ purgeStartedAt: now })
       .where(eq(users.id, trashedCustomer.id));
+
+    await expect(
+      kbParticipant!.purge!(
+        { kind: "customer", id: trashedCustomer.id, publicId: trashedCustomer.publicId, batchId },
+        lostFenceRun,
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "PURGE_FENCE_LOST" });
+    const fbStillPresent = await tdb.db
+      .select()
+      .from(knowledgeTables.knowledgeArticleFeedback)
+      .where(eq(knowledgeTables.knowledgeArticleFeedback.userId, trashedCustomer.id));
+    expect(fbStillPresent).toHaveLength(1);
 
     const firstPurge = await kbParticipant!.purge!(
       { kind: "customer", id: trashedCustomer.id, publicId: trashedCustomer.publicId, batchId },
