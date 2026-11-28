@@ -59,13 +59,13 @@ const retentionValuesSchema = z
     orderDays: z
       .number()
       .int()
-      .min(TRASH_RETENTION_MIN_DAYS, "Use a whole number between 7 and 3,650 days.")
-      .max(TRASH_RETENTION_MAX_DAYS, "Use a whole number between 7 and 3,650 days."),
+      .min(TRASH_RETENTION_MIN_DAYS, "Use a whole number between 1 and 3,650 days.")
+      .max(TRASH_RETENTION_MAX_DAYS, "Use a whole number between 1 and 3,650 days."),
     customerDays: z
       .number()
       .int()
-      .min(TRASH_RETENTION_MIN_DAYS, "Use a whole number between 7 and 3,650 days.")
-      .max(TRASH_RETENTION_MAX_DAYS, "Use a whole number between 7 and 3,650 days."),
+      .min(TRASH_RETENTION_MIN_DAYS, "Use a whole number between 1 and 3,650 days.")
+      .max(TRASH_RETENTION_MAX_DAYS, "Use a whole number between 1 and 3,650 days."),
   })
   .strict();
 
