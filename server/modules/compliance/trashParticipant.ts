@@ -183,9 +183,10 @@ export function createComplianceTrashParticipant(
       return policyAcceptanceCount > 0 ? { policyAcceptances: policyAcceptanceCount } : {};
     },
 
-    async purge(entity: TrashEntityRef, _run: TrashPurgeRun): Promise<TrashPurgeResult> {
+    async purge(entity: TrashEntityRef, run: TrashPurgeRun): Promise<TrashPurgeResult> {
       if (entity.kind === "order") {
         return deps.db.transaction(async (tx) => {
+          await run.assertCurrentInTx(tx);
           const now = deps.clock.now();
 
           // 1. Ensure frozen buyer, order reference, and issuer snapshots are persisted on issued invoices.
@@ -290,6 +291,7 @@ export function createComplianceTrashParticipant(
       }
 
       return deps.db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
         // 1. Freeze snapshots on any kept invoices belonging to this customer's orders before user tombstoning.
         try {
           const customerOrders = await tx

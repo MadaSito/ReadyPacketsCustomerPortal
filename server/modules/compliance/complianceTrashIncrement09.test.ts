@@ -10,7 +10,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createTestDeps, fakePrincipal } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import type { ModuleDeps, Services } from "../../container.js";
-import { DomainError, notFound } from "../../core/errors.js";
+import { conflict, DomainError, notFound } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import { newRequestContext, runWithRequestContext } from "../../core/requestContext.js";
 import type { DbOrTx, Logger, SessionPrincipal, Tx } from "../../core/types.js";
@@ -18,7 +18,7 @@ import { users } from "../identity/schema.js";
 import type { OrderAccessRole, OrderAccessView, OrderLockState, OrdersModule } from "../orders/index.js";
 import { orders } from "../orders/schema.js";
 import * as paymentsSchema from "../payments/schema.js";
-import type { TrashParticipant } from "../trash/ports.js";
+import { unfencedPurgeRunForTests, type TrashParticipant } from "../trash/ports.js";
 import { createAcceptanceLogService } from "./acceptanceLogService.js";
 import * as acceptanceSchema from "./acceptanceSchema.js";
 import { createComplianceModule } from "./index.js";
@@ -378,7 +378,7 @@ describe("Increment 09 — Compliance TrashParticipant, frozen snapshots & finan
     async function purgeOrder(order: TestOrderRow, participant: TrashParticipant) {
       const res = await participant.purge!(
         { kind: "order", id: order.id, publicId: order.publicId, batchId: ulid() },
-        { runId: ulid() },
+        unfencedPurgeRunForTests(ulid()),
       );
       const purgedAt = t.deps.clock.now();
       await tdb.db
@@ -787,10 +787,18 @@ describe("Increment 09 — Compliance TrashParticipant, frozen snapshots & finan
 
       const custPurgeRes = await participant.purge!(
         { kind: "customer", id: zeusUserId, publicId: zeusPublicId, batchId: ulid() },
-        { runId: ulid() },
+        unfencedPurgeRunForTests(ulid()),
       );
       expect(custPurgeRes.deleted.policyEnforcementActions).toBe(1);
       expect(custPurgeRes.kept?.policyAcceptances).toBeGreaterThanOrEqual(2);
+
+      // Idempotent retry on customer purge.
+      const custPurgeRetry = await participant.purge!(
+        { kind: "customer", id: zeusUserId, publicId: zeusPublicId, batchId: ulid() },
+        unfencedPurgeRunForTests(ulid()),
+      );
+      expect(custPurgeRetry.deleted.policyEnforcementActions).toBe(0);
+      expect(custPurgeRetry.kept?.policyAcceptances).toBeGreaterThanOrEqual(2);
 
       // Tombstone Zeus's user row (matching identity's customer purge tombstone).
       await tdb.db
@@ -832,6 +840,153 @@ describe("Increment 09 — Compliance TrashParticipant, frozen snapshots & finan
       expect(zeusAcceptances.length).toBeGreaterThanOrEqual(1);
       expect(zeusAcceptances[0]!.customer?.name).toBe("Deleted account");
       expect(zeusAcceptances[0]!.customer?.email).toBe("");
+    });
+  });
+
+  it("leaves order and customer compliance data unchanged when TrashPurgeRun.assertCurrentInTx throws PURGE_FENCE_LOST", async () => {
+    const h = createHarness();
+    await h.compliance.init?.();
+    const participant = h.registeredTrashParticipants[0]!;
+
+    await runWithRequestContext(newRequestContext("test"), async () => {
+      // Seed active customer for this test so session/user checks pass cleanly.
+      const heraPub = ulid();
+      const now = h.t.deps.clock.now();
+      const [heraIns] = await tdb.db.insert(users).values({
+        publicId: heraPub,
+        customerRef: "RPCUS-F3NCE0001",
+        emailEnc: h.t.deps.crypto.encrypt("hera.fence@example.test", `users.email:${heraPub}`),
+        emailIndex: "d".repeat(64),
+        nameEnc: h.t.deps.crypto.encrypt("Hera Fence", `users.name:${heraPub}`),
+        role: "customer",
+        status: "active",
+        emailVerifiedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      });
+      const heraUserId = heraIns.insertId;
+
+      // Seed an order + unpaid issued invoice + intake submission row for that order.
+      const fenceOrder = await h.insertOrder({
+        reference: "RP-2026-FENCE1",
+        projectName: "Ice Queen Fence",
+      });
+      const orderId = fenceOrder.id;
+      const ordPub = fenceOrder.publicId;
+
+      const invPub = ulid();
+      await tdb.db.insert(complianceSchema.complianceInvoices).values({
+        publicId: invPub,
+        invoiceNumber: "INV-2026-999001",
+        orderId,
+        orderPublicId: ordPub,
+        status: "issued",
+        origin: "portal",
+        currency: "USD",
+        subtotalMinor: 12_000,
+        discountMinor: 0,
+        taxMinor: 0,
+        totalMinor: 12_000,
+        issuedAt: now,
+        createdByUserId: adminUserId,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const qCreated = await h.compliance.intake.admin.createQuestionnaire(adminPrincipal, {
+        slug: `fence-intake-${ulid().toLowerCase()}`,
+        title: "Fence Intake",
+        scopeKind: "default",
+        fields: [{ key: "goal", label: "Goal", type: "short_text", required: true, sensitive: false }],
+      });
+      const [qRow] = await tdb.db
+        .select({ id: complianceSchema.intakeQuestionnaires.id })
+        .from(complianceSchema.intakeQuestionnaires)
+        .where(eq(complianceSchema.intakeQuestionnaires.publicId, qCreated.questionnairePublicId))
+        .limit(1);
+      const [qvRow] = await tdb.db
+        .select({ id: complianceSchema.intakeQuestionnaireVersions.id })
+        .from(complianceSchema.intakeQuestionnaireVersions)
+        .where(eq(complianceSchema.intakeQuestionnaireVersions.publicId, qCreated.draftVersionPublicId))
+        .limit(1);
+      const subPub = ulid();
+      await tdb.db.insert(complianceSchema.intakeSubmissions).values({
+        publicId: subPub,
+        orderId,
+        orderPublicId: ordPub,
+        questionnaireId: qRow!.id,
+        questionnaireVersionId: qvRow!.id,
+        submittedByUserId: heraUserId,
+        status: "submitted",
+        currentAnswersEnc: h.t.deps.crypto.encrypt("{}", `intake_submissions.answers:${subPub}`),
+        submittedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const lostFenceRun = unfencedPurgeRunForTests(ulid(), {
+        async assertCurrentInTx() {
+          throw conflict("PURGE_FENCE_LOST", "Worker ownership fence lost.");
+        },
+      });
+
+      await expect(
+        participant.purge!(
+          { kind: "order", id: orderId, publicId: ordPub, batchId: ulid() },
+          lostFenceRun,
+        ),
+      ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "PURGE_FENCE_LOST" });
+
+      // Invoice stays `issued` (not voided) and intake submission stays intact!
+      const [invAfter] = await tdb.db
+        .select()
+        .from(complianceSchema.complianceInvoices)
+        .where(eq(complianceSchema.complianceInvoices.publicId, invPub));
+      expect(invAfter!.status).toBe("issued");
+      expect(invAfter!.voidedAt).toBeNull();
+
+      const subsAfter = await tdb.db
+        .select()
+        .from(complianceSchema.intakeSubmissions)
+        .where(eq(complianceSchema.intakeSubmissions.orderId, orderId));
+      expect(subsAfter).toHaveLength(1);
+
+      // Customer enforcement row also stays untouched when customer purge fence throws!
+      const polCreated = await h.compliance.policies.admin.createDocument(adminPrincipal, {
+        slug: `fence-terms-${ulid().toLowerCase()}`,
+        title: "Fence Terms",
+        audience: "customer",
+        requiresAcceptance: true,
+        requiresTypedSignature: false,
+        versionLabel: "v1.0",
+        contentFormat: "plain_text",
+        bodyText: "Fence policy text.",
+      });
+      const [polVerRow] = await tdb.db
+        .select({ id: complianceSchema.policyVersions.id })
+        .from(complianceSchema.policyVersions)
+        .where(eq(complianceSchema.policyVersions.publicId, polCreated.draftVersionPublicId))
+        .limit(1);
+      await tdb.db.insert(policyEnforcementSchema.policyEnforcementActions).values({
+        policyVersionId: polVerRow!.id,
+        userId: heraUserId,
+        enforcementVersion: 1,
+        reason: "deadline",
+        createdAt: now,
+      });
+
+      await expect(
+        participant.purge!(
+          { kind: "customer", id: heraUserId, publicId: heraPub, batchId: ulid() },
+          lostFenceRun,
+        ),
+      ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "PURGE_FENCE_LOST" });
+
+      const enfAfter = await tdb.db
+        .select()
+        .from(policyEnforcementSchema.policyEnforcementActions)
+        .where(eq(policyEnforcementSchema.policyEnforcementActions.userId, heraUserId));
+      expect(enfAfter).toHaveLength(1);
     });
   });
 });

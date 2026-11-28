@@ -581,14 +581,15 @@ export function createBillingProfileService(deps: ModuleDeps): BillingProfileMod
       const count = Number(row?.count ?? 0);
       return count > 0 ? { billingProfiles: count } : {};
     },
-    async purge(entity): Promise<TrashPurgeResult> {
+    async purge(entity, run): Promise<TrashPurgeResult> {
       if (entity.kind !== "customer") return { deleted: {} };
-      const result = await deps.db.transaction(async (tx) =>
-        clearForUserInTx(tx, entity.id, {
+      const result = await deps.db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
+        return clearForUserInTx(tx, entity.id, {
           role: "system",
           via: "account_erasure",
-        }),
-      );
+        });
+      });
       return {
         deleted: {
           billingProfiles: result.cleared ? 1 : 0,

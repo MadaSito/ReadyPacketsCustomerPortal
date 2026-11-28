@@ -8,14 +8,18 @@
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Services } from "../../container.js";
-import { DomainError } from "../../core/errors.js";
+import { conflict, DomainError } from "../../core/errors.js";
 import { newRequestContext } from "../../core/requestContext.js";
 import type { SessionPrincipal, SessionTransport } from "../../core/types.js";
 import { createCallerFactory, router } from "../../trpc/trpc.js";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { users } from "../identity/schema.js";
-import { createTrashRegistry, type TrashParticipant } from "../trash/ports.js";
+import {
+  createTrashRegistry,
+  unfencedPurgeRunForTests,
+  type TrashParticipant,
+} from "../trash/ports.js";
 import {
   billingProfileDetailsAad,
   createBillingProfileModule,
@@ -611,7 +615,7 @@ describe("billingProfile module (MySQL)", () => {
           publicId: "01JD9000000000000000000002",
           batchId: "01JD9000000000000000000001",
         },
-        { runId: "01JD9000000000000000000099" },
+        unfencedPurgeRunForTests("01JD9000000000000000000099"),
       ),
     ).toEqual({ deleted: {} });
 
@@ -623,7 +627,7 @@ describe("billingProfile module (MySQL)", () => {
         publicId: userA.publicId,
         batchId: "01JD9000000000000000000001",
       },
-      { runId: "01JD9000000000000000000099" },
+      unfencedPurgeRunForTests("01JD9000000000000000000099"),
     );
     expect(firstPurge).toEqual({ deleted: { billingProfiles: 1 } });
 
@@ -634,7 +638,7 @@ describe("billingProfile module (MySQL)", () => {
         publicId: userA.publicId,
         batchId: "01JD9000000000000000000001",
       },
-      { runId: "01JD9000000000000000000099" },
+      unfencedPurgeRunForTests("01JD9000000000000000000099"),
     );
     expect(secondPurge).toEqual({ deleted: { billingProfiles: 0 } });
 
@@ -662,5 +666,35 @@ describe("billingProfile module (MySQL)", () => {
       ),
     ).rejects.toMatchObject({ reasonCode: "USER_NOT_FOUND" });
     expect(await t.db.transaction((tx) => billingProfile.getForUserInTx(tx, userA.id))).toBeNull();
+  });
+
+  it("leaves billing profile and audit unchanged when TrashPurgeRun.assertCurrentInTx throws PURGE_FENCE_LOST", async () => {
+    const callerA = callerFor(userA.principal);
+    await callerA.billingProfile.save({
+      details: SYNTHETIC_BILLING_A,
+      expectedVersion: 0,
+    });
+    h.audit.clear();
+
+    await expect(
+      trashParticipant!.purge!(
+        {
+          kind: "customer",
+          id: userA.id,
+          publicId: userA.publicId,
+          batchId: "01JD9000000000000000000011",
+        },
+        unfencedPurgeRunForTests("01JD9000000000000000000098", {
+          async assertCurrentInTx() {
+            throw conflict("PURGE_FENCE_LOST", "Worker ownership fence lost.");
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "PURGE_FENCE_LOST" });
+
+    // Billing profile and audit log remain completely untouched.
+    const stillSaved = await t.db.transaction((tx) => billingProfile.getForUserInTx(tx, userA.id));
+    expect(stillSaved?.details.fullName).toBe(SYNTHETIC_BILLING_A.fullName);
+    expect(h.audit.events).toHaveLength(0);
   });
 });
