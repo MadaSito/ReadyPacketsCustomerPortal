@@ -203,6 +203,38 @@ export interface TrashParticipant {
   reason "Suspend this account first" (not a tooltip only).
 - After moving: toast with **Undo** (restores, same permission) and return to the list.
 
+### D2.8 Security addendum (accepted from the design review; binding)
+
+- **Scope is decided by the server.** `summarize`, lists and counts are computed server-side for the acting
+  administrator; the client never supplies counts or internal ids.
+- **Bulk actions carry an explicit list** of public ids (≤ 100), never a filter; the server acts on exactly that
+  list and reports per item. The typed confirmation (`DELETE <count>`) is checked on the server against the list.
+- **Typed intent is checked on the server** for permanent deletion (order number / customer ID sent with the
+  request and compared). Restore and Undo need `trash.manage` and the confirm dialog, not step-up.
+- **Idempotency keys are bound** to actor + action + entity (or the exact item list) + the entity's trash
+  generation (`trash_batch_id`); a key replayed for anything else is rejected.
+- **One claim per cascade.** Trash, restore and purge of an entity take a row lock / compare-and-set on the trash
+  columns (`trashed_at`, `purge_started_at`) so that restore-vs-purge, double submit and job-vs-administrator
+  races have exactly one winner; the loser gets a plain 409.
+- **Purge is durable and fails closed.** The run records the immutable target set (the customer's orders at
+  claim time) and a per-participant checkpoint; a retry works on the same targets. The coordinator knows the
+  expected participant list: a missing participant fails the run (no silent skip). The owner module writes the
+  tombstone only after every participant has reported success, and the files participant reports success only
+  after the stored objects are verified gone (or already absent).
+- **E-mail reservation**: the original address stays reserved until the identity tombstone commits. Kept
+  records (invoices, receipts, payments, acceptance evidence, audit) are tied to immutable internal ids only —
+  no lookup by e-mail, SSO subject, customer ID text or referral code may ever attach them to a new account.
+  Test: re-register the purged address → new ids, nothing inherited, old sessions/tokens/API keys dead.
+- **Retention**: turning auto-clean-up on, or shortening a retention period, shows the number of items that
+  become due and needs the typed confirmation + step-up; the write is a compare-and-set on the settings version
+  and the reviewed count (changed meanwhile → 409, review again). The job is internal only (no caller-supplied
+  target, no way to run it as the system actor from the API), and re-checks "due", "still in trash" and
+  "maintenance off" under its claim for every item.
+- **Fences for work already in flight**: a mail, notification, production delivery, SharePoint write or
+  automation step that was queued or claimed before the item was trashed re-checks the trash state immediately
+  before the external effect and drops itself. Payment: a checkout opened before trashing that is later paid is
+  booked as money received (kept record + existing alert) and never restores the order.
+
 ### D3 New logo and brand files (ui_foundation_engineer; documents platform_engineer)
 
 - Source of truth committed by `/root` under `docs/brand/master/`: the two 4096 px square lockups and
