@@ -3,7 +3,7 @@
  * top bar with global search slot, notifications, theme and account menu, maintenance banner.
  */
 import { ChevronsLeft, ChevronsRight, Menu, Search } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { Component, useState, type ReactNode } from "react";
 import { Link } from "wouter";
 import { ALL_NAV } from "@/app/registry";
 import type { MeUser } from "@/lib/authApi";
@@ -14,6 +14,20 @@ import { CookieConsentSlot, CustomerMaintenanceSlot, GlobalSearchSlot, Notificat
 import { PolicyPromptSlot } from "../policyPromptSlot";
 import { PortalSwitch } from "../portal";
 import { AccountMenu, Footer, navPlacement, MaintenanceBanner, PreviewBanner, SkipLink, ThemeToggle, useCurrentNav, useEnabledNav, visibleNav } from "./common";
+
+/** A navigation count is decoration: when it cannot render (no data layer, no permission) the link stays usable. */
+class NavBadgeBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  override state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  override componentDidCatch() {
+    /* Nothing to report: the badge is optional. */
+  }
+  override render() {
+    return this.state.failed ? null : this.props.children;
+  }
+}
 
 function groupNav(items: NavItem[]): Array<{ group: string; items: NavItem[] }> {
   const groups = new Map<string, NavItem[]>();
@@ -49,7 +63,9 @@ function SideNav({ groups, collapsed, onNavigate }: { groups: ReturnType<typeof 
                   {collapsed ? null : <span className="min-w-0 truncate whitespace-nowrap">{item.label}</span>}
                   {!collapsed && item.badge ? (
                     <span className="ml-auto shrink-0">
-                      <item.badge />
+                      <NavBadgeBoundary>
+                        <item.badge />
+                      </NavBadgeBoundary>
                     </span>
                   ) : null}
                 </Link>
