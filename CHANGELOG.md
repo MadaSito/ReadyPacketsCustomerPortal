@@ -5,6 +5,48 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See `docs/engineering/SDLC.md` for the release
 procedure.
 
+## Increment 09
+
+Requested by the owner on 2026-11-27 (prompt 37). See the [session log](docs/session-logs/2026-11-27-session-01.md) and the [contract](docs/engineering/INCREMENT_09_CONTRACT.md).
+- **Database migration** `0009_increment_09` (final at `d358237`), additive only: 56 statements. Details are in [UPGRADE.md](docs/operations/UPGRADE.md#increment-09-and-migration-0009).
+- **PR and merge commit:** (filled at merge).
+
+### Fixed
+
+- **Links in e-mail were not clickable** (D1). Every shipped template now renders its link variables as anchors in the HTML part. Only template text and trusted link variables become links, and a URL inside a free-form value is never linked. Anchors are produced when the portal address is HTTPS. E-mail addresses in the console (customers list, customer page, reports) are `mailto` links (`EmailLink`).
+
+### Added
+
+- **Trash centre** at **Administration → Trash** (D2).
+  - **Moving to trash.** Orders, and suspended customer accounts, can be moved to the trash and restored. A customer must be suspended first. Moving a customer moves all of their orders, and moving the first order of a project moves its additions.
+  - **Restore.** A restored customer comes back suspended.
+  - **Permanent deletion** needs `trash.purge`, a fresh two-step check, and the typed order number, customer ID, or `DELETE <count>` for several items.
+    - It erases working data, and keeps issued invoices, receipts, payment records, required acceptance evidence and audit entries, tied to a tombstone.
+    - Order numbers and customer IDs are never reused, and the deleted e-mail address can register again.
+  - **Retention clean-up.** An hourly job deletes items after their retention period: 30 days by default for orders and for customer accounts, configurable from 1 to 3,650 days. Shortening a period shows how many items become due and needs the typed confirmation.
+  - **Legal hold.** An order on legal hold cannot be moved to the trash or deleted permanently, and neither can its owner.
+  - **Audit.** Every action is audited (`order.*`, `customer.*`, `trash.retention_changed`, `trash.cleanup_completed`).
+- **Brand files** (D3). The master brand identity archive and the square lockups are in `docs/brand/master/`, as supplied.
+- **Go-live checklist:** 47 new rows for increment 09 in [GO_LIVE_CHECKLIST.md](docs/operations/GO_LIVE_CHECKLIST.md).
+
+### Changed
+
+- **Logo** (D3). The new ReadyPackets square full lockup (package 2026.10.15.2) appears on sign-in, registration and other auth pages, public and legal pages, error and offline pages, and the sidebar. The horizontal full lockup is used in narrow bars and in invoice and receipt PDFs. The favicon, Apple touch icon, maskable icon, manifest icons and share image are new, with versioned file names so that the old logo is not served from cache. The tagline is now "Your Business, Professionally Packeted!™".
+- **Settings owned by a dedicated page.** The three trash retention settings can be changed only in the Trash centre. The generic settings page shows them read-only with a link, and configuration import refuses them.
+- **Password reset.** Reset requests queued before the upgrade are refused; request a new one.
+
+### Security
+
+- A source review by http_security_engineer gave D1, D2 and D3 CLEAR after several rounds. See [INCREMENT_09_SECURITY_REVIEW.md](docs/verification/INCREMENT_09_SECURITY_REVIEW.md).
+- A permanent deletion is durable and fenced: each module's step checks that its worker still owns the run, and a cascade never works on a truncated list.
+
+### Accessibility
+
+The changed screens are designed and tested against WCAG 2.2 AA.
+- **Automated checks.** The lead ran the axe-core WCAG 2.0, 2.1 and 2.2 A and AA rules in Chromium, in light and dark themes, on the Trash centre, the customers list and customer page, the orders list and order page, and the permanent-deletion dialog. No violations were found.
+- **Widths.** No horizontal overflow at 240, 320, 390, 768, 1024 or 1440 px.
+- **Not checked:** screen readers, Windows forced colours, physical devices, and browsers other than Chromium.
+
 ## Increment 08
 
 Requested by the owner on 2026-11-26 (prompt 34). See the [session log](docs/session-logs/2026-11-26-session-02.md) and the [contract](docs/engineering/INCREMENT_08_CONTRACT.md).
