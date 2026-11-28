@@ -17,7 +17,7 @@ import { orders, orderWorkflowVersions } from "../orders/schema.js";
 import { DEFAULT_WORKFLOW, type WorkflowDefinition } from "../orders/workflowTypes.js";
 import { platformSettings } from "../platform/schema.js";
 import { createSettingsStore } from "../platform/settingsStore.js";
-import { createTrashRegistry } from "../trash/ports.js";
+import { createTrashRegistry, unfencedPurgeRunForTests } from "../trash/ports.js";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { PROMO_CODE_ALPHABET } from "./codes.js";
@@ -1748,16 +1748,34 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
     });
     expect(ordSummary).toEqual({ promoRedemptions: 1 });
 
+    // Throwing fence (`PURGE_FENCE_LOST`) leaves release notes and check attempts untouched
+    const lostFenceRun = unfencedPurgeRunForTests("01JPURGERUNLOST00000000001", {
+      async assertCurrentInTx() {
+        throw new DomainError("CONFLICT", "PURGE_FENCE_LOST", "Purge worker replaced.");
+      },
+    });
+    await expect(
+      participant!.purge!(
+        { kind: "order", id: ordRow!.id, publicId: ordZeus, batchId: "01JTRASHBATCHZEUS000000001" },
+        lostFenceRun,
+      ),
+    ).rejects.toMatchObject({ reasonCode: "PURGE_FENCE_LOST" });
+    const [redemptionAfterFailedFence] = await tdb.db
+      .select()
+      .from(promoRedemptions)
+      .where(eq(promoRedemptions.orderPublicId, ordZeus));
+    expect(redemptionAfterFailedFence?.releaseNote).toBe("Operator note mentioning Ice Queen");
+
     const ordPurge = await participant!.purge!(
       { kind: "order", id: ordRow!.id, publicId: ordZeus, batchId: "01JTRASHBATCHZEUS000000001" },
-      { runId: "01JPURGERUNZEUS00000000001" },
+      unfencedPurgeRunForTests("01JPURGERUNZEUS00000000001"),
     );
     expect(ordPurge.deleted).toEqual({ promoReleaseNotes: 1 });
     expect(ordPurge.kept).toEqual({ promoRedemptions: 1 });
 
     const custPurge = await participant!.purge!(
       { kind: "customer", id: zeus.id, publicId: zeus.publicId, batchId: "01JTRASHBATCHZEUS000000001" },
-      { runId: "01JPURGERUNZEUS00000000001" },
+      unfencedPurgeRunForTests("01JPURGERUNZEUS00000000001"),
     );
     expect(custPurge.deleted).toEqual({
       promoCheckAttempts: 1,
@@ -1768,7 +1786,7 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
     // Idempotent retry:
     const custPurgeRetry = await participant!.purge!(
       { kind: "customer", id: zeus.id, publicId: zeus.publicId, batchId: "01JTRASHBATCHZEUS000000001" },
-      { runId: "01JPURGERUNZEUS00000000001" },
+      unfencedPurgeRunForTests("01JPURGERUNZEUS00000000002"),
     );
     expect(custPurgeRetry.deleted).toEqual({});
     expect(custPurgeRetry.kept).toEqual({ promoRedemptions: 1 });

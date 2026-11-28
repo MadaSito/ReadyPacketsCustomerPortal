@@ -4,6 +4,7 @@ import http from "node:http";
 import { eq } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { DomainError } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import { newRequestContext, runWithRequestContext } from "../../core/requestContext.js";
 import type { SessionPrincipal, SessionTransport } from "../../core/types.js";
@@ -11,7 +12,7 @@ import { createCallerFactory, type SafeErrorData } from "../../trpc/trpc.js";
 import { users, userSessions } from "../identity/schema.js";
 import { platformSettings } from "../platform/schema.js";
 import { createSettingsStore } from "../platform/settingsStore.js";
-import { createTrashRegistry } from "../trash/ports.js";
+import { createTrashRegistry, unfencedPurgeRunForTests } from "../trash/ports.js";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { REFERRAL_CODE_REGEX, canonicalEmailIdentity, serializeSafeCsv } from "./codes.js";
@@ -1391,10 +1392,12 @@ describe("server/modules/referrals (Package G)", () => {
     const listWhileTrashed = await callAs(admin.principal, (c) => c.admin.list({ limit: 10 }));
     expect(listWhileTrashed.items).toHaveLength(0);
 
+    const batchId = ulid();
     const summaryBeforePurge = await participant!.summarize!({
       kind: "customer",
       id: referrer.userId,
       publicId: referrer.userPublicId,
+      batchId,
     });
     expect(summaryBeforePurge).toEqual({ referralLinks: 1 });
 
@@ -1410,21 +1413,53 @@ describe("server/modules/referrals (Package G)", () => {
       })
       .where(eq(users.id, referrer.userId));
 
-    const purgeReferrer = await participant!.purge({
-      kind: "customer",
-      id: referrer.userId,
-      publicId: referrer.userPublicId,
+    // Throwing fence (`PURGE_FENCE_LOST`) leaves referral_codes and invite rows untouched
+    const lostFenceRun = unfencedPurgeRunForTests("run-lost-fence", {
+      async assertCurrentInTx() {
+        throw new DomainError("CONFLICT", "PURGE_FENCE_LOST", "Purge worker replaced.");
+      },
     });
+    await expect(
+      participant!.purge!(
+        {
+          kind: "customer",
+          id: referrer.userId,
+          publicId: referrer.userPublicId,
+          batchId,
+        },
+        lostFenceRun,
+      ),
+    ).rejects.toMatchObject({ reasonCode: "PURGE_FENCE_LOST" });
+    const [codeAfterFailedFence] = await tdb.db
+      .select()
+      .from(referralCodes)
+      .where(eq(referralCodes.userId, referrer.userId));
+    expect(codeAfterFailedFence?.code).toBe(referrerCode);
+    expect(codeAfterFailedFence?.active).toBe(true);
+
+    const purgeReferrer = await participant!.purge!(
+      {
+        kind: "customer",
+        id: referrer.userId,
+        publicId: referrer.userPublicId,
+        batchId,
+      },
+      unfencedPurgeRunForTests("run-referrer-1"),
+    );
     expect(purgeReferrer.deleted.referralLinks).toBe(1);
     expect(purgeReferrer.deleted.referralEmailInvites).toBe(1);
     expect(purgeReferrer.kept?.referralAttributions).toBe(1);
 
     // Idempotent second purge call reports 0 newly deleted links
-    const purgeReferrerRetry = await participant!.purge({
-      kind: "customer",
-      id: referrer.userId,
-      publicId: referrer.userPublicId,
-    });
+    const purgeReferrerRetry = await participant!.purge!(
+      {
+        kind: "customer",
+        id: referrer.userId,
+        publicId: referrer.userPublicId,
+        batchId,
+      },
+      unfencedPurgeRunForTests("run-referrer-2"),
+    );
     expect(purgeReferrerRetry.deleted.referralLinks).toBeUndefined();
 
     // Old referral code is completely gone from DB and never resolves again
@@ -1461,11 +1496,15 @@ describe("server/modules/referrals (Package G)", () => {
     expect(ledgerAfterPurge.items[0]?.note).toBeNull();
 
     // Solo customer with zero attributions has referral_codes row deleted outright
-    const purgeSolo = await participant!.purge({
-      kind: "customer",
-      id: soloCustomer.userId,
-      publicId: soloCustomer.userPublicId,
-    });
+    const purgeSolo = await participant!.purge!(
+      {
+        kind: "customer",
+        id: soloCustomer.userId,
+        publicId: soloCustomer.userPublicId,
+        batchId,
+      },
+      unfencedPurgeRunForTests("run-solo-1"),
+    );
     expect(purgeSolo.deleted.referralLinks).toBe(1);
     const soloCodeRows = await tdb.db
       .select()

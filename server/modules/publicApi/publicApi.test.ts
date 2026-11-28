@@ -9,7 +9,7 @@ import { DomainError } from "../../core/errors.js";
 import { createJobQueue } from "../jobs/queue.js";
 import { users } from "../identity/schema.js";
 import { orders } from "../orders/schema.js";
-import { createTrashRegistry } from "../trash/ports.js";
+import { createTrashRegistry, unfencedPurgeRunForTests } from "../trash/ports.js";
 import type { SessionPrincipal } from "../../core/types.js";
 import { TOKEN_RE, computeSignature, generateKeyToken, hasControlChar, ipAllowed, normaliseCidr, parseBearer } from "./credentials.js";
 import type { ApiHttpRequest } from "./engine.js";
@@ -626,6 +626,32 @@ describe("public API administration", () => {
       );
     });
 
+    // Throwing fence (`PURGE_FENCE_LOST`) leaves API key rows untouched
+    const lostFenceRun = unfencedPurgeRunForTests("01JEPURGERUNLOST0000000001", {
+      async assertCurrentInTx() {
+        throw new DomainError("CONFLICT", "PURGE_FENCE_LOST", "Purge worker replaced.");
+      },
+    });
+    await expect(
+      participant.purge!(
+        {
+          kind: "customer",
+          id: trashedCustId,
+          publicId: TRASHED_CUSTOMER,
+          batchId: "01JETRASHBATCH000000000001",
+        },
+        lostFenceRun,
+      ),
+    ).rejects.toMatchObject({ reasonCode: "PURGE_FENCE_LOST" });
+    expect(
+      await participant.summarize!({
+        kind: "customer",
+        id: trashedCustId,
+        publicId: TRASHED_CUSTOMER,
+        batchId: "01JETRASHBATCH000000000001",
+      }),
+    ).toEqual({ apiKeys: 1 });
+
     const purgeResult = await participant.purge!(
       {
         kind: "customer",
@@ -633,7 +659,7 @@ describe("public API administration", () => {
         publicId: TRASHED_CUSTOMER,
         batchId: "01JETRASHBATCH000000000001",
       },
-      { runId: "01JEPURGERUN00000000000001" },
+      unfencedPurgeRunForTests("01JEPURGERUN00000000000001"),
     );
     expect(purgeResult.deleted.apiKeys).toBe(1);
     expect(
@@ -644,6 +670,18 @@ describe("public API administration", () => {
         batchId: "01JETRASHBATCH000000000001",
       }),
     ).toEqual({});
+    // Idempotent repeat purge
+    expect(
+      await participant.purge!(
+        {
+          kind: "customer",
+          id: trashedCustId,
+          publicId: TRASHED_CUSTOMER,
+          batchId: "01JETRASHBATCH000000000001",
+        },
+        unfencedPurgeRunForTests("01JEPURGERUN00000000000002"),
+      ),
+    ).toEqual({ deleted: {} });
     expect((await mod.handle(req(custKeyToken))).status).toBe(401);
   });
 });

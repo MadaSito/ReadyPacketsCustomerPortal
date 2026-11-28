@@ -10,7 +10,12 @@
  */
 import { and, eq, isNotNull, sql } from "drizzle-orm";
 import type { ModuleDeps } from "../../container.js";
-import type { TrashEntityRef, TrashParticipant, TrashPurgeResult } from "../trash/ports.js";
+import type {
+  TrashEntityRef,
+  TrashParticipant,
+  TrashPurgeResult,
+  TrashPurgeRun,
+} from "../trash/ports.js";
 import { promoBatches, promoCheckAttempts, promoRedemptions } from "./schema.js";
 
 function affectedCount(res: unknown): number {
@@ -37,83 +42,87 @@ export function createPromotionsTrashParticipant(deps: ModuleDeps): TrashPartici
       return {};
     },
 
-    async purge(entity: TrashEntityRef): Promise<TrashPurgeResult> {
-      const deleted: Record<string, number> = {};
-      const kept: Record<string, number> = {};
+    async purge(entity: TrashEntityRef, run: TrashPurgeRun): Promise<TrashPurgeResult> {
+      return deps.db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
+        const deleted: Record<string, number> = {};
+        const kept: Record<string, number> = {};
 
-      if (entity.kind === "order") {
-        const scrubRes = await deps.db
+        if (entity.kind === "order") {
+          const scrubRes = await tx
+            .update(promoRedemptions)
+            .set({ releaseNote: null, updatedAt: deps.clock.now() })
+            .where(
+              and(
+                eq(promoRedemptions.orderPublicId, entity.publicId),
+                isNotNull(promoRedemptions.releaseNote),
+              ),
+            );
+          const scrubbed = affectedCount(scrubRes);
+          if (scrubbed > 0) deleted.promoReleaseNotes = scrubbed;
+
+          const [keptRow] = await tx
+            .select({ count: sql<number>`count(*)` })
+            .from(promoRedemptions)
+            .where(eq(promoRedemptions.orderPublicId, entity.publicId));
+          const keptCount = Number(keptRow?.count ?? 0);
+          if (keptCount > 0) kept.promoRedemptions = keptCount;
+
+          return Object.keys(kept).length > 0 ? { deleted, kept } : { deleted };
+        }
+
+        // Customer purge: erase per-account check-attempt state, scrub free-text release notes,
+        // remove customer publicId from allow-lists, and retain numeric redemption counts.
+        const attemptsRes = await tx
+          .delete(promoCheckAttempts)
+          .where(eq(promoCheckAttempts.userId, entity.id));
+        const erasedAttempts = affectedCount(attemptsRes);
+        if (erasedAttempts > 0) deleted.promoCheckAttempts = erasedAttempts;
+
+        const scrubCustRes = await tx
           .update(promoRedemptions)
           .set({ releaseNote: null, updatedAt: deps.clock.now() })
           .where(
             and(
-              eq(promoRedemptions.orderPublicId, entity.publicId),
+              eq(promoRedemptions.customerUserId, entity.id),
               isNotNull(promoRedemptions.releaseNote),
             ),
           );
-        const scrubbed = affectedCount(scrubRes);
-        if (scrubbed > 0) deleted.promoReleaseNotes = scrubbed;
+        const scrubbedCustNotes = affectedCount(scrubCustRes);
+        if (scrubbedCustNotes > 0) deleted.promoReleaseNotes = scrubbedCustNotes;
 
-        const [keptRow] = await deps.db
+        const candidateBatches = await tx
+          .select({
+            id: promoBatches.id,
+            allowCustomerPublicIds: promoBatches.allowCustomerPublicIds,
+          })
+          .from(promoBatches)
+          .where(sql`JSON_CONTAINS(${promoBatches.allowCustomerPublicIds}, JSON_QUOTE(${entity.publicId}))`)
+          .for("update");
+
+        let allowListScrubbed = 0;
+        for (const batch of candidateBatches) {
+          const current = Array.isArray(batch.allowCustomerPublicIds) ? batch.allowCustomerPublicIds : [];
+          const next = current.filter((id) => id !== entity.publicId);
+          if (next.length !== current.length) {
+            await tx
+              .update(promoBatches)
+              .set({ allowCustomerPublicIds: next, updatedAt: deps.clock.now() })
+              .where(eq(promoBatches.id, batch.id));
+            allowListScrubbed += 1;
+          }
+        }
+        if (allowListScrubbed > 0) deleted.promoAllowListEntries = allowListScrubbed;
+
+        const [keptCustRow] = await tx
           .select({ count: sql<number>`count(*)` })
           .from(promoRedemptions)
-          .where(eq(promoRedemptions.orderPublicId, entity.publicId));
-        const keptCount = Number(keptRow?.count ?? 0);
-        if (keptCount > 0) kept.promoRedemptions = keptCount;
+          .where(eq(promoRedemptions.customerUserId, entity.id));
+        const keptCustCount = Number(keptCustRow?.count ?? 0);
+        if (keptCustCount > 0) kept.promoRedemptions = keptCustCount;
 
         return Object.keys(kept).length > 0 ? { deleted, kept } : { deleted };
-      }
-
-      // Customer purge: erase per-account check-attempt state, scrub free-text release notes,
-      // remove customer publicId from allow-lists, and retain numeric redemption counts.
-      const attemptsRes = await deps.db
-        .delete(promoCheckAttempts)
-        .where(eq(promoCheckAttempts.userId, entity.id));
-      const erasedAttempts = affectedCount(attemptsRes);
-      if (erasedAttempts > 0) deleted.promoCheckAttempts = erasedAttempts;
-
-      const scrubCustRes = await deps.db
-        .update(promoRedemptions)
-        .set({ releaseNote: null, updatedAt: deps.clock.now() })
-        .where(
-          and(
-            eq(promoRedemptions.customerUserId, entity.id),
-            isNotNull(promoRedemptions.releaseNote),
-          ),
-        );
-      const scrubbedCustNotes = affectedCount(scrubCustRes);
-      if (scrubbedCustNotes > 0) deleted.promoReleaseNotes = scrubbedCustNotes;
-
-      const candidateBatches = await deps.db
-        .select({
-          id: promoBatches.id,
-          allowCustomerPublicIds: promoBatches.allowCustomerPublicIds,
-        })
-        .from(promoBatches)
-        .where(sql`JSON_CONTAINS(${promoBatches.allowCustomerPublicIds}, JSON_QUOTE(${entity.publicId}))`);
-
-      let allowListScrubbed = 0;
-      for (const batch of candidateBatches) {
-        const current = Array.isArray(batch.allowCustomerPublicIds) ? batch.allowCustomerPublicIds : [];
-        const next = current.filter((id) => id !== entity.publicId);
-        if (next.length !== current.length) {
-          await deps.db
-            .update(promoBatches)
-            .set({ allowCustomerPublicIds: next, updatedAt: deps.clock.now() })
-            .where(eq(promoBatches.id, batch.id));
-          allowListScrubbed += 1;
-        }
-      }
-      if (allowListScrubbed > 0) deleted.promoAllowListEntries = allowListScrubbed;
-
-      const [keptCustRow] = await deps.db
-        .select({ count: sql<number>`count(*)` })
-        .from(promoRedemptions)
-        .where(eq(promoRedemptions.customerUserId, entity.id));
-      const keptCustCount = Number(keptCustRow?.count ?? 0);
-      if (keptCustCount > 0) kept.promoRedemptions = keptCustCount;
-
-      return Object.keys(kept).length > 0 ? { deleted, kept } : { deleted };
+      });
     },
   };
 }

@@ -17,7 +17,12 @@ import { isLiveUserRow, isTrashedUserInTx } from "../identity/live.js";
 import { users } from "../identity/schema.js";
 import { orders } from "../orders/schema.js";
 import { isLiveOrderRow } from "../orders/trashGate.js";
-import type { TrashEntityRef, TrashParticipant, TrashPurgeResult } from "../trash/ports.js";
+import type {
+  TrashEntityRef,
+  TrashParticipant,
+  TrashPurgeResult,
+  TrashPurgeRun,
+} from "../trash/ports.js";
 import type {
   ApiCaller,
   ApiListQuery,
@@ -505,64 +510,69 @@ export function createPublicApiTrashParticipant(
       return apiKeysCount > 0 ? { apiKeys: apiKeysCount } : {};
     },
 
-    async purge(entity: TrashEntityRef): Promise<TrashPurgeResult> {
-      if (entity.kind === "order") {
-        const scrubbed = await scrubRequestLogForEntityPath(db, `/orders/${entity.publicId}`);
+    async purge(entity: TrashEntityRef, run: TrashPurgeRun): Promise<TrashPurgeResult> {
+      return db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
+
+        if (entity.kind === "order") {
+          const scrubbed = await scrubRequestLogForEntityPath(tx, `/orders/${entity.publicId}`);
+          return {
+            deleted: scrubbed > 0 ? { apiRequestPayloads: scrubbed } : {},
+          };
+        }
+
+        const now = clock.now();
+        const keyRows = await tx
+          .select({ id: apiKeys.id })
+          .from(apiKeys)
+          .where(eq(apiKeys.createdByUserId, entity.id))
+          .for("update");
+
+        let deletedKeys = 0;
+        let scrubbedLogs = 0;
+
+        if (keyRows.length > 0) {
+          const keyIds = keyRows.map((k) => k.id);
+          await tx
+            .update(apiKeys)
+            .set({
+              state: "revoked",
+              signingSecretEnc: null,
+              revokedAt: now,
+              version: sql`${apiKeys.version} + 1`,
+            })
+            .where(inArray(apiKeys.id, keyIds));
+
+          await tx.delete(apiSignatureNonces).where(inArray(apiSignatureNonces.keyId, keyIds));
+          await tx.delete(apiRateWindows).where(inArray(apiRateWindows.keyId, keyIds));
+          await tx.delete(apiIdempotency).where(inArray(apiIdempotency.keyId, keyIds));
+
+          const [logRes] = await tx
+            .update(apiRequestLog)
+            .set({
+              keyId: null,
+              keyPublicId: null,
+              requestViewEnc: null,
+              responseViewEnc: null,
+              replayEnc: null,
+              ipEnc: null,
+            })
+            .where(inArray(apiRequestLog.keyId, keyIds));
+          scrubbedLogs += Number(logRes.affectedRows ?? 0);
+
+          const [delRes] = await tx.delete(apiKeys).where(inArray(apiKeys.id, keyIds));
+          deletedKeys = Number(delRes.affectedRows ?? 0);
+        }
+
+        scrubbedLogs += await scrubRequestLogForEntityPath(tx, `/customers/${entity.publicId}`);
+
         return {
-          deleted: scrubbed > 0 ? { apiRequestPayloads: scrubbed } : {},
+          deleted: {
+            ...(deletedKeys > 0 ? { apiKeys: deletedKeys } : {}),
+            ...(scrubbedLogs > 0 ? { apiRequestPayloads: scrubbedLogs } : {}),
+          },
         };
-      }
-
-      const now = clock.now();
-      const keyRows = await db
-        .select({ id: apiKeys.id })
-        .from(apiKeys)
-        .where(eq(apiKeys.createdByUserId, entity.id));
-
-      let deletedKeys = 0;
-      let scrubbedLogs = 0;
-
-      if (keyRows.length > 0) {
-        const keyIds = keyRows.map((k) => k.id);
-        await db
-          .update(apiKeys)
-          .set({
-            state: "revoked",
-            signingSecretEnc: null,
-            revokedAt: now,
-            version: sql`${apiKeys.version} + 1`,
-          })
-          .where(inArray(apiKeys.id, keyIds));
-
-        await db.delete(apiSignatureNonces).where(inArray(apiSignatureNonces.keyId, keyIds));
-        await db.delete(apiRateWindows).where(inArray(apiRateWindows.keyId, keyIds));
-        await db.delete(apiIdempotency).where(inArray(apiIdempotency.keyId, keyIds));
-
-        const [logRes] = await db
-          .update(apiRequestLog)
-          .set({
-            keyId: null,
-            keyPublicId: null,
-            requestViewEnc: null,
-            responseViewEnc: null,
-            replayEnc: null,
-            ipEnc: null,
-          })
-          .where(inArray(apiRequestLog.keyId, keyIds));
-        scrubbedLogs += Number(logRes.affectedRows ?? 0);
-
-        const [delRes] = await db.delete(apiKeys).where(inArray(apiKeys.id, keyIds));
-        deletedKeys = Number(delRes.affectedRows ?? 0);
-      }
-
-      scrubbedLogs += await scrubRequestLogForEntityPath(db, `/customers/${entity.publicId}`);
-
-      return {
-        deleted: {
-          ...(deletedKeys > 0 ? { apiKeys: deletedKeys } : {}),
-          ...(scrubbedLogs > 0 ? { apiRequestPayloads: scrubbedLogs } : {}),
-        },
-      };
+      });
     },
   };
 }
