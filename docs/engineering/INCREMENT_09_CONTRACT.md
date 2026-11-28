@@ -235,6 +235,20 @@ export interface TrashParticipant {
   before the external effect and drops itself. Payment: a checkout opened before trashing that is later paid is
   booked as money received (kept record + existing alert) and never restores the order.
 
+- **Legal hold** (`orders.lock_state = 'legal_hold'`): an order on legal hold can be neither moved to trash nor
+  permanently deleted — by an administrator, by a customer cascade or by the retention job — 409
+  `ORDER_ON_LEGAL_HOLD`, "Release the legal hold first." A customer who owns such an order cannot be moved to
+  trash or purged. An order placed on hold while in the trash is skipped by the retention job (alert).
+- **Storage copies at purge**: (A) recorded-owned copy on a reachable destination → verified deletion;
+  (B) recorded-owned copy on a rotated or unreachable destination → the run fails resumably with
+  `EXTERNAL_COPIES_UNREACHABLE` and keeps the locator, until an administrator chooses "Finish and leave N
+  external copies in place" (`trash.purge`, step-up, typed order number, audited; never the retention job);
+  (C) historical copies whose ownership the portal never recorded → left in place, reported as kept
+  (`unverifiedExternalCopies`); (D) provider recycle bins → reported as kept (`providerRecycleBin`).
+- **No truncated target sets**: a cascade whose target list hits a query limit fails; nothing is tombstoned.
+- **Mail provenance**: only template literal text and trusted link variables may become anchors; a URL inside a
+  free-form value is never linked and never makes rendering fail.
+
 ### D3 New logo and brand files (ui_foundation_engineer; documents platform_engineer)
 
 - Source of truth committed by `/root` under `docs/brand/master/`: the two 4096 px square lockups and
