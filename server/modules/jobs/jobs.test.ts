@@ -11,6 +11,7 @@ import { auditEvents } from "../audit/schema.js";
 import { IDENTITY_MAIL_TEMPLATES } from "../identity/mail.js";
 import { users } from "../identity/schema.js";
 import { orderReferences, orders } from "../orders/schema.js";
+import { TRASH_JOB_RETENTION_CLEANUP } from "../trash/jobNames.js";
 import { createJobsAdmin } from "./admin.js";
 import { customerMaintenanceNotice } from "./customerMaintenance.js";
 import { createJobsModule } from "./index.js";
@@ -78,6 +79,20 @@ const receiptInput = {
   receiptPublicId: noticePublicId, recipientUserId: 22,
   receiptNumber: "RPR-2026-000032", pdf: Buffer.from("%PDF-1.7\nPRIVATE-RECEIPT\n%%EOF"),
 };
+
+it("does not expose or manually retry a failed system-only trash retention job", async () => {
+  const f = fixture();
+  const kind = TRASH_JOB_RETENTION_CLEANUP;
+  f.jobs.register(kind, async () => ({ outcome: "failed", retryable: true, reasonCode: "SYNTHETIC_RETRYABLE_FAILURE" }));
+  const { jobId } = await f.jobs.enqueue(kind, null, { maxAttempts: 1 });
+  await f.engine.execute((await f.engine.claim())!);
+  const [stored] = await t.db.select().from(jobRuns).where(eq(jobRuns.publicId, jobId));
+  expect(stored).toMatchObject({ state: "failed", allowRetry: true });
+  expect(await f.admin.detail(f.operator, jobId)).toMatchObject({ allowRetry: false });
+  expect(await f.admin.list(f.operator, { type: kind })).toMatchObject({ items: [{ publicId: jobId, allowRetry: false }] });
+  await expect(f.admin.retry(f.operator, jobId)).rejects.toMatchObject({ reasonCode: "JOB_RETRY_UNSAFE" });
+  expect(await f.engine.claim()).toBeNull();
+});
 
 describe("Scheduled policy notice batches", () => {
   it("rolls back staged mail and progress on failure, retries with backoff, and chains a single delayed successor", async () => {
@@ -819,7 +834,7 @@ describe("MySQL transactional mail outbox", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  it("does not deliver old unbound literal-address mail to a newer account after the blind index was released", async () => {
+  it.each([false, true])("never dispatches old unbound mail after purge (address registered again: %s)", async (reregistered) => {
     const f = fixture();
     const { send } = setDelivery(f, "accepted", undefined, { trashGuard: createMailTrashGuard(f.h.deps) });
     const to = { address: "recycled@example.test" };
@@ -835,16 +850,59 @@ describe("MySQL transactional mail outbox", () => {
       emailIndex: f.h.deps.crypto.blindIndex("deleted-synthetic@tombstone.invalid", "users.email"),
       nameEnc: "erased", createdAt: row!.createdAt, updatedAt: now, purgedAt: now,
     });
-    await t.db.insert(users).values({
-      publicId: ulid(), role: "customer", status: "active", emailEnc: "synthetic",
-      emailIndex: f.h.deps.crypto.blindIndex(to.address, "users.email"),
-      nameEnc: "synthetic", createdAt: now, updatedAt: now,
-    });
+    if (reregistered) {
+      await t.db.insert(users).values({
+        publicId: ulid(), role: "customer", status: "active", emailEnc: "synthetic",
+        emailIndex: f.h.deps.crypto.blindIndex(to.address, "users.email"),
+        nameEnc: "synthetic", createdAt: now, updatedAt: now,
+      });
+    }
     await f.engine.execute((await f.engine.claim())!);
     expect(send).not.toHaveBeenCalled();
     expect((await t.db.select().from(mailOutbox))[0]).toMatchObject({
       recipientAccountId: null, payloadEnc: null, state: "failed", reasonCode: "MAIL_SCOPE_UNAVAILABLE",
     });
+  });
+
+  it.each(["capture", "content"] as const)("hides and scrubs unbound historical %s after purge, keeping its delivery outcome", async (kind) => {
+    const f = fixture({ config: { deploymentProfile: "development" } });
+    setDelivery(f, "accepted", undefined, { trashGuard: createMailTrashGuard(f.h.deps) });
+    if (kind === "capture") await f.h.settings.set(MAIL_CAPTURE.key, true);
+    else {
+      await f.h.settings.set(MAIL_RETAIN_CONTENT.key, true);
+      await f.h.settings.set(MAIL_RETENTION_DAYS.key, 30);
+    }
+    const to = { address: "historical@example.test" };
+    await f.mailer.enqueue({ ...input, to });
+    await f.mailer.enqueue({ ...input, to, idempotencyKey: "mail-key-modern" });
+    await f.engine.execute((await f.engine.claim())!);
+    await f.engine.execute((await f.engine.claim())!);
+    const [legacy, modern] = await t.db.select().from(mailOutbox).orderBy(mailOutbox.id);
+    const state = kind === "capture" ? "captured" : "accepted";
+    const field = kind === "capture" ? "captureEnc" : "contentEnc";
+    const historical = f.h.deps.crypto.encrypt(JSON.stringify({ to: to.address, subject: "Historical message", text: "Private body",
+      ...(kind === "content" ? { html: "<p>Private body</p>" } : {}),
+    }), `mail_outbox.${kind}_enc:${legacy!.publicId}`);
+    await t.db.update(mailOutbox).set({ [field]: historical }).where(eq(mailOutbox.id, legacy!.id));
+    const read = (publicId: string) => t.db.transaction((tx) => kind === "capture"
+      ? f.mail.viewCapture(tx, publicId) : f.mail.viewContent(tx, publicId));
+    await expect(read(legacy!.publicId)).resolves.toMatchObject({ text: "Private body" });
+    f.h.clock.advance(1_000);
+    const now = f.h.clock.now();
+    await t.db.insert(users).values({
+      publicId: ulid(), role: "customer", status: "suspended", emailEnc: "erased",
+      emailIndex: f.h.deps.crypto.blindIndex("deleted-historical@tombstone.invalid", "users.email"),
+      nameEnc: "erased", createdAt: legacy!.createdAt, updatedAt: now, purgedAt: now,
+    });
+    await expect(read(legacy!.publicId)).rejects.toMatchObject({ reasonCode: "NOT_FOUND" });
+    await expect(read(modern!.publicId)).resolves.toMatchObject({ to: to.address });
+    await f.jobs.enqueue("jobs.mail.expire", null);
+    await f.engine.execute((await f.engine.claim())!);
+    const [scrubbed, kept] = await t.db.select().from(mailOutbox).orderBy(mailOutbox.id);
+    expect(scrubbed).toMatchObject({ state, [field]: null, reasonCode: legacy!.reasonCode });
+    expect(kept?.[field]).toBe(modern?.[field]);
+    const attempts = kind === "capture" ? await t.db.select().from(mailAttempts) : await t.db.select().from(mailTransportAttempts);
+    expect(attempts.map(({ state: attemptState }) => attemptState)).toEqual([state, state]);
   });
 
   it("uses the lifetime cap for legacy literal mail whose original recipient cannot be established", async () => {

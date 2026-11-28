@@ -1,4 +1,4 @@
-import { and, count, eq, inArray, isNotNull, not, or } from "drizzle-orm";
+import { and, count, eq, gte, inArray, isNotNull, max, not, or } from "drizzle-orm";
 import { ULID_PATTERN } from "../../core/ids.js";
 import type { DbOrTx, OutboundMail } from "../../core/types.js";
 import type { ModuleDeps } from "../../container.js";
@@ -42,10 +42,22 @@ function legacyOrderPublicId(scope: MailTrashScope, origin: string): string | un
 export function createMailTrashGuard(deps: ModuleDeps) {
   const emailIndex = (address: string) => deps.crypto.blindIndex(normalizeEmail(address), "users.email");
   const literalAccount = async (db: DbOrTx, address: string) => {
-    const [row] = await db.select({ id: users.id, createdAt: users.createdAt }).from(users)
+    const [row] = await db.select({ id: users.id, createdAt: users.createdAt, updatedAt: users.updatedAt })
+      .from(users)
       .where(eq(users.emailIndex, emailIndex(address))).limit(1);
     return row;
   };
+  async function legacyLiteral(db: DbOrTx, address: string, queuedAt: Date | undefined) {
+    const current = await literalAccount(db, address);
+    if (!queuedAt) return { current, unsafe: false };
+    if (current && current.createdAt > queuedAt) return { unsafe: true, current: undefined };
+    if (current && current.updatedAt < queuedAt) return { current, unsafe: false };
+    // The digest is intentionally erased on tombstoning. If an address was unbound or could have
+    // been changed after enqueue, a purge makes its old association unknowable. Do not send it.
+    const [purge] = await db.select({ id: users.id }).from(users)
+      .where(and(eq(users.role, "customer"), gte(users.purgedAt, queuedAt))).limit(1);
+    return purge ? { unsafe: true, current: undefined } : { current, unsafe: false };
+  }
   async function resolveOrder(scope: MailTrashScope, db: DbOrTx, hiddenOnly = false) {
     if (scope.template.startsWith("mail_templates.test_")) return undefined;
     const publicId = legacyOrderPublicId(scope, deps.config.canonicalOrigin);
@@ -70,10 +82,8 @@ export function createMailTrashGuard(deps: ModuleDeps) {
       let recipientAccountId = scope.recipientAccountId;
       if ("userId" in scope.to) recipientAccountId = scope.to.userId;
       else if (recipientAccountId === undefined) {
-        const current = await literalAccount(db, scope.to.address);
-        // Identity intentionally erases the released blind index. A current holder created later
-        // cannot be the enqueue-time owner; never attach their address to older work.
-        if (current && scope.legacyCreatedAt && current.createdAt > scope.legacyCreatedAt) {
+        const { current, unsafe } = await legacyLiteral(db, scope.to.address, scope.legacyCreatedAt);
+        if (unsafe) {
           return { suppressed: true, orderId, recipientAccountId };
         }
         recipientAccountId = current?.id;
@@ -91,8 +101,7 @@ export function createMailTrashGuard(deps: ModuleDeps) {
         if (!row) return true;
       } else {
         if (scope.legacyCreatedAt) {
-          const current = await literalAccount(db, scope.to.address);
-          if (current && current.createdAt > scope.legacyCreatedAt) return true;
+          if ((await legacyLiteral(db, scope.to.address, scope.legacyCreatedAt)).unsafe) return true;
         }
         const [hidden] = await db.select({ id: users.id }).from(users).where(and(
           eq(users.emailIndex, emailIndex(scope.to.address)), not(liveUserPredicate()),
@@ -107,6 +116,13 @@ export function createMailTrashGuard(deps: ModuleDeps) {
       return (await resolveOrder(scope, db, true)) !== undefined;
     },
   };
+}
+
+export async function latestMailRelevantPurge(db: DbOrTx): Promise<Date | null> {
+  const [customer] = await db.select({ at: max(users.purgedAt) }).from(users).where(eq(users.role, "customer"));
+  const [order] = await db.select({ at: max(orders.purgedAt) }).from(orders);
+  if (!customer?.at) return order?.at ?? null;
+  return order?.at && order.at > customer.at ? order.at : customer.at;
 }
 
 export async function hasHiddenMailBinding(db: DbOrTx, binding: {

@@ -11,7 +11,7 @@ import { defineSetting, readSetting } from "../platform/settingsRegistry.js";
 import { decodeMailAttachments, encodeMailAttachments, storedAttachments } from "./mailAttachments.js";
 import type { MailSenderIdentity, MailTemplateStore, MailTransport, MailTransportKey, MailTransportResult, PublishedMailTemplate } from "./mailPorts.js";
 import { HEADER_CONTROL, MAIL_AUDIT_COPY, MAIL_RETAIN_CONTENT, MAIL_RETENTION_DAYS, MAIL_ROUTING, MAIL_SENDER, mailAddress as address } from "./mailSettings.js";
-import { hasHiddenMailBinding, type createMailTrashGuard, type MailTrashScope } from "./mailTrash.js";
+import { hasHiddenMailBinding, latestMailRelevantPurge, type createMailTrashGuard, type MailTrashScope } from "./mailTrash.js";
 import { currentCorrelation, JOB_TYPE, keyHash, validKey, type QueueDeps } from "./queue.js";
 import { POLICY_UPDATE_TEMPLATE, POLICY_WARNING_TEMPLATE } from "./policyNoticeJobs.js";
 import { PAYMENT_RECEIPT_TEMPLATE } from "./receiptMail.js";
@@ -39,6 +39,8 @@ const payloadSchema = z.strictObject({
 const jobPayload = z.strictObject({ mailId: z.string().regex(ULID_PATTERN), generation: z.number().int().min(1).max(20) });
 const captureSchema = z.strictObject({ to: address, subject: z.string().max(255), text: z.string().max(65_536) });
 const contentSchema = captureSchema.extend({ html: z.string().max(512 * 1024) });
+const storedCaptureSchema = captureSchema.extend({ trashScoped: z.literal(true).optional() });
+const storedContentSchema = contentSchema.extend({ trashScoped: z.literal(true).optional() });
 type MailRow = typeof mailOutbox.$inferSelect;
 type RenderedMail = z.infer<typeof captureSchema>;
 type MessageContent = z.infer<typeof contentSchema>;
@@ -239,6 +241,7 @@ export class MailEngine implements Mailer {
   #getLegacySender: DeliveryDeps["getLegacySender"] = async () => null;
   #trashGuard: DeliveryDeps["trashGuard"];
   #backfillAfter = 0;
+  #historicalCopiesAfter = 0;
 
   #readPayload(row: MailRow) {
     if (row.payloadEnc === null) throw new Error("MAIL_PAYLOAD_UNAVAILABLE");
@@ -256,6 +259,12 @@ export class MailEngine implements Mailer {
   #legacyTooOld(scope: MailTrashScope, now: Date) {
     return scope.legacyCreatedAt !== undefined && "address" in scope.to && scope.recipientAccountId === undefined
       && now.getTime() - scope.legacyCreatedAt.getTime() >= MAX_TTL;
+  }
+
+  async #checkHistoricalCopy(tx: Tx, row: MailRow, trashScoped: true | undefined) {
+    if (!this.#trashGuard || trashScoped || (row.orderId !== null && row.recipientAccountId !== null)) return;
+    const latest = await latestMailRelevantPurge(tx);
+    if (latest && latest >= row.createdAt) throw notFound();
   }
 
   async getMailSenderIdentity(): Promise<MailSenderIdentity | null> {
@@ -413,7 +422,10 @@ export class MailEngine implements Mailer {
     const [row] = await tx.select().from(mailOutbox).where(eq(mailOutbox.publicId, publicId)).limit(1).for("share");
     if (!row || row.state !== "captured" || row.captureEnc === null || row.expiresAt <= this.deps.clock.now()) throw notFound();
     if (this.#trashGuard && await hasHiddenMailBinding(tx, row)) throw notFound();
-    const value = captureSchema.parse(JSON.parse(this.deps.crypto.decrypt(row.captureEnc, `mail_outbox.capture_enc:${row.publicId}`)));
+    const { trashScoped, ...value } = storedCaptureSchema.parse(
+      JSON.parse(this.deps.crypto.decrypt(row.captureEnc, `mail_outbox.capture_enc:${row.publicId}`)),
+    );
+    await this.#checkHistoricalCopy(tx, row, trashScoped);
     await mailAudit(this.deps, tx, row, "job.mail.capture.viewed", "completed", undefined, false, "read");
     return value;
   }
@@ -423,7 +435,10 @@ export class MailEngine implements Mailer {
     const [row] = await tx.select().from(mailOutbox).where(eq(mailOutbox.publicId, publicId)).limit(1).for("share");
     if (!row?.contentEnc || !row.contentExpiresAt || row.contentExpiresAt <= this.deps.clock.now()) throw notFound();
     if (this.#trashGuard && await hasHiddenMailBinding(tx, row)) throw notFound();
-    const value = contentSchema.parse(JSON.parse(this.deps.crypto.decrypt(row.contentEnc, `mail_outbox.content_enc:${row.publicId}`)));
+    const { trashScoped, ...value } = storedContentSchema.parse(
+      JSON.parse(this.deps.crypto.decrypt(row.contentEnc, `mail_outbox.content_enc:${row.publicId}`)),
+    );
+    await this.#checkHistoricalCopy(tx, row, trashScoped);
     await mailAudit(this.deps, tx, row, "mail.content.viewed", "completed", undefined, false, "read");
     return value;
   }
@@ -599,6 +614,7 @@ export class MailEngine implements Mailer {
         await mailAudit(deps, tx, current, "job.mail.expired", "canceled", "MAIL_EXPIRED", true);
         return false;
       }
+      const trashScoped = this.#trashGuard && !scope.legacyCreatedAt ? true : undefined;
       if (mode) {
         if (await this.#trashGuard?.isSuppressed(scope, tx)) {
           await tx.update(mailOutbox).set({ state: "failed", reasonCode: "MAIL_SCOPE_UNAVAILABLE",
@@ -615,7 +631,7 @@ export class MailEngine implements Mailer {
         });
         await tx.update(mailOutbox).set({
           state: "captured", payloadEnc: null,
-          captureEnc: deps.crypto.encrypt(JSON.stringify({ to, subject, text }), `mail_outbox.capture_enc:${current.publicId}`),
+          captureEnc: deps.crypto.encrypt(JSON.stringify({ to, subject, text, trashScoped }), `mail_outbox.capture_enc:${current.publicId}`),
           expiresAt: new Date(Math.min(current.expiresAt.getTime(), now.getTime() + CAPTURE_TTL)), updatedAt: now,
         }).where(eq(mailOutbox.id, current.id));
         await mailAudit(deps, tx, current, "job.mail.captured", "completed", "MAIL_CAPTURE_ONLY", true);
@@ -624,7 +640,7 @@ export class MailEngine implements Mailer {
       await tx.update(mailOutbox).set({
         state: "sending", updatedAt: now,
         ...(redacted && retainDays > 0 ? {
-          contentEnc: deps.crypto.encrypt(JSON.stringify(redacted), `mail_outbox.content_enc:${current.publicId}`),
+          contentEnc: deps.crypto.encrypt(JSON.stringify({ ...redacted, trashScoped }), `mail_outbox.content_enc:${current.publicId}`),
           contentExpiresAt: new Date(now.getTime() + retainDays * ONE_DAY),
         } : {}),
       }).where(eq(mailOutbox.id, current.id));
@@ -821,7 +837,50 @@ export class MailEngine implements Mailer {
       if (changed < 50) break;
     }
     const bindingsRepaired = await this.#backfillLegacyBindings(job);
-    return { outcome: "completed", safeCounts: { purged, content_purged: contentPurged, ...(bindingsRepaired ? { bindings_repaired: bindingsRepaired } : {}) } };
+    const historicalCopiesPurged = await this.#purgeHistoricalCopies(job);
+    return { outcome: "completed", safeCounts: {
+      purged, content_purged: contentPurged + historicalCopiesPurged, ...(bindingsRepaired ? { bindings_repaired: bindingsRepaired } : {}),
+    } };
+  }
+
+  async #purgeHistoricalCopies(job: ClaimedJob): Promise<number> {
+    if (!this.#trashGuard) return 0;
+    const { deps } = this;
+    const { next, purged } = await deps.db.transaction(async (tx) => {
+      await job.assertStillOwned(tx);
+      const latest = await latestMailRelevantPurge(tx);
+      if (!latest) return { next: 0, purged: 0 };
+      const rows = await tx.select().from(mailOutbox).where(and(
+        gt(mailOutbox.id, this.#historicalCopiesAfter), lte(mailOutbox.createdAt, latest), isNull(mailOutbox.payloadEnc),
+        inArray(mailOutbox.state, ["accepted", "captured", "failed", "expired", "unknown", "canceled"]),
+        or(isNull(mailOutbox.orderId), isNull(mailOutbox.recipientAccountId)),
+        or(isNotNull(mailOutbox.captureEnc), isNotNull(mailOutbox.contentEnc)),
+      )).orderBy(asc(mailOutbox.id)).limit(25).for("update", { skipLocked: true });
+      let purged = 0;
+      function currentCopy(encrypted: string | null, kind: "capture" | "content", publicId: string) {
+        if (encrypted === null) return false;
+        try {
+          const json: unknown = JSON.parse(deps.crypto.decrypt(encrypted, `mail_outbox.${kind}_enc:${publicId}`));
+          return (kind === "capture" ? storedCaptureSchema : storedContentSchema).safeParse(json).data?.trashScoped === true;
+        } catch {
+          return false; // No readable data can prove this is a modern, scoped copy.
+        }
+      }
+      for (const row of rows) {
+        const eraseCapture = row.captureEnc !== null && !currentCopy(row.captureEnc, "capture", row.publicId);
+        const eraseContent = row.contentEnc !== null && !currentCopy(row.contentEnc, "content", row.publicId);
+        if (!eraseCapture && !eraseContent) continue;
+        await tx.update(mailOutbox).set({
+          ...(eraseCapture ? { captureEnc: null } : {}),
+          ...(eraseContent ? { contentEnc: null, contentExpiresAt: null } : {}),
+        }).where(eq(mailOutbox.id, row.id));
+        await mailAudit(deps, tx, row, "job.mail.payload.purged", "completed", "MAIL_SCOPE_UNAVAILABLE", true);
+        purged += 1;
+      }
+      return { next: rows.length === 25 ? rows[24]!.id : 0, purged };
+    }, { isolationLevel: "read committed" });
+    this.#historicalCopiesAfter = next;
+    return purged;
   }
 
   async #backfillLegacyBindings(job: ClaimedJob): Promise<number> {
