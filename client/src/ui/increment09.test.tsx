@@ -241,3 +241,22 @@ describe("increment 09: selected tab survives forced colours", () => {
     expect(forced).toMatch(/:focus-visible \{ outline: 3px solid CanvasText; \}/);
   });
 });
+
+describe("increment 09: dialog text wraps at 240 px", () => {
+  it("ConfirmDialog title and description break long unbroken labels", () => {
+    const long = "RP-JJG5-ZEUGRE-ICEQUE-001-".repeat(4);
+    renderUi(<ConfirmDialog open onOpenChange={() => {}} title={`Delete ${long}?`} description={long} confirmLabel="Delete" onConfirm={() => {}} />);
+    const dialog = screen.getByRole("alertdialog");
+    for (const el of [within(dialog).getByText(`Delete ${long}?`), within(dialog).getByText(long)]) {
+      expect(el.className).toContain("[overflow-wrap:anywhere]");
+      expect(el.className).toContain("min-w-0");
+    }
+  });
+
+  it("Dialog and Drawer titles and descriptions carry the same wrap classes", () => {
+    const src = readFileSync(resolve(ROOT, "client/src/ui/Overlay.tsx"), "utf8");
+    const visible = src.match(/<RDialog\.(Title|Description) className="(?!sr-only)[^"]*"/g) ?? [];
+    expect(visible.length).toBe(6);
+    for (const tag of visible) expect(tag).toContain("min-w-0 [overflow-wrap:anywhere]");
+  });
+});
