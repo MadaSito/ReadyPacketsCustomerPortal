@@ -350,5 +350,19 @@ Mounted by `http_security_engineer` (`server/http/API.md` slots `K webhook` and 
   - `PaymentReturnConfirmation` (`PaymentReturnConfirmation.tsx`) — rendered by `CheckoutReturnPage` on `/checkout/return?attempt=...`; invokes `payments.confirmCheckoutPayment` on mount, auto-rechecks with exponential back-off (`CONFIRM_BACKOFF_DELAYS_MS`), supports manual `"Check payment status"`, and presents `"Continue to your order"` + `"View receipt"`.
   - `AdminCheckStripePaymentButton` (`AdminCheckStripePaymentButton.tsx`) — rendered on Console invoice detail (`/admin/invoices/:invoiceId`) and `/admin/payments` attempt drawer; gated to `admin` (`payments.manage`) on `issued` `portal` invoices, enforces step-up MFA, and repairs pre-upgrade payments as well.
 
+---
+
+## 10. Increment 09 — Package D2 & D2.8 (`TrashParticipant` `payments`)
+
+- **Schema (`server/modules/payments/schema.ts`, Migration 0009)**:
+  - `payment_attempts.trash_cancelled_at` (`datetime(3) null`), `payment_attempts.provider_cancelled_at` (`datetime(3) null`), and index `pmt_att_ord_pub_idx (order_public_id, status, id)`.
+- **Trash participant (`init()` registers `module: "payments"` with `services.trash.register`)**:
+  - `onTrashedInTx(tx, entity)`: marks open (`created` / `redirected`) `payment_attempts` of the order `status = "cancelled"` (`trashCancelledAt` set, `failureReasonCode = "ORDER_TRASHED"`, `redirectUrlEnc = null`) and enqueues `payments.attempt.cancel_provider` (`CANCEL_ATTEMPT_PROVIDER_JOB_TYPE`) in `tx` to expire/delete the hosted session at Stripe/Square outside the transaction (zero external HTTP calls inside `tx`).
+  - Starting, checking, or cancelling a checkout attempt for a trashed order is refused (`INVOICE_NOT_FOUND` / `PAYMENT_ATTEMPT_NOT_FOUND`). If an order is trashed while `startCheckout` is creating a provider session in flight, the post-egress transaction cancels the newly created attempt and enqueues `payments.attempt.cancel_provider`.
+  - **D2.8 late payment booking**: if a checkout opened before trashing is paid anyway, both verified webhook booking (`handleSignedWebhook`) and `reconcilePendingAttempts` (`payments.reconcile_redirected`) record the money received as a kept payment (`compliance.bookVerifiedProviderPayment`), emit the operational alert `PAID_ON_CANCELLED_ATTEMPT`, suppress customer order/refund mail on the trashed order (`OutboundMail.orderId`), and **never** un-trash/restore the order.
+  - `summarize(entity)`: reports `{ payments, refunds, paymentAttempts }` for the order so `TrashSummary.hasPayments` informs operators that moving to trash does not refund.
+  - `purge(entity)`: scrubs any residual `redirectUrlEnc` and **retains** all `payment_attempts`, `payment_refunds`, and `payment_webhook_events` records (`deleted: {}`, `kept: { payments, refunds }`).
+
+
 
 

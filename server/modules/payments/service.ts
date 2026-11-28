@@ -22,7 +22,11 @@ import { ULID_PATTERN, ulid } from "../../core/ids.js";
 import type { DbOrTx, EnqueueOptions, SessionPrincipal, Tx } from "../../core/types.js";
 import { assertLiveActorInTx, runComplianceTx } from "../compliance/actorAuth.js";
 import { decodeIdCursor, encodeIdCursor, type InvoicePaymentState } from "../compliance/domain.js";
-import { complianceInvoicePayments } from "../compliance/schema.js";
+import {
+  complianceInvoicePayments,
+  complianceInvoiceRefunds,
+  complianceInvoices,
+} from "../compliance/schema.js";
 import {
   REFUND_NOTICE_TEMPLATE_KEY,
   REFUND_RECONCILE_JOB,
@@ -30,6 +34,7 @@ import {
 } from "../jobs/refundSupport.js";
 import { stripeWebhookDeliveryMissingAlert } from "../opsAlerts/stripeWebhook.js";
 import { isSecretConfigured, readSecret, readSetting, writeSetting } from "../platform/index.js";
+import type { TrashEntityRef, TrashPurgeResult } from "../trash/ports.js";
 import { createSquareProviderAdapter } from "./providers/square.js";
 import { createSquareRefundAdapter } from "./providers/square-refund.js";
 import {
@@ -640,6 +645,7 @@ const DEFAULT_ATTEMPT_TTL_MS = 24 * 60 * 60 * 1000;
 const REFUND_RECONCILE_INITIAL_DELAY_MS = 2 * 60 * 1000;
 export const CUSTOMER_CONFIRM_COOLDOWN_MS = 2_000;
 export const MISSING_WEBHOOK_GRACE_MS = 2 * 60 * 1000;
+export const CANCEL_ATTEMPT_PROVIDER_JOB_TYPE = "payments.attempt.cancel_provider";
 export const STRIPE_WEBHOOK_USUAL_CAUSES: readonly [string, string, string] = [
   "The webhook endpoint URL is not registered in the Stripe Dashboard for this environment (Test mode and Live mode maintain separate webhook endpoint lists).",
   "One or more required events (such as checkout.session.completed or checkout.session.async_payment_succeeded) are not subscribed on the Stripe endpoint.",
@@ -1152,17 +1158,36 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     }
   }
 
+  async function isOrderTrashedInTx(tx: DbOrTx, orderId: number): Promise<boolean> {
+    const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+    if (!ordersSvc || typeof ordersSvc.isTrashedInTx !== "function") {
+      return false;
+    }
+    return ordersSvc.isTrashedInTx(tx, orderId);
+  }
+
   async function notifyOrderPaymentEventInTx(
     tx: Tx,
     input: {
       orderPublicId: string;
+      orderId?: number | undefined;
       kind: "pending_async" | "failed";
       eventRef: string;
     },
   ): Promise<void> {
+    if (input.orderId !== undefined && (await isOrderTrashedInTx(tx, input.orderId))) {
+      return;
+    }
     const ordersPayments = (deps.services as Partial<typeof deps.services>).orders?.payments;
     if (ordersPayments && typeof ordersPayments.onPaymentEventInTx === "function") {
-      await ordersPayments.onPaymentEventInTx(input, tx);
+      await ordersPayments.onPaymentEventInTx(
+        {
+          orderPublicId: input.orderPublicId,
+          kind: input.kind,
+          eventRef: input.eventRef,
+        },
+        tx,
+      );
     }
   }
 
@@ -1610,6 +1635,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     if (opts?.principal && opts.principal.role === "customer" && invoice.ownerUserId !== opts.principal.userId) {
       throw notFound("INVOICE_NOT_FOUND");
     }
+    if (await isOrderTrashedInTx(deps.db, invoice.orderId)) {
+      throw notFound("INVOICE_NOT_FOUND");
+    }
     const preOrdersSvc = (deps.services as Partial<typeof deps.services>).orders;
     if (
       opts?.principal &&
@@ -1640,6 +1668,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           // Canonical lock order: `orders -> compliance_invoices -> users(actor)` so concurrent
           // `confirmCheckoutPayment` / `cancelAttemptIfUnpaid` on the same customer/order cannot deadlock.
           const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+          if (await isOrderTrashedInTx(tx, invoice.orderId)) {
+            throw notFound("INVOICE_NOT_FOUND");
+          }
           let lockedOrderOwnerUserId: number | null = null;
           if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
             const lockedOrder = await ordersSvc.getOrderRefById(invoice.orderId, tx, { forUpdate: true });
@@ -1798,6 +1829,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         // (matching `confirmCheckoutPayment` and `cancelAttemptIfUnpaid`), plus fence against starting
         // a provider checkout after order cancellation, ownership transfer, or concurrent invoice void/payment.
         const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+        if (await isOrderTrashedInTx(tx, invoice.orderId)) {
+          throw notFound("INVOICE_NOT_FOUND");
+        }
         let lockedOrderOwnerUserId: number | null = null;
         if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
           const lockedOrder = await ordersSvc.getOrderRefById(invoice.orderId, tx, { forUpdate: true });
@@ -2129,7 +2163,44 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         `payment_attempts.redirect_url:${preAttempt.attemptPublicId}`,
       );
 
-      await deps.db.transaction(async (tx) => {
+      const postTxResult = await deps.db.transaction(async (tx) => {
+        const [curAttempt] = await tx
+          .select()
+          .from(paymentAttempts)
+          .where(eq(paymentAttempts.id, preAttempt.attemptId))
+          .for("update")
+          .limit(1);
+        const trashedDuringCreate =
+          (await isOrderTrashedInTx(tx, invoice.orderId)) ||
+          curAttempt?.status === "cancelled" ||
+          curAttempt?.trashCancelledAt !== null;
+
+        if (trashedDuringCreate) {
+          await tx
+            .update(paymentAttempts)
+            .set({
+              status: "cancelled",
+              providerRef: createdSession.providerRef,
+              providerOrderRef: createdSession.providerOrderRef ?? null,
+              providerPaymentRef: createdSession.providerPaymentRef ?? null,
+              cancelledAt: curAttempt?.cancelledAt ?? completedAt,
+              trashCancelledAt: curAttempt?.trashCancelledAt ?? completedAt,
+              failureReasonCode: "ORDER_TRASHED",
+              redirectUrlEnc: null,
+              version: (curAttempt?.version ?? 1) + 1,
+              updatedAt: completedAt,
+            })
+            .where(eq(paymentAttempts.id, preAttempt.attemptId));
+
+          await deps.jobs.enqueue(
+            CANCEL_ATTEMPT_PROVIDER_JOB_TYPE,
+            { attemptPublicId: preAttempt.attemptPublicId },
+            { idempotencyKey: `pmt-trash-cancel:${preAttempt.attemptPublicId}` },
+            tx,
+          );
+          return { trashedDuringCreate: true as const };
+        }
+
         await tx
           .update(paymentAttempts)
           .set({
@@ -2167,7 +2238,12 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           },
           tx,
         );
+        return { trashedDuringCreate: false as const };
       });
+
+      if (postTxResult.trashedDuringCreate) {
+        throw notFound("INVOICE_NOT_FOUND");
+      }
 
       return {
         mode: "redirect",
@@ -2179,6 +2255,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         expiresAt,
       };
     } catch (err) {
+      if (err instanceof DomainError && err.code === "NOT_FOUND" && err.reasonCode === "INVOICE_NOT_FOUND") {
+        throw err;
+      }
       const failedAt = deps.clock.now();
       const reasonCode = (err instanceof DomainError ? err.reasonCode : "PROVIDER_CREATE_ERROR").slice(0, 64);
       const errCode = err instanceof DomainError ? err.code : "UNAVAILABLE";
@@ -2220,6 +2299,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
         await notifyOrderPaymentEventInTx(tx, {
           orderPublicId: invoice.orderPublicId,
+          orderId: invoice.orderId,
           kind: "failed",
           eventRef: preAttempt.attemptPublicId,
         });
@@ -2349,6 +2429,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     let invoice: Awaited<ReturnType<typeof complianceSvc.getInvoiceForCheckout>>;
     try {
       invoice = await complianceSvc.getInvoiceForCheckout(targetInvoicePublicId, { principal });
+      if (await isOrderTrashedInTx(deps.db, invoice.orderId)) {
+        throw notFound("INVOICE_NOT_FOUND");
+      }
     } catch (err) {
       if (query.attemptPublicId && !query.invoicePublicId && err instanceof DomainError && err.code === "NOT_FOUND") {
         throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
@@ -2542,6 +2625,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         principal,
         ...(callerTx ? { tx: callerTx } : {}),
       });
+      if (await isOrderTrashedInTx(stagedReadDb, preInvoice.orderId)) {
+        throw notFound("INVOICE_NOT_FOUND");
+      }
       if (principal.role === "customer" && preInvoice.ownerUserId !== principal.userId) {
         throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
       }
@@ -2560,6 +2646,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           tx,
           forUpdate: true,
         });
+        if (await isOrderTrashedInTx(tx, invoice.orderId)) {
+          throw notFound("INVOICE_NOT_FOUND");
+        }
       } catch (err) {
         if (target.attemptPublicId && !target.invoicePublicId && err instanceof DomainError && err.code === "NOT_FOUND") {
           throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
@@ -3003,9 +3092,13 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       };
     }
 
+    const orderIsTrashed = await isOrderTrashedInTx(tx, currentInvoice.orderId);
+    const isTrashCancelledOrTrashedOrder = locked.trashCancelledAt !== null || orderIsTrashed;
+
     if (!input.allowRepair) {
       if (input.source === "provider_lookup") {
-        if (locked.status !== "created" && locked.status !== "redirected") {
+        const allowLateTrashBooking = locked.status === "cancelled" && isTrashCancelledOrTrashedOrder;
+        if (locked.status !== "created" && locked.status !== "redirected" && !allowLateTrashBooking) {
           if (
             locked.status === "cancelled" &&
             currentInvoice.status === "issued" &&
@@ -3082,6 +3175,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
         await notifyOrderPaymentEventInTx(tx, {
           orderPublicId: locked.orderPublicId,
+          orderId: currentInvoice.orderId,
           kind: "failed",
           eventRef: locked.publicId,
         });
@@ -3228,7 +3322,11 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
     await resolvePaymentOpsAlert(`webhook-verify:${locked.publicId}`, tx);
     await resolvePaymentOpsAlert(`verification-mismatch:${locked.publicId}`, tx);
-    await resolvePaymentOpsAlert(`paid-cancelled-attempt:${locked.publicId}`, tx);
+    if (isTrashCancelledOrTrashedOrder) {
+      await emitPaidOnCancelledAttemptAlertInTx(tx, locked, auditActor);
+    } else {
+      await resolvePaymentOpsAlert(`paid-cancelled-attempt:${locked.publicId}`, tx);
+    }
 
     await deps.audit.record(
       {
@@ -3420,6 +3518,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           tx,
           forUpdate: true,
         });
+        if (await isOrderTrashedInTx(tx, invoice.orderId)) {
+          throw notFound("INVOICE_NOT_FOUND");
+        }
       } catch (err) {
         if (err instanceof DomainError && (err.code === "NOT_FOUND" || err.code === "FORBIDDEN")) {
           throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
@@ -5268,8 +5369,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       return { scanned: 0, booked: 0, expired: 0, failed: 0, stillPending: 0 };
     }
     const activeProvider: ActivePaymentProvider = config.provider;
-    // Starvation-free selection: filter in SQL to rows with non-null `providerRef` and either `redirected`
-    // or (`cancelled` with `verifiedWebhookEventId`), ordered oldest-reconciled first (`NULL` first in MySQL ASC).
+    // Starvation-free selection: filter in SQL to rows with non-null `providerRef` and either `redirected`,
+    // (`cancelled` with `verifiedWebhookEventId`), or non-terminal trash-cancelled attempts (D2.8),
+    // ordered oldest-reconciled first (`NULL` first in MySQL ASC).
     const candidates = await deps.db
       .select()
       .from(paymentAttempts)
@@ -5283,6 +5385,14 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             and(
               eq(paymentAttempts.status, "cancelled"),
               isNotNull(paymentAttempts.verifiedWebhookEventId),
+            ),
+            and(
+              eq(paymentAttempts.status, "cancelled"),
+              isNotNull(paymentAttempts.trashCancelledAt),
+              or(
+                isNull(paymentAttempts.reconciliationNote),
+                ne(paymentAttempts.reconciliationNote, "trash_cancelled_terminal"),
+              ),
             ),
           ),
         ),
@@ -5387,7 +5497,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           }
         }
 
-        if (attempt.provider === "stripe") {
+        if (attempt.provider === "stripe" || attempt.trashCancelledAt !== null) {
           const res = await runWithMysqlDeadlockRetry(() =>
             deps.db.transaction(async (tx) => {
               if (!(await verifyPostEgressStripeDigestInTx(tx))) {
@@ -5455,6 +5565,37 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             .limit(1);
           if (!locked || locked.status === "paid" || currentInvoice?.status === "paid") {
             return "already_paid" as const;
+          }
+          if (locked.status === "cancelled" && locked.trashCancelledAt !== null) {
+            if (
+              !currentInvoice ||
+              currentInvoice.status === "void" ||
+              currentInvoice.voidedAt !== null ||
+              fetched.status === "expired" ||
+              fetched.status === "failed" ||
+              (fetched.status === "open" &&
+                locked.providerCancelledAt !== null &&
+                !fetched.asyncPending &&
+                !locked.verifiedWebhookEventId)
+            ) {
+              await tx
+                .update(paymentAttempts)
+                .set({
+                  reconciliationNote: "trash_cancelled_terminal",
+                  lastReconciledAt: now,
+                  updatedAt: now,
+                })
+                .where(eq(paymentAttempts.id, locked.id));
+              return "already_terminal" as const;
+            }
+            await tx
+              .update(paymentAttempts)
+              .set({
+                lastReconciledAt: now,
+                updatedAt: now,
+              })
+              .where(eq(paymentAttempts.id, locked.id));
+            return "pending" as const;
           }
           // Never overwrite or mutate voided invoices or terminal attempts (`cancelled`, `failed`,
           // `expired`) on delayed worker outcomes (`expired`, `failed`, `asyncPending`, or lookup mismatch).
@@ -7406,7 +7547,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     });
 
     let noticeSentAt = row.customerNoticeSentAt;
-    if (row.sendCustomerNotice && !noticeSentAt) {
+    if (row.sendCustomerNotice && !noticeSentAt && !(await isOrderTrashedInTx(tx, row.orderId))) {
       const orderRef =
         typeof ordersSvc.getOrderRefById === "function"
           ? await ordersSvc.getOrderRefById(row.orderId, tx)
@@ -7416,6 +7557,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           {
             template: REFUND_NOTICE_TEMPLATE_KEY,
             to: { userId: orderRef.ownerUserId },
+            orderId: row.orderId,
             vars: {
               orderReference: orderRef.reference,
               refundAmount: formatRefundNoticeAmount(row.amountMinor, row.currency),
@@ -7970,7 +8112,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
         const now = deps.clock.now();
 
-        await ordersSvc.assertCanWriteOrder(livePrincipal, input.orderPublicId, {
+        const orderView = await ordersSvc.assertCanWriteOrder(livePrincipal, input.orderPublicId, {
           kind: "invoice",
           tx,
           forUpdate: true,
@@ -8060,11 +8202,12 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
               tx,
             );
 
-            if (input.sendCustomerNotice) {
+            if (input.sendCustomerNotice && !(await isOrderTrashedInTx(tx, orderView.id))) {
               await deps.mailer.enqueue(
                 {
                   template: REFUND_NOTICE_TEMPLATE_KEY,
                   to: { userId: locked.ownerUserId },
+                  orderId: orderView.id,
                   vars: {
                     orderReference: locked.orderReference,
                     refundAmount: formatRefundNoticeAmount(input.amountMinor, currency),
@@ -8743,6 +8886,241 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     }
   }
 
+  async function onOrderTrashedInTx(tx: Tx, entity: TrashEntityRef): Promise<void> {
+    if (entity.kind !== "order") {
+      return;
+    }
+    const openAttempts = await tx
+      .select()
+      .from(paymentAttempts)
+      .where(
+        and(
+          eq(paymentAttempts.orderPublicId, entity.publicId),
+          inArray(paymentAttempts.status, ["created", "redirected"]),
+        ),
+      )
+      .orderBy(asc(paymentAttempts.id))
+      .for("update");
+
+    if (openAttempts.length === 0) {
+      return;
+    }
+
+    const now = deps.clock.now();
+    for (const att of openAttempts) {
+      await tx
+        .update(paymentAttempts)
+        .set({
+          status: "cancelled",
+          cancelledAt: att.cancelledAt ?? now,
+          trashCancelledAt: att.trashCancelledAt ?? now,
+          failureReasonCode: "ORDER_TRASHED",
+          redirectUrlEnc: null,
+          version: att.version + 1,
+          updatedAt: now,
+        })
+        .where(eq(paymentAttempts.id, att.id));
+
+      await deps.audit.record(
+        {
+          category: "business",
+          eventName: "payments.attempt.cancelled_on_trash",
+          action: "cancel",
+          outcome: "completed",
+          actor: { role: "system" },
+          resource: { type: "payment_attempt", publicId: att.publicId },
+          orderPublicId: att.orderPublicId,
+          attributes: {
+            invoice_public_id: att.invoicePublicId,
+            order_public_id: att.orderPublicId,
+            provider: att.provider,
+            had_provider_ref: Boolean(att.providerRef),
+          },
+        },
+        tx,
+      );
+
+      if (att.providerRef && !att.providerCancelledAt) {
+        await deps.jobs.enqueue(
+          CANCEL_ATTEMPT_PROVIDER_JOB_TYPE,
+          { attemptPublicId: att.publicId },
+          { idempotencyKey: `pmt-trash-cancel:${att.publicId}` },
+          tx,
+        );
+      }
+    }
+  }
+
+  async function cancelProviderAttemptFromJob(
+    attemptPublicId: string,
+    opts?: {
+      signal?: AbortSignal | undefined;
+      beforeSend?: (() => Promise<void>) | undefined;
+      assertOwnedInTx?: ((tx: Tx) => Promise<void>) | undefined;
+    },
+  ): Promise<{ outcome: "noop" | "cancelled" | "already_cancelled" | "booked_late_payment" }> {
+    const [attempt] = await deps.db
+      .select()
+      .from(paymentAttempts)
+      .where(eq(paymentAttempts.publicId, attemptPublicId))
+      .limit(1);
+
+    if (!attempt || !attempt.providerRef || attempt.providerCancelledAt !== null || attempt.status === "paid") {
+      return { outcome: "noop" };
+    }
+
+    const config = await loadConfig();
+    let credentials: ProviderCredentials;
+    let stripeKeyDigest: string | null = null;
+    if (attempt.provider === "stripe") {
+      const loaded = await loadStripeLookupCredentials(attempt.environment);
+      credentials = loaded.credentials;
+      stripeKeyDigest = loaded.keyDigest;
+    } else {
+      const loaded = await loadProviderCredentials(attempt.provider, {
+        ...config,
+        mode: attempt.environment,
+      });
+      credentials = loaded.credentials;
+    }
+
+    const adapter = adapters[attempt.provider];
+    const cancelRes = adapter.cancelCheckout
+      ? await adapter.cancelCheckout({
+          providerRef: attempt.providerRef,
+          providerOrderRef: attempt.providerOrderRef,
+          providerPaymentRef: attempt.providerPaymentRef,
+          credentials,
+          ...(opts?.signal ? { signal: opts.signal } : {}),
+          ...(opts?.beforeSend ? { beforeSend: opts.beforeSend } : {}),
+        })
+      : { status: "already_cancelled" as const };
+
+    if (cancelRes.status === "already_paid") {
+      const fetched = await adapter.fetchPayment({
+        providerRef: attempt.providerRef,
+        providerOrderRef: attempt.providerOrderRef,
+        providerPaymentRef: attempt.providerPaymentRef,
+        credentials,
+        ...(opts?.signal ? { signal: opts.signal } : {}),
+        ...(opts?.beforeSend ? { beforeSend: opts.beforeSend } : {}),
+      });
+      await runWithMysqlDeadlockRetry(() =>
+        deps.db.transaction(async (tx) => {
+          if (opts?.assertOwnedInTx) {
+            await opts.assertOwnedInTx(tx);
+          }
+          if (attempt.provider === "stripe" && stripeKeyDigest) {
+            const post = await loadStripeLookupCredentials(attempt.environment, { tx });
+            if (post.keyDigest !== stripeKeyDigest) {
+              throw new DomainError("UNAVAILABLE", "STRIPE_KEY_DRIFT", "Stripe key rotated during cancel lookup.");
+            }
+          }
+          await bookAuthoritativeAttemptPaymentInTx(tx, {
+            attemptId: attempt.id,
+            source: "provider_lookup",
+            fetched,
+          });
+        }),
+      );
+      return { outcome: "booked_late_payment" };
+    }
+
+    const now = deps.clock.now();
+    await runWithMysqlDeadlockRetry(() =>
+      deps.db.transaction(async (tx) => {
+        if (opts?.assertOwnedInTx) {
+          await opts.assertOwnedInTx(tx);
+        }
+        await tx
+          .update(paymentAttempts)
+          .set({
+            providerCancelledAt: now,
+            updatedAt: now,
+          })
+          .where(and(eq(paymentAttempts.id, attempt.id), isNull(paymentAttempts.providerCancelledAt)));
+      }),
+    );
+
+    return { outcome: cancelRes.status };
+  }
+
+  async function summarizeOrderForTrash(entity: TrashEntityRef): Promise<Record<string, number>> {
+    if (entity.kind !== "order") {
+      return {};
+    }
+    const [[paidAttRow], [openAttRow], [refundRow], [ledgerPaidRow], [ledgerRefundRow]] = await Promise.all([
+      deps.db
+        .select({ total: count() })
+        .from(paymentAttempts)
+        .where(and(eq(paymentAttempts.orderPublicId, entity.publicId), eq(paymentAttempts.status, "paid"))),
+      deps.db
+        .select({ total: count() })
+        .from(paymentAttempts)
+        .where(
+          and(
+            eq(paymentAttempts.orderPublicId, entity.publicId),
+            inArray(paymentAttempts.status, ["created", "redirected"]),
+          ),
+        ),
+      deps.db
+        .select({ total: count() })
+        .from(paymentRefunds)
+        .where(
+          and(
+            eq(paymentRefunds.orderPublicId, entity.publicId),
+            inArray(paymentRefunds.status, ["pending", "succeeded", "unknown"]),
+          ),
+        ),
+      deps.db
+        .select({ total: count() })
+        .from(complianceInvoicePayments)
+        .innerJoin(complianceInvoices, eq(complianceInvoicePayments.invoiceId, complianceInvoices.id))
+        .where(
+          and(
+            eq(complianceInvoices.orderPublicId, entity.publicId),
+            eq(complianceInvoicePayments.status, "succeeded"),
+          ),
+        ),
+      deps.db
+        .select({ total: count() })
+        .from(complianceInvoiceRefunds)
+        .innerJoin(complianceInvoices, eq(complianceInvoiceRefunds.invoiceId, complianceInvoices.id))
+        .where(eq(complianceInvoices.orderPublicId, entity.publicId)),
+    ]);
+
+    const payments = Math.max(paidAttRow?.total ?? 0, ledgerPaidRow?.total ?? 0);
+    const refunds = Math.max(refundRow?.total ?? 0, ledgerRefundRow?.total ?? 0);
+    const paymentAttemptsCount = openAttRow?.total ?? 0;
+
+    const out: Record<string, number> = {};
+    if (payments > 0) out.payments = payments;
+    if (refunds > 0) out.refunds = refunds;
+    if (paymentAttemptsCount > 0) out.paymentAttempts = paymentAttemptsCount;
+    return out;
+  }
+
+  async function purgeOrderForTrash(entity: TrashEntityRef): Promise<TrashPurgeResult> {
+    if (entity.kind !== "order") {
+      return { deleted: {} };
+    }
+    // Scrub any residual encrypted redirect URLs while retaining all payment, refund, and webhook records.
+    await deps.db
+      .update(paymentAttempts)
+      .set({ redirectUrlEnc: null })
+      .where(and(eq(paymentAttempts.orderPublicId, entity.publicId), isNotNull(paymentAttempts.redirectUrlEnc)));
+
+    const summary = await summarizeOrderForTrash(entity);
+    const kept: Record<string, number> = {};
+    if ((summary.payments ?? 0) > 0) kept.payments = summary.payments!;
+    if ((summary.refunds ?? 0) > 0) kept.refunds = summary.refunds!;
+
+    return {
+      deleted: {},
+      ...(Object.keys(kept).length > 0 ? { kept } : {}),
+    };
+  }
+
   return {
     isOnlineCheckoutEnabled,
     getPublicCheckoutConfig,
@@ -8758,6 +9136,10 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     reconcilePendingAttempts,
     reconcileProviderRefund,
     getAttemptExposureForOrderInTx,
+    onOrderTrashedInTx,
+    cancelProviderAttemptFromJob,
+    summarizeOrderForTrash,
+    purgeOrderForTrash,
     refunds: {
       forOrder: forOrderRefunds,
       create: createOrderRefund,

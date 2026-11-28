@@ -190,6 +190,37 @@ export function createSquareProvider(egress: Pick<EgressPolicy, "fetchPinned">):
         paymentMethodBrand, paymentMethodLast4,
         status: payment.status === "COMPLETED" ? "paid" : ["CANCELED", "FAILED"].includes(payment.status) ? "failed" : "open" };
     },
+    async cancelCheckout(input) {
+      const { mode, secretKey } = input.credentials;
+      const host = apiHosts[mode];
+      const ref = providerId.safeParse(input.providerRef);
+      if (!host || !secretKey || /[\r\n]/u.test(secretKey) || !ref.success) {
+        throw unavailable("SQUARE_CONFIGURATION_INVALID");
+      }
+      const response = await egress.fetchPinned(
+        new URL(`/v2/online-checkout/payment-links/${ref.data}`, `https://${host}`),
+        "square",
+        {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${secretKey}`, Accept: "application/json", "Square-Version": "2026-11-18" },
+          requireAllowlistRule: true,
+          publicAddressesOnly: true,
+          expectedHostSuffixes: [host],
+          timeoutMs: 6000,
+          maxResponseBytes: jsonLimit,
+          signal: input.signal,
+          beforeSend: input.beforeSend,
+        },
+      );
+      if (response.status >= 200 && response.status < 300) return { status: "cancelled" };
+      if (response.status === 404) return { status: "already_cancelled" };
+      if (response.status >= 400 && response.status < 500) {
+        const fetched = await this.fetchPayment(input);
+        if (fetched.status === "paid") return { status: "already_paid" };
+        if (fetched.status === "expired" || fetched.status === "failed") return { status: "already_cancelled" };
+      }
+      throw unavailable("SQUARE_CANCEL_LINK_FAILED");
+    },
   };
 }
 

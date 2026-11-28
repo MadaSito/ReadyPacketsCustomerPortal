@@ -257,11 +257,25 @@ export interface PaymentRefundAdapter<P extends ActivePaymentProvider = ActivePa
   listPaymentRefunds?(input: ProviderListPaymentRefundsInput): Promise<ProviderListPaymentRefundsResult>;
 }
 
+export interface ProviderCancelCheckoutInput {
+  providerRef: string;
+  providerOrderRef?: string | null | undefined;
+  providerPaymentRef?: string | null | undefined;
+  credentials: ProviderCredentials;
+  signal?: AbortSignal | undefined;
+  beforeSend?: (() => Promise<void>) | undefined;
+}
+
+export interface ProviderCancelCheckoutResult {
+  status: "cancelled" | "already_cancelled" | "already_paid";
+}
+
 export interface PaymentProviderAdapter {
   readonly key: ActivePaymentProvider;
   createCheckout(input: ProviderCreateCheckoutInput): Promise<ProviderCreateCheckoutOutput>;
   verifyWebhook(input: ProviderVerifyWebhookInput): ProviderVerifyWebhookOutput;
   fetchPayment(input: ProviderFetchPaymentInput): Promise<ProviderFetchedPayment>;
+  cancelCheckout?(input: ProviderCancelCheckoutInput): Promise<ProviderCancelCheckoutResult>;
   testConnection?(input: ProviderTestConnectionInput): Promise<ProviderTestConnectionResult>;
   verifyCheckoutSession?(
     input: ProviderVerifyCheckoutSessionInput,
