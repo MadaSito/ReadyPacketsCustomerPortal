@@ -1620,6 +1620,25 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     };
   }
 
+  async function loadCheckoutInvoiceOrNotFound(
+    complianceSvc: ReturnType<typeof requireComplianceService>,
+    invoicePublicId: string,
+    opts?: {
+      principal?: SessionPrincipal | undefined;
+      tx?: DbOrTx | undefined;
+      forUpdate?: boolean | undefined;
+    },
+  ) {
+    try {
+      return await complianceSvc.getInvoiceForCheckout(invoicePublicId, opts);
+    } catch (err) {
+      if (err instanceof DomainError && err.code === "NOT_FOUND") {
+        throw notFound("INVOICE_NOT_FOUND");
+      }
+      throw err;
+    }
+  }
+
   async function startCheckout(
     invoicePublicId: string,
     returnPaths?: CheckoutReturnPaths,
@@ -1628,7 +1647,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     const complianceSvc = requireComplianceService();
     const config = await loadConfig();
 
-    const invoice = await complianceSvc.getInvoiceForCheckout(invoicePublicId, {
+    const invoice = await loadCheckoutInvoiceOrNotFound(complianceSvc, invoicePublicId, {
       ...(opts?.principal ? { principal: opts.principal } : {}),
     });
 
@@ -1685,7 +1704,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
               });
             }
           }
-          const lockedZeroInvoice = await complianceSvc.getInvoiceForCheckout(invoice.invoicePublicId, {
+          const lockedZeroInvoice = await loadCheckoutInvoiceOrNotFound(complianceSvc, invoice.invoicePublicId, {
             ...(opts?.principal ? { principal: opts.principal } : {}),
             tx,
             forUpdate: true,
@@ -1753,7 +1772,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
                 });
               }
             }
-            const lockedWaivedInvoice = await complianceSvc.getInvoiceForCheckout(invoice.invoicePublicId, {
+            const lockedWaivedInvoice = await loadCheckoutInvoiceOrNotFound(complianceSvc, invoice.invoicePublicId, {
               ...(opts?.principal ? { principal: opts.principal } : {}),
               tx,
               forUpdate: true,
@@ -1858,7 +1877,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           }
         }
 
-        const lockedInvoice = await complianceSvc.getInvoiceForCheckout(invoicePublicId, {
+        const lockedInvoice = await loadCheckoutInvoiceOrNotFound(complianceSvc, invoicePublicId, {
           ...(opts?.principal ? { principal: opts.principal } : {}),
           tx,
           forUpdate: true,
@@ -2433,8 +2452,12 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         throw notFound("INVOICE_NOT_FOUND");
       }
     } catch (err) {
-      if (query.attemptPublicId && !query.invoicePublicId && err instanceof DomainError && err.code === "NOT_FOUND") {
-        throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+      if (err instanceof DomainError && err.code === "NOT_FOUND") {
+        throw notFound(
+          query.attemptPublicId && !query.invoicePublicId
+            ? "PAYMENT_ATTEMPT_NOT_FOUND"
+            : "INVOICE_NOT_FOUND",
+        );
       }
       throw err;
     }
@@ -2632,8 +2655,12 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
       }
     } catch (err) {
-      if (target.attemptPublicId && !target.invoicePublicId && err instanceof DomainError && err.code === "NOT_FOUND") {
-        throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+      if (err instanceof DomainError && err.code === "NOT_FOUND") {
+        throw notFound(
+          target.attemptPublicId && !target.invoicePublicId
+            ? "PAYMENT_ATTEMPT_NOT_FOUND"
+            : "INVOICE_NOT_FOUND",
+        );
       }
       throw err;
     }
@@ -2650,8 +2677,12 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           throw notFound("INVOICE_NOT_FOUND");
         }
       } catch (err) {
-        if (target.attemptPublicId && !target.invoicePublicId && err instanceof DomainError && err.code === "NOT_FOUND") {
-          throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+        if (err instanceof DomainError && err.code === "NOT_FOUND") {
+          throw notFound(
+            target.attemptPublicId && !target.invoicePublicId
+              ? "PAYMENT_ATTEMPT_NOT_FOUND"
+              : "INVOICE_NOT_FOUND",
+          );
         }
         throw err;
       }

@@ -1783,6 +1783,7 @@ describe("Increment 08 — Package D5 Payment confirmation (authoritative bookin
       h,
       fakeStripe,
       ordersMod,
+      complianceMod,
       paymentsMod,
       admin,
       buyer,
@@ -1864,16 +1865,50 @@ describe("Increment 08 — Package D5 Payment confirmation (authoritative bookin
     );
     expect(queuedCancelJob).toBeDefined();
 
-    // Refuse starting or checking checkout while order is in trash:
+    // Refuse starting or checking checkout while order is in trash, matching missing-invoice INVOICE_NOT_FOUND (no existence oracle):
+    let missingInvoiceErr: unknown;
+    try {
+      await buyerCaller.payments.startInvoiceCheckout({ invoicePublicId: ulid() });
+    } catch (err) {
+      missingInvoiceErr = err;
+    }
+    expect(missingInvoiceErr).toMatchObject({
+      code: "NOT_FOUND",
+      cause: expect.objectContaining({ reasonCode: "INVOICE_NOT_FOUND" }),
+    });
+    const expectedMissingMsg = (missingInvoiceErr as Error).message;
+
     await expect(paymentsMod.startCheckout(c1.invoicePublicId)).rejects.toMatchObject({
       code: "NOT_FOUND",
+      reasonCode: "INVOICE_NOT_FOUND",
     });
     await expect(
       buyerCaller.payments.startInvoiceCheckout({ invoicePublicId: c1.invoicePublicId }),
-    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      message: expectedMissingMsg,
+      cause: expect.objectContaining({ reasonCode: "INVOICE_NOT_FOUND" }),
+    });
+    await expect(
+      buyerCaller.payments.checkoutStatus({ invoicePublicId: c1.invoicePublicId }),
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      message: expectedMissingMsg,
+      cause: expect.objectContaining({ reasonCode: "INVOICE_NOT_FOUND" }),
+    });
+    await expect(
+      buyerCaller.payments.cancelAttempt({ invoicePublicId: c1.invoicePublicId }),
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      message: expectedMissingMsg,
+      cause: expect.objectContaining({ reasonCode: "INVOICE_NOT_FOUND" }),
+    });
     await expect(
       buyerCaller.payments.confirmCheckoutPayment({ attemptPublicId: c1.attemptPublicId }),
-    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      cause: expect.objectContaining({ reasonCode: "PAYMENT_ATTEMPT_NOT_FOUND" }),
+    });
 
     // Run registered outbox provider cancel job -> expires session on Stripe and stamps providerCancelledAt:
     await h.jobs.runAll(CANCEL_ATTEMPT_PROVIDER_JOB_TYPE);
@@ -2031,5 +2066,61 @@ describe("Increment 08 — Package D5 Payment confirmation (authoritative bookin
       .from(paymentRefunds)
       .where(eq(paymentRefunds.orderPublicId, c2.orderPublicId));
     expect(keptRefAfterPurge?.providerRefundRef).toBe("re_test_kept_001");
+
+    // 5. Tombstoned order (purgedAt set): both unpaid/voided AND paid invoices normalize checkout endpoints
+    //    to exact INVOICE_NOT_FOUND (matching missing invoice), while kept paid invoice reads stay available!
+    const c4UnpaidTombstoned = await createCustomerCheckout();
+    const entity4 = await markOrderTrashedInTx(
+      c4UnpaidTombstoned.orderPublicId,
+      "01JBATCHPMT000000000000004",
+    );
+    await tdb.db
+      .update(orderTables.orders)
+      .set({ purgedAt: h.clock.now(), projectName: "Deleted order" })
+      .where(eq(orderTables.orders.id, entity4.id));
+    await tdb.db
+      .update(complianceTables.complianceInvoices)
+      .set({ status: "void", voidedAt: h.clock.now() })
+      .where(eq(complianceTables.complianceInvoices.publicId, c4UnpaidTombstoned.invoicePublicId));
+
+    await tdb.db
+      .update(orderTables.orders)
+      .set({ purgedAt: h.clock.now(), projectName: "Deleted order" })
+      .where(eq(orderTables.orders.id, entity2.id));
+
+    for (const invPubId of [c4UnpaidTombstoned.invoicePublicId, c2.invoicePublicId]) {
+      await expect(paymentsMod.startCheckout(invPubId)).rejects.toMatchObject({
+        code: "NOT_FOUND",
+        reasonCode: "INVOICE_NOT_FOUND",
+      });
+      await expect(
+        buyerCaller.payments.startInvoiceCheckout({ invoicePublicId: invPubId }),
+      ).rejects.toMatchObject({
+        code: "NOT_FOUND",
+        message: expectedMissingMsg,
+        cause: expect.objectContaining({ reasonCode: "INVOICE_NOT_FOUND" }),
+      });
+      await expect(
+        buyerCaller.payments.checkoutStatus({ invoicePublicId: invPubId }),
+      ).rejects.toMatchObject({
+        code: "NOT_FOUND",
+        message: expectedMissingMsg,
+        cause: expect.objectContaining({ reasonCode: "INVOICE_NOT_FOUND" }),
+      });
+      await expect(
+        buyerCaller.payments.cancelAttempt({ invoicePublicId: invPubId }),
+      ).rejects.toMatchObject({
+        code: "NOT_FOUND",
+        message: expectedMissingMsg,
+        cause: expect.objectContaining({ reasonCode: "INVOICE_NOT_FOUND" }),
+      });
+    }
+
+    // Kept paid invoice remains readable by customer on tombstoned order:
+    const keptPaidInvoiceView = await complianceMod.invoices.get(
+      buyer.principal,
+      c2.invoicePublicId,
+    );
+    expect(keptPaidInvoiceView.status).toBe("paid");
   });
 });
