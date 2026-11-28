@@ -9,6 +9,7 @@ import { createLocalAdministratorPolicy } from "./breakGlass.js";
 import { createEntraAssurance } from "./entra.js";
 import { createFactorService } from "./factors.js";
 import { clearFactors, getState, pruneChallenges, prunePendingTotp } from "./store.js";
+import { createAssuranceTrashParticipant } from "./trash.js";
 
 export type { SecondFactorInput } from "./input.js";
 export type AssuranceState = Awaited<ReturnType<typeof getState>>;
@@ -38,6 +39,9 @@ export function createAssuranceModule(deps: ModuleDeps): AssuranceModule {
     ...createCredentialAdmin(deps),
     ...createEntraAssurance(deps),
     ...localAdministratorPolicy,
+    init() {
+      deps.services.trash.register(createAssuranceTrashParticipant(deps));
+    },
     getAssuranceState: (userId, tx) => getState(tx ?? deps.db, userId),
     async resetSecondFactors(userId, tx) {
       // The caller must have taken lockLocalAdministratorPolicy before taking any user locks.

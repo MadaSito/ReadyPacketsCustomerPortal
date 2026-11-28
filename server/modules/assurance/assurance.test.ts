@@ -9,7 +9,9 @@ import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { createCallerFactory } from "../../trpc/trpc.js";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
+import { liveUserPredicate } from "../identity/live.js";
 import { users, userSessions } from "../identity/schema.js";
+import { createTrashRegistry } from "../trash/ports.js";
 import { assessEntraSignIn, isFreshEntraAuthentication } from "./entra.js";
 import { createAssuranceModule } from "./index.js";
 import { assuranceRouter } from "./router.js";
@@ -79,7 +81,7 @@ describe("assurance: isolated transactional model", () => {
     mailReadiness.mockResolvedValue({ ready: true });
     h.services.jobAdmin = { getMailReadiness: () => mailReadiness() } as Services["jobAdmin"];
     async function findUser(where: ReturnType<typeof eq>, opts?: { tx?: DbOrTx; forUpdate?: boolean }) {
-      const query = (opts?.tx ?? db.db).select().from(users).where(where).limit(1);
+      const query = (opts?.tx ?? db.db).select().from(users).where(and(where, liveUserPredicate())).limit(1);
       const [row] = await (opts?.forUpdate ? query.for("update") : query);
       if (!row) return null;
       return { ...row, email: h.deps.crypto.decrypt(row.emailEnc, `users.email:${row.publicId}`), emailVerified: !!row.emailVerifiedAt };
@@ -124,6 +126,79 @@ describe("assurance: isolated transactional model", () => {
         },
       },
     } as unknown as Services["identity"];
+  });
+
+  it.each(["trashedAt", "purgedAt"] as const)("excludes %s accounts from public and trusted factor reads", async (flag) => {
+    const { account } = await enroll();
+    const principal = { ...account, state: "full", pendingSteps: [] } as const;
+    const admin = await fixture({ role: "admin", stepUpAt: h.clock.now() });
+    expect((await h.services.assurance.getAssuranceState(account.userId)).totpEnrolled).toBe(true);
+
+    await db.db.update(users).set({ [flag]: h.clock.now() }).where(eq(users.id, account.userId));
+
+    await expect(caller(principal).getState()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(caller(principal).listPasskeys()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(caller(admin).admin.resetMfa({ customerId: account.userPublicId })).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(h.services.assurance.getAssuranceState(account.userId)).resolves.toEqual({
+      totpEnrolled: false, mfaEnrolled: false, passkeyCount: 0, recoveryCodesAcknowledged: false,
+    });
+  });
+
+  it("cancels pending assurance ceremonies on trash and erases only the purged customer's factors", async () => {
+    const { account } = await enroll();
+    const other = (await enroll()).account;
+    const now = h.clock.now();
+    const expiresAt = new Date(+now + 60_000);
+    const passkeyPublicId = ulid(+now);
+    await db.db.update(assuranceAccounts).set({
+      pendingTotpSecretEnc: h.deps.crypto.encrypt("Synthetic setup value", "test"), pendingTotpSessionId: account.sessionId,
+      pendingTotpExpiresAt: expiresAt,
+    }).where(eq(assuranceAccounts.userId, account.userId));
+    await db.db.insert(assurancePasskeys).values({
+      publicId: passkeyPublicId, userId: account.userId, credentialId: "synthetic-credential",
+      credentialIndex: h.deps.crypto.blindIndex(passkeyPublicId, "test"), publicKey: "synthetic-public-key",
+      counter: 0, nameEnc: h.deps.crypto.encrypt("Synthetic passkey", `assurance_passkeys.name_enc:${passkeyPublicId}`),
+    });
+    await db.db.insert(assuranceChallenges).values([
+      { userId: account.userId, sessionId: account.sessionId, purpose: "step_up", challengeHash: "synthetic-step", expiresAt },
+      { userId: account.userId, sessionId: account.sessionId, purpose: "register", challengeHash: "synthetic-setup", expiresAt },
+      { userId: other.userId, sessionId: other.sessionId, purpose: "step_up", challengeHash: "synthetic-other", expiresAt },
+    ]);
+    const registry = createTrashRegistry();
+    h.services.trash = { ...h.services.trash, ...registry };
+    h.services.assurance.init?.();
+    expect(registry.participants().map((participant) => participant.module)).toEqual(["assurance"]);
+    const participant = registry.participants()[0]!;
+    const entity = { kind: "customer", id: account.userId, publicId: account.userPublicId, batchId: ulid(+now) } as const;
+    const run = { runId: ulid(+now) };
+    const order = { ...entity, kind: "order" } as const;
+    const admin = await fixture({ role: "admin" });
+    const actor = { kind: "user", userId: admin.userId, publicId: admin.userPublicId } as const;
+    await expect(participant.purge!(order, run)).resolves.toEqual({ deleted: {} });
+    await db.db.transaction(async (tx) => {
+      await participant.onTrashedInTx!(tx, order, actor);
+      await expect(tx.select().from(assuranceChallenges).where(eq(assuranceChallenges.userId, account.userId))).resolves.toHaveLength(2);
+      await participant.onTrashedInTx!(tx, entity, actor);
+      await participant.onTrashedInTx!(tx, entity, actor);
+    });
+    const [row] = await db.db.select().from(assuranceAccounts).where(eq(assuranceAccounts.userId, account.userId));
+    expect(row).toMatchObject({
+      totpSecretEnc: expect.any(String), pendingTotpSecretEnc: null, pendingTotpSessionId: null, pendingTotpExpiresAt: null,
+    });
+    expect(await db.db.select().from(assuranceChallenges).where(eq(assuranceChallenges.userId, account.userId))).toHaveLength(0);
+    expect(await db.db.select().from(assuranceRecoveryCodes).where(eq(assuranceRecoveryCodes.userId, account.userId))).toHaveLength(10);
+    // Purge must erase a residual challenge even if it survived the earlier trash hook.
+    await db.db.insert(assuranceChallenges).values({
+      userId: account.userId, sessionId: account.sessionId, purpose: "step_up", challengeHash: "synthetic-residual", expiresAt,
+    });
+    expect(await participant.purge!(entity, run)).toEqual({ deleted: {
+      assuranceAccounts: 1, assuranceChallenges: 1, assurancePasskeys: 1, assuranceRecoveryCodes: 10,
+    } });
+    expect(await participant.purge!(entity, run)).toEqual({ deleted: {
+      assuranceAccounts: 0, assuranceChallenges: 0, assurancePasskeys: 0, assuranceRecoveryCodes: 0,
+    } });
+    expect(await h.services.assurance.getAssuranceState(other.userId)).toMatchObject({ totpEnrolled: true });
+    expect(await db.db.select().from(assuranceChallenges).where(eq(assuranceChallenges.userId, other.userId))).toHaveLength(1);
   });
 
   it("trusts only a validated explicit MFA assertion when the trust switch is enabled", () => {

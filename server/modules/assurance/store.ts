@@ -5,6 +5,8 @@ import type { ModuleDeps } from "../../container.js";
 import { DomainError } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { DbOrTx, Tx } from "../../core/types.js";
+import { liveUserPredicate } from "../identity/live.js";
+import { users } from "../identity/schema.js";
 import { assuranceAccounts, assuranceChallenges, assurancePasskeys, assuranceRecoveryCodes } from "./schema.js";
 
 export const PASSKEY_LIMIT = 10;
@@ -43,7 +45,9 @@ export async function getState(db: DbOrTx, userId: number) {
     secretEnc: assuranceAccounts.totpSecretEnc, acknowledgedAt: assuranceAccounts.recoveryAcknowledgedAt,
     passkeyCount: sql<number>`(select count(*) from ${assurancePasskeys}
       where ${assurancePasskeys.userId} = ${assuranceAccounts.userId})`.mapWith(Number),
-  }).from(assuranceAccounts).where(eq(assuranceAccounts.userId, userId)).limit(1);
+  }).from(assuranceAccounts)
+    .innerJoin(users, and(eq(users.id, assuranceAccounts.userId), liveUserPredicate()))
+    .where(eq(assuranceAccounts.userId, userId)).limit(1);
   const passkeyCount = account?.passkeyCount ?? 0;
   const totpEnrolled = !!account?.secretEnc;
   return {

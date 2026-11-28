@@ -150,10 +150,14 @@ export function createFactorService(deps: ModuleDeps) {
 
   return {
     async getSecurityState(actor: SessionPrincipal) {
-      return {
-        ...await getState(deps.db, actor.userId),
-        recoveryCodesRemaining: await recoveryCount(deps.db, actor.userId),
-      };
+      return deps.db.transaction(async (tx) => {
+        // A session can be revoked between request resolution and this read.
+        await assertCurrent(deps, actor, tx);
+        return {
+          ...await getState(tx, actor.userId),
+          recoveryCodesRemaining: await recoveryCount(tx, actor.userId),
+        };
+      });
     },
     async verifySecondFactor(userId: number, input: SecondFactorInput, binding: AuthenticationBinding = {}): Promise<boolean> {
       await throttle(deps, userId);
@@ -342,10 +346,13 @@ export function createFactorService(deps: ModuleDeps) {
     },
     async listPasskeys(actor: SessionPrincipal) {
       requireFull(actor);
-      return (await getPasskeys(deps.db, actor.userId)).map((key) => ({
-        publicId: key.publicId, name: deps.crypto.decrypt(key.nameEnc, `assurance_passkeys.name_enc:${key.publicId}`),
-        createdAt: key.createdAt, lastUsedAt: key.lastUsedAt,
-      }));
+      return deps.db.transaction(async (tx) => {
+        await assertCurrent(deps, actor, tx);
+        return (await getPasskeys(tx, actor.userId)).map((key) => ({
+          publicId: key.publicId, name: deps.crypto.decrypt(key.nameEnc, `assurance_passkeys.name_enc:${key.publicId}`),
+          createdAt: key.createdAt, lastUsedAt: key.lastUsedAt,
+        }));
+      });
     },
     async beginPasskeyRegistration(actor: SessionPrincipal) {
       requireFresh(actor, deps.clock.now());
