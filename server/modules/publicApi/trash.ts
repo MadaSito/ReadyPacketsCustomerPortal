@@ -274,13 +274,13 @@ export function wrapProviderWithTrashGate<K extends ProviderKey>(
       },
       async create(input, caller, tx) {
         if (await isNonLiveCustomerPublicId(tx ?? db, input.customerId)) {
-          throw notFound("CUSTOMER_NOT_FOUND", "Customer not found.");
+          throw notFound("CUSTOMER_NOT_FOUND");
         }
         return p.create(input, caller, tx);
       },
       async transition(publicId, input, caller) {
         if (await isNonLiveOrderPublicId(db, publicId)) {
-          throw notFound("ORDER_NOT_FOUND", "Order not found.");
+          throw notFound("ORDER_NOT_FOUND");
         }
         return p.transition(publicId, input, caller);
       },
@@ -382,10 +382,10 @@ export function wrapProviderWithTrashGate<K extends ProviderKey>(
       },
       async create(input, caller) {
         if (await isNonLiveCustomerPublicId(db, input.customerId)) {
-          throw notFound("CUSTOMER_NOT_FOUND", "Customer not found.");
+          throw notFound("CUSTOMER_NOT_FOUND");
         }
         if (input.orderId && (await isNonLiveOrderPublicId(db, input.orderId))) {
-          throw notFound("ORDER_NOT_FOUND", "Order not found.");
+          throw notFound("ORDER_NOT_FOUND");
         }
         return p.create(input, caller);
       },

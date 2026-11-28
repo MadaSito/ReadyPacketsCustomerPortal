@@ -738,14 +738,16 @@ describe("RFC 5424 & RFC 5425 golden vectors", () => {
 
   it("projects Increment 09 D2.3 trash, restore, purge, retention, and cleanup events without leaking batch_id, run_id, reason, or customer PII", () => {
     const inc09Events: readonly [string, string, string | null][] = [
-      ["order.trashed", "business", "order"],
-      ["order.restored", "business", "order"],
-      ["order.purge_started", "business", "order"],
-      ["order.purged", "business", "order"],
-      ["customer.trashed", "identity", "user"],
-      ["customer.restored", "identity", "user"],
-      ["customer.purge_started", "identity", "user"],
-      ["customer.purged", "identity", "user"],
+      ["order.trashed", "admin", "order"],
+      ["order.restored", "admin", "order"],
+      ["order.purge_started", "admin", "order"],
+      ["order.purged", "admin", "order"],
+      ["order.purge_external_left", "admin", "order"],
+      ["customer.trashed", "admin", "user"],
+      ["customer.restored", "admin", "user"],
+      ["customer.purge_started", "admin", "user"],
+      ["customer.purged", "admin", "user"],
+      ["customer.purge_external_left", "admin", "user"],
       ["trash.retention_changed", "admin", "setting"],
       ["trash.cleanup_completed", "job", "trash_cleanup"],
     ];
@@ -762,10 +764,10 @@ describe("RFC 5424 & RFC 5425 golden vectors", () => {
 
     const customerTrashed = sanitizeProjectedEvent({
       ...sampleEvent({
-        category: "identity",
-        severity_text: "WARN",
+        category: "admin",
+        severity_text: "INFO",
         event_name: "customer.trashed",
-        action: "trash",
+        action: "transition",
         outcome: "completed",
         resource_type: "user",
       }),
@@ -793,10 +795,10 @@ describe("RFC 5424 & RFC 5425 golden vectors", () => {
 
     const customerPurged = sanitizeProjectedEvent({
       ...sampleEvent({
-        category: "identity",
+        category: "admin",
         severity_text: "WARN",
         event_name: "customer.purged",
-        action: "purge",
+        action: "delete",
         outcome: "completed",
         resource_type: "user",
       }),
