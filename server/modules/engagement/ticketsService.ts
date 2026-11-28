@@ -6,6 +6,7 @@ import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
 import { ULID_PATTERN, ulid } from "../../core/ids.js";
 import type { DbOrTx, SessionPrincipal } from "../../core/types.js";
+import { isLiveUserRow, liveUserPredicate } from "../identity/live.js";
 import { users } from "../identity/schema.js";
 import { readSetting } from "../platform/index.js";
 import { buildCanonicalPortalUrl, MAIL_TICKET_UPDATED } from "./mail.js";
@@ -19,6 +20,7 @@ import {
 } from "./schema.js";
 import { ENGAGEMENT_TICKETS_REOPEN_WINDOW_DAYS } from "./settings.js";
 import { computeSearchTokenHashes, decodeIdCursor, encodeIdCursor, normalizePlainText } from "./textAndSearch.js";
+import { isLiveTicketRowInTx, liveTicketPredicate } from "./trashGate.js";
 import type { TicketCategory, TicketPriority, TicketStatus } from "./types.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -150,7 +152,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         );
       } else {
         const sample = rows.find((r) => r.authorUserId === userId);
-        labels.set(userId, sample?.authorRole === "customer" ? "Customer" : "ReadyPackets Support");
+        labels.set(userId, sample?.authorRole === "customer" ? "Deleted account" : "ReadyPackets Support");
       }
     }
     return labels;
@@ -247,6 +249,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
       .where(
         and(
           eq(engagementSupportTickets.requesterUserId, principal.userId),
+          liveTicketPredicate(),
           input.status !== undefined ? eq(engagementSupportTickets.status, input.status) : undefined,
           beforeId !== undefined ? lt(engagementSupportTickets.id, beforeId) : undefined,
         ),
@@ -266,6 +269,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
     principal: SessionPrincipal,
   ): Promise<{ openCount: number; awaitingCustomerCount: number }> {
     assertFullSession(principal);
+    const liveGate = liveTicketPredicate();
     const [openRow, awaitingRow] = await Promise.all([
       db
         .select({ total: count(engagementSupportTickets.id) })
@@ -273,6 +277,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         .where(
           and(
             eq(engagementSupportTickets.requesterUserId, principal.userId),
+            liveGate,
             inArray(engagementSupportTickets.status, ["open", "pending_customer", "pending_staff"]),
           ),
         ),
@@ -282,6 +287,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         .where(
           and(
             eq(engagementSupportTickets.requesterUserId, principal.userId),
+            liveGate,
             eq(engagementSupportTickets.status, "pending_customer"),
           ),
         ),
@@ -319,6 +325,9 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         actor: { userId: principal.userId, role: principal.role },
         resource: { type: "ticket", publicId: ticketPublicId },
       });
+      throw notFound("TICKET_NOT_FOUND");
+    }
+    if (!(await isLiveTicketRowInTx(db, row))) {
       throw notFound("TICKET_NOT_FOUND");
     }
     return row;
@@ -531,7 +540,11 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         .limit(1)
         .for("update");
 
-      if (!lockedTicket || lockedTicket.requesterUserId !== principal.userId) {
+      if (
+        !lockedTicket ||
+        lockedTicket.requesterUserId !== principal.userId ||
+        !(await isLiveTicketRowInTx(tx, lockedTicket))
+      ) {
         throw notFound("TICKET_NOT_FOUND");
       }
 
@@ -659,6 +672,8 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         await notifications.notify(
           {
             userId: lockedTicket.assigneeUserId,
+            ticketId: lockedTicket.id,
+            orderId: lockedTicket.relatedOrderId,
             kind: "ticket.customer_replied",
             title: `Customer replied on ${lockedTicket.ticketNumber}`,
             body: `Ticket ${lockedTicket.ticketNumber} has a new customer reply.`,
@@ -694,7 +709,11 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         .where(eq(engagementSupportTickets.id, initialTicket.id))
         .limit(1)
         .for("update");
-      if (!locked || locked.requesterUserId !== principal.userId) {
+      if (
+        !locked ||
+        locked.requesterUserId !== principal.userId ||
+        !(await isLiveTicketRowInTx(tx, locked))
+      ) {
         throw notFound("TICKET_NOT_FOUND");
       }
       if (locked.status === "closed") {
@@ -776,7 +795,11 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         .where(eq(engagementSupportTickets.id, initialTicket.id))
         .limit(1)
         .for("update");
-      if (!locked || locked.requesterUserId !== principal.userId) {
+      if (
+        !locked ||
+        locked.requesterUserId !== principal.userId ||
+        !(await isLiveTicketRowInTx(tx, locked))
+      ) {
         throw notFound("TICKET_NOT_FOUND");
       }
 
@@ -866,6 +889,8 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         await notifications.notify(
           {
             userId: locked.assigneeUserId,
+            ticketId: locked.id,
+            orderId: locked.relatedOrderId,
             kind: "ticket.reopened",
             title: `Ticket ${locked.ticketNumber} reopened`,
             body: `Customer reopened support ticket ${locked.ticketNumber}.`,
@@ -919,6 +944,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
       .from(engagementSupportTickets)
       .where(
         and(
+          liveTicketPredicate(),
           input.status !== undefined ? eq(engagementSupportTickets.status, input.status) : undefined,
           input.priority !== undefined ? eq(engagementSupportTickets.priority, input.priority) : undefined,
           input.category !== undefined ? eq(engagementSupportTickets.category, input.category) : undefined,
@@ -947,15 +973,22 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
       throw forbidden("CAPABILITY_NOT_GRANTED");
     }
     const activeStatuses: TicketStatus[] = ["open", "pending_customer", "pending_staff"];
+    const liveGate = liveTicketPredicate();
     const [openRow, unassignedRow, mineRow] = await Promise.all([
       db
         .select({ total: count(engagementSupportTickets.id) })
         .from(engagementSupportTickets)
-        .where(inArray(engagementSupportTickets.status, activeStatuses)),
+        .where(and(inArray(engagementSupportTickets.status, activeStatuses), liveGate)),
       db
         .select({ total: count(engagementSupportTickets.id) })
         .from(engagementSupportTickets)
-        .where(and(inArray(engagementSupportTickets.status, activeStatuses), isNull(engagementSupportTickets.assigneeUserId))),
+        .where(
+          and(
+            inArray(engagementSupportTickets.status, activeStatuses),
+            isNull(engagementSupportTickets.assigneeUserId),
+            liveGate,
+          ),
+        ),
       db
         .select({ total: count(engagementSupportTickets.id) })
         .from(engagementSupportTickets)
@@ -963,6 +996,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
           and(
             inArray(engagementSupportTickets.status, activeStatuses),
             eq(engagementSupportTickets.assigneeUserId, principal.userId),
+            liveGate,
           ),
         ),
     ]);
@@ -988,7 +1022,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
     const [row] = await db
       .select()
       .from(engagementSupportTickets)
-      .where(eq(engagementSupportTickets.publicId, ticketPublicId))
+      .where(and(eq(engagementSupportTickets.publicId, ticketPublicId), liveTicketPredicate()))
       .limit(1);
     if (!row) {
       throw notFound("TICKET_NOT_FOUND");
@@ -1051,7 +1085,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         .where(eq(engagementSupportTickets.id, precheck.id))
         .limit(1)
         .for("update");
-      if (!locked) {
+      if (!locked || !(await isLiveTicketRowInTx(tx, locked))) {
         throw notFound("TICKET_NOT_FOUND");
       }
 
@@ -1178,6 +1212,8 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         await notifications.notify(
           {
             userId: locked.requesterUserId,
+            ticketId: locked.id,
+            orderId: locked.relatedOrderId,
             kind: "ticket.updated",
             title: `New reply on ticket ${locked.ticketNumber}`,
             body: `Support posted a reply on ticket ${locked.ticketNumber}.`,
@@ -1198,6 +1234,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
                 link: buildCanonicalPortalUrl(config.canonicalOrigin, relativePath),
               },
               idempotencyKey: `ticket-staff-mail:${msgPublicId}:${locked.requesterUserId}`,
+              ...(locked.relatedOrderId !== null ? { orderId: locked.relatedOrderId } : {}),
             },
             tx,
           );
@@ -1260,7 +1297,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         .where(eq(engagementSupportTickets.id, precheck.id))
         .limit(1)
         .for("update");
-      if (!locked) throw notFound("TICKET_NOT_FOUND");
+      if (!locked || !(await isLiveTicketRowInTx(tx, locked))) throw notFound("TICKET_NOT_FOUND");
       if (locked.status === input.toStatus) return locked;
 
       const now = clock.now();
@@ -1315,6 +1352,8 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         await notifications.notify(
           {
             userId: locked.requesterUserId,
+            ticketId: locked.id,
+            orderId: locked.relatedOrderId,
             kind: "ticket.updated",
             title: `Ticket ${locked.ticketNumber} marked ${label.toLowerCase()}`,
             body: `Support updated ticket ${locked.ticketNumber} status to ${label.toLowerCase()}.`,
@@ -1335,6 +1374,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
                 link: buildCanonicalPortalUrl(config.canonicalOrigin, relativePath),
               },
               idempotencyKey: `ticket-status-mail:${locked.publicId}:${locked.version + 1}`,
+              ...(locked.relatedOrderId !== null ? { orderId: locked.relatedOrderId } : {}),
             },
             tx,
           );
@@ -1377,7 +1417,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         const [userRow] = await db
           .select({ id: users.id })
           .from(users)
-          .where(eq(users.publicId, input.assigneeUserId))
+          .where(and(eq(users.publicId, input.assigneeUserId), liveUserPredicate(users)))
           .limit(1);
         if (!userRow) {
           throw validation("INVALID_ASSIGNEE", "Tickets may only be assigned to active staff or administrators.");
@@ -1389,7 +1429,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
     const [precheckTicket] = await db
       .select({ id: engagementSupportTickets.id })
       .from(engagementSupportTickets)
-      .where(eq(engagementSupportTickets.publicId, input.ticketId))
+      .where(and(eq(engagementSupportTickets.publicId, input.ticketId), liveTicketPredicate()))
       .limit(1);
     if (!precheckTicket) {
       throw notFound("TICKET_NOT_FOUND");
@@ -1408,6 +1448,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         if (
           !assigneeRow ||
           assigneeRow.status !== "active" ||
+          !isLiveUserRow(assigneeRow) ||
           (assigneeRow.role !== "staff" && assigneeRow.role !== "admin")
         ) {
           throw validation("INVALID_ASSIGNEE", "Tickets may only be assigned to active staff or administrators.");
@@ -1421,7 +1462,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         .where(eq(engagementSupportTickets.id, precheckTicket.id))
         .limit(1)
         .for("update");
-      if (!locked) throw notFound("TICKET_NOT_FOUND");
+      if (!locked || !(await isLiveTicketRowInTx(tx, locked))) throw notFound("TICKET_NOT_FOUND");
 
       await tx
         .update(engagementSupportTickets)
@@ -1454,6 +1495,8 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         await notifications.notify(
           {
             userId: verifiedAssignee.id,
+            ticketId: locked.id,
+            orderId: locked.relatedOrderId,
             kind: "ticket.assigned",
             title: `Ticket ${locked.ticketNumber} assigned to you`,
             body: `Support ticket ${locked.ticketNumber} has been assigned to you.`,
@@ -1497,7 +1540,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
         .where(eq(engagementSupportTickets.publicId, input.ticketId))
         .limit(1)
         .for("update");
-      if (!locked) throw notFound("TICKET_NOT_FOUND");
+      if (!locked || !(await isLiveTicketRowInTx(tx, locked))) throw notFound("TICKET_NOT_FOUND");
       if (locked.priority === input.priority) return locked;
 
       const now = clock.now();
@@ -1581,13 +1624,15 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
           publicId: users.publicId,
           role: users.role,
           status: users.status,
+          trashedAt: users.trashedAt,
+          purgedAt: users.purgedAt,
         })
         .from(users)
         .where(eq(users.id, input.requesterUserId))
         .limit(1)
         .for("share");
 
-      if (!requester || requester.status !== "active") {
+      if (!requester || requester.status !== "active" || !isLiveUserRow(requester)) {
         throw validation("AUTOMATION_TICKET_REQUESTER_INACTIVE", "Target requester account is not active.");
       }
 
@@ -1601,6 +1646,7 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
           and(
             eq(engagementSupportTickets.requesterUserId, requester.id),
             eq(engagementSupportTickets.idempotencyKey, idempotencyKey),
+            liveTicketPredicate(),
           ),
         )
         .limit(1);
@@ -1612,13 +1658,14 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
       if (input.relatedOrderPublicId) {
         const orders = getOrdersPeer(deps);
         const summary = await orders.getOrderRefByPublicId?.(input.relatedOrderPublicId, tx);
-        if (summary) {
-          relatedOrder = {
-            id: summary.id,
-            publicId: summary.publicId,
-            reference: summary.reference,
-          };
+        if (!summary) {
+          throw notFound("ORDER_NOT_FOUND");
         }
+        relatedOrder = {
+          id: summary.id,
+          publicId: summary.publicId,
+          reference: summary.reference,
+        };
       }
 
       const now = clock.now();

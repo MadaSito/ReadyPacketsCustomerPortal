@@ -17,6 +17,7 @@ import {
   SEARCH_TOKEN_PURPOSE,
   truncateSnippet,
 } from "./textAndSearch.js";
+import { liveOrderMessagePredicate, liveTicketPredicate } from "./trashGate.js";
 import {
   SEARCH_DOMAINS,
   type SearchDomain,
@@ -234,6 +235,7 @@ export function createSearchService(deps: ModuleDeps) {
             .where(
               and(
                 eq(engagementSearchTokens.domain, "ticket"),
+                liveTicketPredicate(),
                 canReadAllTickets ? undefined : eq(engagementSearchTokens.customerVisible, true),
                 canReadAllTickets ? undefined : eq(engagementSupportTickets.requesterUserId, principal.userId),
                 inArray(engagementSearchTokens.tokenHash, queryTokenHashes),
@@ -268,6 +270,7 @@ export function createSearchService(deps: ModuleDeps) {
             .from(engagementSupportTickets)
             .where(
               and(
+                liveTicketPredicate(),
                 canReadAllTickets ? undefined : eq(engagementSupportTickets.requesterUserId, principal.userId),
                 matchCondition,
               ),
@@ -372,6 +375,7 @@ export function createSearchService(deps: ModuleDeps) {
                   .where(
                     and(
                       eq(engagementSearchTokens.domain, "order_message"),
+                      liveOrderMessagePredicate(),
                       canReadAllMessages ? undefined : eq(engagementSearchTokens.customerVisible, true),
                       canReadAllMessages ? undefined : eq(engagementOrderMessages.visibility, "customer"),
                       accessible.all ? undefined : inArray(engagementOrderMessages.orderId, accessible.orderIds),
@@ -404,6 +408,7 @@ export function createSearchService(deps: ModuleDeps) {
                   .from(engagementOrderMessages)
                   .where(
                     and(
+                      liveOrderMessagePredicate(),
                       accessible.all ? undefined : inArray(engagementOrderMessages.orderId, accessible.orderIds),
                       canReadAllMessages ? undefined : eq(engagementOrderMessages.visibility, "customer"),
                       matchCondition,

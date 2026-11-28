@@ -13,6 +13,7 @@ import { users } from "../identity/schema.js";
 import { platformSettings } from "../platform/schema.js";
 import { createSettingsStore } from "../platform/settingsStore.js";
 import { TRIGGER_CATALOGUE } from "../audit/triggerCatalogue.js";
+import { createTrashRegistry, type TrashRegistry } from "../trash/ports.js";
 import { createCommunityModule, type CommunityModule } from "./index.js";
 import { communityRouter } from "./router.js";
 import * as tables from "./schema.js";
@@ -47,6 +48,7 @@ describe("community forum (package M)", () => {
   let tdb: TestDb;
   let h: TestHarness;
   let community: CommunityModule;
+  let trashRegistry: TrashRegistry;
   const notified: { userId: number; kind: string; link?: string | null; title: string; body: string }[] = [];
   let admin: U, staff: U, alice: U, bob: U, carol: U, newbie: U;
   let general: string;
@@ -96,8 +98,11 @@ describe("community forum (package M)", () => {
         return { created: true };
       },
     } as unknown as Services["engagement"];
+    trashRegistry = createTrashRegistry();
+    (h.services as unknown as { trash: TrashRegistry }).trash = trashRegistry;
     community = createCommunityModule(h.deps);
     (h.services as unknown as { community: CommunityModule }).community = community;
+    community.init?.();
 
     admin = await user("admin");
     staff = await user("staff");
@@ -364,6 +369,176 @@ describe("community forum (package M)", () => {
     it("search escapes LIKE wildcards and only returns published content", async () => {
       expect((await community.search(carol.principal, { q: "%%" })).items).toHaveLength(0);
       expect((await community.search(carol.principal, { q: "Packet tips" })).items.map((i) => i.title)).toContain("Packet tips");
+    });
+  });
+
+  describe("trash & permanent erasure — thread integrity model (increment 09)", () => {
+    it("hides trashed customer solo topics, redacts multi-reply threads as 'Deleted account' even for moderators, suppresses notifications, restores cleanly, and purges fail-closed + idempotently", async () => {
+      const participant = trashRegistry.participants().find((p) => p.module === "community");
+      expect(participant).toBeDefined();
+
+      const zeus = await user("customer");
+      const peer = await user("customer");
+      await community.saveProfile(zeus.principal, { displayName: "Zeus Greene" });
+      await community.saveProfile(peer.principal, { displayName: "Peer Reviewer" });
+
+      // 1. Solo topic (0 replies) authored by Zeus
+      const solo = await community.createTopic(zeus.principal, {
+        categoryPublicId: general,
+        title: "Solo Zeus Ice Queen Question",
+        body: "UniqueSoloZeusToken body text",
+        idempotencyKey: key(),
+      });
+
+      // 2. Multi-reply thread opened by Zeus where Peer replies
+      const shared = await community.createTopic(zeus.principal, {
+        categoryPublicId: general,
+        title: "Shared Zeus Packet Thread",
+        body: "UniqueSharedZeusToken opening body",
+        idempotencyKey: key(),
+      });
+      await community.reply(peer.principal, {
+        topicPublicId: shared.topicPublicId,
+        body: "Peer helpful follow-up reply stays intact",
+        idempotencyKey: key(),
+      });
+
+      // 3. Peer opens a topic; Zeus subscribes, reacts helpful, and files a report
+      const peerTopic = await community.createTopic(peer.principal, {
+        categoryPublicId: general,
+        title: "Peer Checklist Discussion",
+        body: "Peer checklist body",
+        idempotencyKey: key(),
+      });
+      await community.setSubscription(zeus.principal, { topicPublicId: peerTopic.topicPublicId, subscribed: true });
+      await community.react(zeus.principal, { postPublicId: peerTopic.postPublicId, helpful: true });
+      await community.report(zeus.principal, {
+        postPublicId: peerTopic.postPublicId,
+        reason: "other",
+        note: "Zeus synthetic report",
+      });
+
+      const zeusProfilePublicId = (await community.status(zeus.principal)).profile!.publicId;
+
+      // Summarize counts Zeus's non-deleted posts
+      const batchId = ulid();
+      const summaryBefore = await participant!.summarize!({
+        kind: "customer",
+        id: zeus.id,
+        publicId: zeus.principal.userPublicId,
+        batchId,
+      });
+      expect(summaryBefore).toEqual({ communityPosts: 2 });
+
+      // Move Zeus to Trash (trashedAt set while status remains active)
+      const now = h.clock.now();
+      await tdb.db.update(users).set({ trashedAt: now }).where(eq(users.id, zeus.id));
+
+      // Trashed actor refused immediately
+      expect(await code(community.status(zeus.principal))).toBe("UNAUTHENTICATED:SESSION_NOT_CURRENT");
+      expect(
+        await code(
+          community.reply(zeus.principal, {
+            topicPublicId: peerTopic.topicPublicId,
+            body: "Blocked while trashed",
+            idempotencyKey: key(),
+          }),
+        ),
+      ).toBe("UNAUTHENTICATED:SESSION_NOT_CURRENT");
+
+      // Solo 0-reply topic is completely hidden from topic lists, getTopic, and search
+      const listWhileTrashed = await community.listTopics(peer.principal, { categoryPublicId: general });
+      expect(listWhileTrashed.items.some((t) => t.publicId === solo.topicPublicId)).toBe(false);
+      expect(await code(community.getTopic(peer.principal, { topicPublicId: solo.topicPublicId }))).toMatch(/^NOT_FOUND:/u);
+      expect(await code(community.getTopic(staff.principal, { topicPublicId: solo.topicPublicId }))).toMatch(/^NOT_FOUND:/u);
+
+      // Multi-reply thread preserves thread integrity: "Deleted topic", "Deleted account", null body even for moderators
+      const sharedSummary = listWhileTrashed.items.find((t) => t.publicId === shared.topicPublicId);
+      expect(sharedSummary?.title).toBe("Deleted topic");
+      expect(sharedSummary?.author.displayName).toBe("Deleted account");
+
+      const sharedAsPeer = await community.getTopic(peer.principal, { topicPublicId: shared.topicPublicId });
+      expect(sharedAsPeer.topic.title).toBe("Deleted topic");
+      expect(sharedAsPeer.posts[0]!.author.displayName).toBe("Deleted account");
+      expect(sharedAsPeer.posts[0]!.body).toBeNull();
+      expect(sharedAsPeer.posts[1]!.body).toBe("Peer helpful follow-up reply stays intact");
+
+      const sharedAsMod = await community.getTopic(staff.principal, { topicPublicId: shared.topicPublicId });
+      expect(sharedAsMod.posts[0]!.author.displayName).toBe("Deleted account");
+      expect(sharedAsMod.posts[0]!.body).toBeNull();
+
+      // Search never leaks trashed author's title or body tokens
+      expect((await community.search(peer.principal, { q: "UniqueSoloZeusToken" })).items).toHaveLength(0);
+      expect((await community.search(peer.principal, { q: "UniqueSharedZeusToken" })).items).toHaveLength(0);
+      expect((await community.search(peer.principal, { q: "Zeus" })).items).toHaveLength(0);
+
+      // Subscriber notifications skip trashed users
+      notified.length = 0;
+      await community.reply(carol.principal, {
+        topicPublicId: peerTopic.topicPublicId,
+        body: "Carol reply while Zeus is trashed",
+        idempotencyKey: key(),
+      });
+      expect(notified.some((n) => n.userId === zeus.id)).toBe(false);
+
+      // Moderation suspend treats trashed member as not found
+      expect(
+        await code(community.suspend(staff.principal, { memberPublicId: zeusProfilePublicId, days: 3, reason: "n/a" })),
+      ).toMatch(/^NOT_FOUND:/u);
+
+      // Restore Zeus -> solo topic and shared opening body reappear intact
+      await tdb.db.update(users).set({ trashedAt: null }).where(eq(users.id, zeus.id));
+      const restoredSolo = await community.getTopic(peer.principal, { topicPublicId: solo.topicPublicId });
+      expect(restoredSolo.topic.title).toBe("Solo Zeus Ice Queen Question");
+      expect(restoredSolo.posts[0]!.body).toBe("UniqueSoloZeusToken body text");
+      const restoredShared = await community.getTopic(peer.principal, { topicPublicId: shared.topicPublicId });
+      expect(restoredShared.topic.title).toBe("Shared Zeus Packet Thread");
+      expect(restoredShared.posts[0]!.author.displayName).toBe("Zeus Greene");
+      expect(restoredShared.posts[0]!.body).toBe("UniqueSharedZeusToken opening body");
+
+      // Re-trash Zeus and verify fail-closed purge guard before purgeStartedAt
+      const runMeta = { runId: ulid() };
+      await tdb.db.update(users).set({ trashedAt: now }).where(eq(users.id, zeus.id));
+      await expect(
+        participant!.purge!(
+          { kind: "customer", id: zeus.id, publicId: zeus.principal.userPublicId, batchId },
+          runMeta,
+        ),
+      ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "PURGE_NOT_STARTED" });
+
+      // Authorize purgeStartedAt and execute purge (thread integrity model)
+      await tdb.db.update(users).set({ purgeStartedAt: now, purgedAt: now }).where(eq(users.id, zeus.id));
+      const firstPurge = await participant!.purge!(
+        { kind: "customer", id: zeus.id, publicId: zeus.principal.userPublicId, batchId },
+        runMeta,
+      );
+      expect(firstPurge.deleted.communityPosts).toBe(2);
+      expect(firstPurge.deleted.communityReactions).toBe(1);
+      expect(firstPurge.deleted.communityReports).toBe(1);
+
+      // Verify raw DB rows: post bodies erased to "", profile overwritten to "Deleted account", peer reply intact
+      const zeusPosts = await tdb.db.select().from(tables.communityPosts).where(eq(tables.communityPosts.authorUserId, zeus.id));
+      expect(zeusPosts.every((p) => p.bodyText === "" && p.state === "deleted")).toBe(true);
+      const [zeusProfileRow] = await tdb.db.select().from(tables.communityProfiles).where(eq(tables.communityProfiles.userId, zeus.id));
+      expect(zeusProfileRow?.displayName).toBe("Deleted account");
+      expect(zeusProfileRow?.anonymised).toBe(true);
+
+      const afterPurgeShared = await community.getTopic(peer.principal, { topicPublicId: shared.topicPublicId });
+      expect(afterPurgeShared.topic.title).toBe("Deleted topic");
+      expect(afterPurgeShared.posts[0]!.author.displayName).toBe("Deleted account");
+      expect(afterPurgeShared.posts[0]!.body).toBeNull();
+      expect(afterPurgeShared.posts[1]!.body).toBe("Peer helpful follow-up reply stays intact");
+
+      // Peer post helpful count decremented when Zeus's reaction was erased
+      const afterPurgePeerTopic = await community.getTopic(peer.principal, { topicPublicId: peerTopic.topicPublicId });
+      expect(afterPurgePeerTopic.posts[0]!.helpfulCount).toBe(0);
+
+      // Second purge is idempotent
+      const secondPurge = await participant!.purge!(
+        { kind: "customer", id: zeus.id, publicId: zeus.principal.userPublicId, batchId },
+        runMeta,
+      );
+      expect(secondPurge.deleted).toEqual({});
     });
   });
 

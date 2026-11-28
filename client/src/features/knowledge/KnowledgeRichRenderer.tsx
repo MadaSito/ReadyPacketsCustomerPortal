@@ -11,7 +11,7 @@ import type {
   KnowledgeSnippetSegment,
 } from "@server/modules/knowledge/types";
 import { Link } from "wouter";
-import { CodeBlock } from "@/ui";
+import { CodeBlock, EmailLink } from "@/ui";
 
 function renderInlineNodes(nodes: readonly KnowledgeInlineNode[], keyPrefix: string): ReactNode {
   return nodes.map((node, idx) => {
@@ -52,6 +52,17 @@ function renderInlineNodes(nodes: readonly KnowledgeInlineNode[], keyPrefix: str
             >
               {renderInlineNodes(node.children, key)}
             </Link>
+          );
+        }
+        if (node.href.toLowerCase().startsWith("mailto:")) {
+          return (
+            <EmailLink
+              key={key}
+              email={node.href.slice("mailto:".length)}
+              className="font-medium"
+            >
+              {node.children.length > 0 ? renderInlineNodes(node.children, key) : undefined}
+            </EmailLink>
           );
         }
         return (

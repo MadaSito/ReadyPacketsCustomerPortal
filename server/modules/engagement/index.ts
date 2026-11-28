@@ -13,6 +13,7 @@ import { createPortableEngagementService } from "./portableService.js";
 import { createTicketsApiProvider } from "./publicApiProvider.js";
 import { createSearchService, type SearchService } from "./searchService.js";
 import { createTicketsService, type TicketsService } from "./ticketsService.js";
+import { createEngagementTrashParticipant } from "./trash.js";
 import type { PublicApiProviders } from "../publicApi/ports.js";
 import type {
   ImportOrderMessageInput,
@@ -119,7 +120,9 @@ export function createEngagementModule(deps: ModuleDeps): EngagementModule {
   const search = createSearchService(deps);
   const portable = createPortableEngagementService(deps);
   const publicApiProvider = createTicketsApiProvider(deps);
+  const trashParticipant = createEngagementTrashParticipant(deps, notifications);
   let providerRegistered = false;
+  let trashRegistered = false;
 
   deps.jobs.register(
     NOTIFICATIONS_RETENTION_JOB_TYPE,
@@ -193,6 +196,10 @@ export function createEngagementModule(deps: ModuleDeps): EngagementModule {
           pubApi.registerProvider("tickets", publicApiProvider);
           providerRegistered = true;
         }
+      }
+      if (!trashRegistered && deps.services.trash?.register) {
+        deps.services.trash.register(trashParticipant);
+        trashRegistered = true;
       }
     },
     health,

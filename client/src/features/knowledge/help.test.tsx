@@ -97,7 +97,13 @@ const art1Detail = {
       children: [
         { kind: "text" as const, text: "Scan PDFs at " },
         { kind: "strong" as const, children: [{ kind: "text" as const, text: "300 DPI" }] },
-        { kind: "text" as const, text: " for clear exhibit review." },
+        { kind: "text" as const, text: " for clear exhibit review, or contact " },
+        {
+          kind: "link" as const,
+          href: "mailto:support-desk@synthetic.test",
+          children: [{ kind: "text" as const, text: "support-desk@synthetic.test" }],
+        },
+        { kind: "text" as const, text: "." },
       ],
     },
   ],
@@ -287,5 +293,14 @@ describe("Customer Help Centre (`/help*`) — WCAG 2.2 AA & behaviour", () => {
         ),
       ).toBe(true);
     });
+  });
+
+  it("renders mailto contact links via shared EmailLink with underlined accessible address", async () => {
+    renderHelpAt("/help/articles/preparing-exhibits");
+    await screen.findByRole("heading", { level: 1, name: "Preparing Exhibits for Your Packet" });
+
+    const mailLink = await screen.findByRole("link", { name: "support-desk@synthetic.test" });
+    expect(mailLink.getAttribute("href")).toBe("mailto:support-desk@synthetic.test");
+    expect(mailLink.hasAttribute("data-rp-email-link")).toBe(true);
   });
 });

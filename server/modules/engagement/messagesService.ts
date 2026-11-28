@@ -5,6 +5,7 @@ import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
 import { ULID_PATTERN, ulid } from "../../core/ids.js";
 import type { SessionPrincipal } from "../../core/types.js";
+import { isLiveUserRow } from "../identity/live.js";
 import { buildCanonicalPortalUrl, MAIL_ORDER_MESSAGE_RECEIVED } from "./mail.js";
 import type { NotificationsService } from "./notificationsService.js";
 import { assertCurrentActorInTx, getFilesPeer, getIdentityPeer, getOrdersPeer } from "./peers.js";
@@ -15,6 +16,7 @@ import {
   engagementSearchTokens,
 } from "./schema.js";
 import { computeSearchTokenHashes, decodeIdCursor, encodeIdCursor, normalizePlainText, truncateSnippet } from "./textAndSearch.js";
+import { liveOrderMessagePredicate } from "./trashGate.js";
 import type { OrderMessageVisibility } from "./types.js";
 
 export interface MessageAttachmentView {
@@ -95,7 +97,7 @@ export function createMessagesService(deps: ModuleDeps, notifications: Notificat
         }
       } else {
         const sample = rows.find((r) => r.authorUserId === userId);
-        labels.set(userId, sample?.authorRole === "customer" ? "Customer" : "ReadyPackets Team");
+        labels.set(userId, sample?.authorRole === "customer" ? "Deleted account" : "ReadyPackets Team");
       }
     }
     return labels;
@@ -245,6 +247,7 @@ export function createMessagesService(deps: ModuleDeps, notifications: Notificat
       .where(
         and(
           eq(engagementOrderMessages.orderId, order.id),
+          liveOrderMessagePredicate(),
           allowInternal ? undefined : eq(engagementOrderMessages.visibility, "customer"),
           beforeId !== undefined ? lt(engagementOrderMessages.id, beforeId) : undefined,
         ),
@@ -350,7 +353,7 @@ export function createMessagesService(deps: ModuleDeps, notifications: Notificat
     const tokenHashes = computeSearchTokenHashes(crypto, [body]);
 
     const committedRow = await db.transaction(async (tx) => {
-      await assertCurrentActorInTx(deps, principal, tx, {
+      const lockedUsers = await assertCurrentActorInTx(deps, principal, tx, {
         capability: visibility === "internal" ? "messages.read_all" : undefined,
         extraLockUserIds: [precheckOrder.ownerUserId],
       });
@@ -439,11 +442,19 @@ export function createMessagesService(deps: ModuleDeps, notifications: Notificat
       );
 
       // Notify order owner when someone else posts a customer-visible message (never for internal staff notes).
-      if (visibility === "customer" && order.ownerUserId !== principal.userId) {
+      const ownerSummary = lockedUsers.get(order.ownerUserId);
+      if (
+        visibility === "customer" &&
+        order.ownerUserId !== principal.userId &&
+        ownerSummary &&
+        ownerSummary.status === "active" &&
+        isLiveUserRow(ownerSummary)
+      ) {
         const relativePath = `/orders/${order.publicId}`;
         await notifications.notify(
           {
             userId: order.ownerUserId,
+            orderId: order.id,
             kind: "message.received",
             title: `New message on order ${order.reference}`,
             body: `You have a new message on order ${order.reference}.`,
@@ -464,6 +475,7 @@ export function createMessagesService(deps: ModuleDeps, notifications: Notificat
                 link: buildCanonicalPortalUrl(config.canonicalOrigin, relativePath),
               },
               idempotencyKey: `order-msg-mail:${publicId}:${order.ownerUserId}`,
+              orderId: order.id,
             },
             tx,
           );
@@ -503,6 +515,7 @@ export function createMessagesService(deps: ModuleDeps, notifications: Notificat
           and(
             eq(engagementOrderMessages.orderId, order.id),
             eq(engagementOrderMessages.publicId, input.upToMessageId),
+            liveOrderMessagePredicate(),
           ),
         )
         .limit(1);
@@ -518,6 +531,7 @@ export function createMessagesService(deps: ModuleDeps, notifications: Notificat
       .where(
         and(
           eq(engagementOrderMessages.orderId, order.id),
+          liveOrderMessagePredicate(),
           ne(engagementOrderMessages.authorUserId, principal.userId),
           allowInternal ? undefined : eq(engagementOrderMessages.visibility, "customer"),
           maxMessageId !== undefined ? lte(engagementOrderMessages.id, maxMessageId) : undefined,
@@ -575,6 +589,7 @@ export function createMessagesService(deps: ModuleDeps, notifications: Notificat
         .where(
           and(
             eq(engagementOrderMessages.orderId, order.id),
+            liveOrderMessagePredicate(),
             ne(engagementOrderMessages.authorUserId, principal.userId),
             allowInternal ? undefined : eq(engagementOrderMessages.visibility, "customer"),
           ),
@@ -614,6 +629,7 @@ export function createMessagesService(deps: ModuleDeps, notifications: Notificat
       .where(
         and(
           accessible.all ? undefined : inArray(engagementOrderMessages.orderId, accessible.orderIds),
+          liveOrderMessagePredicate(),
           ne(engagementOrderMessages.authorUserId, principal.userId),
           allowInternal ? undefined : eq(engagementOrderMessages.visibility, "customer"),
         ),
@@ -675,6 +691,7 @@ export function createMessagesService(deps: ModuleDeps, notifications: Notificat
       .where(
         and(
           accessible.all ? undefined : inArray(engagementOrderMessages.orderId, accessible.orderIds),
+          liveOrderMessagePredicate(),
           ne(engagementOrderMessages.authorUserId, principal.userId),
           allowInternal ? undefined : eq(engagementOrderMessages.visibility, "customer"),
         ),
@@ -754,6 +771,7 @@ export function createMessagesService(deps: ModuleDeps, notifications: Notificat
       .where(
         and(
           accessible.all ? undefined : inArray(engagementOrderMessages.orderId, accessible.orderIds),
+          liveOrderMessagePredicate(),
           allowInternal ? undefined : eq(engagementOrderMessages.visibility, "customer"),
           beforeId !== undefined ? lt(engagementOrderMessages.id, beforeId) : undefined,
         ),
@@ -874,6 +892,7 @@ export function createMessagesService(deps: ModuleDeps, notifications: Notificat
       .from(engagementOrderMessages)
       .where(
         and(
+          liveOrderMessagePredicate(),
           filterOrderId !== undefined ? eq(engagementOrderMessages.orderId, filterOrderId) : undefined,
           input.visibility !== undefined ? eq(engagementOrderMessages.visibility, input.visibility) : undefined,
           beforeId !== undefined ? lt(engagementOrderMessages.id, beforeId) : undefined,

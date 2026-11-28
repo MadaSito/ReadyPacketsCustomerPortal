@@ -37,6 +37,8 @@ import type {
 import type { StagedUpload } from "../files/index.js";
 import { fileRulesSetting, type FileRules } from "../files/settings.js";
 import { isFlagEnabled, readSetting, writeSetting } from "../platform/settingsRegistry.js";
+import { liveUserPredicate } from "../identity/live.js";
+import { users } from "../identity/schema.js";
 import type {
   ApiCaller,
   ApiListQuery,
@@ -75,6 +77,7 @@ import {
   tokenizeSearchQuery,
 } from "./search.js";
 import { KNOWLEDGE_CONFIG, KNOWLEDGE_FLAG } from "./settings.js";
+import { createKnowledgeTrashParticipant } from "./trash.js";
 import type {
   KnowledgeAdminArticleDetailView,
   KnowledgeArticleDetailView,
@@ -1387,6 +1390,7 @@ export function createKnowledgeService(deps: ModuleDeps): KnowledgeModule {
       const [yesAgg] = await tx
         .select({ c: count() })
         .from(knowledgeArticleFeedback)
+        .innerJoin(users, and(eq(users.id, knowledgeArticleFeedback.userId), liveUserPredicate(users)))
         .where(
           and(
             eq(knowledgeArticleFeedback.articleId, article.id),
@@ -1396,6 +1400,7 @@ export function createKnowledgeService(deps: ModuleDeps): KnowledgeModule {
       const [noAgg] = await tx
         .select({ c: count() })
         .from(knowledgeArticleFeedback)
+        .innerJoin(users, and(eq(users.id, knowledgeArticleFeedback.userId), liveUserPredicate(users)))
         .where(
           and(
             eq(knowledgeArticleFeedback.articleId, article.id),
@@ -3002,6 +3007,7 @@ export function createKnowledgeService(deps: ModuleDeps): KnowledgeModule {
       })
       .from(knowledgeArticleFeedback)
       .innerJoin(knowledgeArticles, eq(knowledgeArticleFeedback.articleId, knowledgeArticles.id))
+      .innerJoin(users, and(eq(users.id, knowledgeArticleFeedback.userId), liveUserPredicate(users)))
       .orderBy(desc(knowledgeArticleFeedback.updatedAt))
       .limit(30);
 
@@ -3202,7 +3208,9 @@ export function createKnowledgeService(deps: ModuleDeps): KnowledgeModule {
     payload: {},
   });
 
+  const trashParticipant = createKnowledgeTrashParticipant(deps);
   let providerRegistered = false;
+  let trashRegistered = false;
 
   return {
     enabled,
@@ -3253,6 +3261,10 @@ export function createKnowledgeService(deps: ModuleDeps): KnowledgeModule {
           pubApi.registerProvider("knowledge", publicApiProvider);
           providerRegistered = true;
         }
+      }
+      if (!trashRegistered && deps.services.trash?.register) {
+        deps.services.trash.register(trashParticipant);
+        trashRegistered = true;
       }
     },
 
