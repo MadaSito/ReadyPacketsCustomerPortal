@@ -280,6 +280,15 @@ describe("order activity port (real MySQL)", () => {
     expect(classifyOrderEvent("promotion.attempts_blocked")).toBeNull();
   });
 
+  it("increment 09: trash events are staff-only status entries with plain labels", () => {
+    expect(classifyOrderEvent("order.trashed")).toMatchObject({ category: "status", label: "Moved to trash", customer: false });
+    expect(classifyOrderEvent("order.restored")).toMatchObject({ category: "status", label: "Restored from trash", customer: false });
+    expect(classifyOrderEvent("order.purge_started")).toMatchObject({ category: "status", label: "Permanent deletion started", customer: false });
+    expect(classifyOrderEvent("order.purged")).toMatchObject({ category: "status", label: "Deleted permanently", customer: false });
+    expect(classifyOrderEvent("customer.trashed")).toMatchObject({ customer: false });
+    expect(classifyOrderEvent("order.purge_external_left")).toMatchObject({ category: "status", customer: false });
+  });
+
   it("increment 07: customers see phase steps, questions and payment state; runs, completions and checklists stay staff-only", () => {
     for (const name of ["order.stage.advanced", "order.stage.submitted", "order.stage.reviewed", "order.stage.reopened", "order.question.asked", "order.question.answered"])
       expect(classifyOrderEvent(name)).toMatchObject({ category: "phases", customer: true });

@@ -262,3 +262,19 @@ Audit owns the names; each owner emits its events (`deps.audit.record`, snake_ca
 Fields are safe attributes only: `stage_key`, `payment_state`, `questionnaire_slug`, `revision_number`, `order_public_id`. Intake answers are never fields. `automations.catalogue` gets the option lists (statuses, phases, payment outcomes) from the owners' resolvers (engagement).
 
 **Package E client (D4)**: the customer order page wizard composes `OrderProgress` and the stepper (ui_foundation), `StageQuestions` (assurance), `PhaseUploadPanel` and `PhaseTeamFiles` (files) on `orders.stages.{workspace,next,submit}` (orders). It has no server code and no schema.
+
+## Increment 09 — trash event names (D2.3)
+
+Emitter: recovery_ops (`server/modules/trash`). Status: **confirmed** by recovery_ops. Public ids and counts only — never names, e-mail addresses, file names or bodies. Correlation id = the trash batch id; a purge also carries `run_public_id`. The audit centre filters them with Category = Administration and Event name *starts with* `order.`, `customer.` or `trash.`.
+
+| Event | Category, outcome, severity | Key attributes |
+| --- | --- | --- |
+| `order.trashed`, `customer.trashed` | admin, completed, INFO | `order_public_id` / `customer_public_id`, `trash_batch_id`, `reason_present` (boolean; the free-text reason stays in the trash record, never in audit/SIEM), `cascaded_orders` (customer) |
+| `order.restored`, `customer.restored` | admin, completed (or refused + `reason_code`), INFO | public id, `trash_batch_id`, `reason_code` (`RESTORE_CONFLICT`, `OWNER_IN_TRASH`, `ROOT_IN_TRASH`, `PURGE_IN_PROGRESS`) |
+| `order.purge_started`, `customer.purge_started` | admin, attempted, WARN | public id, `trash_batch_id`, `run_public_id`, `trigger` (`administrator`, `auto_cleanup`), `bulk_count` |
+| `order.purged`, `customer.purged` | admin, completed or failed, WARN | public id, `trash_batch_id`, `run_public_id`, `safeCounts` (numeric erased counts per participant), `reason_code` on failure |
+| `order.purge_external_left`, `customer.purge_external_left` | admin, completed, WARN | public id, `trash_batch_id`, `run_public_id`, `kept_count`, `connection_public_ids` (comma-joined public ids) — the administrator finished a run stopped with `EXTERNAL_COPIES_UNREACHABLE` |
+| `trash.retention_changed` | admin, completed, WARN when it shortens or turns clean-up on | `auto_purge_enabled`, `order_days`, `customer_days`, `from_*`, `reviewed_due_count`, `settings_version` |
+| `trash.cleanup_completed` | job, completed or failed, INFO (WARN when failed) | `run_public_id`, `purged`, `failed`, `due` |
+
+Order history (`orderActivity.ts`): `order.trashed`, `order.restored`, `order.purge_started`, `order.purged`, `customer.trashed`, `customer.restored` are **staff-only** entries under the `status` category ("Moved to trash", "Restored from trash", "Permanent deletion started", "Deleted permanently"). A purge erases the order's history; the audit centre keeps the events (no personal data).
