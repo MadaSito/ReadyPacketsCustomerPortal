@@ -5,8 +5,21 @@
  */
 import type { ModuleDeps } from "../../container.js";
 import type { ModuleLifecycle } from "../../core/types.js";
+import "./settings.js";
 import { createTrashRegistry, type TrashRegistry } from "./ports.js";
 
+export {
+  TRASH_JOB_RETENTION_CLEANUP,
+  TRASH_SCHEDULE_RETENTION_EVERY_HOUR,
+} from "./jobNames.js";
+export {
+  TRASH_AUTO_PURGE_ENABLED,
+  TRASH_RETENTION_CUSTOMER_DAYS,
+  TRASH_RETENTION_DEFAULT_DAYS,
+  TRASH_RETENTION_MAX_DAYS,
+  TRASH_RETENTION_MIN_DAYS,
+  TRASH_RETENTION_ORDER_DAYS,
+} from "./settings.js";
 export type {
   TrashActor,
   TrashEntityKind,
