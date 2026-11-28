@@ -10,13 +10,15 @@
  * Synthetic fixtures only (`Zeus Greene`, `RPCUS-A1B2CJJG5`, project `Ice Queen`).
  */
 import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/mysql2";
+import mysql from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createTestDeps, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import type { Services } from "../../container.js";
 import { conflict, type DomainError } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
-import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
+import type { Db, DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { createBillingProfileModule } from "../billingProfile/index.js";
 import * as billingProfileTables from "../billingProfile/schema.js";
 import { createComplianceModule } from "../compliance/index.js";
@@ -27,6 +29,7 @@ import { users } from "../identity/schema.js";
 import { createOrdersModule, type OrdersModule } from "../orders/index.js";
 import * as orderTables from "../orders/schema.js";
 import { FakeEngagement, FakeFiles, fakeIdentity, insertUser, type TestUser } from "../orders/testSupport.js";
+import { createPaymentsModule } from "../payments/index.js";
 import * as paymentsTables from "../payments/schema.js";
 import * as platformTables from "../platform/schema.js";
 import { createPromotionsModule } from "../promotions/index.js";
@@ -586,5 +589,238 @@ describe("Increment 09 — Cart TrashParticipant & trashed customer/order guards
       .from(cartTables.carts)
       .where(eq(cartTables.carts.ownerUserId, purgeOrderBuyer.id));
     expect(remainingCarts).toHaveLength(0);
+  });
+
+  it("gates `checkout` idempotent replay on live order when trashed and never falls through to fresh checkout after order-link scrub", async () => {
+    const replayBuyer = await insertUser(h, t.db, { role: "customer" });
+    await t.db.update(users).set({ customerRef: "RPCUS-RPLY30009" }).where(eq(users.id, replayBuyer.id));
+
+    const firstOpen = await cartMod.addItems(replayBuyer.principal, {
+      items: [{ productPublicId: packet1ProductId, quantity: 1 }],
+      projectName: "Ice Queen Replay",
+    });
+    const sharedIdemKey = `inc09-idem-replay-${ulid()}`;
+    const firstCheckout = await cartMod.checkout(replayBuyer.principal, {
+      cartPublicId: firstOpen.cartPublicId!,
+      expectedVersion: firstOpen.version,
+      projectName: "Ice Queen Replay",
+      billing: ZEUS_BILLING,
+      idempotencyKey: sharedIdemKey,
+    });
+
+    // Live replay returns the same committed order/invoice.
+    const liveReplay = await cartMod.checkout(replayBuyer.principal, {
+      cartPublicId: firstOpen.cartPublicId!,
+      expectedVersion: firstOpen.version,
+      projectName: "Ice Queen Replay",
+      billing: ZEUS_BILLING,
+      idempotencyKey: sharedIdemKey,
+    });
+    expect(liveReplay.orderPublicId).toBe(firstCheckout.orderPublicId);
+
+    // Move order to Trash -> idempotent replay rejects with `NOT_FOUND:CART_NOT_FOUND` (does not replay startCheckout).
+    const moved = await trashMod.moveToTrash(admin.principal, {
+      kind: "order",
+      publicId: firstCheckout.orderPublicId,
+      idempotencyKey: `inc09-move-replay-${ulid()}`,
+    });
+
+    await expect(
+      cartMod.checkout(replayBuyer.principal, {
+        cartPublicId: firstOpen.cartPublicId!,
+        expectedVersion: firstOpen.version,
+        projectName: "Ice Queen Replay",
+        billing: ZEUS_BILLING,
+        idempotencyKey: sharedIdemKey,
+      }),
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      reasonCode: "CART_NOT_FOUND",
+    } satisfies Partial<DomainError>);
+
+    // Permanently delete order (`cart.purge` scrubs `checkoutOrderId`/`checkoutOrderPublicId`/`checkoutOrderReference`),
+    // open a brand-new cart, and replay the scrubbed `sharedIdemKey` -> MUST still fail closed with `CART_NOT_FOUND`
+    // and NEVER fall through to create a second order!
+    const purged = await trashMod.purge(admin.principal, {
+      items: [{ kind: "order", publicId: firstCheckout.orderPublicId, batchId: moved.batchId }],
+      confirmation: firstCheckout.orderReference,
+      idempotencyKey: `inc09-purge-replay-${ulid()}`,
+    });
+    expect(purged.results[0]?.ok).toBe(true);
+
+    const freshOpen = await cartMod.addItems(replayBuyer.principal, {
+      items: [{ productPublicId: packet2ProductId, quantity: 1 }],
+      projectName: "Ice Queen Fresh",
+    });
+
+    await expect(
+      cartMod.checkout(replayBuyer.principal, {
+        cartPublicId: freshOpen.cartPublicId!,
+        expectedVersion: freshOpen.version,
+        projectName: "Ice Queen Fresh",
+        billing: ZEUS_BILLING,
+        idempotencyKey: sharedIdemKey,
+      }),
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      reasonCode: "CART_NOT_FOUND",
+    } satisfies Partial<DomainError>);
+
+    const [stillOpenCart] = await t.db
+      .select()
+      .from(cartTables.carts)
+      .where(eq(cartTables.carts.publicId, freshOpen.cartPublicId!));
+    expect(stillOpenCart?.status).toBe("open");
+  });
+
+  it("holds `users FOR SHARE` in `expireAbandonedCarts` so an in-flight customer trash prevents irreversible cart expiry", async () => {
+    const racingBuyer = await insertUser(h, t.db, { role: "customer" });
+    const racingCart = await cartMod.addItems(racingBuyer.principal, {
+      items: [{ productPublicId: packet1ProductId, quantity: 1 }],
+      projectName: "Ice Queen Lock Race",
+    });
+    const staleDate = new Date(h.clock.now().getTime() - 200 * 3_600_000);
+    await t.db
+      .update(cartTables.carts)
+      .set({ lastActivityAt: staleDate, updatedAt: staleDate })
+      .where(eq(cartTables.carts.publicId, racingCart.cartPublicId!));
+
+    // Hold `users FOR UPDATE` on a separate connection (simulating `moveCustomerToTrash` committing after snapshot),
+    // start `expireAbandonedCarts()` concurrently so it blocks on `users FOR SHARE`, then commit `trashed_at` and release.
+    let releaseOwnerLock!: () => void;
+    const ownerLockHeld = new Promise<void>((resolve) => {
+      releaseOwnerLock = resolve;
+    });
+    let markLocked!: () => void;
+    const ownerLockedReady = new Promise<void>((resolve) => {
+      markLocked = resolve;
+    });
+
+    const trashTxPromise = t.db.transaction(async (tx) => {
+      await tx.select({ id: users.id }).from(users).where(eq(users.id, racingBuyer.id)).for("update");
+      markLocked();
+      await ownerLockHeld;
+      await tx
+        .update(users)
+        .set({ trashedAt: h.clock.now(), trashedByUserId: admin.id, trashBatchId: ulid() })
+        .where(eq(users.id, racingBuyer.id));
+    });
+
+    await ownerLockedReady;
+    const expirePromise = cartMod.expireAbandonedCarts();
+    // Give `expireAbandonedCarts` a moment to take its snapshot and block waiting for `users FOR SHARE`.
+    await new Promise((r) => setTimeout(r, 80));
+    releaseOwnerLock();
+
+    await trashTxPromise;
+    await expirePromise;
+
+    const [afterRace] = await t.db
+      .select()
+      .from(cartTables.carts)
+      .where(eq(cartTables.carts.publicId, racingCart.cartPublicId!));
+    expect(afterRace?.status).toBe("open");
+  });
+
+  it("completes unpaid `restoreCheckout` and rejects paid invoices on a `connectionLimit: 1` pool with real `PaymentsModule` without deadlocking", async () => {
+    const singlePool = mysql.createPool({
+      uri: t.url,
+      connectionLimit: 1,
+      timezone: "Z",
+      supportBigNumbers: true,
+      charset: "utf8mb4",
+    });
+    try {
+      const singleDb = drizzle(singlePool, { schema: testSchema, mode: "default" }) as unknown as Db;
+      const singleHarness = createTestDeps({ db: singleDb });
+      singleHarness.settings.flags.add(CART_FEATURE_FLAG.flag);
+
+      singleHarness.services.opsAlerts = h.services.opsAlerts;
+      singleHarness.services.assurance = h.services.assurance;
+      singleHarness.services.jobAdmin = h.services.jobAdmin;
+      const singleIdentity = createIdentityModule(singleHarness.deps);
+      const singleOrders = createOrdersModule(singleHarness.deps);
+      const singleCompliance = createComplianceModule(singleHarness.deps);
+      const singleBilling = createBillingProfileModule(singleHarness.deps);
+      const singlePromos = createPromotionsModule(singleHarness.deps);
+      const singlePayments = createPaymentsModule(singleHarness.deps);
+      const singleCart = createCartModule(singleHarness.deps);
+
+      const singleFakeIdent = fakeIdentity(singleHarness, singleDb);
+      singleHarness.services.identity = {
+        ...singleFakeIdent,
+        users: singleIdentity.users,
+        trash: singleIdentity.trash,
+      } as unknown as Services["identity"];
+      singleHarness.services.orders = singleOrders;
+      singleHarness.services.compliance = singleCompliance;
+      singleHarness.services.billingProfile = singleBilling;
+      singleHarness.services.promotions = singlePromos;
+      singleHarness.services.payments = singlePayments;
+      singleHarness.services.cart = singleCart;
+      singleHarness.services.files = h.services.files;
+      singleHarness.services.engagement = h.services.engagement;
+
+      const singleBuyer = await insertUser(singleHarness, singleDb, { role: "customer" });
+      await singleDb.update(users).set({ customerRef: "RPCUS-POOL10009" }).where(eq(users.id, singleBuyer.id));
+
+      // 1. Unpaid checkout restores cleanly on a 1-connection pool without deadlocking.
+      const unpaidOpen = await singleCart.addItems(singleBuyer.principal, {
+        items: [{ productPublicId: packet1ProductId, quantity: 1 }],
+        projectName: "Ice Queen Pool1 Unpaid",
+      });
+      await singleCart.checkout(singleBuyer.principal, {
+        cartPublicId: unpaidOpen.cartPublicId!,
+        expectedVersion: unpaidOpen.version,
+        projectName: "Ice Queen Pool1 Unpaid",
+        billing: ZEUS_BILLING,
+        idempotencyKey: `inc09-pool1-unpaid-${ulid()}`,
+      });
+
+      const restoredUnpaid = await singleCart.restoreCheckout(singleBuyer.principal, {
+        cartPublicId: unpaidOpen.cartPublicId!,
+      });
+      expect(restoredUnpaid.restored).toBe(true);
+      expect(restoredUnpaid.cart.items).toHaveLength(1);
+
+      // 2. Settled invoice (`compliance_invoices.status = "paid"`, zero `payment_attempts` rows, cart still `"awaiting_payment"`)
+      //    is caught inside `tx` via `compliance.getInvoiceForCheckout` on the 1-connection pool without deadlocking.
+      const paidCheckout = await singleCart.checkout(singleBuyer.principal, {
+        cartPublicId: restoredUnpaid.cart.cartPublicId!,
+        expectedVersion: restoredUnpaid.cart.version,
+        projectName: "Ice Queen Pool1 Paid",
+        billing: ZEUS_BILLING,
+        idempotencyKey: `inc09-pool1-paid-${ulid()}`,
+      });
+      const [paidInv] = await singleDb
+        .select()
+        .from(complianceTables.complianceInvoices)
+        .where(eq(complianceTables.complianceInvoices.publicId, paidCheckout.invoicePublicId));
+      await singleDb.insert(complianceTables.complianceInvoicePayments).values({
+        publicId: ulid(),
+        invoiceId: paidInv!.id,
+        method: "bank_transfer",
+        status: "succeeded",
+        amountMinor: paidInv!.totalMinor,
+        waivedMinor: 0,
+        currency: paidInv!.currency,
+        reference: "WIRE-INC09-POOL1",
+        receivedAt: singleHarness.clock.now(),
+        recordedByUserId: admin.id,
+        idempotencyKey: `inc09-wire-${ulid()}`,
+        createdAt: singleHarness.clock.now(),
+      });
+
+      await expect(
+        singleCart.restoreCheckout(singleBuyer.principal, {
+          cartPublicId: restoredUnpaid.cart.cartPublicId!,
+        }),
+      ).rejects.toMatchObject({
+        code: "CONFLICT",
+        reasonCode: "CHECKOUT_ALREADY_PAID",
+      } satisfies Partial<DomainError>);
+    } finally {
+      await singlePool.end();
+    }
   });
 });

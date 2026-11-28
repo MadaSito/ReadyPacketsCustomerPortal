@@ -25,21 +25,11 @@ import type {
 } from "../trash/ports.js";
 import { cartItems, carts, type CartRow } from "./schema.js";
 
-function isMissingTableError(err: unknown): boolean {
-  if (!err || typeof err !== "object") return false;
-  const e = err as { code?: unknown; errno?: unknown; cause?: unknown };
-  if (e.code === "ER_NO_SUCH_TABLE" || e.errno === 1146) return true;
-  if (e.cause && typeof e.cause === "object") {
-    const c = e.cause as { code?: unknown; errno?: unknown };
-    return c.code === "ER_NO_SUCH_TABLE" || c.errno === 1146;
-  }
-  return false;
-}
-
 /**
  * Returns `true` iff a checked-out cart still points to a live (neither trashed nor tombstoned) order.
- * When `opts.forShare` is set, acquires `FOR SHARE` on `orders` (call BEFORE locking `carts` to preserve
- * `users -> orders -> carts` lock order).
+ * Fails closed when order links were scrubbed or the `orders` row is trashed, tombstoned, or absent.
+ * When `opts.forShare` is set, acquires `FOR SHARE` on `orders` (call BEFORE locking `users`/`carts` to preserve
+ * `orders -> users -> carts` lock order).
  */
 export async function isCheckoutOrderLive(
   db: DbOrTx,
@@ -54,26 +44,21 @@ export async function isCheckoutOrderLive(
     cartRow.checkoutOrderId !== null
       ? eq(orders.id, cartRow.checkoutOrderId)
       : eq(orders.publicId, cartRow.checkoutOrderPublicId!);
-  try {
-    if (opts?.forShare) {
-      const [ordRow] = await (db as Tx)
-        .select({ trashedAt: orders.trashedAt, purgedAt: orders.purgedAt })
-        .from(orders)
-        .where(predicate)
-        .for("share")
-        .limit(1);
-      return Boolean(ordRow && isLiveOrderRow(ordRow));
-    }
-    const [ordRow] = await db
+  if (opts?.forShare) {
+    const [ordRow] = await (db as Tx)
       .select({ trashedAt: orders.trashedAt, purgedAt: orders.purgedAt })
       .from(orders)
       .where(predicate)
+      .for("share")
       .limit(1);
     return Boolean(ordRow && isLiveOrderRow(ordRow));
-  } catch (err) {
-    if (isMissingTableError(err)) return true;
-    throw err;
   }
+  const [ordRow] = await db
+    .select({ trashedAt: orders.trashedAt, purgedAt: orders.purgedAt })
+    .from(orders)
+    .where(predicate)
+    .limit(1);
+  return Boolean(ordRow && isLiveOrderRow(ordRow));
 }
 
 export function createCartTrashParticipant(deps: ModuleDeps): TrashParticipant {
