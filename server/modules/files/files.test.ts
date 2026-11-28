@@ -1000,6 +1000,27 @@ describe("raw multipart admission", () => {
 });
 
 describe("portable classification and backup traversal", () => {
+  it("lists a trashed order in a read-only Portable snapshot, but excludes it after purge starts", async () => {
+    owner = fakePrincipal({ userId: 1, userPublicId });
+    orderOwner = owner;
+    const saved = await add(owner);
+    const now = h.clock.now();
+    const admin = fakePrincipal({ role: "admin", stepUpAt: now });
+    const sessionCheck = vi.spyOn(h.services.identity.sessions, "assertCurrent");
+    const list = (includeTrashedOrders: boolean) => t.db.transaction((tx) =>
+      files.portableFiles(tx, { principal: admin, limit: 10, includeTrashedOrders }), { accessMode: "read only" });
+    try {
+      await t.db.update(orders).set({ trashedAt: now, trashBatchId: orderPublicId }).where(eq(orders.id, orderId));
+      await expect(list(false)).resolves.toMatchObject({ items: [] });
+      await expect(list(true)).resolves.toMatchObject({ items: [{ publicId: saved.publicId }] });
+      expect(sessionCheck).not.toHaveBeenCalled();
+      await t.db.update(orders).set({ purgeStartedAt: now }).where(eq(orders.id, orderId));
+      await expect(list(true)).resolves.toMatchObject({ items: [] });
+    } finally {
+      await t.db.update(orders).set({ trashedAt: null, trashBatchId: null, purgeStartedAt: null }).where(eq(orders.id, orderId));
+    }
+  });
+
   it("reclassifies staged bytes canonically and binds the owner/order on adoption", async () => {
     const admin = fakePrincipal({ role: "admin", stepUpAt: h.clock.now() });
     orderOrigin = "import";

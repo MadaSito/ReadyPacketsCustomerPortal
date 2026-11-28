@@ -536,14 +536,17 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
 
   const portableOrderPredicate = () => and(isNull(orders.purgedAt), isNull(orders.purgeStartedAt),
     isNull(users.purgedAt), isNull(users.purgeStartedAt));
-  async function portableOrder(principal: SessionPrincipal, id: number, tx: Tx) {
+  async function portableOrder(principal: SessionPrincipal, id: number, tx: Tx, mode: "snapshot" | "lock" = "lock") {
     if (principal.role !== "admin") throw forbidden("CAPABILITY_NOT_GRANTED");
-    const [order] = await tx.select({ id: orders.id, publicId: orders.publicId, ownerUserId: orders.ownerUserId,
+    const query = tx.select({ id: orders.id, publicId: orders.publicId, ownerUserId: orders.ownerUserId,
       ownerPublicId: users.publicId, statusKey: orders.statusKey, origin: orders.origin })
       .from(orders).innerJoin(users, eq(users.id, orders.ownerUserId))
-      .where(and(eq(orders.id, id), portableOrderPredicate())).limit(1).for("update");
+      .where(and(eq(orders.id, id), portableOrderPredicate())).limit(1);
+    const [order] = mode === "lock" ? await query.for("update") : await query;
     if (!order) throw notFound("ORDER_NOT_FOUND");
-    await requireCurrent(principal, tx);
+    // The already-authorized Portable worker lists metadata in a read-only snapshot. Session validation
+    // takes locks too, so perform it on the independently fenced import and file-byte opens instead.
+    if (mode === "lock") await requireCurrent(principal, tx);
     return order;
   }
 
@@ -1845,7 +1848,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       )).orderBy(orderFiles.publicId).limit(limit + 1);
       const items: PortableStoredFile[] = [];
       for (const row of rows.slice(0, limit)) {
-        const order = options.includeTrashedOrders ? await portableOrder(options.principal, row.orderId, tx) :
+        const order = options.includeTrashedOrders ? await portableOrder(options.principal, row.orderId, tx, "snapshot") :
           await deps.services.orders.assertCanReadOrderById(options.principal, row.orderId, { tx });
         enforceVisibility(row, options.principal, order.ownerUserId);
         if (row.orderPublicId !== order.publicId) throw notFound("FILE_NOT_FOUND");
