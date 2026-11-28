@@ -19,6 +19,27 @@ const actor = (role: string) => ({
   publicId: null,
 });
 
+/** Trash state as the source row holds it (orders and customers ports, increment 09). */
+interface SourceTrash { trashedAt: Date; batchId: string | null; reason: string | null; purgeStartedAt: Date | null; purgedAt: Date | null }
+
+/**
+ * Increment 09: a row whose permanent deletion has started but not finished cannot travel (it is neither a trash
+ * item nor a tombstone yet). The export refuses rather than guess; the operator retries after the purge.
+ */
+function portableTrash(trash: SourceTrash | null | undefined) {
+  if (!trash) return null;
+  if (trash.purgeStartedAt && !trash.purgedAt) {
+    throw validation("PORTABLE_PURGE_IN_PROGRESS", "A permanent deletion is still running. Export again when it has finished.");
+  }
+  return {
+    trashedAt: trash.trashedAt.toISOString(), batchId: trash.batchId, reason: trash.reason,
+    purgeStartedAt: time(trash.purgeStartedAt), purgedAt: time(trash.purgedAt),
+  };
+}
+
+/** Placeholder address a tombstone carries in a package; never a real mailbox (RFC 2606 `.invalid`). */
+export const tombstoneEmail = (publicId: string) => `deleted-${publicId.toLowerCase()}@tombstone.invalid`;
+
 interface WriteInput { exportId: string; workspace: string; path: string; passphrase: string; now: Date }
 
 export async function collectAndWriteExport(
@@ -38,8 +59,11 @@ export async function collectAndWriteExport(
     }
   };
 
+  // Increment 09: only a full installation export carries the trash and tombstones (so a migration keeps them);
+  // selected exports read live rows only through the owners' gates.
+  const all = selection.kind === "all";
   const snapshot = await deps.db.transaction(async (tx) => {
-    const orders = new Map<number, { order: PortableOrder; ownerPublicId: string }>();
+    const orders = new Map<number, { order: PortableOrder; ownerPublicId: string; tombstone: boolean }>();
     const customerPublicIds = new Set<string>();
     let rootCustomerIds: number[] | undefined;
     let rootOrderIds: number[] | undefined;
@@ -77,17 +101,21 @@ export async function collectAndWriteExport(
     do {
       const { items, nextAfter } = await deps.services.orders.portableOrders(tx, {
         after: cursor, limit: ORDERS_PAGE, customerIds: rootCustomerIds, ...(groupRootIds ? { groupRootIds } : {}),
+        ...(all ? { includeTrashed: true } : {}),
       });
       for (const order of items) {
         let ownerPublicId = customerByInternal.get(order.ownerUserId);
         if (!ownerPublicId) {
-          const owner = await deps.services.identity.getUser(order.ownerUserId, { tx });
+          // Ungated by internal id: the owner of a trashed order is itself in the trash (or a tombstone).
+          const owner = await deps.services.identity.portableCustomerRefInTx(tx, { userId: order.ownerUserId });
           if (!owner || owner.role !== "customer") throw validation("PORTABLE_SOURCE_OWNER_MISMATCH", "An order has invalid source ownership.");
           ownerPublicId = owner.publicId;
-          customerByInternal.set(owner.id, ownerPublicId);
+          customerByInternal.set(owner.userId, ownerPublicId);
         }
         customerPublicIds.add(ownerPublicId);
-        orders.set(order.id, { order, ownerPublicId });
+        const trash = portableTrash(order.trash);
+        const tombstone = Boolean(trash?.purgedAt);
+        orders.set(order.id, { order, ownerPublicId, tombstone });
         emit("orders", {
           publicId: order.publicId, customerPublicId: ownerPublicId, orderNumber: order.reference,
           // Omitted for a root so packages without groups stay readable by increment 07 installations.
@@ -105,7 +133,11 @@ export async function collectAndWriteExport(
             sourceLock: order.lockState,
             retiredOrderReferences: order.retiredReferences,
           },
+          // Omitted for a live order so packages stay readable by increment 07 and 08 installations.
+          ...(trash ? { trash } : {}),
         });
+        // A tombstone holds only what a tombstone keeps: no lines, history or files.
+        if (tombstone) continue;
         for (const [position, item] of order.lineItems.entries()) emit("order-items", {
           publicId: item.publicId, orderPublicId: order.publicId, position,
           sku: item.productPublicId ?? "historical-item", name: item.name, quantity: item.quantity,
@@ -132,12 +164,21 @@ export async function collectAndWriteExport(
       let after: string | null = null;
       const expectedIds = ids ? new Set(ids) : undefined;
       for (;;) {
-        const customers = await deps.services.identity.portableCustomers(tx, after, 100, ids);
+        const customers = await deps.services.identity.portableCustomers(tx, after, 100, ids, all ? { includeTrashed: true } : {});
         for (const item of customers) {
           expectedIds?.delete(item.publicId);
-          const user = await deps.services.identity.getUserByPublicId(item.publicId, { tx });
-          if (!user || user.role !== "customer") throw new CustodyError();
-          const billing = await deps.services.billingProfile.getForUserInTx(tx, user.id);
+          const trash = portableTrash(item.trash);
+          if (trash?.purgedAt) {
+            // A tombstone keeps only its ids, dates and trash state: placeholder address and name, no parts or billing.
+            emit("customers", {
+              publicId: item.publicId, customerNumber: item.customerRef, status: "business-profile",
+              email: tombstoneEmail(item.publicId), firstName: null, lastName: null, preferredName: "Deleted account",
+              middleName: null, suffix: null, company: null, phone: null, address: null, timezone: null, locale: null,
+              marketingOptIn: false, createdAt: item.createdAt.toISOString(), updatedAt: null, trash,
+            });
+            continue;
+          }
+          const billing = await deps.services.billingProfile.getForUserInTx(tx, item.userId);
           // Stored name parts travel as parts; otherwise the display name keeps its legacy place (preferredName).
           const parts = item.firstName && item.lastName
             ? { firstName: item.firstName, lastName: item.lastName, preferredName: item.preferredName }
@@ -149,6 +190,7 @@ export async function collectAndWriteExport(
             marketingOptIn: false, createdAt: item.createdAt.toISOString(), updatedAt: null,
             // Omitted when there is none so such packages stay readable by increment 07 installations.
             ...(billing ? { billingProfile: billing.details } : {}),
+            ...(trash ? { trash } : {}),
           });
         }
         if (customers.length < 100) break;
@@ -165,16 +207,16 @@ export async function collectAndWriteExport(
     }
 
     const files: PortableStoredFile[] = [];
-    const orderIds = [...orders.keys()];
+    const orderIds = [...orders.entries()].filter(([, entry]) => !entry.tombstone).map(([id]) => id);
     for (let batch = 0; batch < orderIds.length; batch += 250) {
       let after: string | undefined;
       do {
         const page = await deps.services.files.portableFiles(tx, {
-          principal, after, limit: 100, orderIds: orderIds.slice(batch, batch + 250),
+          principal, after, limit: 100, orderIds: orderIds.slice(batch, batch + 250), ...(all ? { includeTrashedOrders: true } : {}),
         });
         for (const file of page.items) {
           const origin = orders.get(file.orderId);
-          if (!origin || origin.ownerPublicId !== file.ownerPublicId || origin.order.publicId !== file.orderPublicId ||
+          if (!origin || origin.tombstone || origin.ownerPublicId !== file.ownerPublicId || origin.order.publicId !== file.orderPublicId ||
             origin.order.ownerUserId !== file.ownerUserId) {
             throw validation("PORTABLE_SOURCE_OWNER_MISMATCH", "A source file is not bound to its selected order and owner.");
           }
@@ -226,6 +268,7 @@ export async function collectAndWriteExport(
         { category: "report-definitions", reason: "Saved report definitions and the report run log are installation configuration and operational records." },
         { category: "ephemeral-access", reason: "ZIP archives, archive download tickets and audio playback grants are short-lived access artefacts." },
         { category: "phase-workspace", reason: "Phase questions, answers, administrator tasks, phase progress, phase runs and completion jobs, and derived order progress, attention and payment state, are workflow runtime." },
+        { category: "trash-operations", reason: "Trash purge run records are installation operations; trash state travels on orders and customers." },
         { category: "operational-diagnostics", reason: "Operational alerts and rejected payment webhook diagnostics are installation operations." },
         { category: "installation-configuration", reason: "SSO role mappings and SAML certificates, the order status catalogue, managed storage file sync and automations are installation configuration." },
       ],
@@ -242,9 +285,12 @@ export async function collectAndWriteExport(
       if (verifiedSourceBytes > PACKAGE_LIMITS.maxTotalUncompressed) {
         throw validation("PORTABLE_EXPORT_LIMIT", "The selected file bytes exceed the transfer limit. Make a smaller selection.");
       }
-      const live = await deps.services.orders.assertCanReadOrder(principal, file.orderPublicId);
-      if (live.ownerUserId !== file.ownerUserId || live.ownerPublicId !== file.ownerPublicId) throw new CustodyError();
-      const opened = await deps.services.files.openForExport(principal, file.publicId, file.orderPublicId);
+      // Ungated custody read; a selected export still refuses a trashed order, and no export reads a purge.
+      const live = await deps.db.transaction((tx) => deps.services.orders.portableOrderCustodyInTx(tx, file.orderId));
+      if (!live || live.purgeStarted || live.purged || (!all && live.trashed) || live.publicId !== file.orderPublicId ||
+        live.ownerUserId !== file.ownerUserId) throw new CustodyError();
+      const opened = await deps.services.files.openForExport(principal, file.publicId, file.orderPublicId, undefined,
+        all ? { allowTrashedOrder: true } : undefined);
       if (opened.file.sha256 !== file.sha256 || opened.file.size !== file.size || opened.file.version !== file.version ||
         opened.file.supersededAt || opened.file.deletedAt || opened.file.visibility !== file.visibility) {
         opened.stream.destroy();

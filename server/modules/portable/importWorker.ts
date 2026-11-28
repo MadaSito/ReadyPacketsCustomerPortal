@@ -8,7 +8,7 @@ import { type ImportJob, type ImportRow, lockImport, readImport, transition } fr
 import { computePlanDigest, groupChildren, type JsonRecord, mappedRecord } from "./importPlanning.js";
 import {
   customerBillingProfile, customerCreatedAt, customerIdentity, fileCategory, groupRootOf, numberField, projectedOrder, stringField,
-  targetDate,
+  targetDate, trashOf,
 } from "./importShapes.js";
 import {
   portableImportObjects, portableImportRecords, portableMappings, portablePackageReservations,
@@ -191,9 +191,11 @@ export function createImportWorker(deps: ModuleDeps) {
                 email: stringField(entry.record.email), ...customerIdentity(entry.record), publicId: entry.portableId,
                 createdAt: customerCreatedAt(entry.record.createdAt),
                 customerRef: typeof entry.record.customerNumber === "string" ? entry.record.customerNumber : null,
+                // Increment 09: a trashed account stays in the trash; a tombstone stays a tombstone (identity's placeholder).
+                trash: trashOf(entry.record),
               }, { tx });
               const billing = customerBillingProfile(entry.record);
-              if (billing) {
+              if (billing && !trashOf(entry.record)?.purgedAt) {
                 await deps.services.billingProfile.saveForUserInTx(tx, customer.userId, billing,
                   { userId: null, role: "system", via: "portable_import" });
               }
@@ -210,6 +212,7 @@ export function createImportWorker(deps: ModuleDeps) {
               const imported = await deps.services.orders.importOrder({
                 ...fields, importId: row.publicId, sourceInstallationId: expected.sourceSystem, sourceOrderPublicId: entry.portableId,
                 targetOwnerUserId: customer.localId, editable: false, groupRootOrderId: root?.localId ?? null,
+                trash: trashOf(entry.record),
               }, tx);
               if (!imported.created) throw conflict("PORTABLE_ORDER_PROVENANCE_COLLISION", "The target order has changed since planning.");
               await receipt(tx, row, job, entry, imported);
@@ -233,8 +236,11 @@ export function createImportWorker(deps: ModuleDeps) {
                 !entry.destinationKey || !entry.adoptionKey) throw new CustodyError();
               const order = await readMapping(tx, row, "orders", stringField(file.record.orderPublicId));
               if (!order?.localId || !order.localPublicId) throw new CustodyError();
-              const targetOrder = await deps.services.orders.assertCanReadOrderById(principal, order.localId, { tx, forUpdate: true });
-              if (targetOrder.publicId !== order.localPublicId || !targetOrder.readOnlyImported) throw new CustodyError();
+              // Ungated custody read (the order may be in the trash); a purge-started or purged order never takes a file.
+              const targetOrder = await deps.services.orders.portableOrderCustodyInTx(tx, order.localId, { forUpdate: true });
+              const importedOrder = await deps.services.orders.findImportedOrder(expected.sourceSystem, stringField(file.record.orderPublicId), tx);
+              if (!targetOrder || targetOrder.purgeStarted || targetOrder.purged || targetOrder.publicId !== order.localPublicId ||
+                importedOrder?.id !== order.localId || importedOrder.lockState !== "imported_read_only") throw new CustodyError();
               const prior = await deps.storage.stat(entry.destinationKey);
               let staging = await deps.storage.stat(entry.adoptionKey);
               if (prior) {
@@ -253,7 +259,7 @@ export function createImportWorker(deps: ModuleDeps) {
                 displayName: stringField(entry.record.originalName), category: fileCategory(file.record.category),
                 contentType: stringField(entry.record.mediaType), stagedObject: staging, destinationKey: entry.destinationKey,
                 visibility: file.record.visibleToCustomer === true ? "customer_visible" : "staff_only",
-                createdAt: targetDate(entry.record.createdAt),
+                createdAt: targetDate(entry.record.createdAt), allowTrashedOrder: true,
               }, tx);
               await receipt(tx, row, job, file, { publicId: adopted.logicalPublicId });
               await receipt(tx, row, job, entry, { publicId: adopted.publicId });
@@ -291,6 +297,12 @@ export function createImportWorker(deps: ModuleDeps) {
           if (!mapping || mapping.sourceDigest !== entry.digest) return false;
           if (entry.disposition === "hold" || !mapping.localPublicId) return mapping.localPublicId === null && entry.disposition !== "create";
           if (entry.recordType === "customers") {
+            const sourceTrash = trashOf(entry.record);
+            if (sourceTrash) {
+              // Ungated by public id (never by e-mail): the account must carry the same trash state.
+              const ref = await deps.services.identity.portableCustomerRefInTx(tx, { publicId: mapping.localPublicId });
+              return ref?.role === "customer" && ref.userId === mapping.localId && (sourceTrash.purgedAt ? ref.purged : ref.trashed && !ref.purged && ref.purgeStartedAt === null);
+            }
             const user = await deps.services.identity.getUserByPublicId(mapping.localPublicId, { tx });
             const sourceDate = customerCreatedAt(entry.record.createdAt);
             if (entry.disposition === "create" && customerBillingProfile(entry.record) && user?.id === mapping.localId &&
@@ -305,6 +317,9 @@ export function createImportWorker(deps: ModuleDeps) {
             const rootPortableId = groupRootOf(entry.record);
             const root = rootPortableId ? await readMapping(tx, row, "orders", rootPortableId) : undefined;
             if ((order?.groupRootOrderId ?? null) !== (rootPortableId ? root?.localId ?? -1 : null)) return false;
+            const sourceTrash = trashOf(entry.record);
+            if (Boolean(order?.purgedAt) !== Boolean(sourceTrash?.purgedAt) ||
+              (!sourceTrash?.purgedAt && Boolean(order?.trashedAt) !== Boolean(sourceTrash))) return false;
             return Boolean(order && order.id === mapping.localId && order.publicId === mapping.localPublicId &&
               order.ownerUserId === customer?.localId && order.lockState === "imported_read_only" &&
               order.createdAt.getTime() === source.createdAt.getTime() && order.currency === source.currency &&
@@ -314,7 +329,8 @@ export function createImportWorker(deps: ModuleDeps) {
             const file = ref.get(`files:${stringField(entry.record.filePublicId)}`);
             const order = file ? await readMapping(tx, row, "orders", stringField(file.record.orderPublicId)) : null;
             if (!order?.localPublicId) return false;
-            const opened = await deps.services.files.openForExport(principal, mapping.localPublicId, order.localPublicId, tx);
+            const opened = await deps.services.files.openForExport(principal, mapping.localPublicId, order.localPublicId, tx,
+              { allowTrashedOrder: true });
             const visible = opened.file.visibility === "customer_visible";
             if (opened.file.deletedAt || opened.file.supersededAt || visible !== file?.record.visibleToCustomer ||
               opened.file.createdAt.getTime() !== targetDate(entry.record.createdAt).getTime()) {

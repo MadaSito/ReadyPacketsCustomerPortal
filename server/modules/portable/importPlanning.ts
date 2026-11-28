@@ -6,8 +6,8 @@ import { canonical, digest } from "./custody.js";
 import { portableMappings, type PlanSummary } from "./schema.js";
 import { TRANSFER_MAX_RECORDS } from "./transferPolicy.js";
 import {
-  customerBillingProfile, customerCreatedAt, customerIdentity, fileCategory, groupLinkProblem, projectedOrder, selectLiveVersions,
-  stringField, targetDate,
+  customerBillingProfile, customerCreatedAt, customerIdentity, fileCategory, groupLinkProblem, orderTrashProblem, projectedOrder,
+  selectLiveVersions, stringField, targetDate, trashOf, trashProblem,
 } from "./importShapes.js";
 
 export type JsonRecord = Record<string, unknown> & { publicId: string };
@@ -55,6 +55,13 @@ export async function buildPlan(deps: ModuleDeps, args: {
     const orderItems = groupChildren(args.records, "order-items");
     const orderHistory = groupChildren(args.records, "order-status-history");
     const ordersById = new Map(args.records.filter((item) => item.type === "orders").map((item) => [item.record.publicId, item.record]));
+    const customersById = new Map(args.records.filter((item) => item.type === "customers").map((item) => [item.record.publicId, item.record]));
+    const filesByOrder = new Map<string, number>();
+    for (const item of args.records) {
+      if (item.type !== "files") continue;
+      const key = String(item.record.orderPublicId);
+      filesByOrder.set(key, (filesByOrder.get(key) ?? 0) + 1);
+    }
     const customerFieldCounts = new Map<string, number>();
     const knownStatuses = new Map<string, boolean>();
     for (const item of args.records) {
@@ -94,7 +101,16 @@ export async function buildPlan(deps: ModuleDeps, args: {
       } else if (item.type === "customers") {
         const email = emailSchema.safeParse(item.record.email);
         const reference = customerRefSchema.safeParse(item.record.customerNumber);
-        if (!email.success) {
+        const trashIssue = trashProblem(item.record);
+        // A tombstone's e-mail is a placeholder the target replaces; it is never used to find or link an account.
+        const tombstone = !trashIssue && Boolean(trashOf(item.record)?.purgedAt);
+        if (trashIssue) {
+          step.disposition = "conflict";
+          step.reason = trashIssue;
+        } else if (tombstone && item.record.billingProfile !== undefined && item.record.billingProfile !== null) {
+          step.disposition = "conflict";
+          step.reason = "PORTABLE_TRASH_STATE_INVALID";
+        } else if (!email.success) {
           step.disposition = "conflict";
           step.reason = "PORTABLE_CUSTOMER_EMAIL_REQUIRED";
         } else if (item.record.customerNumber !== null && item.record.customerNumber !== undefined && !reference.success) {
@@ -105,7 +121,7 @@ export async function buildPlan(deps: ModuleDeps, args: {
           step.disposition = "conflict";
           step.reason = "PORTABLE_DUPLICATE_CUSTOMER_IDENTIFIERS";
         } else {
-          const collision = await deps.services.identity.findUserIdByEmail(email.data, { tx });
+          const collision = tombstone ? null : await deps.services.identity.findUserIdByEmail(email.data, { tx, includeTrashed: true });
           const idCollision = await deps.services.identity.getUserByPublicId(item.record.publicId, { tx });
           const refCollision = reference.success && !(await deps.services.identity.isCustomerRefAvailable(reference.data, tx));
           if (collision || idCollision || refCollision) {
@@ -119,7 +135,9 @@ export async function buildPlan(deps: ModuleDeps, args: {
       } else if (item.type === "orders") {
         const order = await deps.services.orders.findImportedOrder(args.sourceSystem, item.record.publicId, tx);
         const owner = selected.get(`customers:${String(item.record.customerPublicId)}`);
-        const groupProblem = groupLinkProblem(item.record, ordersById);
+        const groupProblem = orderTrashProblem(item.record, customersById.get(String(item.record.customerPublicId)),
+          (orderItems.get(item.record.publicId)?.length ?? 0) + (orderHistory.get(item.record.publicId)?.length ?? 0) +
+          (filesByOrder.get(item.record.publicId) ?? 0)) ?? groupLinkProblem(item.record, ordersById);
         if (order || !owner || owner.disposition === "conflict") {
           step.disposition = "conflict";
           step.reason = order ? "PORTABLE_ORDER_PROVENANCE_COLLISION" : "PORTABLE_OWNER_NOT_PLANNED";
@@ -132,7 +150,7 @@ export async function buildPlan(deps: ModuleDeps, args: {
             const check = deps.services.orders.preflightImportOrder({
               ...fields, importId: args.packageId, sourceInstallationId: args.sourceSystem, sourceOrderPublicId: item.record.publicId,
               // A dry run can validate the record shape without allocating a target customer row.
-              targetOwnerUserId: 1, editable: false,
+              targetOwnerUserId: 1, editable: false, trash: trashOf(item.record),
             });
             if (!check.ok) { step.disposition = "conflict"; step.reason = `PORTABLE_${check.reasonCode}`; }
           }

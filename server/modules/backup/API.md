@@ -234,3 +234,9 @@ Router mounted at `trpc.backup` (`server/modules/backup/router.ts`). **There is 
 - `backup.retention.policy_changed`, `backup.retention.intent`, `backup.retention.executed`
 - `backup.legal_hold.created`, `backup.legal_hold.released`
 - **Registered Automation Triggers (`init()`)**: `backup.completed`, `backup.failed`, `backup.verify_failed`, `backup.remote_copy_completed`, `backup.remote_copy_failed`, `backup.policy_unmet`.
+
+## Increment 09: trash, permanent deletion and backups (operator guidance)
+
+- A backup dumps every base table, including `trash_purge_runs` and the trash columns on `users` and `orders`. Bytes of files that are already purged (`order_files.purged_at`) are not collected.
+- **Permanently deleted data remains in the backups taken before the deletion until those backups expire under the retention policy.** A legal hold keeps them longer. Purging does not rewrite existing backups.
+- **Restoring an older backup brings deleted items back**: anything trashed or purged after that backup returns in the state it had then. The restored `trash_purge_runs` table is also from that time. After a restore, look up the purges made after the backup was taken in an audit copy kept outside the restored database (the SIEM or syslog destination), and purge those items again before reopening the portal.

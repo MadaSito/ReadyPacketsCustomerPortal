@@ -55,3 +55,23 @@ scripts/dev/lint.sh server/modules/portable client/src/features/portable
 - **Not tested:** a package where an addition comes before its root (the worker reorders; our exporter always writes roots first); an increment 07 installation reading an 08 package; a real backup and restore with `customer_billing_profiles`.
 - **Note:** the main block's `beforeAll` limit was raised from 20 s to 60 s because it timed out on the loaded 2-vCPU host.
 
+
+## Increment 09
+
+- **Tested (`portable.test.ts`, 14 cases, real MySQL with the 09 schema; run under the light lock):**
+  - Setup on the source: a live customer and order, a trashed customer with a trashed order and one file, and a tombstoned customer and order. The trash and tombstone columns were set directly by the fixture.
+  - Export (all records): the live rows carry no `trash` key. The trashed order carries `trash` with its batch id, and its file travels. The tombstoned customer has the placeholder address and "Deleted account", and its real address appears nowhere in the package. The tombstoned order is "Deleted order" with no child records. The package verifies.
+  - Import into a second installation: no plan conflicts and reconciliation finds 0 discrepancies. The trashed customer and order stay in the trash with the same `trashed_at`, and the file is adopted onto the trashed order. The tombstones stay tombstones, and the order keeps its total.
+  - Purge participant: a lost fence (`assertCurrentInTx` throws) leaves the objects and sealed records unchanged.
+    - Purging the trashed order deletes its escrow and prepared objects (stat returns null afterwards) and redacts its 6 sealed records: the order, its line, two history entries, the file and the version.
+    - A second run erases 0, so it is idempotent. Purging its customer then redacts 1 record. The live customer's and live order's records are untouched.
+  - A half-purged order (`purge_started_at` without `purged_at`) refuses the export with `PORTABLE_PURGE_IN_PROGRESS`.
+  - Pure cases: `trashOf` (absent, trashed, half-purged refused, purged before trashed refused); `orderTrashProblem` (live order under a trashed owner, trashed order under a tombstoned owner, tombstone with children); a live addition under a trashed root; and the `sealedClosure` ownership rules (group additions are not pulled in).
+  - The manifest lists `trash-operations`. All earlier cases still pass.
+- **Linted:** eslint `--max-warnings 0` on `server/modules/portable`. **Contract:** golden 4/4, roundtrip 8/8, legacy 13/13.
+- **Not tested:**
+  - A real backup and restore with the trash tables. Backup enumerates every base table, so it is covered by construction only.
+  - An increment 08 installation reading a package with trash.
+  - The purge participant running through the real trash coordinator; it was called directly here.
+  - Imports of the same package that are still executing (they make the purge fail by design).
+  - Kept financial records that reference a tombstone: billing evidence does not travel in this export, so the case does not arise yet.
