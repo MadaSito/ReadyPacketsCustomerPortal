@@ -13,8 +13,8 @@ Requested by the owner on 2026-11-27 (prompt 37). See the [session log](docs/ses
 
 ### Fixed
 
-- **Kept invoices and receipts for customers** (c1f47f2). On a kept paid invoice or receipt whose order is in the trash, customers see "Order unavailable" instead of the staff label "In trash".
-- **Trash centre request keys** (3eee534). After a failed action on one item, the next item no longer reuses the same request key and is no longer refused. A retry of the same item keeps its key, so the server resumes it.
+- **Kept invoices and receipts for customers** (f57c510). On a kept paid invoice or receipt whose order is in the trash, customers see "Order unavailable" instead of the staff label "In trash".
+- **Trash centre request keys** (6f54429). After a failed action on one item, the next item no longer reuses the same request key and is no longer refused. A retry of the same item keeps its key, so the server resumes it.
 - **Links in e-mail were not clickable** (D1). Every shipped template now renders its link variables as anchors in the HTML part. Only template text and trusted link variables become links, and a URL inside a free-form value is never linked. Anchors are produced when the portal address is HTTPS. E-mail addresses in the console (customers list, customer page, reports) are `mailto` links (`EmailLink`).
 
 ### Added
