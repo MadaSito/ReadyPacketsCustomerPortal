@@ -2,6 +2,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestDeps, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
+import { DomainError } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import { auditExports } from "../audit/schema.js";
 import { users } from "../identity/schema.js";
@@ -14,7 +15,7 @@ import { StorageAdapterError } from "../storage/contracts.js";
 import { COPY_OWNED } from "../storage/fileCopies.js";
 import { createTrashCopies } from "../storage/trashCopies.js";
 import { storageConnections, storageCopyAttempts, storageFileCopies, storageManagedFileCopies, storageManagedOrderRoots } from "../storage/schema.js";
-import type { TrashEntityRef } from "../trash/ports.js";
+import { unfencedPurgeRunForTests, type TrashEntityRef } from "../trash/ports.js";
 import { fileArchives, fileArchiveTickets } from "./archivesSchema.js";
 import { fileDownloadTickets, filePlaybackGrants, orderFiles } from "./schema.js";
 import { archiveObjectAad, createFilesTrashParticipant } from "./trash.js";
@@ -28,7 +29,8 @@ let trash: ReturnType<typeof createFilesTrashParticipant>;
 let a: TrashEntityRef;
 let b: TrashEntityRef;
 let remove: ReturnType<typeof vi.fn<(remoteId: string) => Promise<void | { providerRecycleBin: true }>>>;
-const run = () => ({ runId: ulid() });
+const run = () => unfencedPurgeRunForTests(ulid());
+const fenceLost = () => new DomainError("CONFLICT", "PURGE_FENCE_LOST", "The purge worker was replaced.");
 const hook = (entity: TrashEntityRef) => t.db.transaction((tx) => trash.onTrashedInTx!(tx, entity, { kind: "system", job: "test" }));
 
 beforeAll(async () => { t = await createTestDb({ schema }); });
@@ -72,6 +74,39 @@ async function archive(entity: TrashEntityRef, key: string, requester = 42) {
 }
 
 describe("Files trash participant", () => {
+  it("leaves Files rows, access grants, and bytes unchanged when the purge worker has been replaced", async () => {
+    const f = await file(a), now = h.clock.now();
+    await t.db.insert(fileDownloadTickets).values({ orderId: a.id, fileId: f.id, userId: 42,
+      sessionId: "synthetic", issuedAt: now, expiresAt: now, tokenHash: "a".repeat(64) });
+    const key = h.storage.newKey("exports");
+    await h.storage.put(key, Buffer.from("synthetic ZIP"));
+    await archive(a, key);
+    const assertCurrentInTx = vi.fn(async () => { throw fenceLost(); });
+    await expect(trash.purge!(a, unfencedPurgeRunForTests(ulid(), { assertCurrentInTx })))
+      .rejects.toMatchObject({ reasonCode: "PURGE_FENCE_LOST" });
+    expect(assertCurrentInTx).toHaveBeenCalledTimes(1);
+    expect(await h.storage.stat(f.key)).not.toBeNull();
+    expect(await h.storage.stat(key)).not.toBeNull();
+    expect(await t.db.select().from(fileArchives)).toMatchObject([{ state: "ready", activeUserId: 42 }]);
+    expect(await t.db.select().from(orderFiles)).toMatchObject([{ id: f.id }]);
+    expect(await t.db.select().from(fileDownloadTickets)).toMatchObject([{ fileId: f.id }]);
+  });
+
+  it("rechecks the fence immediately before unlinking ZIP bytes", async () => {
+    const key = h.storage.newKey("exports");
+    await h.storage.put(key, Buffer.from("synthetic ZIP"));
+    const archiveId = await archive(a, key);
+    await hook(a);
+    const unlink = vi.spyOn(h.storage, "delete");
+    const assertCurrentInTx = vi.fn(async () => {}).mockResolvedValueOnce(undefined).mockRejectedValueOnce(fenceLost());
+    await expect(trash.purge!(a, unfencedPurgeRunForTests(ulid(), { assertCurrentInTx })))
+      .rejects.toMatchObject({ reasonCode: "PURGE_FENCE_LOST" });
+    expect(assertCurrentInTx).toHaveBeenCalledTimes(2);
+    expect(unlink).not.toHaveBeenCalled();
+    expect(await h.storage.stat(key)).not.toBeNull();
+    expect(await t.db.select().from(fileArchives)).toMatchObject([{ id: archiveId, state: "revoked" }]);
+  });
+
   it("revokes all scoped links, releases the ZIP slot and preserves another order's file and shared ZIP", async () => {
     const gone = await file(a, "audio/webm");
     const kept = await file(b);
@@ -243,5 +278,25 @@ describe("Files trash participant", () => {
     await expect(trash.purge!(a, run())).resolves.toMatchObject({
       deleted: { storageCopies: 0 }, kept: { providerRecycleBin: 1, receiptCopies: 1 },
     });
+  });
+});
+
+describe("Storage copy purge fence", () => {
+  it("does not call the provider or change the copy journal if the immediate preflight loses its fence", async () => {
+    const f = await file(a), now = h.clock.now(), connectionPublicId = ulid();
+    await t.db.insert(storageConnections).values({ publicId: connectionPublicId, kind: "sharepoint", name: "Synthetic destination",
+      config: {}, credentialsEnc: "synthetic", createdAt: now, updatedAt: now });
+    const publicId = ulid();
+    const remoteIdEnc = h.deps.crypto.encrypt("synthetic-provider-copy", `storage_managed_file_copies.remote_id_enc:${publicId}`);
+    await t.db.insert(storageManagedFileCopies).values({ publicId, orderPublicId: a.publicId, sourcePublicId: f.publicId,
+      connectionPublicId, destinationVersion: 1, role: "originals", state: "copied", targetEnc: "synthetic",
+      remoteIdEnc, createdAt: now, updatedAt: now });
+    const assertCurrentInTx = vi.fn(async () => {}).mockResolvedValueOnce(undefined).mockRejectedValueOnce(fenceLost());
+    await expect(h.services.storageConnections.purgeOrderCopies(Number(a.id), a.publicId,
+      unfencedPurgeRunForTests(ulid(), { assertCurrentInTx }))).rejects.toMatchObject({ reasonCode: "PURGE_FENCE_LOST" });
+    expect(assertCurrentInTx).toHaveBeenCalledTimes(2);
+    expect(remove).not.toHaveBeenCalled();
+    expect(await t.db.select().from(storageManagedFileCopies)).toMatchObject([{ state: "copied", remoteIdEnc, reasonCode: null }]);
+    expect(await t.db.select().from(storageCopyAttempts)).toHaveLength(0);
   });
 });

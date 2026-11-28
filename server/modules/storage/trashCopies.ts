@@ -5,6 +5,7 @@ import { ULID_PATTERN, ulid } from "../../core/ids.js";
 import type { Tx } from "../../core/types.js";
 import { orderFiles } from "../files/schema.js";
 import { jobRuns } from "../jobs/schema.js";
+import type { TrashPurgeRun } from "../trash/ports.js";
 import { readObjectRef } from "./adapters/objectProtocol.js";
 import { StorageAdapterError, type StorageAdapter, type StorageAdapterErrorCode } from "./contracts.js";
 import { COPY_EXTERNAL, COPY_OWNED, COPY_TRASHED } from "./fileCopies.js";
@@ -67,7 +68,7 @@ export function createTrashCopies(deps: ModuleDeps, adapterFor: (row: Connection
     return false;
   }
 
-  async function remove(tx: Tx, row: Legacy | Managed): Promise<Removal> {
+  async function remove(tx: Tx, row: Legacy | Managed, run: TrashPurgeRun): Promise<Removal> {
     const isLegacy = !("role" in row);
     if (!row.remoteIdEnc) {
       if (row.state === "copying") throw unavailable("STORAGE_TRASH_WORK_IN_FLIGHT");
@@ -88,6 +89,10 @@ export function createTrashCopies(deps: ModuleDeps, adapterFor: (row: Connection
       return "deleteUnverified";
     }
     if (await isShared(tx, row, remoteId, connection)) return "shared";
+    // The copy transaction already holds the run fence and pins the destination against rotation. Use a
+    // short savepoint to recheck immediately before the adapter, without taking another pooled connection.
+    // Do not classify fence loss as a provider error or persist it on the copy.
+    await tx.transaction((fenceTx) => run.assertCurrentInTx(fenceTx));
     try {
       const result = await adapterFor(connection).remove(remoteId, AbortSignal.timeout(30_000));
       if (result?.providerRecycleBin) return "providerRecycleBin";
@@ -128,7 +133,7 @@ export function createTrashCopies(deps: ModuleDeps, adapterFor: (row: Connection
         .where(and(eq(managed.orderPublicId, orderPublicId), eq(managed.state, "queued"),
           sql`NOT EXISTS (SELECT 1 FROM ${jobRuns} WHERE ${jobRuns.publicId} = ${managed.jobPublicId} AND ${jobRuns.state} IN ('running','unknown'))`));
     },
-    async purgeOrderCopies(orderId: number, orderPublicId: string, run: { runId: string; acknowledgedUnreachableCopies?: boolean }) {
+    async purgeOrderCopies(orderId: number, orderPublicId: string, run: TrashPurgeRun) {
       if (!ULID_PATTERN.test(run.runId)) throw unavailable("STORAGE_TRASH_RUN_INVALID");
       const result = { deleted: 0, external: 0, shared: 0, receipts: 0, providerRecycleBin: 0,
         unverifiedExternalCopies: {} as Record<string, number>, acknowledgedExternalCopies: {} as Record<string, number> };
@@ -168,6 +173,7 @@ export function createTrashCopies(deps: ModuleDeps, adapterFor: (row: Connection
         after = rows.at(-1)!.id;
         for (const { id } of rows) {
           const disposition = await db.transaction(async (tx) => {
+            await run.assertCurrentInTx(tx);
             const [row] = await tx.select().from(legacy)
               .where(and(eq(legacy.id, id), inArray(legacy.filePublicId, scopedFiles(tx, orderId, orderPublicId)))).for("update");
             if (!row) return;
@@ -178,7 +184,7 @@ export function createTrashCopies(deps: ModuleDeps, adapterFor: (row: Connection
                   eq(attempts.connectionPublicId, row.connectionPublicId), eq(jobRuns.state, "running"))).limit(1);
               if (inFlight) throw unavailable("STORAGE_TRASH_WORK_IN_FLIGHT");
             }
-            const outcome = await remove(tx, row);
+            const outcome = await remove(tx, row, run);
             const disposition = { outcome };
             if (outcome === "deleteUnverified") {
               await tx.update(legacy).set({ reasonCode: deleteUnverified, updatedAt: clock.now() }).where(eq(legacy.id, id));
@@ -202,6 +208,7 @@ export function createTrashCopies(deps: ModuleDeps, adapterFor: (row: Connection
         after = rows.at(-1)!.id;
         for (const { id } of rows) {
           const disposition = await db.transaction(async (tx) => {
+            await run.assertCurrentInTx(tx);
             const [row] = await tx.select().from(managed).where(and(eq(managed.id, id), managedScope(orderPublicId))).for("update");
             if (!row) return;
             if (row.jobPublicId && !row.remoteIdEnc) {
@@ -209,7 +216,7 @@ export function createTrashCopies(deps: ModuleDeps, adapterFor: (row: Connection
               if (job?.state === "running") throw unavailable("STORAGE_TRASH_WORK_IN_FLIGHT");
               if (job?.state === "unknown" && row.reasonCode !== COPY_TRASHED) throw unavailable("STORAGE_TRASH_OUTCOME_UNVERIFIED");
             }
-            const outcome = await remove(tx, row);
+            const outcome = await remove(tx, row, run);
             const disposition = { outcome };
             if (outcome === "deleteUnverified") {
               await tx.update(managed).set({ reasonCode: deleteUnverified, updatedAt: clock.now() }).where(eq(managed.id, id));
@@ -228,6 +235,7 @@ export function createTrashCopies(deps: ModuleDeps, adapterFor: (row: Connection
       // Save the exact blocked set reported by this failure, not a blanket permission for the whole run.
       // Proofs contain no locators and are separate from the durable dispositions for pointers already erased.
       await db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
         await tx.delete(attempts).where(proofScope);
         const now = clock.now();
         for (let i = 0; i < pending.length; i += batchSize) {
@@ -248,11 +256,14 @@ export function createTrashCopies(deps: ModuleDeps, adapterFor: (row: Connection
       const receipts = await db.select({ id: managed.id }).from(managed)
         .where(and(eq(managed.orderPublicId, orderPublicId), eq(managed.role, "receipt")));
       result.receipts = receipts.length;
-      if (!result.receipts) await db.delete(storageManagedOrderRoots).where(eq(storageManagedOrderRoots.orderPublicId, orderPublicId));
-      // Retain evidence (outcome, provider, reason, job and correlation) without keeping working path text.
-      await db.update(attempts).set({ targetPathEnc: null, phaseLabelEnc: null })
-        .where(and(eq(attempts.kind, "order_file"),
-          sql`(${attempts.orderPublicId} = ${orderPublicId} OR ${attempts.sourcePublicId} IN (${scopedFiles(db, orderId, orderPublicId)}))`));
+      await db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
+        if (!result.receipts) await tx.delete(storageManagedOrderRoots).where(eq(storageManagedOrderRoots.orderPublicId, orderPublicId));
+        // Retain evidence (outcome, provider, reason, job and correlation) without keeping working path text.
+        await tx.update(attempts).set({ targetPathEnc: null, phaseLabelEnc: null })
+          .where(and(eq(attempts.kind, "order_file"),
+            sql`(${attempts.orderPublicId} = ${orderPublicId} OR ${attempts.sourcePublicId} IN (${scopedFiles(tx, orderId, orderPublicId)}))`));
+      });
       const retained = await db.select({ connection: attempts.connectionPublicId, reason: attempts.errorCode, total: count() })
         .from(attempts).where(and(eq(attempts.orderPublicId, orderPublicId),
           inArray(attempts.errorCode, [unverifiedExternal, acknowledgedExternal, providerRecycleBin])))

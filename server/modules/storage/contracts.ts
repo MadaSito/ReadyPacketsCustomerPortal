@@ -1,6 +1,7 @@
 import type { Readable } from "node:stream";
 import type { z } from "zod";
 import type { DbOrTx, ModuleLifecycle, SessionPrincipal, Tx } from "../../core/types.js";
+import type { TrashPurgeRun } from "../trash/ports.js";
 import type { CopyLogService } from "./copyLog.js";
 import type { OrderCopiesService } from "./orderCopies.js";
 import type { ManagedFileSync } from "./managedFileSync.js";
@@ -146,7 +147,7 @@ export interface StorageCopyInput extends StoragePutInput {
 
 export interface StorageModule extends ModuleLifecycle {
   trashOrderCopiesInTx(tx: Tx, orderId: number, orderPublicId: string): Promise<void>;
-  purgeOrderCopies(orderId: number, orderPublicId: string, run: { runId: string; acknowledgedUnreachableCopies?: boolean }): Promise<{
+  purgeOrderCopies(orderId: number, orderPublicId: string, run: TrashPurgeRun): Promise<{
     deleted: number; external: number; shared: number; receipts: number; providerRecycleBin: number;
     unverifiedExternalCopies: Record<string, number>; acknowledgedExternalCopies: Record<string, number>;
   }>;

@@ -10,7 +10,7 @@ import { knowledgeArticleAttachments } from "../knowledge/schema.js";
 import { orders } from "../orders/schema.js";
 import { platformPresentationImages } from "../platform/schema.js";
 import { portableExports } from "../portable/schema.js";
-import type { TrashEntityRef, TrashParticipant } from "../trash/ports.js";
+import type { TrashEntityRef, TrashParticipant, TrashPurgeRun } from "../trash/ports.js";
 import { fileArchives, fileArchiveTickets } from "./archivesSchema.js";
 import { audioJob } from "./audio.js";
 import { fileDownloadTickets, filePlaybackGrants, orderFiles } from "./schema.js";
@@ -21,12 +21,14 @@ const zipKey = /^exports\/[a-f0-9]{32}$/u;
 const batchSize = 100;
 const unavailable = (code: string) => new DomainError("UNAVAILABLE", code, "File deletion could not be verified. Try deletion again.");
 
-async function removeVerified(storage: ModuleDeps["storage"], key: string) {
+async function removeVerified(storage: ModuleDeps["storage"], key: string, beforeStorageCall?: () => Promise<void>) {
+  await beforeStorageCall?.();
   await storage.delete(key);
+  await beforeStorageCall?.();
   if (await storage.stat(key)) throw unavailable("FILE_TRASH_OBJECT_REMAINS");
 }
 
-export async function removeUnsharedArchive(deps: ModuleDeps, row: Pick<typeof fileArchives.$inferSelect, "id" | "publicId" | "objectKeyEnc">, tx?: Tx) {
+export async function removeUnsharedArchive(deps: ModuleDeps, row: Pick<typeof fileArchives.$inferSelect, "id" | "publicId" | "objectKeyEnc">, tx?: Tx, beforeStorageCall?: () => Promise<void>) {
   const { storage, crypto } = deps;
   const db = tx ?? deps.db;
   const key = crypto.decrypt(row.objectKeyEnc!, archiveObjectAad(row.publicId));
@@ -45,7 +47,7 @@ export async function removeUnsharedArchive(deps: ModuleDeps, row: Pick<typeof f
     if (rows.length < batchSize) break;
     after = rows.at(-1)!.id;
   }
-  await removeVerified(storage, key);
+  await removeVerified(storage, key, beforeStorageCall);
   return true;
 }
 
@@ -71,7 +73,9 @@ export function createFilesTrashParticipant(deps: ModuleDeps): TrashParticipant 
       .where(and(scope(entity), inArray(fileArchives.state, ["queued", "building", "ready"])));
   }
 
-  async function purgeArchives(entity: TrashEntityRef) {
+  const storageFence = (run: TrashPurgeRun) => () => db.transaction((tx) => run.assertCurrentInTx(tx));
+
+  async function purgeArchives(entity: TrashEntityRef, run: TrashPurgeRun) {
     let archives = 0, sharedObjects = 0;
     for (;;) {
       const rows = await db.select().from(fileArchives).where(scope(entity)).orderBy(fileArchives.id).limit(batchSize);
@@ -85,9 +89,12 @@ export function createFilesTrashParticipant(deps: ModuleDeps): TrashParticipant 
           }
         }
         if (row.objectKeyEnc && !row.purgedAt) {
-          if (!await removeUnsharedArchive(deps, row)) sharedObjects += 1;
+          if (!await removeUnsharedArchive(deps, row, undefined, storageFence(run))) sharedObjects += 1;
         }
-        await db.delete(fileArchives).where(and(eq(fileArchives.id, row.id), scope(entity)));
+        await db.transaction(async (tx) => {
+          await run.assertCurrentInTx(tx);
+          await tx.delete(fileArchives).where(and(eq(fileArchives.id, row.id), scope(entity)));
+        });
         archives += 1;
       }
     }
@@ -113,8 +120,11 @@ export function createFilesTrashParticipant(deps: ModuleDeps): TrashParticipant 
         eq(table.publicId, entity.publicId), eq(table.trashBatchId, entity.batchId),
         isNotNull(table.purgeStartedAt), isNotNull(table.trashedAt), isNull(table.purgedAt)));
       if (!fence) throw unavailable("FILE_TRASH_FENCE_INVALID");
-      await db.transaction((tx) => revoke(tx, entity));
-      const zip = await purgeArchives(entity);
+      await db.transaction(async (tx) => {
+        await run.assertCurrentInTx(tx);
+        await revoke(tx, entity);
+      });
+      const zip = await purgeArchives(entity, run);
       let deletedFiles = 0, recordings = 0, sharedObjects = zip.sharedObjects;
       let copies = { deleted: 0, external: 0, shared: 0, receipts: 0, providerRecycleBin: 0,
         unverifiedExternalCopies: {} as Record<string, number>, acknowledgedExternalCopies: {} as Record<string, number> };
@@ -134,9 +144,12 @@ export function createFilesTrashParticipant(deps: ModuleDeps): TrashParticipant 
               const [brand] = await db.select({ id: platformPresentationImages.id }).from(platformPresentationImages)
                 .where(eq(platformPresentationImages.storageKey, row.storageKey)).limit(1);
               if (knowledge || brand) sharedObjects += 1;
-              else await removeVerified(storage, row.storageKey);
+              else await removeVerified(storage, row.storageKey, storageFence(run));
             }
-            await db.delete(orderFiles).where(and(eq(orderFiles.id, row.id), files(entity)));
+            await db.transaction(async (tx) => {
+              await run.assertCurrentInTx(tx);
+              await tx.delete(orderFiles).where(and(eq(orderFiles.id, row.id), files(entity)));
+            });
             deletedFiles += 1;
             if (!row.derivedFromPublicId && row.contentType.startsWith("audio/")) recordings += 1;
           }
