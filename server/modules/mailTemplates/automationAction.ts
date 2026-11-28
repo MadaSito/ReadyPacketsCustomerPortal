@@ -28,7 +28,7 @@ import {
   type AutomationActionRunResult,
   type AutomationScalarValue,
 } from "../automations/contracts.js";
-import { substitutePlainText } from "./sanitizer.js";
+import { parseAllowedTemplateUrl, substitutePlainText } from "./sanitizer.js";
 import {
   mailTemplates,
   mailTemplateVersions,
@@ -43,14 +43,15 @@ export function ensureGenericAutomationTemplateRegistered(mailer: Mailer): void 
   try {
     mailer.registerTemplate({
       key: GENERIC_AUTOMATION_MAIL_TEMPLATE,
-      vars: ["subject", "body", "recipient_name"],
+      vars: ["subject", "body", "recipient_name", "portalUrl"],
       subject: (vars) => String(vars.subject ?? "Portal notification"),
       text: (vars) => {
         const greeting =
           typeof vars.recipient_name === "string" && vars.recipient_name.trim().length > 0
             ? `Hello ${vars.recipient_name.trim()},\n\n`
             : "";
-        return `${greeting}${String(vars.body ?? "")}`;
+        const action = vars.portalUrl ? `\n\nOpen in ReadyPackets:\n${vars.portalUrl}` : "";
+        return `${greeting}${String(vars.body ?? "")}${action}`;
       },
     });
   } catch {
@@ -70,6 +71,23 @@ function renderGenericNoticeField(
   }
   const rendered = substitutePlainText(template, stringVars);
   return singleLine ? rendered.replace(/[\r\n]+/g, " ").trim() : rendered;
+}
+
+function renderGenericNoticeBody(
+  template: string, fields: Readonly<Record<string, AutomationScalarValue>>, origin: string, allowPortalUrl: boolean,
+): Record<string, string> {
+  const canonical = new URL(origin).origin;
+  if (allowPortalUrl) {
+    for (const name of ["order_link", "invoice_link", "ticket_link", "portal_link"]) {
+      if (!template.includes(`{{${name}}}`)) continue;
+      const value = fields[name];
+      const url = typeof value === "string" ? parseAllowedTemplateUrl(value, { allowMailto: false, canonicalOrigin: canonical }) : null;
+      if (url?.startsWith(`${canonical}/`)) {
+        return { body: renderGenericNoticeField(template, { ...fields, [name]: "" }).trim(), portalUrl: url };
+      }
+    }
+  }
+  return { body: renderGenericNoticeField(template, fields) };
 }
 
 const RESERVED_INTERNAL_TEMPLATE_KEYS = new Set(["jobs.mail.verify_audit_copy"]);
@@ -275,6 +293,10 @@ async function runSendTemplateAction(
       };
     }
 
+    const published = await deps.services.mailTemplates?.store.resolve(GENERIC_AUTOMATION_MAIL_TEMPLATE);
+    const allowPortalUrl = !published || published.vars.includes("portalUrl");
+    const noticeBody = (fields: Readonly<Record<string, AutomationScalarValue>>) =>
+      renderGenericNoticeBody(config.body ?? "", fields, deps.services.config.canonicalOrigin, allowPortalUrl);
     if (config.recipientMode === "fixed") {
       const addr = config.fixedAddress?.trim().toLowerCase() ?? "";
       if (!addr || hasControlChar(addr) || !SIMPLE_EMAIL_RE.test(addr)) {
@@ -286,13 +308,12 @@ async function runSendTemplateAction(
         };
       }
       const subject = renderGenericNoticeField(config.subject ?? "Portal notification", ctx.fields, true);
-      const body = renderGenericNoticeField(config.body ?? "", ctx.fields, false);
       await execWithAutomationCorrelation(() =>
         deps.mailer.enqueue({
           template: GENERIC_AUTOMATION_MAIL_TEMPLATE,
           ...scope,
           to: { address: addr },
-          vars: { subject, body, recipient_name: "" },
+          vars: { subject, ...noticeBody(ctx.fields), recipient_name: "" },
           idempotencyKey: `${ctx.idempotencyKey}:mail:fixed`,
         }),
       );
@@ -336,13 +357,12 @@ async function runSendTemplateAction(
       }
       const perRecipientFields = { ...ctx.fields, recipient_name: displayName };
       const subject = renderGenericNoticeField(config.subject ?? "Portal notification", perRecipientFields, true);
-      const body = renderGenericNoticeField(config.body ?? "", perRecipientFields, false);
       await execWithAutomationCorrelation(() =>
         deps.mailer.enqueue({
           template: GENERIC_AUTOMATION_MAIL_TEMPLATE,
           ...scope,
           to: { userId: u.id },
-          vars: { subject, body, recipient_name: displayName },
+          vars: { subject, ...noticeBody(perRecipientFields), recipient_name: displayName },
           idempotencyKey: `${ctx.idempotencyKey}:mail:u:${u.id}`,
         }),
       );

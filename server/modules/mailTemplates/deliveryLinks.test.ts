@@ -37,14 +37,13 @@ describe("HTML and text alternatives for registered mail", () => {
         return [name, name === "portalPath" ? path : `${origin}${path}`];
       }
       if (template.key === "automations.generic_notice" && name === "body") {
-        const url = `${origin}/orders/demo`;
-        destinations.set(name, url);
-        return [name, `Your order is ready: ${url}`];
+        return [name, "External note: https://untrusted.example.test/message"];
       }
       return [name, sampleValue];
     }));
     const { text, html } = renderShippedMail(template, metadata, vars, origin);
     expect(html).toContain("<html");
+    if (template.key === "automations.generic_notice") expect(html).not.toContain('href="https://untrusted.example.test/message"');
     for (const [name, url] of destinations) {
       const href = `href="${escapeHtmlText(url)}"`;
       expect(html).toContain(href);
@@ -58,6 +57,34 @@ describe("HTML and text alternatives for registered mail", () => {
 });
 
 describe("post-substitution mail links", () => {
+  it.each(["html", "text"] as const)("keeps free-form URL values inert in %s mail, even at a locked origin", (format) => {
+    const hostile = "https://outside.example.test/profile?a=1&b=2";
+    const link = `${origin}/confirm`;
+    const prose = "Hello {{name}}. Project: {{projectName}}. Message: {{body}}.";
+    const rendered = renderMailTemplateVersion({
+      format, subjectTemplate: "ReadyPackets notice",
+      bodyHtmlTemplate: `<p>${prose} {{link}} https://example.test/{{name}} <a href="{{body}}" data-rp-button="primary">Untrusted destination</a></p>`,
+      bodyTextTemplate: `${prose}\n{{link}}`, declaredVars: ["name", "projectName", "body", "link"],
+      vars: { name: hostile, projectName: hostile, body: hostile, link }, canonicalOrigin: origin, lockedOrigin: origin,
+    });
+    expect(rendered.html).toContain(`href="${link}"`);
+    expect(rendered.html.match(/<a /g)).toHaveLength(1);
+    expect(rendered.html).toContain(escapeHtmlText(hostile));
+    expect(rendered.text).toContain(`Hello ${hostile}. Project: ${hostile}. Message: ${hostile}.`);
+    expect(rendered.text.split("\n")).toContain(link);
+  });
+
+  it("canonicalizes trusted link values identically in text and HTML and preserves their trailing punctuation", () => {
+    const raw = "https://éxample.test/path?";
+    const canonical = new URL(raw).href;
+    const { html, text } = renderMailTemplateVersion({
+      format: "text", subjectTemplate: "ReadyPackets notice", bodyHtmlTemplate: null,
+      bodyTextTemplate: "Here ({{link}}).", declaredVars: ["link"], vars: { link: raw },
+    });
+    expect(html).toContain(`href="${canonical}"`);
+    expect(text.split("\n")).toContain(canonical);
+  });
+
   it("links only decoded text, preserves authored anchors and balances trailing punctuation", () => {
     const rendered = renderMailTemplateVersion({
       format: "html",
@@ -87,9 +114,11 @@ describe("post-substitution mail links", () => {
     "http://example.test/path",
     "mailto:help@example.test",
     "https://user:password@example.test/p",
+    "https://@example.test/p",
     "https://example.test\\@other.example.test",
     "https://exam\u202Eple.test",
     "https://exam\u0001ple.test",
+    "https://example.test/path\tmore",
     `https://example.test/${"x".repeat(5000)}`,
   ])("does not make an anchor from invalid or non-HTTPS text %j", (raw) => {
     expect(plainTextToDeliveryHtml(raw)).not.toContain("<a ");

@@ -8,6 +8,7 @@ import { createTestDeps, fakePrincipal } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createAuditEmitter } from "../audit/emitter.js";
 import { auditEvents } from "../audit/schema.js";
+import { IDENTITY_MAIL_TEMPLATES } from "../identity/mail.js";
 import { users } from "../identity/schema.js";
 import { orderReferences, orders } from "../orders/schema.js";
 import { createJobsAdmin } from "./admin.js";
@@ -766,6 +767,100 @@ describe("MySQL transactional mail outbox", () => {
     });
     return { send, findRecipient };
   }
+
+  it("delivers branded activation mail even if the recipient's stored name contains an off-origin URL", async () => {
+    const f = fixture();
+    const { send, findRecipient } = setDelivery(f, "accepted");
+    f.mailer.registerTemplate(IDENTITY_MAIL_TEMPLATES.find(({ key }) => key === "auth.invitation")!);
+    const name = "https://outside.example.test/name?a=1&b=2";
+    const link = `${f.h.config.canonicalOrigin}/choose-password`;
+    findRecipient.mockResolvedValue({ email: "current@example.test", status: "active", emailVerified: true, preferredName: name });
+    await f.mailer.enqueue({ template: "auth.invitation", to: { userId: 22 }, vars: { name, link }, idempotencyKey: "activation-provenance" });
+    await f.engine.execute((await f.engine.claim())!);
+    const delivered = send.mock.calls[0]?.[0];
+    expect(delivered?.html).toContain(`href="${link}"`);
+    expect(delivered?.html.match(/<a /gu)).toHaveLength(1);
+    expect(delivered?.html).toContain("https://outside.example.test/name?a=1&amp;b=2");
+    expect(delivered?.text).toContain(name);
+    expect(delivered?.text.split("\n")).toContain(link);
+  });
+
+  it("repairs legacy recipient and order selectors in the bounded expiry job and then scrubs on trash", async () => {
+    const f = fixture();
+    const { send } = setDelivery(f, "accepted", undefined, { trashGuard: createMailTrashGuard(f.h.deps) });
+    const now = f.h.clock.now();
+    const [owner] = await t.db.insert(users).values({
+      publicId: ulid(), role: "customer", status: "active", emailEnc: "synthetic",
+      emailIndex: f.h.deps.crypto.blindIndex("legacy-owner@example.test", "users.email"),
+      nameEnc: "synthetic", createdAt: now, updatedAt: now,
+    });
+    const orderPublicId = ulid();
+    const [order] = await t.db.insert(orders).values({
+      publicId: orderPublicId, reference: "RP-TEST-LEGACY", ownerUserId: Number(owner.insertId), projectName: "Synthetic order",
+      workflowVersionId: 1, statusKey: "received", subtotalMinor: 0, totalMinor: 0, currency: "USD", createdAt: now, updatedAt: now,
+    });
+    const to = { address: "legacy-owner@example.test" };
+    const vars = { name: "Legacy owner", link: `${f.h.config.canonicalOrigin}/orders/${orderPublicId}` };
+    await f.mailer.enqueue({ ...input, to, vars });
+    const [row] = await t.db.select().from(mailOutbox);
+    await t.db.update(mailOutbox).set({ state: "held", orderId: null, recipientAccountId: null,
+      payloadEnc: f.h.deps.crypto.encrypt(JSON.stringify({ to, vars }), `mail_outbox.payload_enc:${row!.publicId}`),
+    }).where(eq(mailOutbox.id, row!.id));
+    await f.engine.execute((await f.engine.claim())!); // Original delivery ledger entry finds the row held.
+    await f.jobs.enqueue("jobs.mail.expire", null);
+    await f.engine.execute((await f.engine.claim())!);
+    expect((await t.db.select().from(mailOutbox))[0]).toMatchObject({
+      orderId: Number(order.insertId), recipientAccountId: Number(owner.insertId), state: "held",
+    });
+    await t.db.transaction((tx) => createMailTrashParticipant(f.h.deps).onTrashedInTx!(tx, {
+      kind: "order", id: Number(order.insertId), publicId: orderPublicId, batchId: ulid(),
+    }, { kind: "system", job: "test.trash" }));
+    expect((await t.db.select().from(mailOutbox))[0]).toMatchObject({ state: "failed", payloadEnc: null });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("does not deliver old unbound literal-address mail to a newer account after the blind index was released", async () => {
+    const f = fixture();
+    const { send } = setDelivery(f, "accepted", undefined, { trashGuard: createMailTrashGuard(f.h.deps) });
+    const to = { address: "recycled@example.test" };
+    await f.mailer.enqueue({ ...input, to });
+    const [row] = await t.db.select().from(mailOutbox);
+    await t.db.update(mailOutbox).set({
+      payloadEnc: f.h.deps.crypto.encrypt(JSON.stringify({ to, vars: input.vars }), `mail_outbox.payload_enc:${row!.publicId}`),
+    }).where(eq(mailOutbox.id, row!.id));
+    f.h.clock.advance(1_000);
+    const now = f.h.clock.now();
+    await t.db.insert(users).values({
+      publicId: ulid(), role: "customer", status: "suspended", emailEnc: "erased",
+      emailIndex: f.h.deps.crypto.blindIndex("deleted-synthetic@tombstone.invalid", "users.email"),
+      nameEnc: "erased", createdAt: row!.createdAt, updatedAt: now, purgedAt: now,
+    });
+    await t.db.insert(users).values({
+      publicId: ulid(), role: "customer", status: "active", emailEnc: "synthetic",
+      emailIndex: f.h.deps.crypto.blindIndex(to.address, "users.email"),
+      nameEnc: "synthetic", createdAt: now, updatedAt: now,
+    });
+    await f.engine.execute((await f.engine.claim())!);
+    expect(send).not.toHaveBeenCalled();
+    expect((await t.db.select().from(mailOutbox))[0]).toMatchObject({
+      recipientAccountId: null, payloadEnc: null, state: "failed", reasonCode: "MAIL_SCOPE_UNAVAILABLE",
+    });
+  });
+
+  it("uses the lifetime cap for legacy literal mail whose original recipient cannot be established", async () => {
+    const f = fixture();
+    const { send } = setDelivery(f, "accepted", undefined, { trashGuard: createMailTrashGuard(f.h.deps) });
+    const to = { address: "unmapped@example.test" };
+    await f.mailer.enqueue({ ...input, to });
+    const [row] = await t.db.select().from(mailOutbox);
+    await t.db.update(mailOutbox).set({
+      createdAt: new Date(row!.createdAt.getTime() - 73 * 60 * 60_000),
+      payloadEnc: f.h.deps.crypto.encrypt(JSON.stringify({ to, vars: input.vars }), `mail_outbox.payload_enc:${row!.publicId}`),
+    }).where(eq(mailOutbox.id, row!.id));
+    await f.engine.execute((await f.engine.claim())!);
+    expect(send).not.toHaveBeenCalled();
+    expect((await t.db.select().from(mailOutbox))[0]).toMatchObject({ payloadEnc: null, reasonCode: "MAIL_SCOPE_UNAVAILABLE" });
+  });
 
   it("drops claimed mail when its order is trashed just before the transport would send", async () => {
     const f = fixture();

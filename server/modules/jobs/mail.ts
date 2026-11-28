@@ -1,11 +1,11 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { and, asc, eq, inArray, isNotNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DeploymentProfile } from "../../config/env.js";
 import { conflict, DomainError, notFound, validation } from "../../core/errors.js";
 import { ULID_PATTERN, ulid } from "../../core/ids.js";
 import type { AuditOutcome, ClaimedJob, JobQueue, JobResult, Mailer, MailTemplate, OutboundMail, SessionPrincipal, Tx } from "../../core/types.js";
-import { mailTextWithStandaloneLinks, plainTextToDeliveryHtml } from "../mailTemplates/sanitizer.js";
+import { inertPlainTextToDeliveryHtml } from "../mailTemplates/sanitizer.js";
 import { buildSystemTemplateMetadata, renderShippedMail } from "../mailTemplates/systemCatalogue.js";
 import { defineSetting, readSetting } from "../platform/settingsRegistry.js";
 import { decodeMailAttachments, encodeMailAttachments, storedAttachments } from "./mailAttachments.js";
@@ -34,6 +34,7 @@ const payloadSchema = z.strictObject({
   attachments: storedAttachments,
   orderId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
   recipientAccountId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+  trashScoped: z.literal(true).optional(),
 });
 const jobPayload = z.strictObject({ mailId: z.string().regex(ULID_PATTERN), generation: z.number().int().min(1).max(20) });
 const captureSchema = z.strictObject({ to: address, subject: z.string().max(255), text: z.string().max(65_536) });
@@ -237,6 +238,25 @@ export class MailEngine implements Mailer {
 
   #getLegacySender: DeliveryDeps["getLegacySender"] = async () => null;
   #trashGuard: DeliveryDeps["trashGuard"];
+  #backfillAfter = 0;
+
+  #readPayload(row: MailRow) {
+    if (row.payloadEnc === null) throw new Error("MAIL_PAYLOAD_UNAVAILABLE");
+    return payloadSchema.parse(JSON.parse(this.deps.crypto.decrypt(row.payloadEnc, `mail_outbox.payload_enc:${row.publicId}`)));
+  }
+
+  #scope(row: MailRow, payload: z.infer<typeof payloadSchema>): MailTrashScope {
+    return {
+      ...payload, template: row.template, orderId: row.orderId ?? payload.orderId,
+      recipientAccountId: row.recipientAccountId ?? payload.recipientAccountId,
+      legacyCreatedAt: payload.trashScoped === true ? undefined : row.createdAt,
+    };
+  }
+
+  #legacyTooOld(scope: MailTrashScope, now: Date) {
+    return scope.legacyCreatedAt !== undefined && "address" in scope.to && scope.recipientAccountId === undefined
+      && now.getTime() - scope.legacyCreatedAt.getTime() >= MAX_TTL;
+  }
 
   async getMailSenderIdentity(): Promise<MailSenderIdentity | null> {
     const configured = await readSetting(this.deps.settings, MAIL_SENDER);
@@ -320,7 +340,7 @@ export class MailEngine implements Mailer {
       const recipientAccountId = "address" in body.to
         ? await this.#trashGuard?.bindLiteralRecipient(inner, body.to.address) : body.to.userId;
       if (await this.#trashGuard?.isSuppressed({ ...body, recipientAccountId, template: template.key }, inner)) return;
-      const serialized = JSON.stringify({ ...body, recipientAccountId, attachments });
+      const serialized = JSON.stringify({ ...body, recipientAccountId, attachments, trashScoped: this.#trashGuard ? true : undefined });
       const publicId = ulid(now.getTime());
       const correlationId = currentCorrelation(publicId);
       const idempotencyHash = keyHash(mail.idempotencyKey);
@@ -471,8 +491,8 @@ export class MailEngine implements Mailer {
     try {
       const rendered = template.render(vars);
       const { subject } = rendered;
-      const text = rendered.html === undefined ? mailTextWithStandaloneLinks(rendered.text) : rendered.text;
-      const html = rendered.html ?? plainTextToDeliveryHtml(rendered.text);
+      const { text } = rendered;
+      const html = rendered.html ?? inertPlainTextToDeliveryHtml(text);
       if (typeof subject === "string" && subject.length >= 1 && subject.length <= 255 && !HEADER_CONTROL.test(subject)
         && typeof text === "string" && text.length >= 1 && text.length <= 65_536 && !text.includes("\0")
         && typeof html === "string" && html.length <= 512 * 1024 && !html.includes("\0")) {
@@ -520,8 +540,11 @@ export class MailEngine implements Mailer {
       if (mode && row.template === VERIFY_AUDIT) return this.#preSendFailure(job, ids, "MAIL_VERIFICATION_CAPTURE_BLOCKED", true);
       const template = await this.#template(row.template);
       if (!row.payloadEnc || !template) throw new Error("MAIL_PAYLOAD_UNAVAILABLE");
-      const payload = payloadSchema.parse(JSON.parse(deps.crypto.decrypt(row.payloadEnc, `mail_outbox.payload_enc:${row.publicId}`)));
-      scope = { ...payload, template: row.template };
+      const payload = this.#readPayload(row);
+      scope = this.#scope(row, payload);
+      if (this.#trashGuard && (this.#legacyTooOld(scope, deps.clock.now()) || await this.#trashGuard.isSuppressed(scope))) {
+        return this.#preSendFailure(job, ids, "MAIL_SCOPE_UNAVAILABLE", true);
+      }
       if (Object.keys(payload.vars).some((name) => !template.vars.includes(name))) throw new Error("MAIL_TEMPLATE_VARS_CHANGED");
       const recipient = "userId" in payload.to
         ? await delivery.findRecipient(payload.to.userId)
@@ -669,7 +692,8 @@ export class MailEngine implements Mailer {
     job.signal.throwIfAborted();
     if (expiresAt && expiresAt <= this.deps.clock.now()) return { outcome: "expired" };
     try {
-      if (scope && await this.#trashGuard?.isSuppressed(scope)) return { outcome: "suppressed" };
+      if (scope && this.#trashGuard && (this.#legacyTooOld(scope, this.deps.clock.now())
+        || await this.#trashGuard.isSuppressed(scope))) return { outcome: "suppressed" };
     } catch {
       return { outcome: "suppressed" }; // A failed gate cannot authorize an external effect.
     }
@@ -747,7 +771,8 @@ export class MailEngine implements Mailer {
       await tx.insert(mailAttempts).values({
         mailId: current.id, generation: current.generation, state: "failed", reasonCode, startedAt: now, finishedAt: now,
       });
-      await tx.update(mailOutbox).set({ state: "failed", reasonCode, updatedAt: now, ...(purge ? { payloadEnc: null } : {}) })
+      await tx.update(mailOutbox).set({ state: "failed", reasonCode, updatedAt: now, ...(purge ? { payloadEnc: null } : {}),
+        ...(reasonCode === "MAIL_SCOPE_UNAVAILABLE" ? { captureEnc: null, contentEnc: null, contentExpiresAt: null } : {}) })
         .where(eq(mailOutbox.id, current.id));
       await mailAudit(deps, tx, current, "job.mail.failed", "failed", reasonCode, true);
     });
@@ -795,6 +820,52 @@ export class MailEngine implements Mailer {
       contentPurged += changed;
       if (changed < 50) break;
     }
-    return { outcome: "completed", safeCounts: { purged, content_purged: contentPurged } };
+    const bindingsRepaired = await this.#backfillLegacyBindings(job);
+    return { outcome: "completed", safeCounts: { purged, content_purged: contentPurged, ...(bindingsRepaired ? { bindings_repaired: bindingsRepaired } : {}) } };
+  }
+
+  async #backfillLegacyBindings(job: ClaimedJob): Promise<number> {
+    const guard = this.#trashGuard;
+    if (!guard) return 0;
+    const { deps } = this;
+    const { next, repaired } = await deps.db.transaction(async (tx) => {
+      await job.assertStillOwned(tx);
+      const now = deps.clock.now();
+      const rows = await tx.select().from(mailOutbox).where(and(
+        gt(mailOutbox.id, this.#backfillAfter), gt(mailOutbox.expiresAt, now),
+        inArray(mailOutbox.state, ["queued", "held", "failed", "unknown"]), isNotNull(mailOutbox.payloadEnc),
+        or(isNull(mailOutbox.orderId), isNull(mailOutbox.recipientAccountId)),
+      )).orderBy(asc(mailOutbox.id)).limit(25).for("update", { skipLocked: true });
+      let repaired = 0;
+      for (const row of rows) {
+        let scope: MailTrashScope;
+        try {
+          scope = this.#scope(row, this.#readPayload(row));
+        } catch {
+          continue; // The dispatch parser refuses unreadable payloads; expiry still scrubs them.
+        }
+        if (!scope.legacyCreatedAt) continue;
+        const binding = await guard.recoverLegacyBinding(scope, tx);
+        if (binding.suppressed || this.#legacyTooOld(scope, now) || await guard.isSuppressed({ ...scope, ...binding }, tx)) {
+          // Keep transport/queue evidence, and preserve an ambiguous prior provider outcome.
+          await tx.update(mailOutbox).set({
+            state: row.state === "unknown" ? row.state : "failed",
+            reasonCode: row.state === "unknown" ? row.reasonCode : "MAIL_SCOPE_UNAVAILABLE",
+            payloadEnc: null, captureEnc: null, contentEnc: null, contentExpiresAt: null, updatedAt: now,
+            orderId: binding.orderId, recipientAccountId: binding.recipientAccountId,
+          }).where(eq(mailOutbox.id, row.id));
+          await mailAudit(deps, tx, row, "job.mail.payload.purged", "completed", "MAIL_SCOPE_UNAVAILABLE", true);
+          repaired += 1;
+        } else if ((row.orderId === null && binding.orderId !== undefined)
+          || (row.recipientAccountId === null && binding.recipientAccountId !== undefined)) {
+          await tx.update(mailOutbox).set({ orderId: binding.orderId, recipientAccountId: binding.recipientAccountId })
+            .where(eq(mailOutbox.id, row.id));
+          repaired += 1;
+        }
+      }
+      return { next: rows.length === 25 ? rows[24]!.id : 0, repaired };
+    }, { isolationLevel: "read committed" });
+    this.#backfillAfter = next;
+    return repaired;
   }
 }

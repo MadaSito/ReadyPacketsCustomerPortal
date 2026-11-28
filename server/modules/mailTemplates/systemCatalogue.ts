@@ -1,7 +1,6 @@
 import type { Mailer, MailTemplate } from "../../core/types.js";
 import {
-  escapeHtmlText, isMailUrlVariable, mailTextWithStandaloneLinks, parseAllowedTemplateUrl,
-  plainTextToDeliveryHtml, renderMailTemplateVersion, resolveMailPathVariables,
+  escapeHtmlText, isMailUrlVariable, parseAllowedTemplateUrl, renderMailTemplateVersion, resolveMailPathVariables,
 } from "./sanitizer.js";
 import type { MailTemplateCategory, MailTemplateVariableSpec } from "./schema.js";
 
@@ -51,7 +50,8 @@ const DEFAULT_VAR_LABELS: Readonly<Record<string, { label: string; sample: strin
 };
 
 export function getShippedSecurityMailOrigin(key: string, origin: string): string | undefined {
-  return key === "auth.verify_email" || key === "auth.invitation" || key === "auth.password_reset" || key === "auth.admin_set_password"
+  return key === "auth.verify_email" || key === "auth.invitation" || key === "auth.password_reset"
+    || key === "auth.admin_set_password" || key === "auth.account_exists"
     ? new URL(origin).origin : undefined;
 }
 
@@ -329,7 +329,7 @@ export function buildSystemTemplateMetadata(builtin: MailTemplate): SystemMailTe
   const sensitiveSet = new Set(builtin.sensitiveVars ?? []);
   const requiredSet = new Set<string>([
     ...sensitiveSet,
-    ...(seed?.requiredVars ?? builtin.vars),
+    ...(seed?.requiredVars ?? builtin.vars.filter((key) => builtin.key !== "automations.generic_notice" || key !== "portalUrl")),
   ]);
 
   const declaredVars: MailTemplateVariableSpec[] = builtin.vars.map((varName) => {
@@ -387,10 +387,19 @@ export function renderShippedMail(
 ) {
   const vars = resolveMailPathVariables(input, canonicalOrigin);
   const subject = builtin.subject(vars);
-  const rawText = builtin.text(vars);
   const lockedOrigin = getShippedSecurityMailOrigin(builtin.key, canonicalOrigin);
-  const text = mailTextWithStandaloneLinks(rawText, lockedOrigin);
-  if (!builtin.vars.some(isMailUrlVariable)) return { subject, text, html: plainTextToDeliveryHtml(rawText) };
+  // Preserve conditional copy (such as optional order context) while keeping provenance.
+  const placeholders = Object.fromEntries(Object.entries(vars).map(([key, value]) =>
+    [key, typeof value === "string" && !value.trim() ? value : `{{${key}}}`]));
+  const bodyTextTemplate = builtin.text(placeholders);
+  const render = (useHtml: boolean) => {
+    const { html, text } = renderMailTemplateVersion({
+      format: useHtml ? "html" : "text", subjectTemplate: "ReadyPackets", bodyTextTemplate,
+      bodyHtmlTemplate: useHtml ? metadata.defaultBodyHtml : null, declaredVars: builtin.vars, vars, canonicalOrigin, lockedOrigin,
+    });
+    return { subject, text, html };
+  };
+  if (!builtin.vars.some(isMailUrlVariable)) return render(false);
 
   // An optional link might be absent, or a developer may be on a local HTTP origin.
   // In that case do not emit a broken button. The text fallback autolinks only allowed HTTPS.
@@ -399,11 +408,7 @@ export function renderShippedMail(
     if (lockedOrigin && new URL(lockedOrigin).protocol === "https:") {
       throw new Error("SECURITY_MAIL_LINK_INVALID");
     }
-    return { subject, text, html: plainTextToDeliveryHtml(rawText) };
+    return render(false);
   }
-  const { html } = renderMailTemplateVersion({
-    format: "html", subjectTemplate: metadata.defaultSubject, bodyTextTemplate: metadata.defaultBodyText,
-    bodyHtmlTemplate: metadata.defaultBodyHtml, declaredVars: builtin.vars, vars, canonicalOrigin, lockedOrigin,
-  });
-  return { subject, text, html };
+  return render(true);
 }

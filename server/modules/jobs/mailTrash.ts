@@ -17,6 +17,7 @@ export interface MailTrashScope {
   template: string;
   orderId?: number | undefined;
   recipientAccountId?: number | undefined;
+  legacyCreatedAt?: Date | undefined;
 }
 
 const ORDER_LINK_FIELDS = ["link", "portalPath", "orderLink", "order_link"] as const;
@@ -40,10 +41,44 @@ function legacyOrderPublicId(scope: MailTrashScope, origin: string): string | un
 
 export function createMailTrashGuard(deps: ModuleDeps) {
   const emailIndex = (address: string) => deps.crypto.blindIndex(normalizeEmail(address), "users.email");
+  const literalAccount = async (db: DbOrTx, address: string) => {
+    const [row] = await db.select({ id: users.id, createdAt: users.createdAt }).from(users)
+      .where(eq(users.emailIndex, emailIndex(address))).limit(1);
+    return row;
+  };
+  async function resolveOrder(scope: MailTrashScope, db: DbOrTx, hiddenOnly = false) {
+    if (scope.template.startsWith("mail_templates.test_")) return undefined;
+    const publicId = legacyOrderPublicId(scope, deps.config.canonicalOrigin);
+    const ref = scope.vars.orderReference ?? scope.vars.order_reference
+      ?? (scope.template.startsWith("orders.") ? scope.vars.reference : undefined);
+    const reference = typeof ref === "string" && ref.trim().length > 0 && ref.trim().length <= 32 ? ref.trim() : undefined;
+    if (!publicId && !reference) return undefined;
+    // Reserved references survive renames and tombstoning. Prefer the public ID when supplied.
+    const [row] = await db.select({ id: orders.id }).from(orders)
+      .leftJoin(orderReferences, eq(orderReferences.orderId, orders.id)).where(and(
+        hiddenOnly ? not(liveOrderPredicate()) : undefined,
+        publicId ? eq(orders.publicId, publicId) : or(eq(orders.reference, reference!), eq(orderReferences.reference, reference!)),
+      )).limit(1);
+    return row?.id;
+  }
   return {
     async bindLiteralRecipient(tx: DbOrTx, address: string) {
-      const [row] = await tx.select({ id: users.id }).from(users).where(eq(users.emailIndex, emailIndex(address))).limit(1);
-      return row?.id;
+      return (await literalAccount(tx, address))?.id;
+    },
+    async recoverLegacyBinding(scope: MailTrashScope, db: DbOrTx) {
+      const orderId = scope.orderId ?? await resolveOrder(scope, db);
+      let recipientAccountId = scope.recipientAccountId;
+      if ("userId" in scope.to) recipientAccountId = scope.to.userId;
+      else if (recipientAccountId === undefined) {
+        const current = await literalAccount(db, scope.to.address);
+        // Identity intentionally erases the released blind index. A current holder created later
+        // cannot be the enqueue-time owner; never attach their address to older work.
+        if (current && scope.legacyCreatedAt && current.createdAt > scope.legacyCreatedAt) {
+          return { suppressed: true, orderId, recipientAccountId };
+        }
+        recipientAccountId = current?.id;
+      }
+      return { suppressed: false, orderId, recipientAccountId };
     },
     async isSuppressed(scope: MailTrashScope, db: DbOrTx = deps.db): Promise<boolean> {
       if ("userId" in scope.to) {
@@ -55,6 +90,10 @@ export function createMailTrashGuard(deps: ModuleDeps) {
         )).limit(1);
         if (!row) return true;
       } else {
+        if (scope.legacyCreatedAt) {
+          const current = await literalAccount(db, scope.to.address);
+          if (current && current.createdAt > scope.legacyCreatedAt) return true;
+        }
         const [hidden] = await db.select({ id: users.id }).from(users).where(and(
           eq(users.emailIndex, emailIndex(scope.to.address)), not(liveUserPredicate()),
         )).limit(1);
@@ -65,19 +104,7 @@ export function createMailTrashGuard(deps: ModuleDeps) {
           .where(and(eq(orders.id, scope.orderId), liveOrderPredicate())).limit(1);
         return !liveOrder;
       }
-      if (scope.template.startsWith("mail_templates.test_")) return false;
-      const publicId = legacyOrderPublicId(scope, deps.config.canonicalOrigin);
-      const ref = scope.vars.orderReference ?? scope.vars.order_reference
-        ?? (scope.template.startsWith("orders.") ? scope.vars.reference : undefined);
-      const reference = typeof ref === "string" && ref.trim().length > 0 && ref.trim().length <= 32 ? ref.trim() : undefined;
-      if (!publicId && !reference) return false;
-      // Use reserved references as well as the current one: renaming an order does not unblock old mail.
-      const [hidden] = await db.select({ id: orders.id }).from(orders)
-        .leftJoin(orderReferences, eq(orderReferences.orderId, orders.id)).where(and(
-          not(liveOrderPredicate()), or(publicId ? eq(orders.publicId, publicId) : undefined,
-            reference ? or(eq(orders.reference, reference), eq(orderReferences.reference, reference)) : undefined),
-        )).limit(1);
-      return Boolean(hidden);
+      return (await resolveOrder(scope, db, true)) !== undefined;
     },
   };
 }
