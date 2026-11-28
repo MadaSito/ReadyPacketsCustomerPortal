@@ -48,8 +48,13 @@ import {
   trashCleanupSweeps,
   trashIdempotencyKeys,
   trashPurgeRuns,
+  trashPurgeRunTargets,
   trashRetentionState,
 } from "./schema.js";
+import {
+  trashRunAdvisoryLockName,
+  trashSweepAdvisoryLockName,
+} from "./service.js";
 import {
   TRASH_AUTO_PURGE_ENABLED,
   TRASH_RETENTION_CUSTOMER_DAYS,
@@ -83,6 +88,7 @@ const schema = {
   orderAdminTasks,
   platformSettings,
   trashPurgeRuns,
+  trashPurgeRunTargets,
   trashCleanupSweeps,
   trashIdempotencyKeys,
   trashRetentionState,
@@ -126,6 +132,13 @@ beforeEach(async () => {
       mfaEnrolled: true,
       recoveryCodesAcknowledged: true,
     }),
+  } as never;
+
+  h.services.jobAdmin = {
+    isDraining: async () => false,
+    maintenance: {
+      customerAccess: async () => ({ active: false, message: null, updatedAt: null }),
+    },
   } as never;
 
   const identity = createIdentityModule(h.deps);
@@ -664,7 +677,7 @@ describe("idempotency cross-batch protection, retention CAS, and router step-up"
     });
     expect(b2.batchId).not.toBe(b1.batchId);
 
-    // Replaying `idem-restore-shared-key` (even with the same item ref without batchId) must fail closed
+    // Replaying `idem-batch-2` on `moveToTrash` returns the same batch idempotently
     const r1 = await trash.moveToTrash(adminPrincipal, {
       kind: "order",
       publicId: ord.publicId,
@@ -672,21 +685,91 @@ describe("idempotency cross-batch protection, retention CAS, and router step-up"
     });
     expect(r1.batchId).toBe(b2.batchId);
 
-    await trash.restore(adminPrincipal, {
-      items: [{ kind: "order", publicId: ord.publicId }],
-      idempotencyKey: "idem-no-batch-restore",
-    });
-    await trash.moveToTrash(adminPrincipal, {
-      kind: "order",
-      publicId: ord.publicId,
-      idempotencyKey: "idem-batch-3",
-    });
+    // Reusing `idem-restore-shared-key` (bound to `b1.batchId`) against `b2.batchId` fails closed (`IDEMPOTENCY_KEY_REUSED`)
     await expect(
       trash.restore(adminPrincipal, {
-        items: [{ kind: "order", publicId: ord.publicId }],
-        idempotencyKey: "idem-no-batch-restore",
+        items: [{ kind: "order", publicId: ord.publicId, batchId: b2.batchId }],
+        idempotencyKey: "idem-restore-shared-key",
       }),
     ).rejects.toMatchObject({ reasonCode: "IDEMPOTENCY_KEY_REUSED" });
+
+    // Router rejects omitted `batchId` on manual `restore` and `purge`
+    const stepUpCaller = makeCaller({
+      request: newRequestContext("http"),
+      transport: {} as never,
+      session: adminStepUpPrincipal,
+      services: h.services,
+    });
+    await expect(
+      stepUpCaller.trash.restore({
+        items: [{ kind: "order", publicId: ord.publicId } as never],
+        idempotencyKey: "idem-missing-batch-restore",
+      }),
+    ).rejects.toThrow();
+    await expect(
+      stepUpCaller.trash.purge({
+        items: [{ kind: "order", publicId: ord.publicId } as never],
+        confirmation: ord.reference,
+        idempotencyKey: "idem-missing-batch-purge",
+      }),
+    ).rejects.toThrow();
+  });
+
+  it("retains idempotency key after a committed purge claim fails and replays or rejects cross-batch reuse", async () => {
+    const cust = await seedCustomer({ id: 52, status: "active" });
+    const ord = await seedOrder({ id: 502, ownerUserId: cust.id, reference: "ORD-2026-0502" });
+    const ordOther = await seedOrder({ id: 503, ownerUserId: cust.id, reference: "ORD-2026-0503" });
+
+    const failingTrash = createTrashModule(h.deps, {
+      expectedParticipants: ["identity", "orders", "failingMod"],
+    });
+    for (const p of trash.participants()) {
+      if (p.module === "identity" || p.module === "orders") failingTrash.register(p);
+    }
+    failingTrash.register({
+      module: "failingMod",
+      purge: async () => {
+        throw new DomainError("UNAVAILABLE", "DOWNSTREAM_TIMEOUT", "Downstream timed out.");
+      },
+    });
+    failingTrash.init?.();
+
+    const moved1 = await failingTrash.moveToTrash(adminPrincipal, {
+      kind: "order",
+      publicId: ord.publicId,
+      idempotencyKey: "idem-fail-move-1",
+    });
+    const moved2 = await failingTrash.moveToTrash(adminPrincipal, {
+      kind: "order",
+      publicId: ordOther.publicId,
+      idempotencyKey: "idem-fail-move-2",
+    });
+
+    await expect(
+      failingTrash.purge(adminStepUpPrincipal, {
+        items: [{ kind: "order", publicId: ord.publicId, batchId: moved1.batchId }],
+        confirmation: ord.reference,
+        idempotencyKey: "idem-retained-after-claim",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "DOWNSTREAM_TIMEOUT" });
+
+    // Key row was NOT deleted on partial/post-claim failure: reusing it for a different item/batch fails `IDEMPOTENCY_KEY_REUSED`!
+    await expect(
+      failingTrash.purge(adminStepUpPrincipal, {
+        items: [{ kind: "order", publicId: ordOther.publicId, batchId: moved2.batchId }],
+        confirmation: ordOther.reference,
+        idempotencyKey: "idem-retained-after-claim",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "IDEMPOTENCY_KEY_REUSED" });
+
+    // Exact replay with same key & fingerprint replays the recorded failed DomainError deterministically
+    await expect(
+      failingTrash.purge(adminStepUpPrincipal, {
+        items: [{ kind: "order", publicId: ord.publicId, batchId: moved1.batchId }],
+        confirmation: ord.reference,
+        idempotencyKey: "idem-retained-after-claim",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "DOWNSTREAM_TIMEOUT" });
   });
 
   it("enforces exact preview counts, DELETE <N> confirmation, cohort STALE check, and tRPC step-up", async () => {
@@ -799,5 +882,453 @@ describe("idempotency cross-batch protection, retention CAS, and router step-up"
     });
     expect(updated.orderDays).toBe(7);
     expect(updated.version).toBe(preview2.version + 1);
+
+    // Disabling auto clean-up is non-destructive (no confirmation required)
+    const disabled = await stepUpCaller.trash.settings.update({
+      autoPurgeEnabled: false,
+      orderDays: 30,
+      customerDays: 30,
+      expectedVersion: updated.version,
+      idempotencyKey: "idem-ret-disable",
+    });
+    expect(disabled.autoPurgeEnabled).toBe(false);
+
+    // Shortening while disabled is non-destructive (no confirmation required)
+    const previewDisabledShorten = await stepUpCaller.trash.settings.preview({
+      autoPurgeEnabled: false,
+      orderDays: 14,
+      customerDays: 14,
+    });
+    expect(previewDisabledShorten.requiresConfirmation).toBe(false);
+    expect(previewDisabledShorten.confirmationPhrase).toBeNull();
+
+    // Enabling auto clean-up when 0 items become due STILL requires `DELETE 0` typed confirmation (D2.8)!
+    const previewEnableZero = await stepUpCaller.trash.settings.preview({
+      autoPurgeEnabled: true,
+      orderDays: 365,
+      customerDays: 365,
+    });
+    expect(previewEnableZero.becomeDue).toBe(0);
+    expect(previewEnableZero.requiresConfirmation).toBe(true);
+    expect(previewEnableZero.confirmationPhrase).toBe("DELETE 0");
+
+    await expect(
+      stepUpCaller.trash.settings.update({
+        autoPurgeEnabled: true,
+        orderDays: 365,
+        customerDays: 365,
+        expectedVersion: previewEnableZero.version,
+        reviewedDueCount: 0,
+        idempotencyKey: "idem-enable-zero-missing-phrase",
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+
+    const enabledZero = await stepUpCaller.trash.settings.update({
+      autoPurgeEnabled: true,
+      orderDays: 365,
+      customerDays: 365,
+      expectedVersion: previewEnableZero.version,
+      reviewedDueCount: 0,
+      confirmation: "DELETE 0",
+      idempotencyKey: "idem-enable-zero-ok",
+    });
+    expect(enabledZero.autoPurgeEnabled).toBe(true);
+    expect(enabledZero.orderDays).toBe(365);
   });
 });
+
+describe("durable per-target ownership, advisory-lock participant fence, and retention single-flight progression", () => {
+  it("enforces permanent per-target ownership across root/reassigned cascades and supports scoped per-order external-copy acknowledgment", async () => {
+    const ownerA = await seedCustomer({ id: 70, status: "suspended", customerRef: "RPCUS-A1B2CJJG5" });
+    const ownerB = await seedCustomer({ id: 71, status: "suspended", customerRef: "RPCUS-B2C3DKKH6" });
+    const rootOrder = await seedOrder({
+      id: 700,
+      ownerUserId: ownerA.id,
+      reference: "RP-2026-0700",
+    });
+    // Addition order in rootOrder's group, reassigned to ownerB!
+    const reassignedChild = await seedOrder({
+      id: 701,
+      ownerUserId: ownerB.id,
+      reference: "RP-2026-0701",
+      groupRootOrderId: rootOrder.id,
+    });
+    const plainOrderA = await seedOrder({
+      id: 702,
+      ownerUserId: ownerA.id,
+      reference: "RP-2026-0702",
+    });
+
+    const seenByOrder = new Map<string, boolean[]>();
+    const cascadeTrash = createTrashModule(h.deps, {
+      expectedParticipants: ["identity", "orders", "files"],
+    });
+    for (const p of trash.participants()) {
+      if (p.module === "identity" || p.module === "orders") cascadeTrash.register(p);
+    }
+    cascadeTrash.register({
+      module: "files",
+      purge: async (entity: TrashEntityRef, run: TrashPurgeRun): Promise<TrashPurgeResult> => {
+        if (entity.kind !== "order") return { deleted: {} };
+        const arr = seenByOrder.get(entity.publicId) ?? [];
+        arr.push(Boolean(run.acknowledgedUnreachableCopies));
+        seenByOrder.set(entity.publicId, arr);
+        // Only `reassignedChild` has unreachable external copies!
+        if (entity.publicId === reassignedChild.publicId && !run.acknowledgedUnreachableCopies) {
+          throw new DomainError(
+            "UNAVAILABLE",
+            "EXTERNAL_COPIES_UNREACHABLE",
+            "External destination rotated.",
+            { unreachableCopies: 3 },
+          );
+        }
+        return {
+          deleted: { files: 1 },
+          ...(run.acknowledgedUnreachableCopies ? { kept: { acknowledgedExternalCopies: 3 } } : {}),
+        };
+      },
+    });
+    cascadeTrash.init?.();
+
+    const childTrashMove = await cascadeTrash.moveToTrash(adminPrincipal, {
+      kind: "order",
+      publicId: reassignedChild.publicId,
+      idempotencyKey: "idem-reassigned-child-trash",
+    });
+    const custBTrashMove = await cascadeTrash.moveToTrash(adminPrincipal, {
+      kind: "customer",
+      publicId: ownerB.publicId,
+      idempotencyKey: "idem-cust-b-trash",
+    });
+    const custATrashMove = await cascadeTrash.moveToTrash(adminPrincipal, {
+      kind: "customer",
+      publicId: ownerA.publicId,
+      idempotencyKey: "idem-cust-a-trash",
+    });
+
+    // Purging customer A claims `[rootOrder, reassignedChild, plainOrderA, ownerA]` in `trash_purge_run_targets` and halts on `reassignedChild`!
+    await expect(
+      cascadeTrash.purge(adminStepUpPrincipal, {
+        items: [{ kind: "customer", publicId: ownerA.publicId, batchId: custATrashMove.batchId }],
+        confirmation: ownerA.customerRef,
+        idempotencyKey: "idem-purge-cust-a-1",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "EXTERNAL_COPIES_UNREACHABLE" });
+
+    // Even while failed, `ownerA`'s run exclusively owns `reassignedChild` AND `rootOrder`!
+    // Attempting a standalone purge of `reassignedChild` OR `ownerB` fails with `PURGE_ALREADY_OWNED` (never creates a second run)!
+    await expect(
+      cascadeTrash.purge(adminStepUpPrincipal, {
+        items: [{ kind: "order", publicId: reassignedChild.publicId, batchId: childTrashMove.batchId }],
+        confirmation: reassignedChild.reference,
+        idempotencyKey: "idem-competing-child-purge",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "PURGE_ALREADY_OWNED" });
+
+    await expect(
+      cascadeTrash.purge(adminStepUpPrincipal, {
+        items: [{ kind: "customer", publicId: ownerB.publicId, batchId: custBTrashMove.batchId }],
+        confirmation: ownerB.customerRef,
+        idempotencyKey: "idem-competing-cust-b-purge",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "PURGE_ALREADY_OWNED" });
+
+    const allRuns = await t.db.select().from(trashPurgeRuns);
+    expect(allRuns).toHaveLength(1);
+    const owningRunId = allRuns[0]!.publicId;
+
+    // `trash.list` on customers surfaces `failedRunId`, `failedTargetPublicId` (`reassignedChild`), and `failedTargetReference` (`RP-2026-0701`)!
+    const custList = await cascadeTrash.list(adminPrincipal, {
+      kind: "customer",
+      sort: "movedAt",
+      dir: "desc",
+      limit: 20,
+    });
+    const custARow = custList.items.find((r) => r.publicId === ownerA.publicId);
+    expect(custARow).toMatchObject({
+      state: "failed",
+      failureCode: "EXTERNAL_COPIES_UNREACHABLE",
+      unreachableExternalCopies: 3,
+      failedRunId: owningRunId,
+      failedTargetPublicId: reassignedChild.publicId,
+      failedTargetReference: reassignedChild.reference,
+    });
+
+    // Blanket confirmation with customer ID or root order reference is REJECTED — must type `reassignedChild.reference`!
+    await expect(
+      cascadeTrash.finishLeavingExternalCopies(adminStepUpPrincipal, {
+        kind: "customer",
+        publicId: ownerA.publicId,
+        batchId: custATrashMove.batchId,
+        runId: owningRunId,
+        confirmation: ownerA.customerRef,
+        idempotencyKey: "idem-blanket-cust-confirm-rejected",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "CONFIRMATION_MISMATCH" });
+
+    await expect(
+      cascadeTrash.finishLeavingExternalCopies(adminStepUpPrincipal, {
+        kind: "customer",
+        publicId: ownerA.publicId,
+        batchId: custATrashMove.batchId,
+        runId: owningRunId,
+        confirmation: rootOrder.reference,
+        idempotencyKey: "idem-wrong-order-confirm-rejected",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "CONFIRMATION_MISMATCH" });
+
+    // Typing `RP-2026-0701` (`reassignedChild.reference`) scopes acknowledgment ONLY to `reassignedChild` and completes the owning run!
+    const finished = await cascadeTrash.finishLeavingExternalCopies(adminStepUpPrincipal, {
+      kind: "customer",
+      publicId: ownerA.publicId,
+      batchId: custATrashMove.batchId,
+      runId: owningRunId,
+      targetOrderPublicId: reassignedChild.publicId,
+      confirmation: reassignedChild.reference,
+      idempotencyKey: "idem-scoped-child-ack-ok",
+    });
+    expect(finished).toMatchObject({ ok: true, runId: owningRunId, keptExternalCopies: 3 });
+
+    // `plainOrderA` (executed AFTER `reassignedChild` in `id ASC`) NEVER received `acknowledgedUnreachableCopies: true`!
+    expect(seenByOrder.get(reassignedChild.publicId)).toEqual([false, true]);
+    expect(seenByOrder.get(plainOrderA.publicId)).toEqual([false]);
+  });
+
+  it("holds a real MySQL advisory lock across slow participant steps (two-connection race) and stops on fence loss", async () => {
+    const cust = await seedCustomer({ id: 80, status: "active" });
+    const ord = await seedOrder({ id: 800, ownerUserId: cust.id, reference: "RP-2026-0800" });
+
+    let releaseSlowStep!: () => void;
+    const slowStepEntered = new Promise<void>((resolve) => {
+      // replaced inside participant
+      void resolve;
+    });
+    void slowStepEntered;
+
+    let notifyEntered!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => {
+      notifyEntered = resolve;
+    });
+    const unblockPromise = new Promise<void>((resolve) => {
+      releaseSlowStep = resolve;
+    });
+
+    let slowInvocations = 0;
+    const raceTrash = createTrashModule(h.deps, {
+      expectedParticipants: ["identity", "orders", "slowFiles"],
+    });
+    for (const p of trash.participants()) {
+      if (p.module === "identity" || p.module === "orders") raceTrash.register(p);
+    }
+    raceTrash.register({
+      module: "slowFiles",
+      purge: async () => {
+        slowInvocations += 1;
+        notifyEntered();
+        await unblockPromise;
+        return { deleted: { files: 1 } };
+      },
+    });
+    raceTrash.init?.();
+
+    const moved = await raceTrash.moveToTrash(adminPrincipal, {
+      kind: "order",
+      publicId: ord.publicId,
+      idempotencyKey: "idem-race-move",
+    });
+
+    // Start Worker 1 (holds dedicated MySQL connection `GET_LOCK` while awaiting `unblockPromise`)
+    const worker1Promise = raceTrash.purge(adminStepUpPrincipal, {
+      items: [{ kind: "order", publicId: ord.publicId, batchId: moved.batchId }],
+      confirmation: ord.reference,
+      idempotencyKey: "idem-race-worker-1",
+    });
+
+    await enteredPromise;
+
+    // Verify on a SECOND independent MySQL connection from `t.pool` that `GET_LOCK(..., 0)` is held (`0`)!
+    const [activeRun] = await t.db.select().from(trashPurgeRuns);
+    expect(activeRun).toBeDefined();
+    const secondConn = await t.pool.getConnection();
+    try {
+      const [dbhRows] = await secondConn.query(
+        "SELECT SUBSTRING(SHA2(IFNULL(DATABASE(), 'default'), 256), 1, 12) AS dbh",
+      );
+      const dbh = String((dbhRows as { dbh: string }[])[0]!.dbh);
+      const lockName = trashRunAdvisoryLockName(dbh, activeRun!.id);
+      const [probeRows] = await secondConn.query("SELECT GET_LOCK(?, 0) AS got", [lockName]);
+      expect(Number((probeRows as { got: number | null }[])[0]?.got)).toBe(0);
+    } finally {
+      secondConn.release();
+    }
+
+    // Even if fake clock advances hours (which would have expired any wall-clock lease!), Worker 2 CANNOT steal the run
+    // while Worker 1's MySQL connection is alive, and Worker 1's `fencingToken` stays `1`!
+    await expect(
+      raceTrash.purge(adminStepUpPrincipal, {
+        items: [{ kind: "order", publicId: ord.publicId, batchId: moved.batchId }],
+        confirmation: ord.reference,
+        idempotencyKey: "idem-race-worker-2",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "PURGE_IN_PROGRESS" });
+
+    expect(slowInvocations).toBe(1);
+    const [runStillToken1] = await t.db.select().from(trashPurgeRuns).where(eq(trashPurgeRuns.id, activeRun!.id));
+    expect(runStillToken1?.fencingToken).toBe(1);
+
+    releaseSlowStep();
+    const w1Done = await worker1Promise;
+    expect(w1Done.results[0]?.ok).toBe(true);
+    expect(slowInvocations).toBe(1);
+
+    // Also verify stale-holder / fence loss halts BEFORE invoking downstream participants!
+    const ord2 = await seedOrder({ id: 801, ownerUserId: cust.id, reference: "RP-2026-0801" });
+    let downstreamCalledAfterFenceLoss = false;
+    const fenceLossTrash = createTrashModule(h.deps, {
+      expectedParticipants: ["identity", "orders", "saboteur", "downstreamAfterLoss"],
+    });
+    for (const p of trash.participants()) {
+      if (p.module === "identity" || p.module === "orders") fenceLossTrash.register(p);
+    }
+    fenceLossTrash.register({
+      module: "saboteur",
+      purge: async (_entity, run) => {
+        // Simulate fencing token superseded in DB while participant was executing
+        await t.db
+          .update(trashPurgeRuns)
+          .set({ fencingToken: 99 })
+          .where(eq(trashPurgeRuns.publicId, run.runId));
+        return { deleted: { saboteur: 1 } };
+      },
+    });
+    fenceLossTrash.register({
+      module: "downstreamAfterLoss",
+      purge: async () => {
+        downstreamCalledAfterFenceLoss = true;
+        return { deleted: { downstream: 1 } };
+      },
+    });
+    fenceLossTrash.init?.();
+
+    const moved2 = await fenceLossTrash.moveToTrash(adminPrincipal, {
+      kind: "order",
+      publicId: ord2.publicId,
+      idempotencyKey: "idem-fence-loss-move",
+    });
+    await expect(
+      fenceLossTrash.purge(adminStepUpPrincipal, {
+        items: [{ kind: "order", publicId: ord2.publicId, batchId: moved2.batchId }],
+        confirmation: ord2.reference,
+        idempotencyKey: "idem-fence-loss-purge",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "PURGE_FENCE_LOST" });
+    expect(downstreamCalledAfterFenceLoss).toBe(false);
+  });
+
+  it("enforces single-flight retention sweep, cursor progression past failed/held items, per-target job lease recheck, and transactional worker-drain gate", async () => {
+    const cust = await seedCustomer({ id: 90, status: "active" });
+    const failingHead = await seedOrder({ id: 901, ownerUserId: cust.id, reference: "RP-2026-0901" });
+    const heldSecond = await seedOrder({ id: 902, ownerUserId: cust.id, reference: "RP-2026-0902" });
+    const healthyTail = await seedOrder({ id: 903, ownerUserId: cust.id, reference: "RP-2026-0903" });
+
+    const sweepTrash = createTrashModule(h.deps, {
+      expectedParticipants: ["identity", "orders", "selectiveFail"],
+    });
+    for (const p of trash.participants()) {
+      if (p.module === "identity" || p.module === "orders") sweepTrash.register(p);
+    }
+    let failHeadCalls = 0;
+    sweepTrash.register({
+      module: "selectiveFail",
+      purge: async (entity: TrashEntityRef) => {
+        if (entity.publicId === failingHead.publicId) {
+          failHeadCalls += 1;
+          throw new DomainError("UNAVAILABLE", "HEAD_ITEM_BROKEN", "Head item storage error.");
+        }
+        return { deleted: { rows: 1 } };
+      },
+    });
+    sweepTrash.init?.();
+
+    await sweepTrash.moveToTrash(adminPrincipal, {
+      kind: "order",
+      publicId: failingHead.publicId,
+      idempotencyKey: "idem-sweep-1",
+    });
+    h.clock.advance(1_000);
+    await sweepTrash.moveToTrash(adminPrincipal, {
+      kind: "order",
+      publicId: heldSecond.publicId,
+      idempotencyKey: "idem-sweep-2",
+    });
+    await t.db.update(orders).set({ lockState: "legal_hold" }).where(eq(orders.id, heldSecond.id));
+    h.clock.advance(1_000);
+    await sweepTrash.moveToTrash(adminPrincipal, {
+      kind: "order",
+      publicId: healthyTail.publicId,
+      idempotencyKey: "idem-sweep-3",
+    });
+
+    h.clock.advance(31 * 86_400_000);
+
+    // 1. Single-flight check: holding the sweep advisory lock on a second MySQL connection skips with `SWEEP_ALREADY_RUNNING`
+    const lockConn = await t.pool.getConnection();
+    let sweepLockName = "";
+    try {
+      const [dbhRows] = await lockConn.query(
+        "SELECT SUBSTRING(SHA2(IFNULL(DATABASE(), 'default'), 256), 1, 12) AS dbh",
+      );
+      sweepLockName = trashSweepAdvisoryLockName(String((dbhRows as { dbh: string }[])[0]!.dbh));
+      await lockConn.query("SELECT GET_LOCK(?, 0)", [sweepLockName]);
+
+      const skipped = await sweepTrash.runRetentionCleanup("job-single-flight");
+      expect(skipped.skippedReason).toBe("SWEEP_ALREADY_RUNNING");
+    } finally {
+      if (sweepLockName) await lockConn.query("SELECT RELEASE_LOCK(?)", [sweepLockName]);
+      lockConn.release();
+    }
+
+    // 2. Fail-closed if `jobAdmin` drain gate is missing, and skips when `isDraining(tx)` returns true
+    const savedJobAdmin = h.services.jobAdmin;
+    delete (h.services as { jobAdmin?: unknown }).jobAdmin;
+    await expect(sweepTrash.runRetentionCleanup("job-missing-drain-gate")).rejects.toMatchObject({
+      reasonCode: "MAINTENANCE_GATE_UNAVAILABLE",
+    });
+
+    let sawTxInIsDraining = false;
+    h.services.jobAdmin = {
+      isDraining: async (passedTx?: unknown) => {
+        if (passedTx) sawTxInIsDraining = true;
+        return true;
+      },
+      maintenance: { customerAccess: async () => ({ active: false, message: null, updatedAt: null }) },
+    } as never;
+    const drainSkip = await sweepTrash.runRetentionCleanup("job-draining");
+    expect(drainSkip.skippedReason).toBe("WORKER_DRAINING");
+    expect(sawTxInIsDraining).toBe(true);
+    h.services.jobAdmin = savedJobAdmin;
+
+    // 3. Sweep progresses past `failingHead` AND `heldSecond` to purge `healthyTail`, rechecking `jobFence.assertStillOwned` before EVERY target!
+    let leaseChecks = 0;
+    const abortCtrl = new AbortController();
+    const sweep1 = await sweepTrash.runRetentionCleanup("job-fair-sweep-1", {
+      signal: abortCtrl.signal,
+      assertStillOwned: async () => {
+        leaseChecks += 1;
+      },
+    });
+    expect(leaseChecks).toBe(3);
+    expect(sweep1.failed).toBe(1);
+    expect(sweep1.purged).toBe(1);
+    expect(failHeadCalls).toBe(1);
+
+    const [tailAfter] = await t.db.select().from(orders).where(eq(orders.id, healthyTail.id));
+    expect(tailAfter?.purgedAt).not.toBeNull();
+
+    // 4. Immediate second sweep skips `failingHead` due to `nextRetryAt` backoff (`failHeadCalls` stays 1)!
+    const sweep2 = await sweepTrash.runRetentionCleanup("job-fair-sweep-2");
+    expect(sweep2.failed).toBe(0);
+    expect(failHeadCalls).toBe(1);
+  });
+});
+

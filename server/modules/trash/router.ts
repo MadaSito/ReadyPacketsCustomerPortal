@@ -37,11 +37,19 @@ const idempotencyKeySchema = z
   .min(8, "Include an idempotency key.")
   .max(120, "Idempotency key is too long.");
 
-const trashItemRefSchema = z
+const trashSummarizeRefSchema = z
   .object({
     kind: trashKindSchema,
     publicId: publicIdSchema,
     batchId: publicIdSchema.optional(),
+  })
+  .strict();
+
+const trashMutationItemRefSchema = z
+  .object({
+    kind: trashKindSchema,
+    publicId: publicIdSchema,
+    batchId: publicIdSchema,
   })
   .strict();
 
@@ -88,7 +96,7 @@ export const trashRouter = router({
   ),
 
   summarize: trashReadProcedure
-    .input(trashItemRefSchema)
+    .input(trashSummarizeRefSchema)
     .query(({ ctx, input }) => requireCoordinator(ctx.services.trash).summarize(ctx.session, input)),
 
   moveToTrash: trashManageProcedure
@@ -109,7 +117,7 @@ export const trashRouter = router({
     .input(
       z
         .object({
-          items: z.array(trashItemRefSchema).min(1).max(100),
+          items: z.array(trashMutationItemRefSchema).min(1).max(100),
           idempotencyKey: idempotencyKeySchema,
         })
         .strict(),
@@ -120,7 +128,7 @@ export const trashRouter = router({
     .input(
       z
         .object({
-          items: z.array(trashItemRefSchema).min(1).max(100),
+          items: z.array(trashMutationItemRefSchema).min(1).max(100),
           confirmation: z.string().max(160),
           idempotencyKey: idempotencyKeySchema,
         })
@@ -134,8 +142,9 @@ export const trashRouter = router({
         .object({
           kind: trashKindSchema,
           publicId: publicIdSchema,
-          batchId: publicIdSchema.optional(),
+          batchId: publicIdSchema,
           runId: publicIdSchema,
+          targetOrderPublicId: publicIdSchema.optional(),
           confirmation: z.string().max(160),
           idempotencyKey: idempotencyKeySchema,
         })

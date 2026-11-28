@@ -33,6 +33,10 @@ export interface TrashRow {
   unreachableExternalCopies: number | null;
   /** Public id of the failed purge run when `state === "failed"`, otherwise `null`. */
   failedRunId: string | null;
+  /** Specific failing target public ID inside a single-order or cascade run when `state === "failed"`. */
+  failedTargetPublicId: string | null;
+  /** Non-personal `RP-...` / `RPCUS-...` reference of the failing target when `state === "failed"`. */
+  failedTargetReference: string | null;
   canRestore: boolean;
   restoreBlockedReason: string | null;
 }
@@ -70,13 +74,24 @@ export interface TrashSummary {
   autoPurgeEnabled: boolean;
 }
 
+/** Read-only item reference (e.g. `summarize` on live or trashed items). */
 export interface TrashItemRef {
   kind: TrashEntityKind;
   publicId: string;
   batchId?: string;
 }
 
-export interface TrashItemResult extends TrashItemRef {
+/** Generation-pinned item reference required on all manual `restore` and `purge` mutations (D2.8). */
+export interface TrashMutationItemRef {
+  kind: TrashEntityKind;
+  publicId: string;
+  batchId: string;
+}
+
+export interface TrashItemResult {
+  kind: TrashEntityKind;
+  publicId: string;
+  batchId?: string;
   ok: boolean;
   reasonCode?: string | null;
   safeMessage?: string | null;
@@ -98,7 +113,7 @@ export interface TrashMoveOutput {
 }
 
 export interface TrashRestoreInput {
-  items: TrashItemRef[];
+  items: TrashMutationItemRef[];
   idempotencyKey: string;
 }
 
@@ -108,7 +123,7 @@ export interface TrashRestoreOutput {
 }
 
 export interface TrashPurgeInput {
-  items: TrashItemRef[];
+  items: TrashMutationItemRef[];
   confirmation: string;
   idempotencyKey: string;
 }
@@ -121,8 +136,10 @@ export interface TrashPurgeOutput {
 export interface TrashFinishLeavingExternalInput {
   kind: TrashEntityKind;
   publicId: string;
-  batchId?: string;
+  batchId: string;
   runId: string;
+  /** Optional specific order public ID inside a root-order or customer cascade run; defaults to `failedTargetPublicId`. */
+  targetOrderPublicId?: string;
   confirmation: string;
   idempotencyKey: string;
 }
@@ -167,6 +184,11 @@ export interface TrashSettingsUpdateInput extends RetentionValues {
   idempotencyKey: string;
 }
 
+export interface TrashCleanupJobFence {
+  signal: AbortSignal;
+  assertStillOwned(): Promise<void>;
+}
+
 export interface TrashCleanupResult {
   sweepPublicId: string;
   skippedReason: string | null;
@@ -199,5 +221,5 @@ export interface TrashService extends ModuleLifecycle, TrashRegistry {
   previewSettings(principal: SessionPrincipal, input: RetentionValues): Promise<TrashSettingsPreview>;
   updateSettings(principal: SessionPrincipal, input: TrashSettingsUpdateInput): Promise<TrashSettings>;
   /** Internal scheduled retention clean-up handler; never exposed via tRPC. */
-  runRetentionCleanup(triggerJobId?: string): Promise<TrashCleanupResult>;
+  runRetentionCleanup(triggerJobId?: string, jobFence?: TrashCleanupJobFence): Promise<TrashCleanupResult>;
 }

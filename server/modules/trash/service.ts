@@ -1,25 +1,35 @@
 /**
  * Trash coordinator service (Increment 09, Decision D2 & D2.8). Owner: recovery_ops_engineer.
  *
- * Security invariants enforced (D2.8 + lead rulings):
+ * Security & durability invariants enforced (D2.8 + lead rulings):
  *  - Every procedure re-validates actor role, capability, session freshness, and MFA step-up inside `tx`
  *    via `createActorGuard` (fail closed if identity session verification is unavailable).
- *  - Missing `orders.trash`, `identity.trash`, or any expected `TrashParticipant` fails closed (`503 UNAVAILABLE`).
+ *  - Missing `orders.trash`, `identity.trash`, `jobAdmin` maintenance gates, or any expected `TrashParticipant`
+ *    fails closed (`503 UNAVAILABLE`).
  *  - Legal hold (`orders.lock_state = 'legal_hold'`) blocks order & customer move-to-trash and purge with
- *    `409 ORDER_ON_LEGAL_HOLD` ("Release the legal hold first."); the retention job skips held items and raises
- *    an operational alert without failing the rest of the sweep.
+ *    `409 ORDER_ON_LEGAL_HOLD` ("Release the legal hold first."); the retention sweep skips held items, emits an
+ *    operational alert, and advances its cursor past them so later due items never starve.
  *  - Cascades enforce bounded target counts (`MAX_CASCADE_TARGETS`) and fail closed on overflow.
- *  - Idempotency keys are durably reserved BEFORE side effects and bound to `(actor, action, fingerprint, batchGenerations)`.
- *  - Purge runs use durable per-run lease + monotonic `fencingToken` + cross-entity overlap exclusion (`FOR UPDATE`),
- *    so two workers cannot run the same participant concurrently or overwrite checkpoints, and tombstones are
- *    written only after every participant succeeds and target batch generations still match under `FOR UPDATE`.
- *  - Retention preview & update use exact SQL `COUNT(*)` queries (zero in-memory scan truncation) and serialize
- *    cohort-changing writes (`FOR SHARE` on `trash_retention_state`) against settings CAS (`FOR UPDATE`).
- *  - Recorded-owned external copies on rotated/unreachable destinations fail resumably with
- *    `EXTERNAL_COPIES_UNREACHABLE`; only `finishLeavingExternalCopies` (`trash.purge` + step-up + typed reference
- *    + CAS on failed `runId`, durably audited BEFORE invoking destructive work) sets `acknowledgedUnreachableCopies: true`.
+ *  - Generation (`batchId`) is mandatory on all manual `restore`, `purge`, and `finishLeavingExternalCopies` inputs.
+ *    Idempotency reservations store `(actor, action, fingerprintHash, batchBindings)` BEFORE any side effect and are
+ *    retained permanently once a purge claim or participant/restore effect commits (failed outcomes recorded & replayed;
+ *    only unmutated pre-claim rejections release the reservation).
+ *  - Durable per-target run ownership (`trash_purge_run_targets`, permanent `UNIQUE(entity_kind, entity_id)`):
+ *    every claimed target (root, all group additions including reassigned cross-owner members, customer-cascaded orders,
+ *    and the customer row) belongs to at most one purge run forever; failed runs are resumed, never replaced.
+ *  - Exclusive participant-effect fence: worker holds a dedicated MySQL connection advisory lock
+ *    (`GET_LOCK('rp.trash.<dbHash>.run.<runId>', 0)`) for the entire run execution, verifies ownership via
+ *    `IS_USED_LOCK(...) = CONNECTION_ID()` before every participant step and checkpoint/tombstone write, and enforces
+ *    monotonic `fencing_token` CAS on every DB checkpoint/finalization write. Residual risk: if the MySQL TCP session
+ *    drops mid-step while an external I/O call is in flight, a subsequent takeover relies on participant idempotency
+ *    (required by the `TrashParticipant.purge` contract) and fenced checkpoint CAS.
+ *  - Retention preview & update use exact SQL `COUNT(*)` queries and require step-up + typed `DELETE <N>` confirmation
+ *    for every risky change (enabling automatic clean-up or shortening either active period, including `DELETE 0`).
+ *  - Single-flight retention sweep (`GET_LOCK('rp.trash.<dbHash>.sweep', 0)`) with keyset cursor progression, per-run
+ *    `next_retry_at` exponential backoff, and per-target job-lease + transactional worker-drain checks.
  */
-import { and, asc, desc, eq, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
+import type mysql from "mysql2/promise";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, or, sql } from "drizzle-orm";
 import { STEP_UP_CAPABILITIES, type Capability } from "../../../shared/capabilities.js";
 import type { ModuleDeps, Services } from "../../container.js";
 import { DomainError, conflict, forbidden, notFound, validation } from "../../core/errors.js";
@@ -37,13 +47,17 @@ import type {
   TrashEntityKind,
   TrashEntityRef,
   TrashParticipant,
+  TrashPurgeResult,
   TrashRegistry,
 } from "./ports.js";
 import {
   trashCleanupSweeps,
   trashIdempotencyKeys,
   trashPurgeRuns,
+  trashPurgeRunTargets,
   trashRetentionState,
+  type TrashPurgeRunRow,
+  type TrashPurgeRunTargetRow,
 } from "./schema.js";
 import {
   parseRetentionDays,
@@ -56,6 +70,7 @@ import {
 } from "./settings.js";
 import type {
   RetentionValues,
+  TrashCleanupJobFence,
   TrashCleanupResult,
   TrashCoordinatorOptions,
   TrashCounts,
@@ -65,6 +80,7 @@ import type {
   TrashItemResult,
   TrashListOutput,
   TrashMoveOutput,
+  TrashMutationItemRef,
   TrashPerson,
   TrashPurgeOutput,
   TrashRestoreOutput,
@@ -78,11 +94,12 @@ import type {
 
 const DAY_MS = 24 * 60 * 60_000;
 const IDEM_TTL_MS = 24 * 60 * 60_000;
-const PURGE_LEASE_MS = 2 * 60_000;
 const MAX_BULK_ITEMS = 100;
 const MAX_CASCADE_TARGETS = 10_000;
 const MAX_LIST_COHORT = 10_000;
 const SWEEP_BATCH_LIMIT = 500;
+const SWEEP_PAGE_SIZE = 100;
+const SWEEP_MAX_SCANNED = 10_000;
 const REASON_MAX_LENGTH = 200;
 
 /**
@@ -112,18 +129,19 @@ export const EXPECTED_CONTAINER_PARTICIPANTS = [
   "promotions",
 ] as const;
 
-interface PersistedTargetsEnvelope {
-  targets: TrashEntityRef[];
+export function trashRunAdvisoryLockName(dbHash12: string, runRowId: number): string {
+  return `rp.trash.${dbHash12}.run.${runRowId}`;
+}
+
+export function trashSweepAdvisoryLockName(dbHash12: string): string {
+  return `rp.trash.${dbHash12}.sweep`;
+}
+
+interface PersistedRunMeta {
   expectedModules: string[];
 }
 
-interface PersistedCheckpoint {
-  completedSteps: string[];
-  leaseOwner: string | null;
-  leaseExpiresAtMs: number;
-  fencingToken: number;
-  acknowledgedUnreachableCopies?: boolean;
-}
+type PerTargetCheckpointMap = Record<string, TrashPurgeResult>;
 
 interface PersistedCounts {
   deleted: Record<string, number>;
@@ -132,11 +150,24 @@ interface PersistedCounts {
   unreachableTotal?: number;
 }
 
+interface StoredFailedDomainError {
+  code: DomainError["code"];
+  reasonCode: string;
+  safeMessage: string;
+}
+
 interface StoredIdempotencyEnvelope<T> {
-  status: "in_progress" | "completed";
+  status: "in_progress" | "completed" | "failed";
   fingerprintHash: string;
   batchBindings: Record<string, string | null>;
   payload?: T;
+  failedError?: StoredFailedDomainError;
+}
+
+interface AdvisoryLockHandle {
+  readonly lockName: string;
+  assertStillHeld(): Promise<void>;
+  release(): Promise<void>;
 }
 
 const stepUpError = () =>
@@ -144,6 +175,22 @@ const stepUpError = () =>
 
 const legalHoldError = () =>
   conflict("ORDER_ON_LEGAL_HOLD", "Release the legal hold first.");
+
+function isMysqlDupEntry(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const rec = err as { code?: unknown; errno?: unknown; cause?: unknown };
+  if (rec.code === "ER_DUP_ENTRY" || rec.errno === 1062) return true;
+  if (rec.cause && typeof rec.cause === "object") {
+    const c = rec.cause as { code?: unknown; errno?: unknown };
+    return c.code === "ER_DUP_ENTRY" || c.errno === 1062;
+  }
+  return false;
+}
+
+function computeRetryBackoffMs(attemptCount: number): number {
+  const exp = Math.min(Math.max(attemptCount - 1, 0), 7);
+  return Math.min(60 * 60_000, 30_000 * Math.pow(2, exp));
+}
 
 function stripUnsafeText(raw: string): string {
   let out = "";
@@ -249,12 +296,15 @@ function validateRetentionValues(values: RetentionValues): RetentionValues {
   };
 }
 
-function assertUniqueItems(items: readonly TrashItemRef[]): void {
+function assertUniqueMutationItems(items: readonly TrashMutationItemRef[]): void {
   if (items.length < 1 || items.length > MAX_BULK_ITEMS) {
     throw validation("INVALID_BULK_COUNT", `Select between 1 and ${MAX_BULK_ITEMS} items.`);
   }
   const seen = new Set<string>();
   for (const item of items) {
+    if (!item.batchId || item.batchId.trim().length === 0) {
+      throw validation("BATCH_ID_REQUIRED", "Include the trash batch identifier for each item.");
+    }
     const key = `${item.kind}:${item.publicId}`;
     if (seen.has(key)) {
       throw validation("DUPLICATE_TARGETS", "Each item may appear at most once in a request.");
@@ -290,15 +340,27 @@ function safeCountsForAudit(counts: Record<string, number>): Record<string, numb
   return out;
 }
 
-function parseCheckpoint(raw: string): PersistedCheckpoint {
-  const parsed = JSON.parse(raw) as Partial<PersistedCheckpoint>;
-  return {
-    completedSteps: Array.isArray(parsed.completedSteps) ? parsed.completedSteps : [],
-    leaseOwner: typeof parsed.leaseOwner === "string" ? parsed.leaseOwner : null,
-    leaseExpiresAtMs: typeof parsed.leaseExpiresAtMs === "number" ? parsed.leaseExpiresAtMs : 0,
-    fencingToken: typeof parsed.fencingToken === "number" ? parsed.fencingToken : 0,
-    ...(parsed.acknowledgedUnreachableCopies ? { acknowledgedUnreachableCopies: true } : {}),
-  };
+function parseRunMeta(raw: string): PersistedRunMeta {
+  try {
+    const parsed = JSON.parse(raw) as Partial<PersistedRunMeta>;
+    return {
+      expectedModules: Array.isArray(parsed.expectedModules) ? parsed.expectedModules : [],
+    };
+  } catch {
+    return { expectedModules: [] };
+  }
+}
+
+function parseTargetCheckpoint(raw: string): PerTargetCheckpointMap {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as PerTargetCheckpointMap;
+    }
+  } catch {
+    // Fall back to empty checkpoint if malformed.
+  }
+  return {};
 }
 
 function parseCounts(raw: string | null): PersistedCounts {
@@ -322,8 +384,87 @@ export function createTrashCoordinator(
 ): TrashService {
   const log = deps.logger.child({ module: "trash" });
   let initializedExpectedModules: ReadonlySet<string> | null = null;
+  let cachedDbHash12: string | null = null;
 
   const services = (): Partial<Services> => deps.services as Partial<Services>;
+
+  function requireMysqlPool(): mysql.Pool {
+    const pool = (deps.db as unknown as { $client?: mysql.Pool }).$client;
+    if (!pool || typeof pool.getConnection !== "function") {
+      throw unavailable("TRASH_DB_POOL_UNAVAILABLE", "Permanent deletion lock pool is unavailable.");
+    }
+    return pool;
+  }
+
+  async function tryAcquireAdvisoryLock(
+    buildName: (dbHash12: string) => string,
+  ): Promise<AdvisoryLockHandle | null> {
+    const pool = requireMysqlPool();
+    const conn = await pool.getConnection();
+    let broken = false;
+    try {
+      if (!cachedDbHash12) {
+        const [dbRows] = await conn.query(
+          "SELECT SUBSTRING(SHA2(IFNULL(DATABASE(), 'default'), 256), 1, 12) AS dbh",
+        );
+        const dbh = String((dbRows as { dbh?: string }[])[0]?.dbh ?? "default00000").slice(0, 12);
+        cachedDbHash12 = dbh || "default00000";
+      }
+      const lockName = buildName(cachedDbHash12);
+      const [lockRows] = await conn.query("SELECT GET_LOCK(?, 0) AS got", [lockName]);
+      const got = Number((lockRows as { got: number | null }[])[0]?.got ?? 0);
+      if (got !== 1) {
+        conn.release();
+        return null;
+      }
+
+      let released = false;
+      return {
+        lockName,
+        async assertStillHeld(): Promise<void> {
+          if (released || broken) {
+            throw conflict("PURGE_FENCE_LOST", "Permanent deletion lock was lost.");
+          }
+          try {
+            const [rows] = await conn.query(
+              "SELECT (IS_USED_LOCK(?) = CONNECTION_ID()) AS held",
+              [lockName],
+            );
+            const held = Number((rows as { held: number | null }[])[0]?.held ?? 0);
+            if (held !== 1) {
+              broken = true;
+              throw conflict("PURGE_FENCE_LOST", "Permanent deletion lock is no longer owned by this worker.");
+            }
+          } catch (err) {
+            broken = true;
+            if (err instanceof DomainError) throw err;
+            throw conflict("PURGE_FENCE_LOST", "Permanent deletion lock verification failed.");
+          }
+        },
+        async release(): Promise<void> {
+          if (released) return;
+          released = true;
+          try {
+            if (!broken) {
+              await conn.query("SELECT RELEASE_LOCK(?)", [lockName]);
+            }
+          } catch {
+            broken = true;
+          } finally {
+            if (broken) {
+              conn.destroy();
+            } else {
+              conn.release();
+            }
+          }
+        },
+      };
+    } catch (err) {
+      conn.destroy();
+      if (err instanceof DomainError) throw err;
+      throw unavailable("TRASH_ADVISORY_LOCK_FAILED", "Could not acquire permanent deletion lock.");
+    }
+  }
 
   function requireOrdersTrash() {
     const port = services().orders?.trash;
@@ -404,13 +545,32 @@ export function createTrashCoordinator(
         .where(inArray(platformSettings.settingKey, keys))
         .for("share");
       const byKey = new Map(rows.map((r) => [r.settingKey, r.valueJson]));
-      const rawAuto = byKey.get(TRASH_AUTO_PURGE_ENABLED.key);
-      const autoPurgeEnabled = typeof rawAuto === "boolean" ? rawAuto : true;
-      const orderDays = parseRetentionDays(byKey.get(TRASH_RETENTION_ORDER_DAYS.key), TRASH_RETENTION_DEFAULT_DAYS);
-      const customerDays = parseRetentionDays(
-        byKey.get(TRASH_RETENTION_CUSTOMER_DAYS.key),
-        TRASH_RETENTION_DEFAULT_DAYS,
-      );
+      const autoPurgeEnabled = byKey.has(TRASH_AUTO_PURGE_ENABLED.key)
+        ? typeof byKey.get(TRASH_AUTO_PURGE_ENABLED.key) === "boolean"
+          ? (byKey.get(TRASH_AUTO_PURGE_ENABLED.key) as boolean)
+          : true
+        : await deps.settings.get<boolean>(
+            TRASH_AUTO_PURGE_ENABLED.key,
+            (raw) => (typeof raw === "boolean" ? raw : true),
+            true,
+            tx,
+          );
+      const orderDays = byKey.has(TRASH_RETENTION_ORDER_DAYS.key)
+        ? parseRetentionDays(byKey.get(TRASH_RETENTION_ORDER_DAYS.key), TRASH_RETENTION_DEFAULT_DAYS)
+        : await deps.settings.get<number>(
+            TRASH_RETENTION_ORDER_DAYS.key,
+            (raw) => parseRetentionDays(raw, TRASH_RETENTION_DEFAULT_DAYS),
+            TRASH_RETENTION_DEFAULT_DAYS,
+            tx,
+          );
+      const customerDays = byKey.has(TRASH_RETENTION_CUSTOMER_DAYS.key)
+        ? parseRetentionDays(byKey.get(TRASH_RETENTION_CUSTOMER_DAYS.key), TRASH_RETENTION_DEFAULT_DAYS)
+        : await deps.settings.get<number>(
+            TRASH_RETENTION_CUSTOMER_DAYS.key,
+            (raw) => parseRetentionDays(raw, TRASH_RETENTION_DEFAULT_DAYS),
+            TRASH_RETENTION_DEFAULT_DAYS,
+            tx,
+          );
       return { autoPurgeEnabled, orderDays, customerDays };
     }
 
@@ -448,10 +608,6 @@ export function createTrashCoordinator(
       .onDuplicateKeyUpdate({ set: { singletonKey: sql`${trashRetentionState.singletonKey}` } });
   }
 
-  /**
-   * Takes a shared lock on `trash_retention_state` so cohort-changing writes (`moveToTrash`, `restore`)
-   * serialize cleanly with `updateSettings`'s exclusive `FOR UPDATE` CAS check.
-   */
   async function shareLockRetentionCohortInTx(tx: Tx): Promise<number> {
     await ensureRetentionRowInTx(tx);
     const [row] = await tx
@@ -505,7 +661,7 @@ export function createTrashCoordinator(
 
   /**
    * Durably reserves `(actorUserId, operation, idempotencyKey)` BEFORE side effects execute.
-   * Serializes concurrent calls with the same key via the unique index + `FOR UPDATE`.
+   * Stores `fingerprintHash` AND `initialBatchBindings` upfront so any subsequent generation mismatch is rejected.
    */
   async function reserveIdempotency<T>(params: {
     principal: SessionPrincipal;
@@ -513,9 +669,18 @@ export function createTrashCoordinator(
     operation: string;
     idempotencyKey: string;
     fingerprintHash: string;
+    initialBatchBindings?: Record<string, string | null>;
     verifyBatchGenerations: boolean;
   }): Promise<{ hit: true; payload: T } | { hit: false; rowId: number }> {
-    const { principal, capability, operation, idempotencyKey, fingerprintHash, verifyBatchGenerations } = params;
+    const {
+      principal,
+      capability,
+      operation,
+      idempotencyKey,
+      fingerprintHash,
+      initialBatchBindings = {},
+      verifyBatchGenerations,
+    } = params;
     const actionKey = `${capability}:${operation}`.slice(0, 48);
     const kHash = keyHash(`trash.idem:${actionKey}:${idempotencyKey}`);
 
@@ -559,6 +724,13 @@ export function createTrashCoordinator(
               }
             }
           }
+          if (parsed.status === "failed" && parsed.failedError) {
+            throw new DomainError(
+              parsed.failedError.code,
+              parsed.failedError.reasonCode,
+              parsed.failedError.safeMessage,
+            );
+          }
           return { hit: true as const, payload: parsed.payload as T };
         }
       }
@@ -566,7 +738,7 @@ export function createTrashCoordinator(
       const initial: StoredIdempotencyEnvelope<T> = {
         status: "in_progress",
         fingerprintHash,
-        batchBindings: {},
+        batchBindings: { ...initialBatchBindings },
       };
       const [ins] = await tx.insert(trashIdempotencyKeys).values({
         actorUserId: principal.userId,
@@ -600,6 +772,37 @@ export function createTrashCoordinator(
       .where(eq(trashIdempotencyKeys.id, rowId));
   }
 
+  /**
+   * Retains the idempotency key and records the failed outcome whenever a durable purge claim or mutation
+   * has already committed (D2.8: never release an idempotency key after any committed effect).
+   */
+  async function failIdempotency(
+    rowId: number,
+    fingerprintHash: string,
+    batchBindings: Record<string, string | null>,
+    err: unknown,
+  ): Promise<void> {
+    const domErr =
+      err instanceof DomainError
+        ? err
+        : unavailable("TRASH_PURGE_FAILED", "Permanent deletion did not finish cleanly and can be retried.");
+    const envelope: StoredIdempotencyEnvelope<never> = {
+      status: "failed",
+      fingerprintHash,
+      batchBindings,
+      failedError: {
+        code: domErr.code,
+        reasonCode: domErr.reasonCode,
+        safeMessage: domErr.safeMessage,
+      },
+    };
+    await deps.db
+      .update(trashIdempotencyKeys)
+      .set({ responseJson: JSON.stringify(envelope) })
+      .where(eq(trashIdempotencyKeys.id, rowId))
+      .catch(() => undefined);
+  }
+
   async function releaseUnmutatedIdempotency(rowId: number): Promise<void> {
     await deps.db
       .delete(trashIdempotencyKeys)
@@ -607,12 +810,6 @@ export function createTrashCoordinator(
       .catch(() => undefined);
   }
 
-  /**
-   * Exact SQL totals & due counts (zero in-memory scan cap or truncation).
-   * D2.4: Orders moved to the trash WITH a customer (`owner.trashed_at IS NOT NULL AND owner.purged_at IS NULL
-   * AND owner.trash_batch_id = orders.trash_batch_id`) follow the customer's retention and are counted/purged
-   * with that customer, never standalone.
-   */
   async function exactCountsAtHorizon(
     retention: RetentionValues,
     withinMs: number,
@@ -677,10 +874,6 @@ export function createTrashCoordinator(
     };
   }
 
-  /**
-   * Exact SQL count of items currently in the trash that newly become due when moving from `current` to `proposed`.
-   * Uses `FOR SHARE` when `lockForShare = true` inside `updateSettings` so MySQL RR performs a current read.
-   */
   async function computeExactNewlyBecomingDueCount(
     current: RetentionValues,
     proposed: RetentionValues,
@@ -795,7 +988,11 @@ export function createTrashCoordinator(
     return out;
   }
 
-  async function latestPurgeRunsByEntity(
+  /**
+   * Resolves the owning purge run for each entity via `trash_purge_run_targets` JOIN `trash_purge_runs`,
+   * plus the failing target's `publicId` and `targetReference` when the run halted on a specific target.
+   */
+  async function owningPurgeRunsByEntity(
     kind: TrashEntityKind,
     entityIds: readonly number[],
     dbOrTx: DbOrTx = deps.db,
@@ -803,12 +1000,13 @@ export function createTrashCoordinator(
     Map<
       number,
       {
+        runId: number;
         publicId: string;
         status: "running" | "completed" | "failed";
         errorCode: string | null;
-        targetsJson: string;
         countsJson: string | null;
-        checkpointJson: string;
+        failedTargetPublicId: string | null;
+        failedTargetReference: string | null;
       }
     >
   > {
@@ -816,32 +1014,65 @@ export function createTrashCoordinator(
     const out = new Map<
       number,
       {
+        runId: number;
         publicId: string;
         status: "running" | "completed" | "failed";
         errorCode: string | null;
-        targetsJson: string;
         countsJson: string | null;
-        checkpointJson: string;
+        failedTargetPublicId: string | null;
+        failedTargetReference: string | null;
       }
     >();
     if (!unique.length) return out;
+
     const rows = await dbOrTx
       .select({
-        entityId: trashPurgeRuns.entityId,
+        targetEntityId: trashPurgeRunTargets.entityId,
+        runId: trashPurgeRuns.id,
         publicId: trashPurgeRuns.publicId,
         status: trashPurgeRuns.status,
         errorCode: trashPurgeRuns.errorCode,
-        targetsJson: trashPurgeRuns.targetsJson,
         countsJson: trashPurgeRuns.countsJson,
-        checkpointJson: trashPurgeRuns.checkpointJson,
+        failedTargetPublicId: trashPurgeRuns.failedTargetPublicId,
       })
-      .from(trashPurgeRuns)
-      .where(and(eq(trashPurgeRuns.entityKind, kind), inArray(trashPurgeRuns.entityId, unique)))
-      .orderBy(desc(trashPurgeRuns.id));
-    for (const row of rows) {
-      if (!out.has(row.entityId)) {
-        out.set(row.entityId, row);
+      .from(trashPurgeRunTargets)
+      .innerJoin(trashPurgeRuns, eq(trashPurgeRuns.id, trashPurgeRunTargets.runId))
+      .where(
+        and(
+          eq(trashPurgeRunTargets.entityKind, kind),
+          inArray(trashPurgeRunTargets.entityId, unique),
+        ),
+      );
+
+    const failedPubIds = [
+      ...new Set(rows.map((r) => r.failedTargetPublicId).filter((v): v is string => Boolean(v))),
+    ];
+    const failedRefByPubId = new Map<string, string | null>();
+    if (failedPubIds.length > 0) {
+      const failedTargetRows = await dbOrTx
+        .select({
+          entityPublicId: trashPurgeRunTargets.entityPublicId,
+          targetReference: trashPurgeRunTargets.targetReference,
+        })
+        .from(trashPurgeRunTargets)
+        .where(inArray(trashPurgeRunTargets.entityPublicId, failedPubIds));
+      for (const ft of failedTargetRows) {
+        failedRefByPubId.set(ft.entityPublicId, ft.targetReference);
       }
+    }
+
+    for (const row of rows) {
+      out.set(row.targetEntityId, {
+        runId: row.runId,
+        publicId: row.publicId,
+        status: row.status,
+        errorCode: row.errorCode,
+        countsJson: row.countsJson,
+        failedTargetPublicId: row.failedTargetPublicId,
+        failedTargetReference: row.failedTargetPublicId
+          ? (failedRefByPubId.get(row.failedTargetPublicId) ?? null)
+          : null,
+      });
     }
     return out;
   }
@@ -938,21 +1169,33 @@ export function createTrashCoordinator(
     };
   }
 
+  /**
+   * Synchronized worker-drain and customer-maintenance gate (D2.8).
+   * Passes `tx` so `jobAdmin.isDraining(tx)` and `customerAccess(tx)` lock their singleton rows `FOR SHARE`.
+   * Fails closed if `jobAdmin` or its drain/maintenance gates are unavailable.
+   */
   async function isMaintenanceBlockingCleanup(tx?: Tx): Promise<string | null> {
-    const jobAdmin = services().jobAdmin;
-    if (jobAdmin?.isDraining && (await jobAdmin.isDraining())) {
+    const jobAdmin = services().jobAdmin as
+      | {
+          isDraining?: (t?: DbOrTx) => Promise<boolean>;
+          maintenance?: { customerAccess?: (t?: Tx) => Promise<{ active: boolean }> };
+        }
+      | undefined;
+    if (
+      !jobAdmin ||
+      typeof jobAdmin.isDraining !== "function" ||
+      typeof jobAdmin.maintenance?.customerAccess !== "function"
+    ) {
+      throw unavailable("MAINTENANCE_GATE_UNAVAILABLE", "Maintenance gate is temporarily unavailable.");
+    }
+    if (await jobAdmin.isDraining(tx)) {
       return "WORKER_DRAINING";
     }
-    if (jobAdmin?.maintenance?.customerAccess) {
-      const status = await jobAdmin.maintenance.customerAccess(tx);
-      if (status.active) return "CUSTOMER_MAINTENANCE_ACTIVE";
-    }
+    const status = await jobAdmin.maintenance.customerAccess(tx);
+    if (status.active) return "CUSTOMER_MAINTENANCE_ACTIVE";
     return null;
   }
 
-  /**
-   * Checks under `FOR UPDATE` / `FOR SHARE` whether a customer owns any non-purged order on `legal_hold`.
-   */
   async function assertCustomerHasNoLegalHoldInTx(tx: Tx, customerUserId: number): Promise<void> {
     const [held] = await tx
       .select({ id: orders.id })
@@ -969,54 +1212,9 @@ export function createTrashCoordinator(
     if (held) throw legalHoldError();
   }
 
-  /**
-   * Verifies no other active purge run (`status === "running"` with unexpired lease) overlaps any target
-   * in `candidateOrderIds` or `candidateCustomerId` (locks overlapping run rows `FOR UPDATE`).
-   */
-  async function assertNoOverlappingActiveRunsInTx(
-    tx: Tx,
-    selfRunRowId: number | null,
-    candidateOrderIds: readonly number[],
-    candidateCustomerIds: readonly number[],
-    nowMs: number,
-  ): Promise<void> {
-    const conditions = [];
-    if (candidateOrderIds.length > 0) {
-      conditions.push(
-        and(eq(trashPurgeRuns.entityKind, "order"), inArray(trashPurgeRuns.entityId, [...candidateOrderIds])),
-      );
-    }
-    if (candidateCustomerIds.length > 0) {
-      conditions.push(
-        and(
-          eq(trashPurgeRuns.entityKind, "customer"),
-          inArray(trashPurgeRuns.entityId, [...candidateCustomerIds]),
-        ),
-      );
-    }
-    if (!conditions.length) return;
-
-    const overlapping = await tx
-      .select()
-      .from(trashPurgeRuns)
-      .where(and(eq(trashPurgeRuns.status, "running"), or(...conditions)))
-      .for("update");
-
-    for (const run of overlapping) {
-      if (selfRunRowId !== null && run.id === selfRunRowId) continue;
-      const cp = parseCheckpoint(run.checkpointJson);
-      if (cp.leaseExpiresAtMs > nowMs) {
-        throw conflict(
-          "PURGE_IN_PROGRESS",
-          "Permanent deletion is already running for this item or an associated account.",
-        );
-      }
-    }
-  }
-
   async function restoreSingleInTx(
     tx: Tx,
-    item: TrashItemRef,
+    item: TrashMutationItemRef,
     actor: TrashActor,
     auditPrincipal: SessionPrincipal,
   ): Promise<{ batchId: string }> {
@@ -1026,7 +1224,6 @@ export function createTrashCoordinator(
     const idTrash = requireIdentityTrash();
 
     if (item.kind === "order") {
-      // Plain read for ownerUserId, then lock `users FOR SHARE` BEFORE `orders FOR UPDATE` (`users -> sessions -> orders`).
       const [peekOwner] = await tx
         .select({ ownerUserId: orders.ownerUserId })
         .from(orders)
@@ -1064,7 +1261,24 @@ export function createTrashCoordinator(
           "Permanent deletion has started for this order, so it can no longer be restored.",
         );
       }
-      if (item.batchId && lockedOrder.trashBatchId !== item.batchId) {
+      const [ownedTarget] = await tx
+        .select({ id: trashPurgeRunTargets.id })
+        .from(trashPurgeRunTargets)
+        .where(
+          and(
+            eq(trashPurgeRunTargets.entityKind, "order"),
+            eq(trashPurgeRunTargets.entityId, lockedOrder.id),
+          ),
+        )
+        .for("share")
+        .limit(1);
+      if (ownedTarget) {
+        throw conflict(
+          "PURGE_IN_PROGRESS",
+          "Permanent deletion has started for this order, so it can no longer be restored.",
+        );
+      }
+      if (lockedOrder.trashBatchId !== item.batchId) {
         throw conflict("STALE", "This order changed meanwhile. Review again.");
       }
       const batchId = lockedOrder.trashBatchId;
@@ -1111,7 +1325,6 @@ export function createTrashCoordinator(
       return { batchId };
     }
 
-    // Customer restore: lock user row FIRST (`users -> orders` lock order), then lock customer's orders.
     const [lockedCust] = await tx
       .select({
         id: users.id,
@@ -1154,7 +1367,24 @@ export function createTrashCoordinator(
         "Permanent deletion has started for this customer account, so it can no longer be restored.",
       );
     }
-    if (item.batchId && lockedCust.trashBatchId !== item.batchId) {
+    const [ownedCustTarget] = await tx
+      .select({ id: trashPurgeRunTargets.id })
+      .from(trashPurgeRunTargets)
+      .where(
+        and(
+          eq(trashPurgeRunTargets.entityKind, "customer"),
+          eq(trashPurgeRunTargets.entityId, lockedCust.id),
+        ),
+      )
+      .for("share")
+      .limit(1);
+    if (ownedCustTarget) {
+      throw conflict(
+        "PURGE_IN_PROGRESS",
+        "Permanent deletion has started for this customer account, so it can no longer be restored.",
+      );
+    }
+    if (lockedCust.trashBatchId !== item.batchId) {
       throw conflict("STALE", "This customer account changed meanwhile. Review again.");
     }
     const batchId = lockedCust.trashBatchId;
@@ -1227,7 +1457,242 @@ export function createTrashCoordinator(
   }
 
   /**
-   * Executes or resumes one durable, lease-fenced purge run for an order or customer.
+   * Re-locks and re-validates an existing owning run's targets in strict `users -> orders` ascending order,
+   * optionally records per-target typed external-copy acknowledgment, increments `fencingToken`, and resumes.
+   */
+  async function resumeExistingPurgeRunInTx(params: {
+    tx: Tx;
+    existingRun: TrashPurgeRunRow;
+    actor: TrashActor;
+    auditPrincipal?: SessionPrincipal;
+    now: Date;
+    acquireRunLock: (runRowId: number) => Promise<void>;
+    acknowledgeExternal?: {
+      targetOrderPublicId?: string;
+      confirmation: string;
+    };
+  }): Promise<
+    | { alreadyCompleted: true; runId: string; batchId: string; keptExternalCopies: number }
+    | {
+        alreadyCompleted: false;
+        runRowId: number;
+        runId: string;
+        batchId: string;
+        fencingToken: number;
+        expectedModules: string[];
+        targets: TrashPurgeRunTargetRow[];
+        counts: PersistedCounts;
+      }
+  > {
+    const { tx, existingRun, actor, auditPrincipal, now, acquireRunLock, acknowledgeExternal } = params;
+    const ordersTrash = requireOrdersTrash();
+    const idTrash = requireIdentityTrash();
+
+    if (existingRun.status === "completed") {
+      const c = parseCounts(existingRun.countsJson);
+      return {
+        alreadyCompleted: true,
+        runId: existingRun.publicId,
+        batchId: existingRun.batchId,
+        keptExternalCopies: c.kept.acknowledgedExternalCopies ?? 0,
+      };
+    }
+
+    if (
+      actor.kind === "system" &&
+      existingRun.status === "failed" &&
+      existingRun.nextRetryAt &&
+      existingRun.nextRetryAt.getTime() > now.getTime()
+    ) {
+      throw conflict("PURGE_RETRY_BACKOFF", "Deletion run is waiting for retry backoff.");
+    }
+
+    // Acquire exclusive advisory lock BEFORE bumping `fencingToken` so a live worker is never disturbed!
+    await acquireRunLock(existingRun.id);
+
+    const [lockedRun] = await tx
+      .select()
+      .from(trashPurgeRuns)
+      .where(eq(trashPurgeRuns.id, existingRun.id))
+      .for("update")
+      .limit(1);
+    if (!lockedRun) throw notFound("PURGE_RUN_NOT_FOUND");
+    if (lockedRun.status === "completed") {
+      const c = parseCounts(lockedRun.countsJson);
+      return {
+        alreadyCompleted: true,
+        runId: lockedRun.publicId,
+        batchId: lockedRun.batchId,
+        keptExternalCopies: c.kept.acknowledgedExternalCopies ?? 0,
+      };
+    }
+
+    const targetRows = await tx
+      .select()
+      .from(trashPurgeRunTargets)
+      .where(eq(trashPurgeRunTargets.runId, lockedRun.id))
+      .orderBy(asc(trashPurgeRunTargets.position))
+      .for("update");
+
+    if (acknowledgeExternal !== undefined) {
+      if (lockedRun.status !== "failed" || lockedRun.errorCode !== "EXTERNAL_COPIES_UNREACHABLE") {
+        throw conflict("STALE", "The failed deletion run changed meanwhile. Review again.");
+      }
+      const desiredOrderPubId = acknowledgeExternal.targetOrderPublicId ?? lockedRun.failedTargetPublicId;
+      const ackTarget = desiredOrderPubId
+        ? targetRows.find((t) => t.entityKind === "order" && t.entityPublicId === desiredOrderPubId)
+        : targetRows.length === 1 && targetRows[0]?.entityKind === "order"
+          ? targetRows[0]
+          : undefined;
+      if (!ackTarget || ackTarget.status === "completed") {
+        throw conflict(
+          "ACKNOWLEDGMENT_SINGLE_ORDER_ONLY",
+          "Specify the exact failing order and type its order number to leave external copies in place.",
+        );
+      }
+      if (!ackTarget.targetReference || acknowledgeExternal.confirmation.trim() !== ackTarget.targetReference) {
+        throw validation(
+          "CONFIRMATION_MISMATCH",
+          "The confirmation you typed doesn't match. Nothing was deleted.",
+        );
+      }
+      if (!auditPrincipal || actor.kind !== "user") {
+        throw forbidden("ROLE_NOT_PERMITTED");
+      }
+
+      await tx
+        .update(trashPurgeRunTargets)
+        .set({
+          leaveExternalCopiesApprovedAt: now,
+          leaveExternalCopiesActorUserId: auditPrincipal.userId,
+          updatedAt: now,
+        })
+        .where(eq(trashPurgeRunTargets.id, ackTarget.id));
+      ackTarget.leaveExternalCopiesApprovedAt = now;
+      ackTarget.leaveExternalCopiesActorUserId = auditPrincipal.userId;
+
+      const parsedCounts = parseCounts(lockedRun.countsJson);
+      const connIds = Object.keys(parsedCounts.unreachableByConnection ?? {}).join(",");
+      const displayedBlocked = parsedCounts.unreachableTotal ?? 1;
+      await deps.audit.record(
+        {
+          category: "admin",
+          eventName: "order.purge_external_left",
+          action: "delete",
+          outcome: "completed",
+          severity: "WARN",
+          actor: { userId: auditPrincipal.userId, role: auditPrincipal.role },
+          resource: { type: "order", id: ackTarget.entityId, publicId: ackTarget.entityPublicId },
+          orderPublicId: ackTarget.entityPublicId,
+          correlationId: ackTarget.batchId,
+          safeCounts: { kept_count: displayedBlocked },
+          attributes: {
+            order_public_id: ackTarget.entityPublicId,
+            trash_batch_id: ackTarget.batchId,
+            run_public_id: lockedRun.publicId,
+            kept_count: displayedBlocked,
+            ...(connIds ? { connection_public_ids: connIds.slice(0, 120) } : {}),
+          },
+        },
+        tx,
+      );
+    }
+
+    // Re-lock customer targets FIRST (`users -> orders` ascending order), then order targets.
+    const customerTargets = targetRows
+      .filter((t) => t.entityKind === "customer")
+      .sort((a, b) => a.entityId - b.entityId);
+    const orderTargets = targetRows
+      .filter((t) => t.entityKind === "order")
+      .sort((a, b) => a.entityId - b.entityId);
+
+    for (const ct of customerTargets) {
+      const [cRow] = await tx
+        .select({
+          id: users.id,
+          trashBatchId: users.trashBatchId,
+          purgedAt: users.purgedAt,
+        })
+        .from(users)
+        .where(eq(users.id, ct.entityId))
+        .for("update")
+        .limit(1);
+      if (!cRow) throw notFound("CUSTOMER_NOT_FOUND");
+      if (!cRow.purgedAt && cRow.trashBatchId !== ct.batchId) {
+        throw conflict("STALE", "Customer trash generation changed meanwhile. Review again.");
+      }
+      if (!cRow.purgedAt) {
+        await idTrash.markPurgeStartedInTx(tx, ct.entityId, {
+          batchId: ct.batchId,
+          runId: lockedRun.publicId,
+          actor,
+        });
+      }
+    }
+
+    if (orderTargets.length > 0) {
+      const lockedOrders = await tx
+        .select({
+          id: orders.id,
+          lockState: orders.lockState,
+          trashBatchId: orders.trashBatchId,
+          purgedAt: orders.purgedAt,
+        })
+        .from(orders)
+        .where(inArray(orders.id, orderTargets.map((t) => t.entityId)))
+        .orderBy(asc(orders.id))
+        .for("update");
+      const byId = new Map(lockedOrders.map((o) => [o.id, o]));
+      for (const ot of orderTargets) {
+        const oRow = byId.get(ot.entityId);
+        if (!oRow) throw notFound("ORDER_NOT_FOUND");
+        if (oRow.lockState === "legal_hold") throw legalHoldError();
+        if (!oRow.purgedAt && oRow.trashBatchId !== ot.batchId) {
+          throw conflict("STALE", "Order trash generation changed meanwhile. Review again.");
+        }
+        if (!oRow.purgedAt) {
+          await ordersTrash.markPurgeStartedInTx(tx, {
+            orderId: ot.entityId,
+            runId: lockedRun.publicId,
+            actor,
+          });
+        }
+      }
+    }
+
+    const nextToken = lockedRun.fencingToken + 1;
+    const parsedCounts = parseCounts(lockedRun.countsJson);
+    const meta = parseRunMeta(lockedRun.checkpointJson);
+
+    await tx
+      .update(trashPurgeRuns)
+      .set({
+        status: "running",
+        fencingToken: nextToken,
+        attemptCount: lockedRun.attemptCount + 1,
+        errorCode: null,
+        failedModule: null,
+        failedTargetPublicId: null,
+        nextRetryAt: null,
+        finishedAt: null,
+        updatedAt: now,
+      })
+      .where(and(eq(trashPurgeRuns.id, lockedRun.id), eq(trashPurgeRuns.fencingToken, lockedRun.fencingToken)));
+
+    return {
+      alreadyCompleted: false,
+      runRowId: lockedRun.id,
+      runId: lockedRun.publicId,
+      batchId: lockedRun.batchId,
+      fencingToken: nextToken,
+      expectedModules: meta.expectedModules,
+      targets: targetRows,
+      counts: parsedCounts,
+    };
+  }
+
+  /**
+   * Claims or resumes one durable, advisory-locked, token-fenced purge run for an order or customer.
    */
   async function executePurgeOne(params: {
     item: TrashItemRef;
@@ -1236,7 +1701,12 @@ export function createTrashCoordinator(
     bulkCount: number;
     expectedSingleConfirmation?: string;
     sweepPublicId?: string;
-    acknowledgeUnreachableRunId?: string;
+    acknowledgeExternal?: {
+      runPublicId: string;
+      targetOrderPublicId?: string;
+      confirmation: string;
+    };
+    onClaimCommitted?: (batchId: string) => void;
   }): Promise<{ runId: string; batchId: string; keptExternalCopies: number }> {
     const {
       item,
@@ -1245,352 +1715,630 @@ export function createTrashCoordinator(
       bulkCount,
       expectedSingleConfirmation,
       sweepPublicId,
-      acknowledgeUnreachableRunId,
+      acknowledgeExternal,
+      onClaimCommitted,
     } = params;
     const triggerLabel = actor.kind === "user" ? "administrator" : "auto_cleanup";
     const ordersTrash = requireOrdersTrash();
     const idTrash = requireIdentityTrash();
 
-    // Phase 1: Synchronized lock + claim / resume durable run inside TX.
-    const claimed = await deps.db.transaction(async (tx) => {
-      if (auditPrincipal) {
-        await guardActorInTx(tx, auditPrincipal, "trash.purge");
-      } else {
-        // Scheduled job performs synchronized `FOR SHARE` reads of policy & maintenance under claim (D2.8).
-        await shareLockRetentionCohortInTx(tx);
-        const retention = await readRetentionValues(tx, true);
-        if (!retention.autoPurgeEnabled) {
-          throw conflict("AUTO_PURGE_DISABLED", "Automatic clean-up is disabled.");
-        }
-        const maint = await isMaintenanceBlockingCleanup(tx);
-        if (maint) {
-          throw conflict("MAINTENANCE_ACTIVE", "Maintenance mode is active.");
-        }
+    let runLock: AdvisoryLockHandle | null = null;
+    const acquireRunLock = async (runRowId: number): Promise<void> => {
+      if (runLock) return;
+      const acquired = await tryAcquireAdvisoryLock((dbh) => trashRunAdvisoryLockName(dbh, runRowId));
+      if (!acquired) {
+        throw conflict(
+          "PURGE_IN_PROGRESS",
+          "Permanent deletion is already running for this item or an associated account.",
+        );
       }
+      runLock = acquired;
+    };
 
-      const now = deps.clock.now();
-      const nowMs = now.getTime();
-      const leaseOwner = ulid(nowMs);
+    try {
+      // Phase 1: Synchronized lock + durable per-target ownership claim / resume inside TX.
+      const claimed = await deps.db.transaction(async (tx) => {
+        if (auditPrincipal) {
+          await guardActorInTx(tx, auditPrincipal, "trash.purge");
+          const maint = await isMaintenanceBlockingCleanup(tx);
+          if (maint === "WORKER_DRAINING") {
+            throw conflict("MAINTENANCE_ACTIVE", "Workers are draining for maintenance. Try again shortly.");
+          }
+        } else {
+          await shareLockRetentionCohortInTx(tx);
+          const retention = await readRetentionValues(tx, true);
+          if (!retention.autoPurgeEnabled) {
+            throw conflict("AUTO_PURGE_DISABLED", "Automatic clean-up is disabled.");
+          }
+          const maint = await isMaintenanceBlockingCleanup(tx);
+          if (maint) {
+            throw conflict("MAINTENANCE_ACTIVE", "Maintenance mode is active.");
+          }
+        }
 
-      if (item.kind === "order") {
-        // Snapshot lookup of owner user id so we acquire `users` lock BEFORE `orders` lock (`users -> orders`).
-        const [preOrder] = await tx
-          .select({ id: orders.id, ownerUserId: orders.ownerUserId })
-          .from(orders)
-          .where(eq(orders.publicId, item.publicId))
-          .limit(1);
-        if (!preOrder) throw notFound("ORDER_NOT_FOUND");
+        const now = deps.clock.now();
+        const nowMs = now.getTime();
 
-        const [lockedOwner] = await tx
-          .select({
-            id: users.id,
-            trashedAt: users.trashedAt,
-            trashBatchId: users.trashBatchId,
-            purgedAt: users.purgedAt,
-          })
-          .from(users)
-          .where(eq(users.id, preOrder.ownerUserId))
-          .for("share")
-          .limit(1);
-
-        const [lockedPrimary] = await tx
-          .select()
-          .from(orders)
-          .where(eq(orders.id, preOrder.id))
-          .for("update")
-          .limit(1);
-
-        if (!lockedPrimary) throw notFound("ORDER_NOT_FOUND");
-        if (lockedPrimary.purgedAt) {
-          const [doneRun] = await tx
+        // Explicit `finishLeavingExternalCopies` resumption by `runPublicId`
+        if (acknowledgeExternal !== undefined) {
+          const [targetRun] = await tx
             .select()
             .from(trashPurgeRuns)
-            .where(
-              and(
-                eq(trashPurgeRuns.entityKind, "order"),
-                eq(trashPurgeRuns.entityId, lockedPrimary.id),
-                eq(trashPurgeRuns.status, "completed"),
-              ),
-            )
-            .orderBy(desc(trashPurgeRuns.id))
+            .where(eq(trashPurgeRuns.publicId, acknowledgeExternal.runPublicId))
             .limit(1);
-          if (
-            doneRun &&
-            (!item.batchId || doneRun.batchId === item.batchId) &&
-            (!acknowledgeUnreachableRunId || doneRun.publicId === acknowledgeUnreachableRunId)
-          ) {
-            const c = parseCounts(doneRun.countsJson);
-            return {
-              alreadyCompleted: true as const,
-              runId: doneRun.publicId,
-              batchId: doneRun.batchId,
-              keptExternalCopies: c.kept.acknowledgedExternalCopies ?? 0,
-            };
-          }
-          throw notFound("ORDER_NOT_FOUND");
-        }
-        if (!lockedPrimary.trashedAt || !lockedPrimary.trashBatchId) {
-          throw conflict("NOT_IN_TRASH", "This order is no longer in the trash.");
-        }
-        if (lockedPrimary.lockState === "legal_hold") {
-          throw legalHoldError();
-        }
-        if (item.batchId && lockedPrimary.trashBatchId !== item.batchId) {
-          throw conflict("STALE", "This order changed meanwhile. Review again.");
-        }
-        if (
-          expectedSingleConfirmation !== undefined &&
-          expectedSingleConfirmation.trim() !== lockedPrimary.reference
-        ) {
-          throw validation(
-            "CONFIRMATION_MISMATCH",
-            "The confirmation you typed doesn't match. Nothing was deleted.",
+          if (!targetRun) throw notFound("PURGE_RUN_NOT_FOUND");
+
+          const runTargets = await tx
+            .select()
+            .from(trashPurgeRunTargets)
+            .where(eq(trashPurgeRunTargets.runId, targetRun.id))
+            .orderBy(asc(trashPurgeRunTargets.position));
+
+          const matchesPrimary =
+            targetRun.entityKind === item.kind &&
+            targetRun.entityPublicId === item.publicId &&
+            (!item.batchId || targetRun.batchId === item.batchId);
+          const matchesTarget = runTargets.some(
+            (t) =>
+              t.entityKind === item.kind &&
+              t.entityPublicId === item.publicId &&
+              (!item.batchId || t.batchId === item.batchId),
           );
+          if (!matchesPrimary && !matchesTarget) {
+            throw conflict("STALE", "The failed deletion run does not match this item or trash batch.");
+          }
+
+          return resumeExistingPurgeRunInTx({
+            tx,
+            existingRun: targetRun,
+            actor,
+            auditPrincipal,
+            now,
+            acquireRunLock,
+            acknowledgeExternal: {
+              targetOrderPublicId: acknowledgeExternal.targetOrderPublicId,
+              confirmation: acknowledgeExternal.confirmation,
+            },
+          });
         }
 
-        const expectedBatchId = lockedPrimary.trashBatchId;
-
-        // Lock group additions if root order, and lock owner user `FOR SHARE` (`orders -> users`) for retention check.
-        let groupAdditions: (typeof orders.$inferSelect)[] = [];
-        if (lockedPrimary.groupRootOrderId === null) {
-          const addIds = await tx
-            .select({ id: orders.id })
+        if (item.kind === "order") {
+          const [preOrder] = await tx
+            .select({
+              id: orders.id,
+              ownerUserId: orders.ownerUserId,
+              groupRootOrderId: orders.groupRootOrderId,
+            })
             .from(orders)
-            .where(
-              and(
-                eq(orders.groupRootOrderId, lockedPrimary.id),
-                eq(orders.trashBatchId, expectedBatchId),
-                isNull(orders.purgedAt),
-              ),
-            )
-            .orderBy(asc(orders.id))
-            .limit(MAX_CASCADE_TARGETS + 1);
-          if (addIds.length > MAX_CASCADE_TARGETS) {
+            .where(eq(orders.publicId, item.publicId))
+            .limit(1);
+          if (!preOrder) throw notFound("ORDER_NOT_FOUND");
+
+          // Pre-read group additions (including cross-owner reassigned additions) so we lock ALL `users` BEFORE `orders`.
+          const preAdditions =
+            preOrder.groupRootOrderId === null
+              ? await tx
+                  .select({ id: orders.id, ownerUserId: orders.ownerUserId })
+                  .from(orders)
+                  .where(and(eq(orders.groupRootOrderId, preOrder.id), isNull(orders.purgedAt)))
+                  .orderBy(asc(orders.id))
+                  .limit(MAX_CASCADE_TARGETS + 1)
+              : [];
+          if (preAdditions.length > MAX_CASCADE_TARGETS) {
             throw conflict("CASCADE_TOO_LARGE", "This order group has too many additions to delete at once.");
           }
-          if (addIds.length > 0) {
-            groupAdditions = await tx
-              .select()
-              .from(orders)
-              .where(inArray(orders.id, addIds.map((r) => r.id)))
-              .orderBy(asc(orders.id))
-              .for("update");
+
+          const allOwnerIds = [
+            ...new Set([preOrder.ownerUserId, ...preAdditions.map((a) => a.ownerUserId)]),
+          ].sort((a, b) => a - b);
+          const lockedOwners = await tx
+            .select({
+              id: users.id,
+              trashedAt: users.trashedAt,
+              trashBatchId: users.trashBatchId,
+              purgedAt: users.purgedAt,
+            })
+            .from(users)
+            .where(inArray(users.id, allOwnerIds))
+            .orderBy(asc(users.id))
+            .for("share");
+          const lockedOwner = lockedOwners.find((u) => u.id === preOrder.ownerUserId);
+
+          const candidateIds = [preOrder.id, ...preAdditions.map((a) => a.id)].sort((a, b) => a - b);
+          const lockedOrders = await tx
+            .select()
+            .from(orders)
+            .where(inArray(orders.id, candidateIds))
+            .orderBy(asc(orders.id))
+            .for("update");
+          const lockedPrimary = lockedOrders.find((o) => o.id === preOrder.id);
+          if (!lockedPrimary) throw notFound("ORDER_NOT_FOUND");
+
+          if (lockedPrimary.purgedAt) {
+            const [ownedTarget] = await tx
+              .select({ runId: trashPurgeRunTargets.runId })
+              .from(trashPurgeRunTargets)
+              .where(
+                and(
+                  eq(trashPurgeRunTargets.entityKind, "order"),
+                  eq(trashPurgeRunTargets.entityId, lockedPrimary.id),
+                ),
+              )
+              .limit(1);
+            if (ownedTarget) {
+              const [doneRun] = await tx
+                .select()
+                .from(trashPurgeRuns)
+                .where(eq(trashPurgeRuns.id, ownedTarget.runId))
+                .limit(1);
+              if (doneRun && doneRun.status === "completed") {
+                if (item.batchId && doneRun.batchId !== item.batchId && lockedPrimary.trashBatchId !== item.batchId) {
+                  throw conflict("STALE", "This order changed meanwhile. Review again.");
+                }
+                const c = parseCounts(doneRun.countsJson);
+                return {
+                  alreadyCompleted: true as const,
+                  runId: doneRun.publicId,
+                  batchId: lockedPrimary.trashBatchId ?? doneRun.batchId,
+                  keptExternalCopies: c.kept.acknowledgedExternalCopies ?? 0,
+                };
+              }
+            }
+            throw notFound("ORDER_NOT_FOUND");
           }
-          if (groupAdditions.some((a) => a.lockState === "legal_hold")) {
+
+          if (!lockedPrimary.trashedAt || !lockedPrimary.trashBatchId) {
+            throw conflict("NOT_IN_TRASH", "This order is no longer in the trash.");
+          }
+          if (lockedPrimary.lockState === "legal_hold") {
             throw legalHoldError();
           }
-        }
-
-        if (actor.kind === "system") {
-          const retention = await readRetentionValues(tx, true);
-          const { dueAt, movedWithCustomer } = computeOrderDueAt(
-            lockedPrimary.trashedAt,
-            expectedBatchId,
-            lockedOwner && !lockedOwner.purgedAt
-              ? { trashedAt: lockedOwner.trashedAt, trashBatchId: lockedOwner.trashBatchId }
-              : undefined,
-            retention,
-          );
-          if (movedWithCustomer || !dueAt || dueAt.getTime() > nowMs) {
-            throw conflict("NOT_DUE", "This order is not yet due for automatic clean-up.");
+          if (actor.kind === "user" && !item.batchId) {
+            throw validation("BATCH_ID_REQUIRED", "Include the trash batch identifier.");
           }
-        }
-
-        const [existingRun] = await tx
-          .select()
-          .from(trashPurgeRuns)
-          .where(
-            and(
-              eq(trashPurgeRuns.entityKind, "order"),
-              eq(trashPurgeRuns.entityId, lockedPrimary.id),
-              eq(trashPurgeRuns.batchId, expectedBatchId),
-            ),
-          )
-          .orderBy(desc(trashPurgeRuns.id))
-          .for("update")
-          .limit(1);
-
-        const candidateOrderIds = [
-          ...groupAdditions.map((a) => a.id),
-          lockedPrimary.id,
-        ];
-        await assertNoOverlappingActiveRunsInTx(
-          tx,
-          existingRun?.id ?? null,
-          candidateOrderIds,
-          [lockedPrimary.ownerUserId],
-          nowMs,
-        );
-
-        if (existingRun?.status === "completed") {
-          const c = parseCounts(existingRun.countsJson);
-          return {
-            alreadyCompleted: true as const,
-            runId: existingRun.publicId,
-            batchId: expectedBatchId,
-            keptExternalCopies: c.kept.acknowledgedExternalCopies ?? 0,
-          };
-        }
-
-        if (acknowledgeUnreachableRunId !== undefined) {
+          if (item.batchId && lockedPrimary.trashBatchId !== item.batchId) {
+            throw conflict("STALE", "This order changed meanwhile. Review again.");
+          }
           if (
-            !existingRun ||
-            existingRun.publicId !== acknowledgeUnreachableRunId ||
-            existingRun.status !== "failed" ||
-            existingRun.errorCode !== "EXTERNAL_COPIES_UNREACHABLE"
+            expectedSingleConfirmation !== undefined &&
+            expectedSingleConfirmation.trim() !== lockedPrimary.reference
           ) {
-            throw conflict("STALE", "The failed deletion run changed meanwhile. Review again.");
-          }
-        }
-
-        if (existingRun) {
-          const prevCp = parseCheckpoint(existingRun.checkpointJson);
-          if (existingRun.status === "running" && prevCp.leaseExpiresAtMs > nowMs) {
-            throw conflict(
-              "PURGE_IN_PROGRESS",
-              "Permanent deletion has started for this order, so it is already running.",
+            throw validation(
+              "CONFIRMATION_MISMATCH",
+              "The confirmation you typed doesn't match. Nothing was deleted.",
             );
           }
 
-          const parsedTargets = JSON.parse(existingRun.targetsJson) as PersistedTargetsEnvelope;
-          if (acknowledgeUnreachableRunId !== undefined && parsedTargets.targets.length !== 1) {
-            throw conflict(
-              "ACKNOWLEDGMENT_SINGLE_ORDER_ONLY",
-              "Delete add-on orders individually before leaving external copies in place on an order.",
-            );
-          }
-          // Re-verify all persisted order targets are not on legal hold and still match their recorded batch.
-          for (const t of parsedTargets.targets) {
-            if (t.kind === "order") {
-              const [tRow] = await tx
-                .select({
-                  id: orders.id,
-                  lockState: orders.lockState,
-                  trashBatchId: orders.trashBatchId,
-                  purgedAt: orders.purgedAt,
-                })
+          const expectedBatchId = lockedPrimary.trashBatchId;
+
+          // Re-verify complete group additions under lock (including cross-batch or reassigned additions).
+          let groupAdditions: (typeof orders.$inferSelect)[] = [];
+          if (lockedPrimary.groupRootOrderId === null) {
+            const liveCheck = await tx
+              .select({ id: orders.id })
+              .from(orders)
+              .where(and(eq(orders.groupRootOrderId, lockedPrimary.id), isNull(orders.purgedAt)))
+              .orderBy(asc(orders.id))
+              .limit(MAX_CASCADE_TARGETS + 1);
+            if (liveCheck.length > MAX_CASCADE_TARGETS) {
+              throw conflict("CASCADE_TOO_LARGE", "This order group has too many additions to delete at once.");
+            }
+            if (liveCheck.length > 0) {
+              groupAdditions = await tx
+                .select()
                 .from(orders)
-                .where(eq(orders.id, t.id))
-                .for("update")
-                .limit(1);
-              if (!tRow) throw notFound("ORDER_NOT_FOUND");
-              if (tRow.lockState === "legal_hold") throw legalHoldError();
-              if (!tRow.purgedAt && tRow.trashBatchId !== t.batchId) {
-                throw conflict("STALE", "This order changed meanwhile. Review again.");
-              }
-              if (!tRow.purgedAt) {
-                await ordersTrash.markPurgeStartedInTx(tx, {
-                  orderId: t.id,
-                  runId: existingRun.publicId,
-                  actor,
-                });
+                .where(inArray(orders.id, liveCheck.map((r) => r.id)))
+                .orderBy(asc(orders.id))
+                .for("update");
+            }
+            for (const add of groupAdditions) {
+              if (add.lockState === "legal_hold") throw legalHoldError();
+              if (!add.trashedAt || !add.trashBatchId) {
+                throw conflict(
+                  "ROOT_HAS_LIVE_ADDITIONS",
+                  "Move all add-on orders in this project to the trash before deleting the first order permanently.",
+                );
               }
             }
           }
 
-          const parsedCounts = parseCounts(existingRun.countsJson);
-          const nextToken = prevCp.fencingToken + 1;
-          const nextAck =
-            Boolean(acknowledgeUnreachableRunId) && actor.kind === "user" && Boolean(auditPrincipal);
-          const nextCp: PersistedCheckpoint = {
-            completedSteps: prevCp.completedSteps,
-            leaseOwner,
-            leaseExpiresAtMs: nowMs + PURGE_LEASE_MS,
-            fencingToken: nextToken,
-            ...(nextAck ? { acknowledgedUnreachableCopies: true } : {}),
-          };
+          if (actor.kind === "system") {
+            const retention = await readRetentionValues(tx, true);
+            const { dueAt, movedWithCustomer } = computeOrderDueAt(
+              lockedPrimary.trashedAt,
+              expectedBatchId,
+              lockedOwner && !lockedOwner.purgedAt
+                ? { trashedAt: lockedOwner.trashedAt, trashBatchId: lockedOwner.trashBatchId }
+                : undefined,
+              retention,
+            );
+            if (movedWithCustomer || !dueAt || dueAt.getTime() > nowMs) {
+              throw conflict("NOT_DUE", "This order is not yet due for automatic clean-up.");
+            }
+          }
 
-          if (nextAck && auditPrincipal) {
-            const connIds = Object.keys(parsedCounts.unreachableByConnection ?? {}).join(",");
-            const displayedBlocked = parsedCounts.unreachableTotal ?? 1;
+          const allOrderRows = [
+            ...groupAdditions.sort((a, b) => a.id - b.id),
+            lockedPrimary,
+          ];
+          const allOrderIds = allOrderRows.map((o) => o.id);
+
+          const existingTargets = await tx
+            .select()
+            .from(trashPurgeRunTargets)
+            .where(
+              and(
+                eq(trashPurgeRunTargets.entityKind, "order"),
+                inArray(trashPurgeRunTargets.entityId, allOrderIds),
+              ),
+            )
+            .for("update");
+
+          if (existingTargets.length > 0) {
+            const distinctRunIds = [...new Set(existingTargets.map((t) => t.runId))];
+            const owningRuns = await tx
+              .select()
+              .from(trashPurgeRuns)
+              .where(inArray(trashPurgeRuns.id, distinctRunIds))
+              .for("update");
+
+            if (
+              owningRuns.length === 1 &&
+              owningRuns[0]!.entityKind === "order" &&
+              owningRuns[0]!.entityId === lockedPrimary.id &&
+              owningRuns[0]!.batchId === expectedBatchId
+            ) {
+              return resumeExistingPurgeRunInTx({
+                tx,
+                existingRun: owningRuns[0]!,
+                actor,
+                auditPrincipal,
+                now,
+                acquireRunLock,
+              });
+            }
+
+            const conflictingRun = owningRuns[0]!;
+            throw new DomainError(
+              "CONFLICT",
+              "PURGE_ALREADY_OWNED",
+              "Permanent deletion is already owned by an existing deletion run. Resume that run first.",
+              {
+                owningRunPublicId: conflictingRun.publicId,
+                owningEntityKind: conflictingRun.entityKind,
+                owningEntityPublicId: conflictingRun.entityPublicId,
+              },
+            );
+          }
+
+          const runId = ulid(nowMs);
+          const expectedModules = computeExpectedModules();
+          const meta: PersistedRunMeta = { expectedModules };
+          const counts: PersistedCounts = { deleted: {}, kept: {} };
+
+          const [ins] = await tx.insert(trashPurgeRuns).values({
+            publicId: runId,
+            trigger: actor.kind === "user" ? "manual" : "retention",
+            actorUserId: actor.kind === "user" ? actor.userId : null,
+            sweepPublicId: sweepPublicId ?? null,
+            entityKind: "order",
+            entityId: lockedPrimary.id,
+            entityPublicId: lockedPrimary.publicId,
+            batchId: expectedBatchId,
+            status: "running",
+            fencingToken: 1,
+            targetsJson: "[]",
+            checkpointJson: JSON.stringify(meta),
+            countsJson: JSON.stringify(counts),
+            attemptCount: 1,
+            correlationId: expectedBatchId,
+            startedAt: now,
+            updatedAt: now,
+          });
+          const runRowId = Number(ins.insertId);
+
+          const insertedTargets: TrashPurgeRunTargetRow[] = [];
+          try {
+            for (let idx = 0; idx < allOrderRows.length; idx++) {
+              const ord = allOrderRows[idx]!;
+              const [tIns] = await tx.insert(trashPurgeRunTargets).values({
+                runId: runRowId,
+                entityKind: "order",
+                entityId: ord.id,
+                entityPublicId: ord.publicId,
+                targetReference: ord.reference,
+                batchId: ord.trashBatchId!,
+                position: idx,
+                status: "pending",
+                checkpointJson: "{}",
+                createdAt: now,
+                updatedAt: now,
+              });
+              insertedTargets.push({
+                id: Number(tIns.insertId),
+                runId: runRowId,
+                entityKind: "order",
+                entityId: ord.id,
+                entityPublicId: ord.publicId,
+                targetReference: ord.reference,
+                batchId: ord.trashBatchId!,
+                position: idx,
+                status: "pending",
+                checkpointJson: "{}",
+                leaveExternalCopiesApprovedAt: null,
+                leaveExternalCopiesActorUserId: null,
+                tombstonedAt: null,
+                createdAt: now,
+                updatedAt: now,
+              });
+            }
+          } catch (err) {
+            if (isMysqlDupEntry(err)) {
+              throw conflict(
+                "PURGE_ALREADY_OWNED",
+                "Permanent deletion is already owned by an existing deletion run.",
+              );
+            }
+            throw err;
+          }
+
+          await acquireRunLock(runRowId);
+
+          for (const ord of allOrderRows) {
+            await ordersTrash.markPurgeStartedInTx(tx, { orderId: ord.id, runId, actor });
             await deps.audit.record(
               {
                 category: "admin",
-                eventName: "order.purge_external_left",
+                eventName: "order.purge_started",
                 action: "delete",
-                outcome: "completed",
+                outcome: "attempted",
                 severity: "WARN",
-                actor: { userId: auditPrincipal.userId, role: auditPrincipal.role },
-                resource: { type: "order", id: lockedPrimary.id, publicId: lockedPrimary.publicId },
-                orderPublicId: lockedPrimary.publicId,
-                correlationId: expectedBatchId,
-                safeCounts: { kept_count: displayedBlocked },
+                actor:
+                  actor.kind === "user" && auditPrincipal
+                    ? { userId: auditPrincipal.userId, role: auditPrincipal.role }
+                    : { role: "system" },
+                resource: { type: "order", id: ord.id, publicId: ord.publicId },
+                orderPublicId: ord.publicId,
+                correlationId: ord.trashBatchId!,
                 attributes: {
-                  order_public_id: lockedPrimary.publicId,
-                  trash_batch_id: expectedBatchId,
-                  run_public_id: existingRun.publicId,
-                  kept_count: displayedBlocked,
-                  ...(connIds ? { connection_public_ids: connIds.slice(0, 120) } : {}),
+                  order_public_id: ord.publicId,
+                  trash_batch_id: ord.trashBatchId!,
+                  run_public_id: runId,
+                  trigger: triggerLabel,
+                  bulk_count: bulkCount,
                 },
               },
               tx,
             );
           }
 
-          await tx
-            .update(trashPurgeRuns)
-            .set({
-              status: "running",
-              checkpointJson: JSON.stringify(nextCp),
-              attemptCount: existingRun.attemptCount + 1,
-              errorCode: null,
-              failedModule: null,
-              finishedAt: null,
-              updatedAt: now,
-            })
-            .where(
-              and(
-                eq(trashPurgeRuns.id, existingRun.id),
-                eq(trashPurgeRuns.attemptCount, existingRun.attemptCount),
-              ),
-            );
-
           return {
             alreadyCompleted: false as const,
-            runRowId: existingRun.id,
-            runId: existingRun.publicId,
+            runRowId,
+            runId,
             batchId: expectedBatchId,
-            leaseOwner,
-            fencingToken: nextToken,
-            acknowledgeUnreachable: nextAck,
-            envelope: parsedTargets,
-            checkpoint: nextCp,
-            counts: parsedCounts,
+            fencingToken: 1,
+            expectedModules,
+            targets: insertedTargets,
+            counts,
           };
         }
 
-        const runId = ulid(nowMs);
-        const targets: TrashEntityRef[] = [
-          ...groupAdditions
-            .filter((a) => a.trashedAt !== null && a.purgedAt === null)
-            .map((a) => ({
-              kind: "order" as const,
-              id: a.id,
-              publicId: a.publicId,
-              batchId: expectedBatchId,
-            })),
-          {
-            kind: "order" as const,
-            id: lockedPrimary.id,
-            publicId: lockedPrimary.publicId,
-            batchId: expectedBatchId,
-          },
-        ];
+        // Customer target: pre-read customer + all owned orders + reassigned group additions of owned root orders
+        // so we acquire ALL `users` locks in `id ASC` BEFORE ANY `orders` locks!
+        const [preCust] = await tx
+          .select({ id: users.id })
+          .from(users)
+          .where(and(eq(users.publicId, item.publicId), eq(users.role, "customer")))
+          .limit(1);
+        if (!preCust) throw notFound("CUSTOMER_NOT_FOUND");
 
-        for (const t of targets) {
-          await ordersTrash.markPurgeStartedInTx(tx, { orderId: t.id, runId, actor });
+        const preOwnedOrders = await tx
+          .select({ id: orders.id, ownerUserId: orders.ownerUserId, groupRootOrderId: orders.groupRootOrderId })
+          .from(orders)
+          .where(and(eq(orders.ownerUserId, preCust.id), isNull(orders.purgedAt)))
+          .orderBy(asc(orders.id))
+          .limit(MAX_CASCADE_TARGETS + 1);
+        if (preOwnedOrders.length > MAX_CASCADE_TARGETS) {
+          throw conflict("CASCADE_TOO_LARGE", "This customer account has too many orders to delete at once.");
         }
 
-        const envelope: PersistedTargetsEnvelope = {
-          targets,
-          expectedModules: computeExpectedModules(),
-        };
-        const checkpoint: PersistedCheckpoint = {
-          completedSteps: [],
-          leaseOwner,
-          leaseExpiresAtMs: nowMs + PURGE_LEASE_MS,
-          fencingToken: 1,
-        };
+        const ownedRootIds = preOwnedOrders
+          .filter((o) => o.groupRootOrderId === null)
+          .map((o) => o.id);
+        const preReassignedAdditions =
+          ownedRootIds.length > 0
+            ? await tx
+                .select({ id: orders.id, ownerUserId: orders.ownerUserId })
+                .from(orders)
+                .where(
+                  and(
+                    inArray(orders.groupRootOrderId, ownedRootIds),
+                    ne(orders.ownerUserId, preCust.id),
+                    isNull(orders.purgedAt),
+                  ),
+                )
+                .orderBy(asc(orders.id))
+                .limit(MAX_CASCADE_TARGETS + 1)
+            : [];
+        if (preOwnedOrders.length + preReassignedAdditions.length > MAX_CASCADE_TARGETS) {
+          throw conflict("CASCADE_TOO_LARGE", "This customer account has too many orders to delete at once.");
+        }
+
+        const otherOwnerIds = [...new Set(preReassignedAdditions.map((a) => a.ownerUserId))].sort(
+          (a, b) => a - b,
+        );
+        const allUserIdsSorted = [...new Set([preCust.id, ...otherOwnerIds])].sort((a, b) => a - b);
+
+        let lockedCust: typeof users.$inferSelect | undefined;
+        for (const uid of allUserIdsSorted) {
+          if (uid === preCust.id) {
+            const [cRow] = await tx
+              .select()
+              .from(users)
+              .where(and(eq(users.id, uid), eq(users.role, "customer")))
+              .for("update")
+              .limit(1);
+            lockedCust = cRow;
+          } else {
+            await tx.select({ id: users.id }).from(users).where(eq(users.id, uid)).for("share").limit(1);
+          }
+        }
+        if (!lockedCust) throw notFound("CUSTOMER_NOT_FOUND");
+
+        const allCascadeOrderIdSet = new Set<number>([
+          ...preOwnedOrders.map((o) => o.id),
+          ...preReassignedAdditions.map((a) => a.id),
+        ]);
+        const lockedCascadeOrders =
+          allCascadeOrderIdSet.size > 0
+            ? await tx
+                .select()
+                .from(orders)
+                .where(inArray(orders.id, [...allCascadeOrderIdSet]))
+                .orderBy(asc(orders.id))
+                .for("update")
+            : [];
+
+        if (lockedCust.purgedAt) {
+          const [ownedCustTarget] = await tx
+            .select({ runId: trashPurgeRunTargets.runId })
+            .from(trashPurgeRunTargets)
+            .where(
+              and(
+                eq(trashPurgeRunTargets.entityKind, "customer"),
+                eq(trashPurgeRunTargets.entityId, lockedCust.id),
+              ),
+            )
+            .limit(1);
+          if (ownedCustTarget) {
+            const [doneRun] = await tx
+              .select()
+              .from(trashPurgeRuns)
+              .where(eq(trashPurgeRuns.id, ownedCustTarget.runId))
+              .limit(1);
+            if (doneRun && doneRun.status === "completed") {
+              if (item.batchId && doneRun.batchId !== item.batchId && lockedCust.trashBatchId !== item.batchId) {
+                throw conflict("STALE", "This customer account changed meanwhile. Review again.");
+              }
+              const c = parseCounts(doneRun.countsJson);
+              return {
+                alreadyCompleted: true as const,
+                runId: doneRun.publicId,
+                batchId: lockedCust.trashBatchId ?? doneRun.batchId,
+                keptExternalCopies: c.kept.acknowledgedExternalCopies ?? 0,
+              };
+            }
+          }
+          throw notFound("CUSTOMER_NOT_FOUND");
+        }
+
+        if (!lockedCust.trashedAt || !lockedCust.trashBatchId) {
+          throw conflict("NOT_IN_TRASH", "This customer account is no longer in the trash.");
+        }
+        if (actor.kind === "user" && !item.batchId) {
+          throw validation("BATCH_ID_REQUIRED", "Include the trash batch identifier.");
+        }
+        if (item.batchId && lockedCust.trashBatchId !== item.batchId) {
+          throw conflict("STALE", "This customer account changed meanwhile. Review again.");
+        }
+        const expectedRef = lockedCust.customerRef ?? lockedCust.publicId;
+        if (expectedSingleConfirmation !== undefined && expectedSingleConfirmation.trim() !== expectedRef) {
+          throw validation(
+            "CONFIRMATION_MISMATCH",
+            "The confirmation you typed doesn't match. Nothing was deleted.",
+          );
+        }
+
+        const nonPurgedOrders = lockedCascadeOrders.filter((o) => o.purgedAt === null);
+        if (nonPurgedOrders.some((o) => o.lockState === "legal_hold")) {
+          throw legalHoldError();
+        }
+        if (nonPurgedOrders.some((o) => o.trashedAt === null || !o.trashBatchId)) {
+          throw conflict(
+            "CUSTOMER_HAS_LIVE_ORDERS",
+            "Move all live orders of this customer account to the trash before deleting the account permanently.",
+          );
+        }
+
+        const expectedBatchId = lockedCust.trashBatchId;
+
+        if (actor.kind === "system") {
+          const retention = await readRetentionValues(tx, true);
+          const dueAt = retention.autoPurgeEnabled
+            ? addDays(lockedCust.trashedAt, retention.customerDays)
+            : null;
+          if (!dueAt || dueAt.getTime() > nowMs) {
+            throw conflict("NOT_DUE", "This customer account is not yet due for automatic clean-up.");
+          }
+        }
+
+        // Order additions before roots (`groupRootOrderId !== null` first, or `id ASC` for participants, tombstoned additions-first).
+        const orderedCascadeOrders = [...nonPurgedOrders].sort((a, b) => a.id - b.id);
+        const targetLookupPredicates = [
+          and(
+            eq(trashPurgeRunTargets.entityKind, "customer"),
+            eq(trashPurgeRunTargets.entityId, lockedCust.id),
+          ),
+          ...(orderedCascadeOrders.length > 0
+            ? [
+                and(
+                  eq(trashPurgeRunTargets.entityKind, "order"),
+                  inArray(
+                    trashPurgeRunTargets.entityId,
+                    orderedCascadeOrders.map((o) => o.id),
+                  ),
+                ),
+              ]
+            : []),
+        ];
+
+        const existingTargets = await tx
+          .select()
+          .from(trashPurgeRunTargets)
+          .where(or(...targetLookupPredicates))
+          .for("update");
+
+        if (existingTargets.length > 0) {
+          const distinctRunIds = [...new Set(existingTargets.map((t) => t.runId))];
+          const owningRuns = await tx
+            .select()
+            .from(trashPurgeRuns)
+            .where(inArray(trashPurgeRuns.id, distinctRunIds))
+            .for("update");
+
+          if (
+            owningRuns.length === 1 &&
+            owningRuns[0]!.entityKind === "customer" &&
+            owningRuns[0]!.entityId === lockedCust.id &&
+            owningRuns[0]!.batchId === expectedBatchId
+          ) {
+            return resumeExistingPurgeRunInTx({
+              tx,
+              existingRun: owningRuns[0]!,
+              actor,
+              auditPrincipal,
+              now,
+              acquireRunLock,
+            });
+          }
+
+          const conflictingRun = owningRuns[0]!;
+          throw new DomainError(
+            "CONFLICT",
+            "PURGE_ALREADY_OWNED",
+            "An associated order or account already has an unfinished permanent deletion run. Resume that run first.",
+            {
+              owningRunPublicId: conflictingRun.publicId,
+              owningEntityKind: conflictingRun.entityKind,
+              owningEntityPublicId: conflictingRun.entityPublicId,
+            },
+          );
+        }
+
+        const runId = ulid(nowMs);
+        const expectedModules = computeExpectedModules();
+        const meta: PersistedRunMeta = { expectedModules };
         const counts: PersistedCounts = { deleted: {}, kept: {} };
 
         const [ins] = await tx.insert(trashPurgeRuns).values({
@@ -1598,21 +2346,103 @@ export function createTrashCoordinator(
           trigger: actor.kind === "user" ? "manual" : "retention",
           actorUserId: actor.kind === "user" ? actor.userId : null,
           sweepPublicId: sweepPublicId ?? null,
-          entityKind: "order",
-          entityId: lockedPrimary.id,
-          entityPublicId: lockedPrimary.publicId,
+          entityKind: "customer",
+          entityId: lockedCust.id,
+          entityPublicId: lockedCust.publicId,
           batchId: expectedBatchId,
           status: "running",
-          targetsJson: JSON.stringify(envelope),
-          checkpointJson: JSON.stringify(checkpoint),
+          fencingToken: 1,
+          targetsJson: "[]",
+          checkpointJson: JSON.stringify(meta),
           countsJson: JSON.stringify(counts),
           attemptCount: 1,
           correlationId: expectedBatchId,
           startedAt: now,
           updatedAt: now,
         });
+        const runRowId = Number(ins.insertId);
 
-        for (const t of targets) {
+        const insertedTargets: TrashPurgeRunTargetRow[] = [];
+        try {
+          let pos = 0;
+          for (const ord of orderedCascadeOrders) {
+            const [tIns] = await tx.insert(trashPurgeRunTargets).values({
+              runId: runRowId,
+              entityKind: "order",
+              entityId: ord.id,
+              entityPublicId: ord.publicId,
+              targetReference: ord.reference,
+              batchId: ord.trashBatchId!,
+              position: pos,
+              status: "pending",
+              checkpointJson: "{}",
+              createdAt: now,
+              updatedAt: now,
+            });
+            insertedTargets.push({
+              id: Number(tIns.insertId),
+              runId: runRowId,
+              entityKind: "order",
+              entityId: ord.id,
+              entityPublicId: ord.publicId,
+              targetReference: ord.reference,
+              batchId: ord.trashBatchId!,
+              position: pos,
+              status: "pending",
+              checkpointJson: "{}",
+              leaveExternalCopiesApprovedAt: null,
+              leaveExternalCopiesActorUserId: null,
+              tombstonedAt: null,
+              createdAt: now,
+              updatedAt: now,
+            });
+            pos += 1;
+          }
+
+          const [custTargetIns] = await tx.insert(trashPurgeRunTargets).values({
+            runId: runRowId,
+            entityKind: "customer",
+            entityId: lockedCust.id,
+            entityPublicId: lockedCust.publicId,
+            targetReference: expectedRef,
+            batchId: expectedBatchId,
+            position: pos,
+            status: "pending",
+            checkpointJson: "{}",
+            createdAt: now,
+            updatedAt: now,
+          });
+          insertedTargets.push({
+            id: Number(custTargetIns.insertId),
+            runId: runRowId,
+            entityKind: "customer",
+            entityId: lockedCust.id,
+            entityPublicId: lockedCust.publicId,
+            targetReference: expectedRef,
+            batchId: expectedBatchId,
+            position: pos,
+            status: "pending",
+            checkpointJson: "{}",
+            leaveExternalCopiesApprovedAt: null,
+            leaveExternalCopiesActorUserId: null,
+            tombstonedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          });
+        } catch (err) {
+          if (isMysqlDupEntry(err)) {
+            throw conflict(
+              "PURGE_ALREADY_OWNED",
+              "Permanent deletion is already owned by an existing deletion run.",
+            );
+          }
+          throw err;
+        }
+
+        await acquireRunLock(runRowId);
+
+        for (const ord of orderedCascadeOrders) {
+          await ordersTrash.markPurgeStartedInTx(tx, { orderId: ord.id, runId, actor });
           await deps.audit.record(
             {
               category: "admin",
@@ -1624,12 +2454,13 @@ export function createTrashCoordinator(
                 actor.kind === "user" && auditPrincipal
                   ? { userId: auditPrincipal.userId, role: auditPrincipal.role }
                   : { role: "system" },
-              resource: { type: "order", id: t.id, publicId: t.publicId },
-              orderPublicId: t.publicId,
-              correlationId: t.batchId,
+              resource: { type: "order", id: ord.id, publicId: ord.publicId },
+              orderPublicId: ord.publicId,
+              correlationId: expectedBatchId,
               attributes: {
-                order_public_id: t.publicId,
-                trash_batch_id: t.batchId,
+                order_public_id: ord.publicId,
+                customer_public_id: lockedCust.publicId,
+                trash_batch_id: ord.trashBatchId!,
                 run_public_id: runId,
                 trigger: triggerLabel,
                 bulk_count: bulkCount,
@@ -1639,330 +2470,15 @@ export function createTrashCoordinator(
           );
         }
 
-        return {
-          alreadyCompleted: false as const,
-          runRowId: Number(ins.insertId),
+        await idTrash.markPurgeStartedInTx(tx, lockedCust.id, {
+          batchId: expectedBatchId,
           runId,
-          batchId: expectedBatchId,
-          leaseOwner,
-          fencingToken: 1,
-          acknowledgeUnreachable: false,
-          envelope,
-          checkpoint,
-          counts,
-        };
-      }
-
-      // Customer target: lock `users` row FIRST (`users -> orders` lock order), then lock customer's orders `FOR UPDATE`.
-      const [lockedCust] = await tx
-        .select()
-        .from(users)
-        .where(and(eq(users.publicId, item.publicId), eq(users.role, "customer")))
-        .for("update")
-        .limit(1);
-
-      if (!lockedCust) throw notFound("CUSTOMER_NOT_FOUND");
-
-      const ownedOrderIdRows = await tx
-        .select({ id: orders.id })
-        .from(orders)
-        .where(and(eq(orders.ownerUserId, lockedCust.id), isNull(orders.purgedAt)))
-        .orderBy(asc(orders.id))
-        .limit(MAX_CASCADE_TARGETS + 1);
-      if (ownedOrderIdRows.length > MAX_CASCADE_TARGETS) {
-        throw conflict("CASCADE_TOO_LARGE", "This customer account has too many orders to delete at once.");
-      }
-
-      const lockedCustomerOrders = ownedOrderIdRows.length
-        ? await tx
-            .select()
-            .from(orders)
-            .where(inArray(orders.id, ownedOrderIdRows.map((r) => r.id)))
-            .orderBy(asc(orders.id))
-            .for("update")
-        : [];
-      if (lockedCust.purgedAt) {
-        const [doneRun] = await tx
-          .select()
-          .from(trashPurgeRuns)
-          .where(
-            and(
-              eq(trashPurgeRuns.entityKind, "customer"),
-              eq(trashPurgeRuns.entityId, lockedCust.id),
-              eq(trashPurgeRuns.status, "completed"),
-            ),
-          )
-          .orderBy(desc(trashPurgeRuns.id))
-          .limit(1);
-        if (
-          doneRun &&
-          (!item.batchId || doneRun.batchId === item.batchId) &&
-          (!acknowledgeUnreachableRunId || doneRun.publicId === acknowledgeUnreachableRunId)
-        ) {
-          const c = parseCounts(doneRun.countsJson);
-          return {
-            alreadyCompleted: true as const,
-            runId: doneRun.publicId,
-            batchId: doneRun.batchId,
-            keptExternalCopies: c.kept.acknowledgedExternalCopies ?? 0,
-          };
-        }
-        throw notFound("CUSTOMER_NOT_FOUND");
-      }
-      if (!lockedCust.trashedAt || !lockedCust.trashBatchId) {
-        throw conflict("NOT_IN_TRASH", "This customer account is no longer in the trash.");
-      }
-      if (item.batchId && lockedCust.trashBatchId !== item.batchId) {
-        throw conflict("STALE", "This customer account changed meanwhile. Review again.");
-      }
-      const expectedRef = lockedCust.customerRef ?? lockedCust.publicId;
-      if (expectedSingleConfirmation !== undefined && expectedSingleConfirmation.trim() !== expectedRef) {
-        throw validation(
-          "CONFIRMATION_MISMATCH",
-          "The confirmation you typed doesn't match. Nothing was deleted.",
-        );
-      }
-
-      // Refuse if ANY non-purged order of this customer is on legal hold or is live!
-      const nonPurgedOrders = lockedCustomerOrders.filter(
-        (o) => o.ownerUserId === lockedCust.id && o.purgedAt === null,
-      );
-      if (nonPurgedOrders.some((o) => o.lockState === "legal_hold")) {
-        throw legalHoldError();
-      }
-      if (nonPurgedOrders.some((o) => o.trashedAt === null || !o.trashBatchId)) {
-        throw conflict(
-          "CUSTOMER_HAS_LIVE_ORDERS",
-          "Move all live orders of this customer account to the trash before deleting the account permanently.",
-        );
-      }
-
-      const expectedBatchId = lockedCust.trashBatchId;
-
-      if (actor.kind === "system") {
-        const retention = await readRetentionValues(tx, true);
-        const dueAt = retention.autoPurgeEnabled
-          ? addDays(lockedCust.trashedAt, retention.customerDays)
-          : null;
-        if (!dueAt || dueAt.getTime() > nowMs) {
-          throw conflict("NOT_DUE", "This customer account is not yet due for automatic clean-up.");
-        }
-      }
-
-      const [existingRun] = await tx
-        .select()
-        .from(trashPurgeRuns)
-        .where(
-          and(
-            eq(trashPurgeRuns.entityKind, "customer"),
-            eq(trashPurgeRuns.entityId, lockedCust.id),
-            eq(trashPurgeRuns.batchId, expectedBatchId),
-          ),
-        )
-        .orderBy(desc(trashPurgeRuns.id))
-        .for("update")
-        .limit(1);
-
-      await assertNoOverlappingActiveRunsInTx(
-        tx,
-        existingRun?.id ?? null,
-        nonPurgedOrders.map((o) => o.id),
-        [lockedCust.id],
-        nowMs,
-      );
-
-      if (existingRun?.status === "completed") {
-        const c = parseCounts(existingRun.countsJson);
-        return {
-          alreadyCompleted: true as const,
-          runId: existingRun.publicId,
-          batchId: expectedBatchId,
-          keptExternalCopies: c.kept.acknowledgedExternalCopies ?? 0,
-        };
-      }
-
-      if (acknowledgeUnreachableRunId !== undefined) {
-        throw conflict(
-          "ACKNOWLEDGMENT_SINGLE_ORDER_ONLY",
-          "Leave external copies in place on each order individually, typing its order number.",
-        );
-      }
-
-      if (existingRun) {
-        const prevCp = parseCheckpoint(existingRun.checkpointJson);
-        if (existingRun.status === "running" && prevCp.leaseExpiresAtMs > nowMs) {
-          throw conflict(
-            "PURGE_IN_PROGRESS",
-            "Permanent deletion has started for this customer account, so it is already running.",
-          );
-        }
-
-        const parsedTargets = JSON.parse(existingRun.targetsJson) as PersistedTargetsEnvelope;
-        for (const t of parsedTargets.targets) {
-          if (t.kind === "order") {
-            const [tRow] = await tx
-              .select({
-                id: orders.id,
-                lockState: orders.lockState,
-                trashBatchId: orders.trashBatchId,
-                purgedAt: orders.purgedAt,
-              })
-              .from(orders)
-              .where(eq(orders.id, t.id))
-              .for("update")
-              .limit(1);
-            if (!tRow) throw notFound("ORDER_NOT_FOUND");
-            if (tRow.lockState === "legal_hold") throw legalHoldError();
-            if (!tRow.purgedAt && tRow.trashBatchId !== t.batchId) {
-              throw conflict("STALE", "An order of this customer changed meanwhile. Review again.");
-            }
-            if (!tRow.purgedAt) {
-              await ordersTrash.markPurgeStartedInTx(tx, {
-                orderId: t.id,
-                runId: existingRun.publicId,
-                actor,
-              });
-            }
-          } else {
-            await idTrash.markPurgeStartedInTx(tx, t.id, {
-              batchId: t.batchId,
-              runId: existingRun.publicId,
-              actor,
-            });
-          }
-        }
-
-        const parsedCounts = parseCounts(existingRun.countsJson);
-        const nextToken = prevCp.fencingToken + 1;
-        const nextAck =
-          Boolean(acknowledgeUnreachableRunId) && actor.kind === "user" && Boolean(auditPrincipal);
-        const nextCp: PersistedCheckpoint = {
-          completedSteps: prevCp.completedSteps,
-          leaseOwner,
-          leaseExpiresAtMs: nowMs + PURGE_LEASE_MS,
-          fencingToken: nextToken,
-          ...(nextAck ? { acknowledgedUnreachableCopies: true } : {}),
-        };
-
-        if (nextAck && auditPrincipal) {
-          const connIds = Object.keys(parsedCounts.unreachableByConnection ?? {}).join(",");
-          const displayedBlocked = parsedCounts.unreachableTotal ?? 1;
-          await deps.audit.record(
-            {
-              category: "admin",
-              eventName: "customer.purge_external_left",
-              action: "delete",
-              outcome: "completed",
-              severity: "WARN",
-              actor: { userId: auditPrincipal.userId, role: auditPrincipal.role },
-              resource: { type: "user", id: lockedCust.id, publicId: lockedCust.publicId },
-              correlationId: expectedBatchId,
-              safeCounts: { kept_count: displayedBlocked },
-              attributes: {
-                customer_public_id: lockedCust.publicId,
-                trash_batch_id: expectedBatchId,
-                run_public_id: existingRun.publicId,
-                kept_count: displayedBlocked,
-                ...(connIds ? { connection_public_ids: connIds.slice(0, 120) } : {}),
-              },
-            },
-            tx,
-          );
-        }
-
-        await tx
-          .update(trashPurgeRuns)
-          .set({
-            status: "running",
-            checkpointJson: JSON.stringify(nextCp),
-            attemptCount: existingRun.attemptCount + 1,
-            errorCode: null,
-            failedModule: null,
-            finishedAt: null,
-            updatedAt: now,
-          })
-          .where(
-            and(
-              eq(trashPurgeRuns.id, existingRun.id),
-              eq(trashPurgeRuns.attemptCount, existingRun.attemptCount),
-            ),
-          );
-
-        return {
-          alreadyCompleted: false as const,
-          runRowId: existingRun.id,
-          runId: existingRun.publicId,
-          batchId: expectedBatchId,
-          leaseOwner,
-          fencingToken: nextToken,
-          acknowledgeUnreachable: nextAck,
-          envelope: parsedTargets,
-          checkpoint: nextCp,
-          counts: parsedCounts,
-        };
-      }
-
-      const runId = ulid(nowMs);
-      const targets: TrashEntityRef[] = [
-        ...nonPurgedOrders.map((o) => ({
-          kind: "order" as const,
-          id: o.id,
-          publicId: o.publicId,
-          batchId: o.trashBatchId!,
-        })),
-        {
-          kind: "customer" as const,
-          id: lockedCust.id,
-          publicId: lockedCust.publicId,
-          batchId: expectedBatchId,
-        },
-      ];
-
-      for (const ord of nonPurgedOrders) {
-        await ordersTrash.markPurgeStartedInTx(tx, { orderId: ord.id, runId, actor });
-      }
-      await idTrash.markPurgeStartedInTx(tx, lockedCust.id, {
-        batchId: expectedBatchId,
-        runId,
-        actor,
-      });
-
-      const envelope: PersistedTargetsEnvelope = {
-        targets,
-        expectedModules: computeExpectedModules(),
-      };
-      const checkpoint: PersistedCheckpoint = {
-        completedSteps: [],
-        leaseOwner,
-        leaseExpiresAtMs: nowMs + PURGE_LEASE_MS,
-        fencingToken: 1,
-      };
-      const counts: PersistedCounts = { deleted: {}, kept: {} };
-
-      const [ins] = await tx.insert(trashPurgeRuns).values({
-        publicId: runId,
-        trigger: actor.kind === "user" ? "manual" : "retention",
-        actorUserId: actor.kind === "user" ? actor.userId : null,
-        sweepPublicId: sweepPublicId ?? null,
-        entityKind: "customer",
-        entityId: lockedCust.id,
-        entityPublicId: lockedCust.publicId,
-        batchId: expectedBatchId,
-        status: "running",
-        targetsJson: JSON.stringify(envelope),
-        checkpointJson: JSON.stringify(checkpoint),
-        countsJson: JSON.stringify(counts),
-        attemptCount: 1,
-        correlationId: expectedBatchId,
-        startedAt: now,
-        updatedAt: now,
-      });
-
-      for (const ord of nonPurgedOrders) {
+          actor,
+        });
         await deps.audit.record(
           {
             category: "admin",
-            eventName: "order.purge_started",
+            eventName: "customer.purge_started",
             action: "delete",
             outcome: "attempted",
             severity: "WARN",
@@ -1970,434 +2486,441 @@ export function createTrashCoordinator(
               actor.kind === "user" && auditPrincipal
                 ? { userId: auditPrincipal.userId, role: auditPrincipal.role }
                 : { role: "system" },
-            resource: { type: "order", id: ord.id, publicId: ord.publicId },
-            orderPublicId: ord.publicId,
+            resource: { type: "user", id: lockedCust.id, publicId: lockedCust.publicId },
             correlationId: expectedBatchId,
+            safeCounts: { cascaded_orders: orderedCascadeOrders.length },
             attributes: {
-              order_public_id: ord.publicId,
               customer_public_id: lockedCust.publicId,
-              trash_batch_id: ord.trashBatchId!,
+              trash_batch_id: expectedBatchId,
               run_public_id: runId,
               trigger: triggerLabel,
               bulk_count: bulkCount,
+              cascaded_orders: orderedCascadeOrders.length,
             },
           },
           tx,
         );
-      }
-      await deps.audit.record(
-        {
-          category: "admin",
-          eventName: "customer.purge_started",
-          action: "delete",
-          outcome: "attempted",
-          severity: "WARN",
-          actor:
-            actor.kind === "user" && auditPrincipal
-              ? { userId: auditPrincipal.userId, role: auditPrincipal.role }
-              : { role: "system" },
-          resource: { type: "user", id: lockedCust.id, publicId: lockedCust.publicId },
-          correlationId: expectedBatchId,
-          safeCounts: { cascaded_orders: nonPurgedOrders.length },
-          attributes: {
-            customer_public_id: lockedCust.publicId,
-            trash_batch_id: expectedBatchId,
-            run_public_id: runId,
-            trigger: triggerLabel,
-            bulk_count: bulkCount,
-            cascaded_orders: nonPurgedOrders.length,
-          },
-        },
-        tx,
-      );
 
-      return {
-        alreadyCompleted: false as const,
-        runRowId: Number(ins.insertId),
-        runId,
-        batchId: expectedBatchId,
-        leaseOwner,
-        fencingToken: 1,
-        acknowledgeUnreachable: false,
-        envelope,
-        checkpoint,
-        counts,
-      };
-    });
-
-    if (claimed.alreadyCompleted) {
-      return {
-        runId: claimed.runId,
-        batchId: claimed.batchId,
-        keptExternalCopies: claimed.keptExternalCopies,
-      };
-    }
-
-    const {
-      runRowId,
-      runId,
-      batchId,
-      leaseOwner,
-      fencingToken,
-      acknowledgeUnreachable,
-      envelope,
-      checkpoint,
-      counts,
-    } = claimed;
-    const completedSet = new Set<string>(checkpoint.completedSteps);
-
-    async function assertAndWriteCheckpoint(tx?: Tx): Promise<void> {
-      const runTx = async (innerTx: Tx) => {
-        const [liveRun] = await innerTx
-          .select({ status: trashPurgeRuns.status, checkpointJson: trashPurgeRuns.checkpointJson })
-          .from(trashPurgeRuns)
-          .where(eq(trashPurgeRuns.id, runRowId))
-          .for("update")
-          .limit(1);
-        if (!liveRun || liveRun.status !== "running") {
-          throw conflict("PURGE_FENCE_LOST", "Permanent deletion claim was superseded.");
-        }
-        const liveCp = parseCheckpoint(liveRun.checkpointJson);
-        if (liveCp.fencingToken !== fencingToken || liveCp.leaseOwner !== leaseOwner) {
-          throw conflict("PURGE_FENCE_LOST", "Permanent deletion claim was superseded.");
-        }
-        const now = deps.clock.now();
-        checkpoint.leaseExpiresAtMs = now.getTime() + PURGE_LEASE_MS;
-        await innerTx
-          .update(trashPurgeRuns)
-          .set({
-            checkpointJson: JSON.stringify(checkpoint),
-            countsJson: JSON.stringify(counts),
-            updatedAt: now,
-          })
-          .where(eq(trashPurgeRuns.id, runRowId));
-      };
-      if (tx) await runTx(tx);
-      else await deps.db.transaction(runTx);
-    }
-
-    try {
-      // Phase 2: Fail closed if any expected participant is missing; execute each step & checkpoint under fence.
-      const requiredModules = [...new Set([...envelope.expectedModules, ...computeExpectedModules()])];
-      const participants = resolveParticipantsOrFail(requiredModules);
-
-      for (const target of envelope.targets) {
-        for (const participant of participants) {
-          const stepKey = `${target.kind}:${target.id}:${participant.module}`;
-          if (completedSet.has(stepKey)) continue;
-          if (participant.purge) {
-            const passSingleOrderAck =
-              acknowledgeUnreachable === true &&
-              actor.kind === "user" &&
-              envelope.targets.length === 1 &&
-              target.kind === "order";
-            const res = await participant.purge(target, {
-              runId,
-              ...(passSingleOrderAck ? { acknowledgedUnreachableCopies: true } : {}),
-            });
-            mergeCounts(counts.deleted, res.deleted);
-            mergeCounts(counts.kept, res.kept);
-          }
-          completedSet.add(stepKey);
-          checkpoint.completedSteps = [...completedSet];
-          await assertAndWriteCheckpoint();
-        }
-      }
-
-      // Phase 3: Under `FOR UPDATE` fence + target locks (`orders -> users`), verify batch generations & legal holds, then write tombstones.
-      await deps.db.transaction(async (tx) => {
-        const [liveRun] = await tx
-          .select({ status: trashPurgeRuns.status, checkpointJson: trashPurgeRuns.checkpointJson })
-          .from(trashPurgeRuns)
-          .where(eq(trashPurgeRuns.id, runRowId))
-          .for("update")
-          .limit(1);
-        if (!liveRun || liveRun.status !== "running") {
-          throw conflict("PURGE_FENCE_LOST", "Permanent deletion claim was superseded.");
-        }
-        const liveCp = parseCheckpoint(liveRun.checkpointJson);
-        if (liveCp.fencingToken !== fencingToken || liveCp.leaseOwner !== leaseOwner) {
-          throw conflict("PURGE_FENCE_LOST", "Permanent deletion claim was superseded.");
-        }
-
-        const orderTargets = envelope.targets
-          .filter((t) => t.kind === "order")
-          .sort((a, b) => a.id - b.id);
-        const customerTargets = envelope.targets
-          .filter((t) => t.kind === "customer")
-          .sort((a, b) => a.id - b.id);
-
-        // Lock `users` targets FIRST (`users -> orders` lock order), then lock `orders` targets.
-        for (const ct of customerTargets) {
-          const [cRow] = await tx
-            .select({
-              id: users.id,
-              trashBatchId: users.trashBatchId,
-              purgedAt: users.purgedAt,
-            })
-            .from(users)
-            .where(eq(users.id, ct.id))
-            .for("update")
-            .limit(1);
-          if (!cRow) throw notFound("CUSTOMER_NOT_FOUND");
-          if (!cRow.purgedAt && cRow.trashBatchId !== ct.batchId) {
-            throw conflict("STALE", "Customer trash generation changed before completion.");
-          }
-        }
-
-        if (orderTargets.length > 0) {
-          const lockedOrders = await tx
-            .select({
-              id: orders.id,
-              lockState: orders.lockState,
-              trashBatchId: orders.trashBatchId,
-              purgedAt: orders.purgedAt,
-            })
-            .from(orders)
-            .where(inArray(orders.id, orderTargets.map((t) => t.id)))
-            .orderBy(asc(orders.id))
-            .for("update");
-          const byId = new Map(lockedOrders.map((o) => [o.id, o]));
-          for (const ot of orderTargets) {
-            const row = byId.get(ot.id);
-            if (!row) throw notFound("ORDER_NOT_FOUND");
-            if (row.lockState === "legal_hold") throw legalHoldError();
-            if (!row.purgedAt && row.trashBatchId !== ot.batchId) {
-              throw conflict("STALE", "Order trash generation changed before completion.");
-            }
-          }
-        }
-
-        for (const ct of customerTargets) {
-          // Verify no new live or legal-hold orders appeared for this customer before tombstoning.
-          const [extraOrder] = await tx
-            .select({ id: orders.id, lockState: orders.lockState, trashedAt: orders.trashedAt })
-            .from(orders)
-            .where(
-              and(
-                eq(orders.ownerUserId, ct.id),
-                isNull(orders.purgedAt),
-                or(isNull(orders.trashedAt), eq(orders.lockState, "legal_hold")),
-              ),
-            )
-            .for("share")
-            .limit(1);
-          if (extraOrder?.lockState === "legal_hold") throw legalHoldError();
-          if (extraOrder && extraOrder.trashedAt === null) {
-            throw conflict(
-              "CUSTOMER_HAS_LIVE_ORDERS",
-              "Customer owns a live order and cannot be permanently deleted.",
-            );
-          }
-        }
-
-        for (const ot of orderTargets) {
-          await ordersTrash.tombstoneOrderInTx(tx, { orderId: ot.id, runId, actor });
-          await deps.audit.record(
-            {
-              category: "admin",
-              eventName: "order.purged",
-              action: "delete",
-              outcome: "completed",
-              severity: "WARN",
-              actor:
-                actor.kind === "user" && auditPrincipal
-                  ? { userId: auditPrincipal.userId, role: auditPrincipal.role }
-                  : { role: "system" },
-              resource: { type: "order", id: ot.id, publicId: ot.publicId },
-              orderPublicId: ot.publicId,
-              correlationId: batchId,
-              safeCounts: safeCountsForAudit(counts.deleted),
-              attributes: {
-                order_public_id: ot.publicId,
-                trash_batch_id: ot.batchId,
-                run_public_id: runId,
-                trigger: triggerLabel,
-              },
-            },
-            tx,
-          );
-        }
-
-        for (const ct of customerTargets) {
-          const done = await idTrash.tombstoneCustomerInTx(tx, ct.id, { runId, actor });
-          mergeCounts(counts.deleted, done.erased);
-          await deps.audit.record(
-            {
-              category: "admin",
-              eventName: "customer.purged",
-              action: "delete",
-              outcome: "completed",
-              severity: "WARN",
-              actor:
-                actor.kind === "user" && auditPrincipal
-                  ? { userId: auditPrincipal.userId, role: auditPrincipal.role }
-                  : { role: "system" },
-              resource: { type: "user", id: ct.id, publicId: ct.publicId },
-              correlationId: batchId,
-              safeCounts: safeCountsForAudit(counts.deleted),
-              attributes: {
-                customer_public_id: ct.publicId,
-                trash_batch_id: ct.batchId,
-                run_public_id: runId,
-                trigger: triggerLabel,
-              },
-            },
-            tx,
-          );
-        }
-
-        delete counts.unreachableByConnection;
-        delete counts.unreachableTotal;
-        checkpoint.leaseOwner = null;
-        checkpoint.leaseExpiresAtMs = 0;
-
-        const finishedAt = deps.clock.now();
-        await tx
-          .update(trashPurgeRuns)
-          .set({
-            status: "completed",
-            checkpointJson: JSON.stringify(checkpoint),
-            countsJson: JSON.stringify(counts),
-            errorCode: null,
-            failedModule: null,
-            finishedAt,
-            updatedAt: finishedAt,
-          })
-          .where(eq(trashPurgeRuns.id, runRowId));
+        return {
+          alreadyCompleted: false as const,
+          runRowId,
+          runId,
+          batchId: expectedBatchId,
+          fencingToken: 1,
+          expectedModules,
+          targets: insertedTargets,
+          counts,
+        };
       });
 
-      const opsAlerts = services().opsAlerts;
-      if (opsAlerts) {
-        await opsAlerts.resolve({ source: "trash", dedupKey: `purge:${runId}` }).catch(() => false);
-        const unverified = counts.kept.unverifiedExternalCopies ?? 0;
-        if (unverified > 0) {
-          await opsAlerts
-            .emit({
-              source: "trash",
-              dedupKey: `purge-unverified-copies:${runId}`,
-              severity: "warning",
-              code: "TRASH_EXTERNAL_COPIES_UNVERIFIED",
-              title: "External storage copies could not be verified after permanent deletion",
-              text: `${unverified} historical external storage copy record(s) could not be verified with the remote provider.`,
-              orderPublicId: item.kind === "order" ? item.publicId : undefined,
-              runPublicId: runId,
-              correlationId: batchId,
-            })
-            .catch((err: unknown) => {
-              log.warn("failed to emit unverified external copies alert", { err, runId });
-            });
+      onClaimCommitted?.(claimed.batchId);
+
+      if (claimed.alreadyCompleted) {
+        return {
+          runId: claimed.runId,
+          batchId: claimed.batchId,
+          keptExternalCopies: claimed.keptExternalCopies,
+        };
+      }
+
+      const { runRowId, runId, batchId, fencingToken, expectedModules, targets, counts } = claimed;
+
+      async function assertFencedRunInTx(tx: Tx): Promise<TrashPurgeRunRow> {
+        const [liveRun] = await tx
+          .select()
+          .from(trashPurgeRuns)
+          .where(eq(trashPurgeRuns.id, runRowId))
+          .for("update")
+          .limit(1);
+        if (!liveRun || liveRun.status !== "running" || liveRun.fencingToken !== fencingToken) {
+          throw conflict("PURGE_FENCE_LOST", "Permanent deletion claim was superseded.");
         }
+        return liveRun;
       }
 
-      return {
-        runId,
-        batchId,
-        keptExternalCopies: counts.kept.acknowledgedExternalCopies ?? 0,
-      };
-    } catch (err) {
-      if (err instanceof DomainError && err.reasonCode === "PURGE_FENCE_LOST") {
-        throw err;
-      }
+      let activeTargetPublicId: string | null = null;
+      let activeModuleName: string | null = null;
 
-      const errorCode = err instanceof DomainError ? err.reasonCode : "TRASH_PURGE_FAILED";
-      const safeMsg =
-        err instanceof DomainError
-          ? err.safeMessage.slice(0, 250)
-          : "Permanent deletion did not finish cleanly and can be retried.";
+      try {
+        // Phase 2: Fail closed if any expected participant is missing; verify advisory lock BEFORE & AFTER each step.
+        const requiredModules = [...new Set([...expectedModules, ...computeExpectedModules()])];
+        const participants = resolveParticipantsOrFail(requiredModules);
 
-      if (err instanceof DomainError && err.reasonCode === "EXTERNAL_COPIES_UNREACHABLE") {
-        const parsedUnreachable = parseUnreachableDetails(err);
-        counts.unreachableByConnection = parsedUnreachable.byConnection;
-        counts.unreachableTotal = parsedUnreachable.total;
-      }
+        for (const targetRow of targets) {
+          if (targetRow.status === "completed") continue;
+          activeTargetPublicId = targetRow.entityPublicId;
+          const targetRef: TrashEntityRef = {
+            kind: targetRow.entityKind,
+            id: targetRow.entityId,
+            publicId: targetRow.entityPublicId,
+            batchId: targetRow.batchId,
+          };
+          const targetCp = parseTargetCheckpoint(targetRow.checkpointJson);
 
-      await deps.db
-        .transaction(async (tx) => {
-          const [liveRun] = await tx
-            .select({ status: trashPurgeRuns.status, checkpointJson: trashPurgeRuns.checkpointJson })
-            .from(trashPurgeRuns)
-            .where(eq(trashPurgeRuns.id, runRowId))
-            .for("update")
-            .limit(1);
-          if (!liveRun || liveRun.status !== "running") return;
-          const liveCp = parseCheckpoint(liveRun.checkpointJson);
-          if (liveCp.fencingToken !== fencingToken || liveCp.leaseOwner !== leaseOwner) return;
-          checkpoint.leaseOwner = null;
-          checkpoint.leaseExpiresAtMs = 0;
-          const failedAt = deps.clock.now();
+          if (targetRow.status === "pending") {
+            await runLock!.assertStillHeld();
+            await deps.db.transaction(async (tx) => {
+              await assertFencedRunInTx(tx);
+              await tx
+                .update(trashPurgeRunTargets)
+                .set({ status: "running", updatedAt: deps.clock.now() })
+                .where(eq(trashPurgeRunTargets.id, targetRow.id));
+            });
+            targetRow.status = "running";
+          }
+
+          for (const participant of participants) {
+            if (Object.prototype.hasOwnProperty.call(targetCp, participant.module)) {
+              continue;
+            }
+            activeModuleName = participant.module;
+            // Verify exclusive advisory lock is STILL held on our dedicated MySQL connection BEFORE participant I/O!
+            await runLock!.assertStillHeld();
+
+            let stepResult: TrashPurgeResult = { deleted: {} };
+            if (participant.purge) {
+              const passScopedOrderAck =
+                actor.kind === "user" &&
+                targetRow.entityKind === "order" &&
+                targetRow.leaveExternalCopiesApprovedAt !== null;
+              stepResult = await participant.purge(targetRef, {
+                runId,
+                ...(passScopedOrderAck ? { acknowledgedUnreachableCopies: true } : {}),
+              });
+            }
+
+            // Re-verify advisory lock after participant returns and persist per-target checkpoint under fencingToken CAS!
+            await runLock!.assertStillHeld();
+            targetCp[participant.module] = {
+              deleted: stepResult.deleted ?? {},
+              ...(stepResult.kept ? { kept: stepResult.kept } : {}),
+            };
+            mergeCounts(counts.deleted, stepResult.deleted);
+            mergeCounts(counts.kept, stepResult.kept);
+
+            await deps.db.transaction(async (tx) => {
+              await assertFencedRunInTx(tx);
+              const stepNow = deps.clock.now();
+              await tx
+                .update(trashPurgeRunTargets)
+                .set({
+                  checkpointJson: JSON.stringify(targetCp),
+                  updatedAt: stepNow,
+                })
+                .where(eq(trashPurgeRunTargets.id, targetRow.id));
+              await tx
+                .update(trashPurgeRuns)
+                .set({
+                  countsJson: JSON.stringify(counts),
+                  updatedAt: stepNow,
+                })
+                .where(and(eq(trashPurgeRuns.id, runRowId), eq(trashPurgeRuns.fencingToken, fencingToken)));
+            });
+            activeModuleName = null;
+          }
+          activeTargetPublicId = null;
+        }
+
+        // Phase 3: Verify advisory lock + fencingToken CAS + `users -> orders` locks, verify generations & legal holds, write tombstones.
+        await runLock!.assertStillHeld();
+        await deps.db.transaction(async (tx) => {
+          await assertFencedRunInTx(tx);
+
+          const orderTargetRows = targets
+            .filter((t) => t.entityKind === "order")
+            .sort((a, b) => a.entityId - b.entityId);
+          const customerTargetRows = targets
+            .filter((t) => t.entityKind === "customer")
+            .sort((a, b) => a.entityId - b.entityId);
+
+          for (const ct of customerTargetRows) {
+            const [cRow] = await tx
+              .select({
+                id: users.id,
+                trashBatchId: users.trashBatchId,
+                purgedAt: users.purgedAt,
+              })
+              .from(users)
+              .where(eq(users.id, ct.entityId))
+              .for("update")
+              .limit(1);
+            if (!cRow) throw notFound("CUSTOMER_NOT_FOUND");
+            if (!cRow.purgedAt && cRow.trashBatchId !== ct.batchId) {
+              throw conflict("STALE", "Customer trash generation changed before completion.");
+            }
+          }
+
+          if (orderTargetRows.length > 0) {
+            const lockedOrders = await tx
+              .select({
+                id: orders.id,
+                lockState: orders.lockState,
+                trashBatchId: orders.trashBatchId,
+                purgedAt: orders.purgedAt,
+              })
+              .from(orders)
+              .where(inArray(orders.id, orderTargetRows.map((t) => t.entityId)))
+              .orderBy(asc(orders.id))
+              .for("update");
+            const byId = new Map(lockedOrders.map((o) => [o.id, o]));
+            for (const ot of orderTargetRows) {
+              const row = byId.get(ot.entityId);
+              if (!row) throw notFound("ORDER_NOT_FOUND");
+              if (row.lockState === "legal_hold") throw legalHoldError();
+              if (!row.purgedAt && row.trashBatchId !== ot.batchId) {
+                throw conflict("STALE", "Order trash generation changed before completion.");
+              }
+            }
+          }
+
+          for (const ct of customerTargetRows) {
+            const [extraOrder] = await tx
+              .select({ id: orders.id, lockState: orders.lockState, trashedAt: orders.trashedAt })
+              .from(orders)
+              .where(
+                and(
+                  eq(orders.ownerUserId, ct.entityId),
+                  isNull(orders.purgedAt),
+                  or(isNull(orders.trashedAt), eq(orders.lockState, "legal_hold")),
+                ),
+              )
+              .for("share")
+              .limit(1);
+            if (extraOrder?.lockState === "legal_hold") throw legalHoldError();
+            if (extraOrder && extraOrder.trashedAt === null) {
+              throw conflict(
+                "CUSTOMER_HAS_LIVE_ORDERS",
+                "Customer owns a live order and cannot be permanently deleted.",
+              );
+            }
+          }
+
+          const finishedAt = deps.clock.now();
+
+          // Tombstone additions before roots (`entityId DESC`), then customers.
+          const tombstoneOrdersDesc = [...orderTargetRows].sort((a, b) => b.entityId - a.entityId);
+          for (const ot of tombstoneOrdersDesc) {
+            await ordersTrash.tombstoneOrderInTx(tx, { orderId: ot.entityId, runId, actor });
+            await tx
+              .update(trashPurgeRunTargets)
+              .set({ status: "completed", tombstonedAt: finishedAt, updatedAt: finishedAt })
+              .where(eq(trashPurgeRunTargets.id, ot.id));
+            await deps.audit.record(
+              {
+                category: "admin",
+                eventName: "order.purged",
+                action: "delete",
+                outcome: "completed",
+                severity: "WARN",
+                actor:
+                  actor.kind === "user" && auditPrincipal
+                    ? { userId: auditPrincipal.userId, role: auditPrincipal.role }
+                    : { role: "system" },
+                resource: { type: "order", id: ot.entityId, publicId: ot.entityPublicId },
+                orderPublicId: ot.entityPublicId,
+                correlationId: batchId,
+                safeCounts: safeCountsForAudit(counts.deleted),
+                attributes: {
+                  order_public_id: ot.entityPublicId,
+                  trash_batch_id: ot.batchId,
+                  run_public_id: runId,
+                  trigger: triggerLabel,
+                },
+              },
+              tx,
+            );
+          }
+
+          for (const ct of customerTargetRows) {
+            const done = await idTrash.tombstoneCustomerInTx(tx, ct.entityId, { runId, actor });
+            mergeCounts(counts.deleted, done.erased);
+            await tx
+              .update(trashPurgeRunTargets)
+              .set({ status: "completed", tombstonedAt: finishedAt, updatedAt: finishedAt })
+              .where(eq(trashPurgeRunTargets.id, ct.id));
+            await deps.audit.record(
+              {
+                category: "admin",
+                eventName: "customer.purged",
+                action: "delete",
+                outcome: "completed",
+                severity: "WARN",
+                actor:
+                  actor.kind === "user" && auditPrincipal
+                    ? { userId: auditPrincipal.userId, role: auditPrincipal.role }
+                    : { role: "system" },
+                resource: { type: "user", id: ct.entityId, publicId: ct.entityPublicId },
+                correlationId: batchId,
+                safeCounts: safeCountsForAudit(counts.deleted),
+                attributes: {
+                  customer_public_id: ct.entityPublicId,
+                  trash_batch_id: ct.batchId,
+                  run_public_id: runId,
+                  trigger: triggerLabel,
+                },
+              },
+              tx,
+            );
+          }
+
+          delete counts.unreachableByConnection;
+          delete counts.unreachableTotal;
+
           await tx
             .update(trashPurgeRuns)
             .set({
-              status: "failed",
-              checkpointJson: JSON.stringify(checkpoint),
+              status: "completed",
               countsJson: JSON.stringify(counts),
-              errorCode,
-              finishedAt: failedAt,
-              updatedAt: failedAt,
+              errorCode: null,
+              failedModule: null,
+              failedTargetPublicId: null,
+              nextRetryAt: null,
+              finishedAt,
+              updatedAt: finishedAt,
             })
-            .where(eq(trashPurgeRuns.id, runRowId));
-        })
-        .catch((dbErr: unknown) => {
-          log.error("failed to record failed purge run state", { err: dbErr, runId });
+            .where(and(eq(trashPurgeRuns.id, runRowId), eq(trashPurgeRuns.fencingToken, fencingToken)));
         });
 
-      await deps.audit
-        .record({
-          category: "admin",
-          eventName: item.kind === "order" ? "order.purged" : "customer.purged",
-          action: "delete",
-          outcome: "failed",
-          severity: "WARN",
-          reasonCode: errorCode,
-          actor:
-            actor.kind === "user" && auditPrincipal
-              ? { userId: auditPrincipal.userId, role: auditPrincipal.role }
-              : { role: "system" },
-          resource:
-            item.kind === "order"
-              ? { type: "order", publicId: item.publicId }
-              : { type: "user", publicId: item.publicId },
-          orderPublicId: item.kind === "order" ? item.publicId : undefined,
-          correlationId: batchId,
-          attributes: {
-            ...(item.kind === "order"
-              ? { order_public_id: item.publicId }
-              : { customer_public_id: item.publicId }),
-            trash_batch_id: batchId,
-            run_public_id: runId,
-            reason_code: errorCode,
-            trigger: triggerLabel,
-          },
-        })
-        .catch((auditErr: unknown) => {
-          log.error("failed to record purge failure audit event", { err: auditErr, runId });
-        });
+        const opsAlerts = services().opsAlerts;
+        if (opsAlerts) {
+          await opsAlerts.resolve({ source: "trash", dedupKey: `purge:${runId}` }).catch(() => false);
+          const unverified = counts.kept.unverifiedExternalCopies ?? 0;
+          if (unverified > 0) {
+            await opsAlerts
+              .emit({
+                source: "trash",
+                dedupKey: `purge-unverified-copies:${runId}`,
+                severity: "warning",
+                code: "TRASH_EXTERNAL_COPIES_UNVERIFIED",
+                title: "External storage copies could not be verified after permanent deletion",
+                text: `${unverified} historical external storage copy record(s) could not be verified with the remote provider.`,
+                orderPublicId: item.kind === "order" ? item.publicId : undefined,
+                runPublicId: runId,
+                correlationId: batchId,
+              })
+              .catch((err: unknown) => {
+                log.warn("failed to emit unverified external copies alert", { err, runId });
+              });
+          }
+        }
 
-      const opsAlerts = services().opsAlerts;
-      if (opsAlerts) {
-        await opsAlerts
-          .emit({
-            source: "trash",
-            dedupKey: `purge:${runId}`,
-            severity: "error",
-            code: errorCode,
-            title:
-              errorCode === "EXTERNAL_COPIES_UNREACHABLE"
-                ? "External storage destination unreachable during permanent deletion"
-                : "Trash permanent deletion needs attention",
-            text: safeMsg,
-            orderPublicId: item.kind === "order" ? item.publicId : undefined,
-            runPublicId: runId,
-            correlationId: batchId,
+        return {
+          runId,
+          batchId,
+          keptExternalCopies: counts.kept.acknowledgedExternalCopies ?? 0,
+        };
+      } catch (err) {
+        if (err instanceof DomainError && err.reasonCode === "PURGE_FENCE_LOST") {
+          throw err;
+        }
+
+        const errorCode = err instanceof DomainError ? err.reasonCode : "TRASH_PURGE_FAILED";
+        const safeMsg =
+          err instanceof DomainError
+            ? err.safeMessage.slice(0, 250)
+            : "Permanent deletion did not finish cleanly and can be retried.";
+
+        if (err instanceof DomainError && err.reasonCode === "EXTERNAL_COPIES_UNREACHABLE") {
+          const parsedUnreachable = parseUnreachableDetails(err);
+          counts.unreachableByConnection = parsedUnreachable.byConnection;
+          counts.unreachableTotal = parsedUnreachable.total;
+        }
+
+        await deps.db
+          .transaction(async (tx) => {
+            const [liveRun] = await tx
+              .select({
+                status: trashPurgeRuns.status,
+                fencingToken: trashPurgeRuns.fencingToken,
+                attemptCount: trashPurgeRuns.attemptCount,
+              })
+              .from(trashPurgeRuns)
+              .where(eq(trashPurgeRuns.id, runRowId))
+              .for("update")
+              .limit(1);
+            if (!liveRun || liveRun.status !== "running" || liveRun.fencingToken !== fencingToken) return;
+            const failedAt = deps.clock.now();
+            const retryAt = new Date(failedAt.getTime() + computeRetryBackoffMs(liveRun.attemptCount));
+            await tx
+              .update(trashPurgeRuns)
+              .set({
+                status: "failed",
+                countsJson: JSON.stringify(counts),
+                errorCode,
+                failedModule: activeModuleName,
+                failedTargetPublicId: activeTargetPublicId,
+                nextRetryAt: retryAt,
+                finishedAt: failedAt,
+                updatedAt: failedAt,
+              })
+              .where(and(eq(trashPurgeRuns.id, runRowId), eq(trashPurgeRuns.fencingToken, fencingToken)));
           })
-          .catch((alertErr: unknown) => {
-            log.error("failed to emit ops alert for failed purge", { err: alertErr, runId });
+          .catch((dbErr: unknown) => {
+            log.error("failed to record failed purge run state", { err: dbErr, runId });
           });
-      }
 
-      if (err instanceof DomainError) throw err;
-      throw unavailable("TRASH_PURGE_FAILED", safeMsg);
+        await deps.audit
+          .record({
+            category: "admin",
+            eventName: item.kind === "order" ? "order.purged" : "customer.purged",
+            action: "delete",
+            outcome: "failed",
+            severity: "WARN",
+            reasonCode: errorCode,
+            actor:
+              actor.kind === "user" && auditPrincipal
+                ? { userId: auditPrincipal.userId, role: auditPrincipal.role }
+                : { role: "system" },
+            resource:
+              item.kind === "order"
+                ? { type: "order", publicId: item.publicId }
+                : { type: "user", publicId: item.publicId },
+            orderPublicId: activeTargetPublicId ?? (item.kind === "order" ? item.publicId : undefined),
+            correlationId: batchId,
+            attributes: {
+              ...(item.kind === "order"
+                ? { order_public_id: item.publicId }
+                : { customer_public_id: item.publicId }),
+              ...(activeTargetPublicId ? { failed_target_public_id: activeTargetPublicId } : {}),
+              trash_batch_id: batchId,
+              run_public_id: runId,
+              reason_code: errorCode,
+              trigger: triggerLabel,
+            },
+          })
+          .catch((auditErr: unknown) => {
+            log.error("failed to record purge failure audit event", { err: auditErr, runId });
+          });
+
+        const opsAlerts = services().opsAlerts;
+        if (opsAlerts) {
+          await opsAlerts
+            .emit({
+              source: "trash",
+              dedupKey: `purge:${runId}`,
+              severity: "error",
+              code: errorCode,
+              title:
+                errorCode === "EXTERNAL_COPIES_UNREACHABLE"
+                  ? "External storage destination unreachable during permanent deletion"
+                  : "Trash permanent deletion needs attention",
+              text: safeMsg,
+              orderPublicId: activeTargetPublicId ?? (item.kind === "order" ? item.publicId : undefined),
+              runPublicId: runId,
+              correlationId: batchId,
+            })
+            .catch((alertErr: unknown) => {
+              log.error("failed to emit ops alert for failed purge", { err: alertErr, runId });
+            });
+        }
+
+        if (err instanceof DomainError) throw err;
+        throw unavailable("TRASH_PURGE_FAILED", safeMsg);
+      }
+    } finally {
+      if (runLock !== null) {
+        await (runLock as AdvisoryLockHandle).release();
+      }
     }
   }
 
@@ -2457,7 +2980,7 @@ export function createTrashCoordinator(
         const [ownerMap, staffMap, runStatusMap] = await Promise.all([
           loadCustomerTrashMetaChunked(ownerIds),
           resolveStaffNamesByIds(staffIds),
-          latestPurgeRunsByEntity("order", orderItems.map((o) => o.id)),
+          owningPurgeRunsByEntity("order", orderItems.map((o) => o.id)),
         ]);
 
         for (const ord of orderItems) {
@@ -2468,29 +2991,24 @@ export function createTrashCoordinator(
             if (!dueAt || dueAt.getTime() > dueHorizonMs) continue;
           }
 
-          const latestRun = runStatusMap.get(ord.id);
+          const owningRun = runStatusMap.get(ord.id);
           let state: TrashRow["state"] = "in_trash";
           let failureCode: string | null = null;
           let unreachableExternalCopies: number | null = null;
           let failedRunId: string | null = null;
+          let failedTargetPublicId: string | null = null;
+          let failedTargetReference: string | null = null;
 
-          if (ord.purgeStartedAt) {
-            const cp = latestRun ? parseCheckpoint(latestRun.checkpointJson) : null;
-            const activelyRunning = latestRun?.status === "running" && (cp?.leaseExpiresAtMs ?? 0) > nowMs;
-            if (!activelyRunning && latestRun && latestRun.status === "failed") {
+          if (ord.purgeStartedAt || owningRun) {
+            if (owningRun?.status === "failed") {
               state = "failed";
-              failureCode = latestRun.errorCode ?? "TRASH_PURGE_FAILED";
-              failedRunId = latestRun.publicId;
+              failureCode = owningRun.errorCode ?? "TRASH_PURGE_FAILED";
+              failedRunId = owningRun.publicId;
+              failedTargetPublicId = owningRun.failedTargetPublicId;
+              failedTargetReference = owningRun.failedTargetReference;
               if (failureCode === "EXTERNAL_COPIES_UNREACHABLE") {
-                try {
-                  const env = JSON.parse(latestRun.targetsJson) as PersistedTargetsEnvelope;
-                  if (env.targets.length === 1) {
-                    const c = parseCounts(latestRun.countsJson);
-                    unreachableExternalCopies = c.unreachableTotal ?? 1;
-                  }
-                } catch {
-                  // Only expose single-order acknowledgment when target envelope is valid.
-                }
+                const c = parseCounts(owningRun.countsJson);
+                unreachableExternalCopies = c.unreachableTotal ?? 1;
               }
             } else {
               state = "deleting";
@@ -2499,7 +3017,7 @@ export function createTrashCoordinator(
 
           let canRestore = true;
           let restoreBlockedReason: string | null = null;
-          if (ord.purgeStartedAt) {
+          if (ord.purgeStartedAt || owningRun) {
             canRestore = false;
             restoreBlockedReason = "PURGE_IN_PROGRESS";
           } else if (ownerMeta?.trashedAt) {
@@ -2525,6 +3043,8 @@ export function createTrashCoordinator(
             failureCode,
             unreachableExternalCopies,
             failedRunId,
+            failedTargetPublicId,
+            failedTargetReference,
             canRestore,
             restoreBlockedReason,
           });
@@ -2541,7 +3061,7 @@ export function createTrashCoordinator(
           .filter((id): id is number => id !== null);
         const [staffMap, runStatusMap] = await Promise.all([
           resolveStaffNamesByIds(staffIds),
-          latestPurgeRunsByEntity("customer", custItems.map((c) => c.id)),
+          owningPurgeRunsByEntity("customer", custItems.map((c) => c.id)),
         ]);
 
         for (const cust of custItems) {
@@ -2552,25 +3072,32 @@ export function createTrashCoordinator(
             if (!dueAt || dueAt.getTime() > dueHorizonMs) continue;
           }
 
-          const latestRun = runStatusMap.get(cust.id);
+          const owningRun = runStatusMap.get(cust.id);
           let state: TrashRow["state"] = "in_trash";
           let failureCode: string | null = null;
-          const unreachableExternalCopies: number | null = null;
+          let unreachableExternalCopies: number | null = null;
           let failedRunId: string | null = null;
+          let failedTargetPublicId: string | null = null;
+          let failedTargetReference: string | null = null;
 
-          if (cust.purgeStartedAt) {
-            const cp = latestRun ? parseCheckpoint(latestRun.checkpointJson) : null;
-            const activelyRunning = latestRun?.status === "running" && (cp?.leaseExpiresAtMs ?? 0) > nowMs;
-            if (!activelyRunning && latestRun && latestRun.status === "failed") {
+          if (cust.purgeStartedAt || owningRun) {
+            if (owningRun?.status === "failed") {
               state = "failed";
-              failureCode = latestRun.errorCode ?? "TRASH_PURGE_FAILED";
-              failedRunId = latestRun.publicId;
+              failureCode = owningRun.errorCode ?? "TRASH_PURGE_FAILED";
+              failedRunId = owningRun.publicId;
+              failedTargetPublicId = owningRun.failedTargetPublicId;
+              failedTargetReference = owningRun.failedTargetReference;
+              if (failureCode === "EXTERNAL_COPIES_UNREACHABLE") {
+                const c = parseCounts(owningRun.countsJson);
+                unreachableExternalCopies = c.unreachableTotal ?? 1;
+              }
             } else {
               state = "deleting";
             }
           }
 
           const ref = cust.customerRef ?? cust.publicId;
+          const blockedByPurge = Boolean(cust.purgeStartedAt || owningRun);
           allRows.push({
             kind: "customer",
             publicId: cust.publicId,
@@ -2586,8 +3113,10 @@ export function createTrashCoordinator(
             failureCode,
             unreachableExternalCopies,
             failedRunId,
-            canRestore: cust.purgeStartedAt === null,
-            restoreBlockedReason: cust.purgeStartedAt ? "PURGE_IN_PROGRESS" : null,
+            failedTargetPublicId,
+            failedTargetReference,
+            canRestore: !blockedByPurge,
+            restoreBlockedReason: blockedByPurge ? "PURGE_IN_PROGRESS" : null,
           });
         }
       }
@@ -2890,8 +3419,6 @@ export function createTrashCoordinator(
             return { batchId: effectiveBatchId, dueAt, cascadedOrders };
           }
 
-          // Customer move-to-trash: lock `users` row FIRST via `trashCustomerInTx` (`users -> orders` lock order),
-          // then check legal holds & trash customer's orders (transaction rolls back atomically on legal hold).
           const cust = await idTrash.resolveCustomerInTx(tx, input.publicId);
           if (!cust || cust.purgedAt) throw notFound("CUSTOMER_NOT_FOUND");
           if (cust.trashedAt) {
@@ -2987,10 +3514,14 @@ export function createTrashCoordinator(
     },
 
     async restore(principal, input): Promise<TrashRestoreOutput> {
-      assertUniqueItems(input.items);
+      assertUniqueMutationItems(input.items);
+      const initialBatchBindings: Record<string, string | null> = {};
+      for (const item of input.items) {
+        initialBatchBindings[`${item.kind}:${item.publicId}`] = item.batchId;
+      }
       const fingerprintHash = keyHash(
         `trash.fp:restore:${JSON.stringify(
-          input.items.map((i) => ({ kind: i.kind, publicId: i.publicId, batchId: i.batchId ?? null })),
+          input.items.map((i) => ({ kind: i.kind, publicId: i.publicId, batchId: i.batchId })),
         )}`,
       );
 
@@ -3000,6 +3531,7 @@ export function createTrashCoordinator(
         operation: "restore",
         idempotencyKey: input.idempotencyKey,
         fingerprintHash,
+        initialBatchBindings,
         verifyBatchGenerations: true,
       });
       if (reservation.hit) return reservation.payload;
@@ -3012,7 +3544,7 @@ export function createTrashCoordinator(
       };
       const single = input.items.length === 1;
       const results: TrashItemResult[] = [];
-      const batchBindings: Record<string, string | null> = {};
+      const batchBindings: Record<string, string | null> = { ...initialBatchBindings };
       let restored = 0;
 
       try {
@@ -3047,12 +3579,12 @@ export function createTrashCoordinator(
                       ? { type: "order", publicId: item.publicId }
                       : { type: "user", publicId: item.publicId },
                   orderPublicId: item.kind === "order" ? item.publicId : undefined,
-                  ...(item.batchId ? { correlationId: item.batchId } : {}),
+                  correlationId: item.batchId,
                   attributes: {
                     ...(item.kind === "order"
                       ? { order_public_id: item.publicId }
                       : { customer_public_id: item.publicId }),
-                    ...(item.batchId ? { trash_batch_id: item.batchId } : {}),
+                    trash_batch_id: item.batchId,
                     reason_code: normalized.reasonCode,
                   },
                 })
@@ -3068,7 +3600,11 @@ export function createTrashCoordinator(
           }
         }
       } catch (err) {
-        await releaseUnmutatedIdempotency(reservation.rowId);
+        if (restored > 0) {
+          await failIdempotency(reservation.rowId, fingerprintHash, batchBindings, err);
+        } else {
+          await releaseUnmutatedIdempotency(reservation.rowId);
+        }
         throw err;
       }
 
@@ -3078,7 +3614,7 @@ export function createTrashCoordinator(
     },
 
     async purge(principal, input): Promise<TrashPurgeOutput> {
-      assertUniqueItems(input.items);
+      assertUniqueMutationItems(input.items);
       const single = input.items.length === 1;
       const trimmedConfirmation = input.confirmation.trim();
       if (!single && trimmedConfirmation !== `DELETE ${input.items.length}`) {
@@ -3088,9 +3624,14 @@ export function createTrashCoordinator(
         );
       }
 
+      const initialBatchBindings: Record<string, string | null> = {};
+      for (const item of input.items) {
+        initialBatchBindings[`${item.kind}:${item.publicId}`] = item.batchId;
+      }
+
       const fingerprintHash = keyHash(
         `trash.fp:purge:${JSON.stringify({
-          items: input.items.map((i) => ({ kind: i.kind, publicId: i.publicId, batchId: i.batchId ?? null })),
+          items: input.items.map((i) => ({ kind: i.kind, publicId: i.publicId, batchId: i.batchId })),
           confirmation: trimmedConfirmation,
         })}`,
       );
@@ -3101,6 +3642,7 @@ export function createTrashCoordinator(
         operation: "purge",
         idempotencyKey: input.idempotencyKey,
         fingerprintHash,
+        initialBatchBindings,
         verifyBatchGenerations: true,
       });
       if (reservation.hit) return reservation.payload;
@@ -3113,7 +3655,8 @@ export function createTrashCoordinator(
       };
       const runIds: string[] = [];
       const results: TrashItemResult[] = [];
-      const batchBindings: Record<string, string | null> = {};
+      const batchBindings: Record<string, string | null> = { ...initialBatchBindings };
+      let anyClaimCommitted = false;
 
       try {
         for (const item of input.items) {
@@ -3124,6 +3667,10 @@ export function createTrashCoordinator(
               auditPrincipal: principal,
               bulkCount: input.items.length,
               expectedSingleConfirmation: single ? trimmedConfirmation : undefined,
+              onClaimCommitted: (claimedBatchId) => {
+                anyClaimCommitted = true;
+                batchBindings[`${item.kind}:${item.publicId}`] = claimedBatchId;
+              },
             });
             runIds.push(done.runId);
             batchBindings[`${item.kind}:${item.publicId}`] = done.batchId;
@@ -3140,7 +3687,11 @@ export function createTrashCoordinator(
           }
         }
       } catch (err) {
-        await releaseUnmutatedIdempotency(reservation.rowId);
+        if (anyClaimCommitted) {
+          await failIdempotency(reservation.rowId, fingerprintHash, batchBindings, err);
+        } else {
+          await releaseUnmutatedIdempotency(reservation.rowId);
+        }
         throw err;
       }
 
@@ -3153,19 +3704,20 @@ export function createTrashCoordinator(
       principal,
       input: TrashFinishLeavingExternalInput,
     ): Promise<TrashFinishLeavingExternalOutput> {
-      if (input.kind !== "order") {
-        throw conflict(
-          "ACKNOWLEDGMENT_SINGLE_ORDER_ONLY",
-          "Leave external copies in place on each order individually, typing its order number.",
-        );
+      if (!input.batchId || input.batchId.trim().length === 0) {
+        throw validation("BATCH_ID_REQUIRED", "Include the trash batch identifier.");
       }
       const trimmedConfirmation = input.confirmation.trim();
+      const initialBatchBindings: Record<string, string | null> = {
+        [`${input.kind}:${input.publicId}`]: input.batchId,
+      };
       const fingerprintHash = keyHash(
         `trash.fp:finish_external:${JSON.stringify({
           kind: input.kind,
           publicId: input.publicId,
-          batchId: input.batchId ?? null,
+          batchId: input.batchId,
           runId: input.runId,
+          targetOrderPublicId: input.targetOrderPublicId ?? null,
           confirmation: trimmedConfirmation,
         })}`,
       );
@@ -3176,6 +3728,7 @@ export function createTrashCoordinator(
         operation: "finish_leaving_external_copies",
         idempotencyKey: input.idempotencyKey,
         fingerprintHash,
+        initialBatchBindings,
         verifyBatchGenerations: true,
       });
       if (reservation.hit) return reservation.payload;
@@ -3186,6 +3739,7 @@ export function createTrashCoordinator(
         publicId: principal.userPublicId,
         sessionId: principal.sessionId,
       };
+      let claimCommitted = false;
 
       try {
         const done = await executePurgeOne({
@@ -3193,23 +3747,29 @@ export function createTrashCoordinator(
           actor,
           auditPrincipal: principal,
           bulkCount: 1,
-          expectedSingleConfirmation: trimmedConfirmation,
-          acknowledgeUnreachableRunId: input.runId,
+          acknowledgeExternal: {
+            runPublicId: input.runId,
+            targetOrderPublicId: input.targetOrderPublicId,
+            confirmation: trimmedConfirmation,
+          },
+          onClaimCommitted: (claimedBatchId) => {
+            claimCommitted = true;
+            initialBatchBindings[`${input.kind}:${input.publicId}`] = claimedBatchId;
+          },
         });
         const output: TrashFinishLeavingExternalOutput = {
           ok: true,
           runId: done.runId,
           keptExternalCopies: done.keptExternalCopies,
         };
-        await completeIdempotency(
-          reservation.rowId,
-          fingerprintHash,
-          { [`${input.kind}:${input.publicId}`]: done.batchId },
-          output,
-        );
+        await completeIdempotency(reservation.rowId, fingerprintHash, initialBatchBindings, output);
         return output;
       } catch (err) {
-        await releaseUnmutatedIdempotency(reservation.rowId);
+        if (claimCommitted) {
+          await failIdempotency(reservation.rowId, fingerprintHash, initialBatchBindings, err);
+        } else {
+          await releaseUnmutatedIdempotency(reservation.rowId);
+        }
         throw err;
       }
     },
@@ -3231,7 +3791,8 @@ export function createTrashCoordinator(
           tx,
           true,
         );
-        const requiresConfirmation = shorteningOrEnabling && becomeDue > 0;
+        // D2.8: Enabling auto clean-up or shortening an active period ALWAYS requires typed confirmation (including `DELETE 0`).
+        const requiresConfirmation = shorteningOrEnabling;
         return {
           becomeDue,
           requiresConfirmation,
@@ -3281,23 +3842,16 @@ export function createTrashCoordinator(
           );
 
           if (shorteningOrEnabling) {
-            if (becomeDue > 0) {
-              if (input.reviewedDueCount === undefined || input.reviewedDueCount !== becomeDue) {
-                throw conflict(
-                  "STALE",
-                  "The settings or the number of items due changed meanwhile. Review again.",
-                );
-              }
-              if ((input.confirmation ?? "").trim() !== `DELETE ${becomeDue}`) {
-                throw validation(
-                  "CONFIRMATION_MISMATCH",
-                  "The confirmation you typed doesn't match. Nothing was changed.",
-                );
-              }
-            } else if (input.reviewedDueCount !== undefined && input.reviewedDueCount !== 0) {
+            if (input.reviewedDueCount === undefined || input.reviewedDueCount !== becomeDue) {
               throw conflict(
                 "STALE",
                 "The settings or the number of items due changed meanwhile. Review again.",
+              );
+            }
+            if ((input.confirmation ?? "").trim() !== `DELETE ${becomeDue}`) {
+              throw validation(
+                "CONFIRMATION_MISMATCH",
+                "The confirmation you typed doesn't match. Nothing was changed.",
               );
             }
           }
@@ -3354,191 +3908,350 @@ export function createTrashCoordinator(
       return buildSettingsView();
     },
 
-    async runRetentionCleanup(triggerJobId?: string): Promise<TrashCleanupResult> {
+    async runRetentionCleanup(
+      triggerJobId?: string,
+      jobFence?: TrashCleanupJobFence,
+    ): Promise<TrashCleanupResult> {
       const now = deps.clock.now();
       const sweepPublicId = ulid(now.getTime());
 
-      const maintenanceSkip = await isMaintenanceBlockingCleanup();
-      if (maintenanceSkip) {
+      const sweepLock = await tryAcquireAdvisoryLock((dbh) => trashSweepAdvisoryLockName(dbh));
+      if (!sweepLock) {
         return {
           sweepPublicId,
-          skippedReason: maintenanceSkip,
+          skippedReason: "SWEEP_ALREADY_RUNNING",
           due: 0,
           purged: 0,
           failed: 0,
         };
       }
 
-      const retention = await readRetentionValues();
-      if (!retention.autoPurgeEnabled) {
-        return {
-          sweepPublicId,
-          skippedReason: "AUTO_PURGE_DISABLED",
-          due: 0,
-          purged: 0,
-          failed: 0,
-        };
-      }
+      try {
+        const preSkip = await deps.db.transaction(async (tx) => {
+          await shareLockRetentionCohortInTx(tx);
+          const maint = await isMaintenanceBlockingCleanup(tx);
+          if (maint) return { reason: maint, retention: null };
+          const ret = await readRetentionValues(tx, true);
+          if (!ret.autoPurgeEnabled) return { reason: "AUTO_PURGE_DISABLED", retention: null };
+          return { reason: null, retention: ret };
+        });
 
-      const nowMs = now.getTime();
-      const customerCutoff = new Date(nowMs - retention.customerDays * DAY_MS);
-      const orderCutoff = new Date(nowMs - retention.orderDays * DAY_MS);
-
-      const [dueCustRows, dueOrdRows] = await Promise.all([
-        deps.db
-          .select({ publicId: users.publicId })
-          .from(users)
-          .where(
-            and(
-              eq(users.role, "customer"),
-              isNotNull(users.trashedAt),
-              isNull(users.purgedAt),
-              lte(users.trashedAt, customerCutoff),
-            ),
-          )
-          .orderBy(asc(users.trashedAt), asc(users.id))
-          .limit(SWEEP_BATCH_LIMIT),
-        deps.db
-          .select({ publicId: orders.publicId })
-          .from(orders)
-          .leftJoin(users, eq(users.id, orders.ownerUserId))
-          .where(
-            and(
-              isNotNull(orders.trashedAt),
-              isNull(orders.purgedAt),
-              lte(orders.trashedAt, orderCutoff),
-              sql`NOT (${users.trashedAt} IS NOT NULL AND ${users.purgedAt} IS NULL AND ${users.trashBatchId} = ${orders.trashBatchId})`,
-            ),
-          )
-          .orderBy(asc(orders.trashedAt), asc(orders.id))
-          .limit(SWEEP_BATCH_LIMIT),
-      ]);
-
-      const dueTargets: TrashItemRef[] = [
-        ...dueCustRows.map((r) => ({ kind: "customer" as const, publicId: r.publicId })),
-        ...dueOrdRows.map((r) => ({ kind: "order" as const, publicId: r.publicId })),
-      ].slice(0, SWEEP_BATCH_LIMIT);
-
-      const [sweepIns] = await deps.db.insert(trashCleanupSweeps).values({
-        publicId: sweepPublicId,
-        correlationId: triggerJobId ?? sweepPublicId,
-        status: "running",
-        purgedCount: 0,
-        failedCount: 0,
-        startedAt: now,
-      });
-      const sweepRowId = Number(sweepIns.insertId);
-
-      const actor: TrashActor = { kind: "system", job: TRASH_JOB_RETENTION_CLEANUP };
-      let purged = 0;
-      let failed = 0;
-
-      for (const target of dueTargets) {
-        if (await isMaintenanceBlockingCleanup()) break;
-        try {
-          await executePurgeOne({
-            item: target,
-            actor,
-            bulkCount: dueTargets.length,
+        if (preSkip.reason || !preSkip.retention) {
+          return {
             sweepPublicId,
-          });
-          purged += 1;
-        } catch (err) {
-          // Legal hold on a trashed item: skip + emit alert, do NOT fail the whole sweep (lead ruling).
-          if (err instanceof DomainError && err.reasonCode === "ORDER_ON_LEGAL_HOLD") {
-            const opsAlerts = services().opsAlerts;
-            if (opsAlerts) {
-              await opsAlerts
-                .emit({
-                  source: "trash",
-                  dedupKey: `legal-hold:${target.kind}:${target.publicId}`,
-                  severity: "warning",
-                  code: "ORDER_ON_LEGAL_HOLD",
-                  title: "Item on legal hold skipped during retention clean-up",
-                  text: "Release the legal hold before automatic permanent deletion can proceed.",
-                  orderPublicId: target.kind === "order" ? target.publicId : undefined,
-                  runPublicId: sweepPublicId,
-                  correlationId: sweepPublicId,
-                })
-                .catch(() => undefined);
-            }
-            continue;
-          }
-          // Concurrent restore / retention change / active manual purge is benign, not a sweep failure.
-          if (
-            err instanceof DomainError &&
-            (err.reasonCode === "NOT_IN_TRASH" ||
-              err.reasonCode === "NOT_DUE" ||
-              err.reasonCode === "MAINTENANCE_ACTIVE" ||
-              err.reasonCode === "AUTO_PURGE_DISABLED" ||
-              err.reasonCode === "PURGE_IN_PROGRESS" ||
-              err.reasonCode === "ORDER_NOT_FOUND" ||
-              err.reasonCode === "CUSTOMER_NOT_FOUND")
-          ) {
-            continue;
-          }
-          failed += 1;
-          log.warn("retention cleanup item failed; continuing sweep", { err, target, sweepPublicId });
+            skippedReason: preSkip.reason ?? "AUTO_PURGE_DISABLED",
+            due: 0,
+            purged: 0,
+            failed: 0,
+          };
         }
-      }
 
-      const finishedAt = deps.clock.now();
-      const status: "completed" | "failed" = failed > 0 ? "failed" : "completed";
-      await deps.db
-        .update(trashCleanupSweeps)
-        .set({
-          status,
-          purgedCount: purged,
-          failedCount: failed,
-          errorCode: failed > 0 ? "TRASH_CLEANUP_PARTIAL_FAILURE" : null,
-          finishedAt,
-        })
-        .where(eq(trashCleanupSweeps.id, sweepRowId));
+        const retention = preSkip.retention;
+        const nowMs = now.getTime();
+        const customerCutoff = new Date(nowMs - retention.customerDays * DAY_MS);
+        const orderCutoff = new Date(nowMs - retention.orderDays * DAY_MS);
 
-      await deps.audit.record({
-        category: "job",
-        eventName: "trash.cleanup_completed",
-        action: "delete",
-        outcome: failed > 0 ? "failed" : "completed",
-        severity: failed > 0 ? "WARN" : "INFO",
-        actor: { role: "system" },
-        resource: { type: "trash_cleanup", id: sweepRowId, publicId: sweepPublicId },
-        correlationId: sweepPublicId,
-        ...(triggerJobId ? { jobId: triggerJobId } : {}),
-        safeCounts: { due: dueTargets.length, purged, failed },
-        attributes: {
-          run_public_id: sweepPublicId,
-          due: dueTargets.length,
+        const [sweepIns] = await deps.db.insert(trashCleanupSweeps).values({
+          publicId: sweepPublicId,
+          correlationId: triggerJobId ?? sweepPublicId,
+          status: "running",
+          fencingToken: 1,
+          purgedCount: 0,
+          failedCount: 0,
+          startedAt: now,
+        });
+        const sweepRowId = Number(sweepIns.insertId);
+
+        const actor: TrashActor = { kind: "system", job: TRASH_JOB_RETENTION_CLEANUP };
+        let dueEvaluated = 0;
+        let purged = 0;
+        let failed = 0;
+        let scanned = 0;
+        let stoppedEarly = false;
+
+        type DueCandidate = {
+          kind: TrashEntityKind;
+          id: number;
+          publicId: string;
+          trashedAt: Date;
+          dueAtMs: number;
+        };
+
+        let custCursor: { trashedAt: Date; id: number } | null = null;
+        let ordCursor: { trashedAt: Date; id: number } | null = null;
+        let custDone = false;
+        let ordDone = false;
+        const custBuffer: DueCandidate[] = [];
+        const ordBuffer: DueCandidate[] = [];
+
+        const refillCustomers = async () => {
+          if (custDone || custBuffer.length > 0) return;
+          const sweepNow = deps.clock.now();
+          const cursorCond = custCursor
+            ? or(
+                gt(users.trashedAt, custCursor.trashedAt),
+                and(eq(users.trashedAt, custCursor.trashedAt), gt(users.id, custCursor.id)),
+              )
+            : undefined;
+          const rows = await deps.db
+            .select({
+              id: users.id,
+              publicId: users.publicId,
+              trashedAt: users.trashedAt,
+              runStatus: trashPurgeRuns.status,
+              nextRetryAt: trashPurgeRuns.nextRetryAt,
+            })
+            .from(users)
+            .leftJoin(
+              trashPurgeRunTargets,
+              and(
+                eq(trashPurgeRunTargets.entityKind, "customer"),
+                eq(trashPurgeRunTargets.entityId, users.id),
+              ),
+            )
+            .leftJoin(trashPurgeRuns, eq(trashPurgeRuns.id, trashPurgeRunTargets.runId))
+            .where(
+              and(
+                eq(users.role, "customer"),
+                isNotNull(users.trashedAt),
+                isNull(users.purgedAt),
+                lte(users.trashedAt, customerCutoff),
+                cursorCond,
+              ),
+            )
+            .orderBy(asc(users.trashedAt), asc(users.id))
+            .limit(SWEEP_PAGE_SIZE);
+
+          if (rows.length < SWEEP_PAGE_SIZE) custDone = true;
+          for (const r of rows) {
+            custCursor = { trashedAt: r.trashedAt!, id: r.id };
+            if (
+              r.runStatus === "failed" &&
+              r.nextRetryAt !== null &&
+              r.nextRetryAt.getTime() > sweepNow.getTime()
+            ) {
+              continue;
+            }
+            custBuffer.push({
+              kind: "customer",
+              id: r.id,
+              publicId: r.publicId,
+              trashedAt: r.trashedAt!,
+              dueAtMs: r.trashedAt!.getTime() + retention.customerDays * DAY_MS,
+            });
+          }
+        };
+
+        const refillOrders = async () => {
+          if (ordDone || ordBuffer.length > 0) return;
+          const sweepNow = deps.clock.now();
+          const cursorCond = ordCursor
+            ? or(
+                gt(orders.trashedAt, ordCursor.trashedAt),
+                and(eq(orders.trashedAt, ordCursor.trashedAt), gt(orders.id, ordCursor.id)),
+              )
+            : undefined;
+          const rows = await deps.db
+            .select({
+              id: orders.id,
+              publicId: orders.publicId,
+              trashedAt: orders.trashedAt,
+              runStatus: trashPurgeRuns.status,
+              nextRetryAt: trashPurgeRuns.nextRetryAt,
+            })
+            .from(orders)
+            .leftJoin(users, eq(users.id, orders.ownerUserId))
+            .leftJoin(
+              trashPurgeRunTargets,
+              and(
+                eq(trashPurgeRunTargets.entityKind, "order"),
+                eq(trashPurgeRunTargets.entityId, orders.id),
+              ),
+            )
+            .leftJoin(trashPurgeRuns, eq(trashPurgeRuns.id, trashPurgeRunTargets.runId))
+            .where(
+              and(
+                isNotNull(orders.trashedAt),
+                isNull(orders.purgedAt),
+                lte(orders.trashedAt, orderCutoff),
+                sql`NOT (${users.trashedAt} IS NOT NULL AND ${users.purgedAt} IS NULL AND ${users.trashBatchId} = ${orders.trashBatchId})`,
+                cursorCond,
+              ),
+            )
+            .orderBy(asc(orders.trashedAt), asc(orders.id))
+            .limit(SWEEP_PAGE_SIZE);
+
+          if (rows.length < SWEEP_PAGE_SIZE) ordDone = true;
+          for (const r of rows) {
+            ordCursor = { trashedAt: r.trashedAt!, id: r.id };
+            if (
+              r.runStatus === "failed" &&
+              r.nextRetryAt !== null &&
+              r.nextRetryAt.getTime() > sweepNow.getTime()
+            ) {
+              continue;
+            }
+            ordBuffer.push({
+              kind: "order",
+              id: r.id,
+              publicId: r.publicId,
+              trashedAt: r.trashedAt!,
+              dueAtMs: r.trashedAt!.getTime() + retention.orderDays * DAY_MS,
+            });
+          }
+        };
+
+        while (dueEvaluated < SWEEP_BATCH_LIMIT && scanned < SWEEP_MAX_SCANNED) {
+          await refillCustomers();
+          await refillOrders();
+
+          if (custBuffer.length === 0 && ordBuffer.length === 0) {
+            if (custDone && ordDone) break;
+            continue;
+          }
+
+          let nextCandidate: DueCandidate;
+          if (custBuffer.length > 0 && ordBuffer.length > 0) {
+            // Fair interleaved ordering by earliest `dueAtMs` (tie-breaking customer before order, then id ASC).
+            nextCandidate =
+              custBuffer[0]!.dueAtMs <= ordBuffer[0]!.dueAtMs ? custBuffer.shift()! : ordBuffer.shift()!;
+          } else if (custBuffer.length > 0) {
+            nextCandidate = custBuffer.shift()!;
+          } else {
+            nextCandidate = ordBuffer.shift()!;
+          }
+
+          scanned += 1;
+
+          // Re-verify sweep advisory lock AND job worker lease BEFORE every target!
+          await sweepLock.assertStillHeld();
+          if (jobFence) {
+            if (jobFence.signal.aborted) {
+              stoppedEarly = true;
+              break;
+            }
+            await jobFence.assertStillOwned();
+          }
+
+          try {
+            await executePurgeOne({
+              item: { kind: nextCandidate.kind, publicId: nextCandidate.publicId },
+              actor,
+              bulkCount: 1,
+              sweepPublicId,
+            });
+            dueEvaluated += 1;
+            purged += 1;
+          } catch (err) {
+            if (err instanceof DomainError && err.reasonCode === "ORDER_ON_LEGAL_HOLD") {
+              const opsAlerts = services().opsAlerts;
+              if (opsAlerts) {
+                await opsAlerts
+                  .emit({
+                    source: "trash",
+                    dedupKey: `legal-hold:${nextCandidate.kind}:${nextCandidate.publicId}`,
+                    severity: "warning",
+                    code: "ORDER_ON_LEGAL_HOLD",
+                    title: "Item on legal hold skipped during retention clean-up",
+                    text: "Release the legal hold before automatic permanent deletion can proceed.",
+                    orderPublicId: nextCandidate.kind === "order" ? nextCandidate.publicId : undefined,
+                    runPublicId: sweepPublicId,
+                    correlationId: sweepPublicId,
+                  })
+                  .catch(() => undefined);
+              }
+              // Held items do NOT consume `dueEvaluated`, so later due items never starve!
+              continue;
+            }
+            if (
+              err instanceof DomainError &&
+              (err.reasonCode === "MAINTENANCE_ACTIVE" || err.reasonCode === "AUTO_PURGE_DISABLED")
+            ) {
+              stoppedEarly = true;
+              break;
+            }
+            if (
+              err instanceof DomainError &&
+              (err.reasonCode === "NOT_IN_TRASH" ||
+                err.reasonCode === "NOT_DUE" ||
+                err.reasonCode === "PURGE_IN_PROGRESS" ||
+                err.reasonCode === "PURGE_ALREADY_OWNED" ||
+                err.reasonCode === "PURGE_RETRY_BACKOFF" ||
+                err.reasonCode === "ORDER_NOT_FOUND" ||
+                err.reasonCode === "CUSTOMER_NOT_FOUND")
+            ) {
+              continue;
+            }
+            dueEvaluated += 1;
+            failed += 1;
+            log.warn("retention cleanup item failed; continuing sweep", {
+              err,
+              target: { kind: nextCandidate.kind, publicId: nextCandidate.publicId },
+              sweepPublicId,
+            });
+          }
+        }
+
+        const finishedAt = deps.clock.now();
+        const status: "completed" | "failed" = failed > 0 ? "failed" : "completed";
+        await deps.db
+          .update(trashCleanupSweeps)
+          .set({
+            status,
+            purgedCount: purged,
+            failedCount: failed,
+            errorCode: failed > 0 ? "TRASH_CLEANUP_PARTIAL_FAILURE" : stoppedEarly ? "SWEEP_INTERRUPTED" : null,
+            finishedAt,
+          })
+          .where(eq(trashCleanupSweeps.id, sweepRowId));
+
+        await deps.audit.record({
+          category: "job",
+          eventName: "trash.cleanup_completed",
+          action: "delete",
+          outcome: failed > 0 ? "failed" : "completed",
+          severity: failed > 0 ? "WARN" : "INFO",
+          actor: { role: "system" },
+          resource: { type: "trash_cleanup", id: sweepRowId, publicId: sweepPublicId },
+          correlationId: sweepPublicId,
+          ...(triggerJobId ? { jobId: triggerJobId } : {}),
+          safeCounts: { due: dueEvaluated, purged, failed },
+          attributes: {
+            run_public_id: sweepPublicId,
+            due: dueEvaluated,
+            purged,
+            failed,
+          },
+        });
+
+        const opsAlerts = services().opsAlerts;
+        if (opsAlerts && failed > 0) {
+          await opsAlerts
+            .emit({
+              source: "trash",
+              dedupKey: `retention:${sweepPublicId}`,
+              severity: "error",
+              code: "TRASH_PURGE_FAILED",
+              title: "Trash cleanup needs attention",
+              text: `${failed} item(s) could not be deleted permanently during scheduled retention cleanup.`,
+              runPublicId: sweepPublicId,
+              correlationId: sweepPublicId,
+            })
+            .catch((err: unknown) => {
+              log.error("failed to emit retention sweep failure alert", { err, sweepPublicId });
+            });
+        }
+
+        return {
+          sweepPublicId,
+          skippedReason: null,
+          due: dueEvaluated,
           purged,
           failed,
-        },
-      });
-
-      const opsAlerts = services().opsAlerts;
-      if (opsAlerts && failed > 0) {
-        await opsAlerts
-          .emit({
-            source: "trash",
-            dedupKey: `retention:${sweepPublicId}`,
-            severity: "error",
-            code: "TRASH_PURGE_FAILED",
-            title: "Trash cleanup needs attention",
-            text: `${failed} item(s) could not be deleted permanently during scheduled retention cleanup.`,
-            runPublicId: sweepPublicId,
-            correlationId: sweepPublicId,
-          })
-          .catch((err: unknown) => {
-            log.error("failed to emit retention sweep failure alert", { err, sweepPublicId });
-          });
+        };
+      } finally {
+        await sweepLock.release();
       }
-
-      return {
-        sweepPublicId,
-        skippedReason: null,
-        due: dueTargets.length,
-        purged,
-        failed,
-      };
     },
   };
 
@@ -3549,7 +4262,7 @@ export function createTrashCoordinator(
         return { outcome: "canceled", reasonCode: "ABORTED" };
       }
       await job.assertStillOwned();
-      const res = await service.runRetentionCleanup(job.jobId);
+      const res = await service.runRetentionCleanup(job.jobId, job);
       if (res.failed > 0) {
         return { outcome: "failed", reasonCode: "TRASH_PURGE_FAILED", retryable: true };
       }
