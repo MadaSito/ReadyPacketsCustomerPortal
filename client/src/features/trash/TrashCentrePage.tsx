@@ -9,7 +9,7 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { Badge, Button, DataTable, DateTime, EmptyState, Field, FilterBar, Input, PageHeader, Pagination, Select, Tabs, type Column, type SortState } from "@/ui";
 import { useTrashApi, type TrashKind, type TrashListInput, type TrashRow } from "./api";
-import { EXTERNAL_COPIES_UNREACHABLE, STATE_META, dueText, unreachableCopiesText } from "./model";
+import { EXTERNAL_COPIES_UNREACHABLE, STATE_META, dueText, restoreBlockedText, unreachableCopiesText } from "./model";
 import { RetentionPanel } from "./RetentionPanel";
 import { FinishLeavingCopiesDialog, PurgeDialog, RestoreDialog, type TrashTarget } from "./TrashDialogs";
 
@@ -63,7 +63,7 @@ function RowActions({ row: r, onRestore, onPurge, onFinish }: { row: TrashRow; o
           {finishLabel(r.unreachableExternalCopies ?? 0)}
         </Button>
       ) : null}
-      {r.restoreBlockedReason ? <span id={reasonId} className="w-full text-xs break-words text-body">{r.restoreBlockedReason}</span> : null}
+      {r.restoreBlockedReason ? <span id={reasonId} className="w-full text-xs break-words text-body">{restoreBlockedText(r.restoreBlockedReason)}</span> : null}
     </span>
   );
 }

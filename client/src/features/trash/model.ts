@@ -40,11 +40,18 @@ export const bulkConfirmation = (count: number): string => `DELETE ${count}`;
 /** Typed word for turning on clean-up or shortening retention (same strength as a permanent deletion). */
 export const retentionConfirmation = (count: number, serverPhrase?: string | null): string => serverPhrase?.trim() || `DELETE ${count}`;
 
+/** "retained mail copies" → "retained mail copy", "addresses" → "address", "paid invoices" → "paid invoice". */
+function singularWords(words: string): string {
+  if (words.endsWith("ies")) return `${words.slice(0, -3)}y`;
+  if (/(?:ss|sh|ch|x|z)es$/.test(words)) return words.slice(0, -2);
+  if (words.endsWith("s") && !words.endsWith("ss")) return words.slice(0, -1);
+  return words;
+}
+
 /** `paidInvoices` → "paid invoices"; counts never carry personal data. */
 export function countLabel(key: string, n: number): string {
   const words = key.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_.]+/g, " ").toLowerCase().trim();
-  const singular = n === 1 && words.endsWith("s") && !words.endsWith("ss") ? words.slice(0, -1) : words;
-  return `${n} ${singular}`;
+  return `${n} ${n === 1 ? singularWords(words) : words}`;
 }
 
 /** Non-zero counts as readable lines, largest first. */
@@ -111,6 +118,11 @@ const REASON_MESSAGES: Record<string, string> = {
 export function trashErrorMessage(reasonCode: string | null | undefined, safeMessage?: string | null): string {
   if (reasonCode && REASON_MESSAGES[reasonCode]) return REASON_MESSAGES[reasonCode];
   return safeMessage || "Something went wrong. Nothing was changed. Please try again.";
+}
+
+/** Why "Restore" is unavailable on a row; the server sends a reason code, never shown raw. */
+export function restoreBlockedText(reasonCode: string): string {
+  return REASON_MESSAGES[reasonCode] ?? "This item can't be restored right now.";
 }
 
 /** "2 orders restored. 1 could not be restored: …" — one sentence per outcome, for the live region. */

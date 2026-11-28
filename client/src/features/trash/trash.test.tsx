@@ -6,7 +6,7 @@ import type * as trpcModule from "@/lib/trpc";
 import { pageA11y } from "@/test/a11y";
 import { Button } from "@/ui";
 import { fakeAuthApi, renderUi } from "@/ui/testing";
-import { bulkConfirmation, dueText, resultSentence, retentionConfirmation, retentionError, retentionNeedsConfirmation, trashErrorMessage } from "./model";
+import { bulkConfirmation, countLabel, dueText, resultSentence, retentionConfirmation, retentionError, retentionNeedsConfirmation, trashErrorMessage } from "./model";
 import { lastRunText } from "./RetentionPanel";
 import { MoveToTrashDialog } from "./TrashDialogs";
 import TrashCentrePage, { toListInput } from "./TrashCentrePage";
@@ -80,7 +80,7 @@ beforeEach(() => {
   handlers.clear();
   calls.length = 0;
   handlers.set("trash.list", (input) => ((input as { kind: string }).kind === "order"
-    ? { items: [row(1), row(2, { canRestore: false, restoreBlockedReason: "Restore the customer account first." })], nextCursor: null, total: 2 }
+    ? { items: [row(1), row(2, { canRestore: false, restoreBlockedReason: "OWNER_IN_TRASH" })], nextCursor: null, total: 2 }
     : { items: [], nextCursor: null, total: 0 }));
   handlers.set("trash.counts", () => ({ orders: 2, customers: 0, dueWithin7d: 1 }));
   handlers.set("trash.movedByOptions", () => [{ publicId: "01JADMIN0000000000000000001", displayName: "Zeus Greene" }]);
@@ -99,6 +99,14 @@ const firstButton = (name: RegExp) => screen.getAllByRole("button", { name })[0]
 const lastCall = (path: string) => [...calls].reverse().find((c) => c.path === path)?.input as Record<string, unknown> | undefined;
 
 describe("trash model", () => {
+  it("words a single count correctly, including irregular plurals", () => {
+    expect(countLabel("retainedMailCopies", 1)).toBe("1 retained mail copy");
+    expect(countLabel("retainedMailCopies", 2)).toBe("2 retained mail copies");
+    expect(countLabel("paidInvoices", 1)).toBe("1 paid invoice");
+    expect(countLabel("billingAddresses", 1)).toBe("1 billing address");
+    expect(countLabel("lineItems", 3)).toBe("3 line items");
+  });
+
   it("words confirmations, due dates, results and retention checks", () => {
     expect(bulkConfirmation(3)).toBe("DELETE 3");
     expect(retentionConfirmation(0)).toBe("DELETE 0");

@@ -7,7 +7,7 @@ import { PRESENTATION_QUERY_KEY } from "@/app/shell/common";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronLeft, ChevronRight, Pause, Play } from "lucide-react";
 import { useEffect, useState } from "react";
-import { BRAND_PILLARS } from "@shared/brand";
+import { BRAND, BRAND_PILLARS } from "@shared/brand";
 import { useAuthApi, type PublicSlide } from "@/lib/authApi";
 import { apiUrl, assetUrl } from "@/lib/runtime";
 import { BrandLogo } from "@/ui";
@@ -80,7 +80,7 @@ export function BrandSlideshow() {
           </div>
         ) : null}
       </div>
-      <p className="relative text-sm text-on-navy-muted">{presentation.data?.supportText || "Your Business, Professionally Packeted\u2122"}</p>
+      <p className="relative text-sm text-on-navy-muted">{presentation.data?.supportText || BRAND.tagline}</p>
     </section>
   );
 }
